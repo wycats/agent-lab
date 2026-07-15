@@ -1,5 +1,6 @@
 use std::{
     path::Path,
+    process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -18,12 +19,14 @@ use rmcp::{
         ProgressToken, Tool,
     },
     service::NotificationContext,
-    transport::TokioChildProcess,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use thiserror::Error;
-use tokio::{process::Command, sync::mpsc as tokio_mpsc};
+use tokio::{
+    process::Command,
+    sync::{mpsc as tokio_mpsc, oneshot},
+};
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -53,7 +56,7 @@ pub struct McpBridge {
 }
 
 struct BridgeInner {
-    sender: tokio_mpsc::Sender<Request>,
+    sender: tokio_mpsc::UnboundedSender<Request>,
     events: Arc<EventLog>,
     discovery_stale: Arc<AtomicBool>,
     runtime_id: u64,
@@ -71,25 +74,33 @@ enum Request {
 
 #[derive(Default)]
 struct EventLog {
-    next_sequence: AtomicU64,
-    events: Mutex<Vec<LifecycleEvent>>,
+    state: Mutex<EventLogState>,
+}
+
+#[derive(Default)]
+struct EventLogState {
+    next_sequence: u64,
+    events: Vec<LifecycleEvent>,
 }
 
 impl EventLog {
     fn record(&self, kind: &str, payload: JsonValue) {
-        let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        self.events
-            .lock()
-            .expect("event log lock poisoned")
-            .push(LifecycleEvent {
-                sequence,
-                kind: kind.to_owned(),
-                payload,
-            });
+        let mut state = self.state.lock().expect("event log lock poisoned");
+        state.next_sequence += 1;
+        let sequence = state.next_sequence;
+        state.events.push(LifecycleEvent {
+            sequence,
+            kind: kind.to_owned(),
+            payload,
+        });
     }
 
     fn snapshot(&self) -> Vec<LifecycleEvent> {
-        self.events.lock().expect("event log lock poisoned").clone()
+        self.state
+            .lock()
+            .expect("event log lock poisoned")
+            .events
+            .clone()
     }
 }
 
@@ -146,18 +157,28 @@ impl McpBridge {
         executable: impl AsRef<Path>,
         args: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self, BridgeError> {
+        Self::connect_with_timeout(
+            executable.as_ref().to_owned(),
+            args.into_iter().map(Into::into).collect(),
+            STARTUP_TIMEOUT,
+        )
+    }
+
+    fn connect_with_timeout(
+        executable: std::path::PathBuf,
+        args: Vec<String>,
+        startup_timeout: Duration,
+    ) -> Result<Self, BridgeError> {
         let runtime_id = NEXT_RUNTIME_ID.fetch_add(1, Ordering::SeqCst);
-        let (sender, receiver) = tokio_mpsc::channel(32);
+        let (sender, receiver) = tokio_mpsc::unbounded_channel();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (startup_cancel_sender, startup_cancel_receiver) = oneshot::channel();
         let events = Arc::new(EventLog::default());
         let discovery_stale = Arc::new(AtomicBool::new(false));
         let handler = RecordingClient {
             events: events.clone(),
             discovery_stale: discovery_stale.clone(),
         };
-        let executable = executable.as_ref().to_owned();
-        let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
-
         thread::Builder::new()
             .name(format!("agent-lab-mcp-{runtime_id}"))
             .spawn(move || {
@@ -172,6 +193,7 @@ impl McpBridge {
                         handler,
                         receiver,
                         ready_sender.clone(),
+                        startup_cancel_receiver,
                     )),
                     Err(error) => Err(error.to_string()),
                 };
@@ -182,11 +204,12 @@ impl McpBridge {
             })
             .map_err(|error| BridgeError::Startup(error.to_string()))?;
 
-        match ready_receiver.recv_timeout(STARTUP_TIMEOUT) {
+        match ready_receiver.recv_timeout(startup_timeout) {
             Ok(result) => result.map_err(BridgeError::Startup)?,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = startup_cancel_sender.send(());
                 return Err(BridgeError::StartupTimeout {
-                    timeout: STARTUP_TIMEOUT,
+                    timeout: startup_timeout,
                 });
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -216,12 +239,19 @@ impl McpBridge {
         self.inner.discovery_stale.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn mark_discovery_fresh(&self) {
+        self.inner.discovery_stale.store(false, Ordering::SeqCst);
+    }
+
     #[must_use]
     pub fn events(&self) -> Vec<LifecycleEvent> {
         self.inner.events.snapshot()
     }
 
     /// Return all tools currently exposed by the live MCP session.
+    ///
+    /// This method waits synchronously for the background actor. It is safe to
+    /// call from a Tokio context, but it blocks the caller's thread.
     ///
     /// # Errors
     ///
@@ -230,13 +260,12 @@ impl McpBridge {
         let (sender, receiver) = mpsc::sync_channel(1);
         self.inner
             .sender
-            .blocking_send(Request::ListTools(sender))
+            .send(Request::ListTools(sender))
             .map_err(|_| BridgeError::ChannelClosed)?;
         let tools = receiver
             .recv()
             .map_err(|_| BridgeError::ChannelClosed)?
             .map_err(BridgeError::Request)?;
-        self.inner.discovery_stale.store(false, Ordering::SeqCst);
         self.inner
             .events
             .record("mcp.tools.listed", json!({ "count": tools.len() }));
@@ -244,6 +273,9 @@ impl McpBridge {
     }
 
     /// Invoke one tool through the live MCP session.
+    ///
+    /// This method waits synchronously for the background actor. It is safe to
+    /// call from a Tokio context, but it blocks the caller's thread.
     ///
     /// # Errors
     ///
@@ -262,7 +294,7 @@ impl McpBridge {
             .record("mcp.tool.started", json!({ "name": name }));
         self.inner
             .sender
-            .blocking_send(Request::CallTool {
+            .send(Request::CallTool {
                 name: name.clone(),
                 arguments,
                 response: sender,
@@ -289,7 +321,7 @@ impl McpBridge {
 
 impl Drop for BridgeInner {
     fn drop(&mut self) {
-        let _ = self.sender.try_send(Request::Shutdown);
+        let _ = self.sender.send(Request::Shutdown);
     }
 }
 
@@ -297,21 +329,51 @@ async fn run_actor(
     executable: std::path::PathBuf,
     args: Vec<String>,
     handler: RecordingClient,
-    mut receiver: tokio_mpsc::Receiver<Request>,
+    mut receiver: tokio_mpsc::UnboundedReceiver<Request>,
     ready_sender: mpsc::SyncSender<Result<(), String>>,
+    mut startup_cancel: oneshot::Receiver<()>,
 ) -> Result<(), String> {
     let mut command = Command::new(executable);
-    command.args(args).kill_on_drop(true);
-    let transport = TokioChildProcess::new(command).map_err(|error| error.to_string())?;
-    let mut service = handler
-        .serve(transport)
-        .await
-        .map_err(|error| error.to_string())?;
-    service
-        .peer()
-        .list_all_tools()
-        .await
-        .map_err(|error| error.to_string())?;
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "MCP child stdout was not piped".to_owned())?;
+    let child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "MCP child stdin was not piped".to_owned())?;
+    let startup_result = {
+        let startup = async {
+            let service = handler
+                .serve((child_stdout, child_stdin))
+                .await
+                .map_err(|error| error.to_string())?;
+            service
+                .peer()
+                .list_all_tools()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(service)
+        };
+        tokio::pin!(startup);
+        tokio::select! {
+            result = &mut startup => Some(result),
+            _ = &mut startup_cancel => None,
+        }
+    };
+    let mut service = if let Some(result) = startup_result {
+        result?
+    } else {
+        terminate_child(&mut child).await?;
+        return Err("bridge startup cancelled".to_owned());
+    };
     ready_sender
         .send(Ok(()))
         .map_err(|_| "bridge ready receiver closed".to_owned())?;
@@ -349,5 +411,105 @@ async fn run_actor(
     }
 
     let _ = service.close().await;
+    wait_for_child_exit(&mut child).await?;
     Ok(())
+}
+
+async fn terminate_child(child: &mut tokio::process::Child) -> Result<(), String> {
+    match child.try_wait().map_err(|error| error.to_string())? {
+        Some(_) => Ok(()),
+        None => child.kill().await.map_err(|error| error.to_string()),
+    }
+}
+
+async fn wait_for_child_exit(child: &mut tokio::process::Child) -> Result<(), String> {
+    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(result) => result.map(|_| ()).map_err(|error| error.to_string()),
+        Err(_) => terminate_child(child).await,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{
+        fs,
+        process::{Command, Stdio},
+        sync::Arc,
+        thread,
+        time::Instant,
+    };
+
+    use serde_json::json;
+
+    use super::{BridgeError, EventLog, McpBridge};
+
+    #[test]
+    fn startup_timeout_stops_the_in_flight_child() {
+        let marker = std::env::temp_dir().join(format!(
+            "agent-lab-mcp-timeout-{}-{}",
+            std::process::id(),
+            super::NEXT_RUNTIME_ID.load(std::sync::atomic::Ordering::SeqCst)
+        ));
+        let script = r#"echo $$ > "$1"; exec sleep 30"#;
+        let error = McpBridge::connect_with_timeout(
+            "/bin/sh".into(),
+            vec![
+                "-c".to_owned(),
+                script.to_owned(),
+                "agent-lab-timeout".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            std::time::Duration::from_millis(500),
+        )
+        .err()
+        .expect("hung startup should time out");
+        assert!(matches!(error, BridgeError::StartupTimeout { .. }));
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let pid = loop {
+            if let Ok(pid) = fs::read_to_string(&marker) {
+                break pid.trim().to_owned();
+            }
+            assert!(Instant::now() < deadline, "child should record its pid");
+            thread::sleep(std::time::Duration::from_millis(10));
+        };
+        while Command::new("kill")
+            .args(["-0", &pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            assert!(Instant::now() < deadline, "timed-out child should stop");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = fs::remove_file(marker);
+    }
+
+    #[test]
+    fn concurrent_event_records_remain_in_sequence_order() {
+        let events = Arc::new(EventLog::default());
+        let threads = (0..8)
+            .map(|thread_id| {
+                let events = events.clone();
+                thread::spawn(move || {
+                    for event_id in 0..100 {
+                        events.record("test", json!({ "thread": thread_id, "event": event_id }));
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("event writer should finish");
+        }
+
+        let snapshot = events.snapshot();
+        assert_eq!(snapshot.len(), 800);
+        assert!(
+            snapshot
+                .iter()
+                .enumerate()
+                .all(|(index, event)| event.sequence == index as u64 + 1)
+        );
+    }
 }

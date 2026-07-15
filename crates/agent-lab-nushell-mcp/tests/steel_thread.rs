@@ -92,8 +92,15 @@ fn lifecycle_and_discovery_changes_remain_observable() {
     host.eval("tool fixture enable_extra")
         .expect("fixture should change its tool list");
     wait_for_stale_discovery(&bridge);
+    host.eval("mcp fixture tools")
+        .expect("catalog inspection should succeed");
+    assert!(
+        bridge.discovery_is_stale(),
+        "catalog inspection must not mark host commands refreshed"
+    );
     host.refresh("fixture")
         .expect("refresh should merge commands");
+    assert!(!bridge.discovery_is_stale());
     assert_eq!(
         host.eval("tool fixture extra | get available")
             .unwrap()
@@ -159,6 +166,26 @@ fn lifecycle_and_discovery_changes_remain_observable() {
             .iter()
             .any(|event| event.kind == "mcp.tool.protocol_failed")
     );
+}
+
+#[test]
+fn synchronous_bridge_calls_are_safe_inside_a_tokio_context() {
+    let bridge = fixture_bridge();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime should build");
+
+    runtime.block_on(async {
+        assert!(!bridge.list_tools().expect("tools should list").is_empty());
+        assert!(
+            bridge
+                .call_tool("session", serde_json::Map::new())
+                .expect("tool should run")
+                .structured_content
+                .is_some()
+        );
+    });
 }
 
 fn wait_for_stale_discovery(bridge: &McpBridge) {

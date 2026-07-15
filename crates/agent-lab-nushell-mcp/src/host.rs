@@ -141,6 +141,7 @@ impl NushellHost {
         }
         self.registered_tools
             .insert(namespace.to_owned(), current_tools);
+        bridge.mark_discovery_fresh();
         Ok(())
     }
 

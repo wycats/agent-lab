@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{ControllerCommand, DriverMessage, PROTOCOL_VERSION};
@@ -18,7 +19,8 @@ pub struct RawDriverMessage {
     pub parsed: DriverMessage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DriverTranscript {
     pub controller_records: Vec<Vec<u8>>,
     pub driver_records: Vec<Vec<u8>>,

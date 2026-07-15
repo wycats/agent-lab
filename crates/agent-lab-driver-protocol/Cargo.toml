@@ -15,3 +15,7 @@ workspace = true
 [[bin]]
 name = "agent-lab-driver-fixture"
 path = "src/bin/fixture.rs"
+
+[[bin]]
+name = "agent-lab-driver-probe"
+path = "src/bin/probe.rs"

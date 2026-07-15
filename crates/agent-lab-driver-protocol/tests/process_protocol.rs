@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use agent_lab_driver_protocol::{
-    CommandBody, ControllerCommand, DriverBody, DriverFailureScope, DriverProcess,
-    PROTOCOL_VERSION, ProcessError,
+    CanonicalizationPolicy, CommandBody, ControllerCommand, DriverBody, DriverEvidenceBundle,
+    DriverFailureScope, DriverProcess, PROTOCOL_VERSION, ProcessError,
 };
 use serde_json::json;
 
@@ -255,4 +255,65 @@ fn protocol_version_and_sequence_violations_are_distinct() {
             actual: 2
         })
     ));
+}
+
+#[test]
+fn raw_runs_remain_distinct_while_named_canonical_evidence_matches() {
+    let first = completed_fixture_bundle();
+    let second = completed_fixture_bundle();
+
+    assert_ne!(
+        first.transcript.driver_records,
+        second.transcript.driver_records
+    );
+    assert_eq!(first.canonical, second.canonical);
+    assert_eq!(
+        first.canonical.policy.removed_object_keys,
+        ["processId".to_owned()].into_iter().collect()
+    );
+}
+
+fn completed_fixture_bundle() -> DriverEvidenceBundle {
+    let mut process = fixture();
+    let ready = process.receive(TIMEOUT).unwrap();
+    let DriverBody::Ready { driver } = ready.parsed.body else {
+        panic!("expected driver.ready")
+    };
+    process
+        .send(&command(
+            "open-evidence",
+            CommandBody::OpenSession {
+                session_id: "evidence-session".to_owned(),
+                config: json!({}),
+                limits: json!({}),
+            },
+        ))
+        .unwrap();
+    let opened = process.receive(TIMEOUT).unwrap();
+    assert!(matches!(
+        opened.parsed.body,
+        DriverBody::SessionOpened { .. }
+    ));
+    process
+        .send(&command(
+            "close-evidence",
+            CommandBody::CloseSession {
+                session_id: "evidence-session".to_owned(),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        process.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::SessionClosed { .. }
+    ));
+    assert_eq!(process.wait_for_exit(TIMEOUT).unwrap(), Some(0));
+
+    DriverEvidenceBundle::new(
+        Some("test-controller".to_owned()),
+        driver,
+        process.process_id(),
+        process.transcript(),
+        CanonicalizationPolicy::new("fixture-v1", ["processId"]),
+    )
+    .unwrap()
 }

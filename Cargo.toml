@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/agent-lab-cli", "crates/agent-lab-core"]
+members = [
+    "crates/agent-lab-cli",
+    "crates/agent-lab-core",
+    "crates/agent-lab-nushell-mcp",
+]
 resolver = "2"
 
 [workspace.package]

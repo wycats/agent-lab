@@ -46,6 +46,10 @@ impl ServerHandler for Fixture {
             tool("lifecycle", "Emit progress and a structured log"),
             tool("enable_extra", "Add a tool and notify discovery clients"),
             tool(
+                "schedule_extra",
+                "Add a tool after returning to the discovery client",
+            ),
+            tool(
                 "disable_extra",
                 "Remove a tool and notify discovery clients",
             ),
@@ -131,6 +135,17 @@ impl ServerHandler for Fixture {
                 self.extra_revision.store(1, Ordering::SeqCst);
                 notify_tools_changed(&context).await?;
                 Ok(CallToolResult::structured(json!({ "enabled": "extra" })))
+            }
+            "schedule_extra" => {
+                let fixture = self.clone();
+                let peer = context.peer.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    fixture.extra_enabled.store(true, Ordering::SeqCst);
+                    fixture.extra_revision.store(1, Ordering::SeqCst);
+                    let _ = peer.notify_tool_list_changed().await;
+                });
+                Ok(CallToolResult::structured(json!({ "scheduled": "extra" })))
             }
             "disable_extra" => {
                 self.extra_enabled.store(false, Ordering::SeqCst);

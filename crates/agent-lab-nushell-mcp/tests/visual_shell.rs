@@ -56,15 +56,21 @@ fn pty_session_preserves_visible_nushell_and_mcp_behavior() {
     shell.expect("agent-lab> ").expect("prompt should return");
 
     shell
-        .send_line("tool fixture enable_extra {}")
-        .expect("catalog mutation should be submitted");
+        .send_line("tool fixture schedule_extra {}")
+        .expect("delayed catalog mutation should be submitted");
     shell
-        .expect("[capabilities refreshed: fixture]")
-        .expect("catalog refresh should be visible between lines");
-    shell.expect("agent-lab> ").expect("prompt should return");
+        .expect("scheduled")
+        .expect("mutation should be scheduled");
+    shell
+        .expect("agent-lab> ")
+        .expect("prompt should open before the catalog changes");
+    std::thread::sleep(Duration::from_millis(750));
     shell
         .send_line("tool fixture extra {}")
-        .expect("new command should be submitted");
+        .expect("new command should be submitted immediately after the change");
+    shell
+        .expect("[capabilities refreshed: fixture]")
+        .expect("catalog should refresh before the submitted line is evaluated");
     shell
         .expect("available")
         .expect("new command output should be visible");

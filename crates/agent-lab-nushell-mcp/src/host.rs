@@ -255,6 +255,10 @@ impl NushellHost {
                 break;
             }
 
+            // A capability notification may arrive while the prompt blocks on input.
+            for namespace in self.refresh_stale()? {
+                writeln!(stdout, "[capabilities refreshed: {namespace}]")?;
+            }
             self.eval_and_print(&source);
         }
         Ok(())

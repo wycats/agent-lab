@@ -193,12 +193,13 @@ impl NushellHost {
     ///
     /// Returns an error when refreshed discovery or declaration merging fails.
     pub fn refresh_stale(&mut self) -> Result<Vec<String>, HostError> {
-        let stale = self
+        let mut stale = self
             .sessions
             .iter()
             .filter(|(_, bridge)| bridge.discovery_is_stale())
             .map(|(namespace, _)| namespace.clone())
             .collect::<Vec<_>>();
+        stale.sort();
         for namespace in &stale {
             self.refresh(namespace)?;
         }

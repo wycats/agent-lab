@@ -188,6 +188,30 @@ fn synchronous_bridge_calls_are_safe_inside_a_tokio_context() {
     });
 }
 
+#[test]
+fn stale_namespaces_refresh_in_stable_visible_order() {
+    let alpha = fixture_bridge();
+    let zeta = fixture_bridge();
+    let mut host = NushellHost::new();
+    host.attach("zeta", zeta.clone())
+        .expect("zeta fixture should attach");
+    host.attach("alpha", alpha.clone())
+        .expect("alpha fixture should attach");
+
+    host.eval("tool zeta enable_extra")
+        .expect("zeta fixture should change its tool list");
+    host.eval("tool alpha enable_extra")
+        .expect("alpha fixture should change its tool list");
+    wait_for_stale_discovery(&alpha);
+    wait_for_stale_discovery(&zeta);
+
+    assert_eq!(
+        host.refresh_stale()
+            .expect("both namespaces should refresh"),
+        ["alpha", "zeta"]
+    );
+}
+
 fn wait_for_stale_discovery(bridge: &McpBridge) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

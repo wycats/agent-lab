@@ -1,10 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    io::{self, IsTerminal, Write},
+};
 
 use nu_engine::CallExt;
 use nu_protocol::{
     IntoPipelineData, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
     debugger::WithoutDebug,
     engine::{Command, EngineState, Stack, StateWorkingSet},
+    report_error::report_compile_error,
+    report_parse_error, report_shell_error,
     shell_error::generic::GenericError,
 };
 use rmcp::model::{CallToolResult, Tool};
@@ -30,6 +35,10 @@ pub enum HostError {
     UnknownNamespace(String),
     #[error("MCP namespace already attached: {0}")]
     NamespaceAlreadyAttached(String),
+    #[error("interactive shell requires terminal stdin and stdout")]
+    InteractiveTerminalRequired,
+    #[error("interactive shell I/O failed: {0}")]
+    InteractiveIo(#[from] io::Error),
 }
 
 pub struct NushellHost {
@@ -171,6 +180,125 @@ impl NushellHost {
         .body
         .into_value(Span::unknown())
         .map_err(HostError::from)
+    }
+
+    /// Refresh every attached namespace whose source reported a catalog change.
+    ///
+    /// The returned names identify declarations that changed between submitted
+    /// shell lines. Keeping this boundary outside Nushell evaluation lets an
+    /// interactive surface make refresh visible without teaching MCP commands
+    /// to mutate the engine that is currently executing them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when refreshed discovery or declaration merging fails.
+    pub fn refresh_stale(&mut self) -> Result<Vec<String>, HostError> {
+        let stale = self
+            .sessions
+            .iter()
+            .filter(|(_, bridge)| bridge.discovery_is_stale())
+            .map(|(namespace, _)| namespace.clone())
+            .collect::<Vec<_>>();
+        for namespace in &stale {
+            self.refresh(namespace)?;
+        }
+        Ok(stale)
+    }
+
+    /// Run the evidence-oriented interactive shell on a real terminal.
+    ///
+    /// This intentionally owns only line submission, visible prompts, and the
+    /// between-line capability refresh boundary. Nushell continues to own
+    /// parsing, evaluation, help, structured values, tables, and error
+    /// rendering. Line editing, completion, history, and multiline input are
+    /// later product work rather than part of this feedback harness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-terminal input/output, terminal I/O failure, or
+    /// capability refresh failure.
+    pub fn run_interactive(mut self) -> Result<(), HostError> {
+        let stdin = io::stdin();
+        let mut stdout = io::stdout();
+        if !stdin.is_terminal() || !stdout.is_terminal() {
+            return Err(HostError::InteractiveTerminalRequired);
+        }
+
+        let mut namespaces = self.sessions.keys().cloned().collect::<Vec<_>>();
+        namespaces.sort();
+        writeln!(stdout, "Agent Lab visual shell")?;
+        if namespaces.is_empty() {
+            writeln!(stdout, "MCP namespaces: none")?;
+        } else {
+            writeln!(stdout, "MCP namespaces: {}", namespaces.join(", "))?;
+        }
+        writeln!(
+            stdout,
+            "Nushell evaluates each submitted line; `exit` leaves."
+        )?;
+
+        let mut source = String::new();
+        loop {
+            for namespace in self.refresh_stale()? {
+                writeln!(stdout, "[capabilities refreshed: {namespace}]")?;
+            }
+            write!(stdout, "agent-lab> ")?;
+            stdout.flush()?;
+
+            source.clear();
+            if stdin.read_line(&mut source)? == 0 {
+                writeln!(stdout)?;
+                break;
+            }
+            if matches!(source.trim(), "exit" | "quit") {
+                break;
+            }
+
+            self.eval_and_print(&source);
+        }
+        Ok(())
+    }
+
+    fn eval_and_print(&mut self, source: &str) {
+        let mut working_set = StateWorkingSet::new(&self.engine_state);
+        let block = nu_parser::parse(
+            &mut working_set,
+            Some("agent-lab-repl"),
+            source.as_bytes(),
+            false,
+        );
+        if let Some(error) = working_set.parse_errors.first() {
+            report_parse_error(Some(&self.stack), &working_set, error);
+            return;
+        }
+        if let Some(error) = working_set.compile_errors.first() {
+            report_compile_error(Some(&self.stack), &working_set, error);
+            return;
+        }
+        let delta = working_set.render();
+        if let Err(error) = self.engine_state.merge_delta(delta) {
+            report_shell_error(Some(&self.stack), &self.engine_state, &error);
+            return;
+        }
+
+        let pipeline = nu_engine::eval_block::<WithoutDebug>(
+            &self.engine_state,
+            &mut self.stack,
+            &block,
+            PipelineData::empty(),
+        );
+        match pipeline {
+            Ok(output) => {
+                if let Err(error) =
+                    output
+                        .body
+                        .print_table(&self.engine_state, &mut self.stack, false, false)
+                {
+                    report_shell_error(Some(&self.stack), &self.engine_state, &error);
+                }
+            }
+            Err(error) => report_shell_error(Some(&self.stack), &self.engine_state, &error),
+        }
     }
 }
 

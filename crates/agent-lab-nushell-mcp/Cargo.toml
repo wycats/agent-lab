@@ -28,9 +28,16 @@ tokio = { version = "1.49.0", features = [
     "time",
 ] }
 
+[dev-dependencies]
+expectrl = "0.9.0"
+
 [lints]
 workspace = true
 
 [[bin]]
 name = "agent-lab-mcp-fixture"
 path = "src/bin/fixture.rs"
+
+[[bin]]
+name = "agent-lab-nushell-mcp-shell"
+path = "src/bin/shell.rs"

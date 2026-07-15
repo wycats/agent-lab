@@ -46,5 +46,8 @@ being copied here.
 
 ## Status
 
-The repository is at the bootstrap stage. Its names and contracts are
-provisional and expected to change as steel threads produce evidence.
+The first embedded Nushell/MCP steel thread is implemented. A PTY-driven visual
+shell feedback loop now makes its prompt, structured rendering, generated help,
+live capability refresh, persistent state, and errors directly inspectable
+before REPL polish. Names and contracts remain provisional as later steel
+threads produce evidence.

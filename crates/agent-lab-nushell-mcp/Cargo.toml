@@ -34,4 +34,3 @@ workspace = true
 [[bin]]
 name = "agent-lab-mcp-fixture"
 path = "src/bin/fixture.rs"
-

@@ -3,7 +3,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -58,7 +58,8 @@ pub struct McpBridge {
 struct BridgeInner {
     sender: tokio_mpsc::UnboundedSender<Request>,
     events: Arc<EventLog>,
-    discovery_stale: Arc<AtomicBool>,
+    discovery: Arc<DiscoveryState>,
+    lifecycle_cancel_sender: Option<oneshot::Sender<()>>,
     runtime_id: u64,
 }
 
@@ -69,7 +70,33 @@ enum Request {
         arguments: serde_json::Map<String, JsonValue>,
         response: mpsc::SyncSender<Result<CallToolResult, String>>,
     },
-    Shutdown,
+}
+
+#[derive(Default)]
+struct DiscoveryState {
+    generation: AtomicU64,
+    refreshed_generation: AtomicU64,
+}
+
+impl DiscoveryState {
+    fn mark_changed(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn is_stale(&self) -> bool {
+        self.generation() != self.refreshed_generation.load(Ordering::SeqCst)
+    }
+
+    fn mark_refreshed_if_current(&self, generation: u64) {
+        if self.generation() == generation {
+            self.refreshed_generation
+                .store(generation, Ordering::SeqCst);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -107,7 +134,7 @@ impl EventLog {
 #[derive(Clone)]
 struct RecordingClient {
     events: Arc<EventLog>,
-    discovery_stale: Arc<AtomicBool>,
+    discovery: Arc<DiscoveryState>,
 }
 
 impl ClientHandler for RecordingClient {
@@ -140,7 +167,7 @@ impl ClientHandler for RecordingClient {
         &self,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        self.discovery_stale.store(true, Ordering::SeqCst);
+        self.discovery.mark_changed();
         self.events.record("mcp.tools.changed", JsonValue::Null);
         std::future::ready(())
     }
@@ -172,12 +199,13 @@ impl McpBridge {
         let runtime_id = NEXT_RUNTIME_ID.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = tokio_mpsc::unbounded_channel();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
-        let (startup_cancel_sender, startup_cancel_receiver) = oneshot::channel();
+        let (lifecycle_cancel_sender, lifecycle_cancel_receiver) = oneshot::channel();
+        let mut lifecycle_cancel_sender = Some(lifecycle_cancel_sender);
         let events = Arc::new(EventLog::default());
-        let discovery_stale = Arc::new(AtomicBool::new(false));
+        let discovery = Arc::new(DiscoveryState::default());
         let handler = RecordingClient {
             events: events.clone(),
-            discovery_stale: discovery_stale.clone(),
+            discovery: discovery.clone(),
         };
         thread::Builder::new()
             .name(format!("agent-lab-mcp-{runtime_id}"))
@@ -193,7 +221,7 @@ impl McpBridge {
                         handler,
                         receiver,
                         ready_sender.clone(),
-                        startup_cancel_receiver,
+                        lifecycle_cancel_receiver,
                     )),
                     Err(error) => Err(error.to_string()),
                 };
@@ -207,7 +235,9 @@ impl McpBridge {
         match ready_receiver.recv_timeout(startup_timeout) {
             Ok(result) => result.map_err(BridgeError::Startup)?,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = startup_cancel_sender.send(());
+                if let Some(sender) = lifecycle_cancel_sender.take() {
+                    let _ = sender.send(());
+                }
                 return Err(BridgeError::StartupTimeout {
                     timeout: startup_timeout,
                 });
@@ -223,7 +253,8 @@ impl McpBridge {
             inner: Arc::new(BridgeInner {
                 sender,
                 events,
-                discovery_stale,
+                discovery,
+                lifecycle_cancel_sender,
                 runtime_id,
             }),
         })
@@ -236,11 +267,15 @@ impl McpBridge {
 
     #[must_use]
     pub fn discovery_is_stale(&self) -> bool {
-        self.inner.discovery_stale.load(Ordering::SeqCst)
+        self.inner.discovery.is_stale()
     }
 
-    pub(crate) fn mark_discovery_fresh(&self) {
-        self.inner.discovery_stale.store(false, Ordering::SeqCst);
+    pub(crate) fn discovery_generation(&self) -> u64 {
+        self.inner.discovery.generation()
+    }
+
+    pub(crate) fn mark_discovery_fresh(&self, generation: u64) {
+        self.inner.discovery.mark_refreshed_if_current(generation);
     }
 
     #[must_use]
@@ -321,7 +356,11 @@ impl McpBridge {
 
 impl Drop for BridgeInner {
     fn drop(&mut self) {
-        let _ = self.sender.send(Request::Shutdown);
+        self.events
+            .record("bridge.shutdown.requested", JsonValue::Null);
+        if let Some(sender) = self.lifecycle_cancel_sender.take() {
+            let _ = sender.send(());
+        }
     }
 }
 
@@ -331,7 +370,7 @@ async fn run_actor(
     handler: RecordingClient,
     mut receiver: tokio_mpsc::UnboundedReceiver<Request>,
     ready_sender: mpsc::SyncSender<Result<(), String>>,
-    mut startup_cancel: oneshot::Receiver<()>,
+    mut lifecycle_cancel: oneshot::Receiver<()>,
 ) -> Result<(), String> {
     let mut command = Command::new(executable);
     command
@@ -365,7 +404,7 @@ async fn run_actor(
         tokio::pin!(startup);
         tokio::select! {
             result = &mut startup => Some(result),
-            _ = &mut startup_cancel => None,
+            _ = &mut lifecycle_cancel => None,
         }
     };
     let mut service = if let Some(result) = startup_result {
@@ -379,14 +418,27 @@ async fn run_actor(
         .map_err(|_| "bridge ready receiver closed".to_owned())?;
 
     let mut progress_token = 0_i64;
-    while let Some(request) = receiver.recv().await {
+    'actor: loop {
+        let request = tokio::select! {
+            _ = &mut lifecycle_cancel => break 'actor,
+            request = receiver.recv() => {
+                let Some(request) = request else {
+                    break 'actor;
+                };
+                request
+            }
+        };
         match request {
             Request::ListTools(response) => {
-                let result = service
-                    .peer()
-                    .list_all_tools()
-                    .await
-                    .map_err(|error| error.to_string());
+                let operation = service.peer().list_all_tools();
+                tokio::pin!(operation);
+                let result = tokio::select! {
+                    _ = &mut lifecycle_cancel => {
+                        let _ = response.send(Err("MCP bridge shutting down".to_owned()));
+                        break 'actor;
+                    }
+                    result = &mut operation => result.map_err(|error| error.to_string()),
+                };
                 let _ = response.send(result);
             }
             Request::CallTool {
@@ -399,19 +451,22 @@ async fn run_actor(
                 params.meta = Some(Meta::with_progress_token(ProgressToken(
                     NumberOrString::Number(progress_token),
                 )));
-                let result = service
-                    .peer()
-                    .call_tool(params)
-                    .await
-                    .map_err(|error| error.to_string());
+                let operation = service.peer().call_tool(params);
+                tokio::pin!(operation);
+                let result = tokio::select! {
+                    _ = &mut lifecycle_cancel => {
+                        let _ = response.send(Err("MCP bridge shutting down".to_owned()));
+                        break 'actor;
+                    }
+                    result = &mut operation => result.map_err(|error| error.to_string()),
+                };
                 let _ = response.send(result);
             }
-            Request::Shutdown => break,
         }
     }
 
-    let _ = service.close().await;
-    wait_for_child_exit(&mut child).await?;
+    let _ = tokio::time::timeout(Duration::from_millis(100), service.close()).await;
+    terminate_child(&mut child).await?;
     Ok(())
 }
 
@@ -419,13 +474,6 @@ async fn terminate_child(child: &mut tokio::process::Child) -> Result<(), String
     match child.try_wait().map_err(|error| error.to_string())? {
         Some(_) => Ok(()),
         None => child.kill().await.map_err(|error| error.to_string()),
-    }
-}
-
-async fn wait_for_child_exit(child: &mut tokio::process::Child) -> Result<(), String> {
-    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
-        Ok(result) => result.map(|_| ()).map_err(|error| error.to_string()),
-        Err(_) => terminate_child(child).await,
     }
 }
 
@@ -441,7 +489,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{BridgeError, EventLog, McpBridge};
+    use super::{BridgeError, DiscoveryState, EventLog, McpBridge};
 
     #[test]
     fn startup_timeout_stops_the_in_flight_child() {
@@ -511,5 +559,17 @@ mod tests {
                 .enumerate()
                 .all(|(index, event)| event.sequence == index as u64 + 1)
         );
+    }
+
+    #[test]
+    fn older_refresh_generation_cannot_erase_a_newer_change() {
+        let discovery = DiscoveryState::default();
+        discovery.mark_changed();
+        let observed_generation = discovery.generation();
+        discovery.mark_changed();
+
+        discovery.mark_refreshed_if_current(observed_generation);
+
+        assert!(discovery.is_stale());
     }
 }

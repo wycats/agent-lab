@@ -124,11 +124,12 @@ addition, descriptor revision, and removal.
 
 ```console
 $ cargo test -p agent-lab-nushell-mcp --test steel_thread
-running 2 tests
+running 3 tests
 test persistent_nushell_and_mcp_session_preserve_structured_behavior ... ok
 test lifecycle_and_discovery_changes_remain_observable ... ok
+test synchronous_bridge_calls_are_safe_inside_a_tokio_context ... ok
 
-test result: ok. 2 passed; 0 failed
+test result: ok. 3 passed; 0 failed
 ```
 
 The tests directly establish:
@@ -214,7 +215,7 @@ cargo fmt --all -- --check
 cargo check --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-git diff --check
+git diff --check origin/main...HEAD
 ```
 
 All four hypotheses are supported by this pass. Embedded Nushell is viable as

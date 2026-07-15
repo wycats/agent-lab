@@ -95,6 +95,7 @@ impl NushellHost {
             .get(namespace)
             .cloned()
             .ok_or_else(|| HostError::UnknownNamespace(namespace.to_owned()))?;
+        let discovery_generation = bridge.discovery_generation();
         let tools = bridge.list_tools()?;
         let current_tools = tools
             .into_iter()
@@ -141,7 +142,7 @@ impl NushellHost {
         }
         self.registered_tools
             .insert(namespace.to_owned(), current_tools);
-        bridge.mark_discovery_fresh();
+        bridge.mark_discovery_fresh(discovery_generation);
         Ok(())
     }
 

@@ -74,5 +74,7 @@ The bootstrap does not attempt to:
 
 Embed the current Nushell release, connect a deterministic MCP fixture and one
 real open-source server, preserve structured results through native Nushell
-pipelines, exercise completion and discovery refresh, and record typed lifecycle
-events without constructing a runtime per tool call.
+pipelines, exercise native command parsing, help, and discovery refresh, and
+record typed lifecycle events without constructing a runtime per tool call.
+Interactive completion remains important product behavior, but is not evidence
+claimed by the first headless embedding thread.

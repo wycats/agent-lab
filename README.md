@@ -30,7 +30,8 @@ The initial sequence is:
 
 See [RFC 0001](docs/rfcs/0001-product-thesis.md) for the provisional product
 thesis and [RFC 0002](docs/rfcs/0002-steel-thread-method.md) for the working
-method.
+method. Active experiments are indexed under
+[steel threads](docs/steel-threads/README.md).
 
 ## Public boundary
 

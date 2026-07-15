@@ -20,6 +20,15 @@ name = "agent-lab-core"
 version = "0.0.0"
 
 [[package]]
+name = "agent-lab-driver-protocol"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "agent-lab-nushell-mcp"
 version = "0.0.0"
 dependencies = [

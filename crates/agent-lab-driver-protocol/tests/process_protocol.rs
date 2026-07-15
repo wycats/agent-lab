@@ -1,0 +1,258 @@
+use std::time::Duration;
+
+use agent_lab_driver_protocol::{
+    CommandBody, ControllerCommand, DriverBody, DriverFailureScope, DriverProcess,
+    PROTOCOL_VERSION, ProcessError,
+};
+use serde_json::json;
+
+const TIMEOUT: Duration = Duration::from_secs(2);
+
+fn fixture() -> DriverProcess {
+    DriverProcess::spawn(
+        env!("CARGO_BIN_EXE_agent-lab-driver-fixture"),
+        std::iter::empty::<String>(),
+    )
+    .expect("fixture driver should spawn")
+}
+
+fn command(message_id: &str, body: CommandBody) -> ControllerCommand {
+    ControllerCommand {
+        protocol_version: PROTOCOL_VERSION,
+        message_id: message_id.to_owned(),
+        body,
+    }
+}
+
+fn open_session(driver: &mut DriverProcess) -> u32 {
+    let ready = driver.receive(TIMEOUT).expect("driver should become ready");
+    assert!(ready.raw.ends_with(b"\n"));
+    assert!(matches!(ready.parsed.body, DriverBody::Ready { .. }));
+    driver
+        .send(&command(
+            "open-1",
+            CommandBody::OpenSession {
+                session_id: "session-1".to_owned(),
+                config: json!({ "driver": "fixture" }),
+                limits: json!({ "turns": 2 }),
+            },
+        ))
+        .unwrap();
+    let opened = driver.receive(TIMEOUT).unwrap();
+    let DriverBody::SessionOpened {
+        session_id,
+        process_id,
+    } = opened.parsed.body
+    else {
+        panic!("expected session.opened")
+    };
+    assert_eq!(session_id, "session-1");
+    assert_eq!(opened.parsed.caused_by.as_deref(), Some("open-1"));
+    process_id
+}
+
+#[test]
+fn one_process_streams_two_turns_and_cancels_the_second() {
+    let mut driver = fixture();
+    let process_id = driver.process_id();
+    assert_eq!(open_session(&mut driver), process_id);
+
+    driver
+        .send(&command(
+            "turn-1",
+            CommandBody::StartTurn {
+                session_id: "session-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                task: json!({ "prompt": "inspect" }),
+                capability_sources: json!([{ "id": "fixture-mcp" }]),
+            },
+        ))
+        .unwrap();
+    let started = driver.receive(TIMEOUT).unwrap();
+    assert!(matches!(
+        started.parsed.body,
+        DriverBody::TurnEvent { ref event_type, .. } if event_type == "fixture.started"
+    ));
+    let capabilities = driver.receive(TIMEOUT).unwrap();
+    assert!(matches!(
+        capabilities.parsed.body,
+        DriverBody::TurnEvent { ref event_type, .. } if event_type == "fixture.capabilities"
+    ));
+    let finished = driver.receive(TIMEOUT).unwrap();
+    assert!(matches!(
+        finished.parsed.body,
+        DriverBody::TurnFinished { ref outcome, .. } if outcome == "completed"
+    ));
+
+    driver
+        .send(&command(
+            "turn-2",
+            CommandBody::StartTurn {
+                session_id: "session-1".to_owned(),
+                turn_id: "turn-2".to_owned(),
+                task: json!({ "mode": "wait-for-abort" }),
+                capability_sources: json!([]),
+            },
+        ))
+        .unwrap();
+    let waiting = driver.receive(TIMEOUT).unwrap();
+    assert!(matches!(
+        waiting.parsed.body,
+        DriverBody::TurnEvent { ref event_type, .. } if event_type == "fixture.waiting"
+    ));
+    driver
+        .send(&command(
+            "abort-2",
+            CommandBody::AbortTurn {
+                session_id: "session-1".to_owned(),
+                turn_id: "turn-2".to_owned(),
+                reason: Some("test cancellation".to_owned()),
+            },
+        ))
+        .unwrap();
+    let aborted = driver.receive(TIMEOUT).unwrap();
+    assert!(matches!(
+        aborted.parsed.body,
+        DriverBody::TurnEvent { ref event_type, .. } if event_type == "fixture.aborted"
+    ));
+    let finished = driver.receive(TIMEOUT).unwrap();
+    assert!(matches!(
+        finished.parsed.body,
+        DriverBody::TurnFinished { ref outcome, .. } if outcome == "aborted"
+    ));
+
+    driver
+        .send(&command(
+            "close-1",
+            CommandBody::CloseSession {
+                session_id: "session-1".to_owned(),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::SessionClosed { .. }
+    ));
+    assert_eq!(driver.wait_for_exit(TIMEOUT).unwrap(), Some(0));
+    assert_eq!(driver.sent_records().len(), 5);
+    let transcript = driver.transcript();
+    assert_eq!(transcript.controller_records.len(), 5);
+    assert_eq!(transcript.driver_records.len(), 9);
+    assert!(
+        transcript
+            .driver_records
+            .iter()
+            .all(|raw| raw.ends_with(b"\n"))
+    );
+}
+
+#[test]
+fn malformed_output_reported_failure_and_process_exit_are_distinct() {
+    let mut malformed = fixture();
+    open_session(&mut malformed);
+    malformed
+        .send(&command(
+            "malformed",
+            CommandBody::StartTurn {
+                session_id: "session-1".to_owned(),
+                turn_id: "malformed".to_owned(),
+                task: json!({ "mode": "malformed-output" }),
+                capability_sources: json!([]),
+            },
+        ))
+        .unwrap();
+    let malformed_error = malformed.receive(TIMEOUT).unwrap_err();
+    assert!(matches!(
+        malformed_error,
+        ProcessError::MalformedOutput { ref raw, .. } if raw == b"{not-json}\n"
+    ));
+    assert_eq!(
+        malformed.transcript().driver_records.last().unwrap(),
+        b"{not-json}\n"
+    );
+
+    let mut failed = fixture();
+    open_session(&mut failed);
+    failed
+        .send(&command(
+            "failed",
+            CommandBody::StartTurn {
+                session_id: "session-1".to_owned(),
+                turn_id: "failed".to_owned(),
+                task: json!({ "mode": "fail" }),
+                capability_sources: json!([]),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        failed.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::Failed {
+            scope: DriverFailureScope::Turn,
+            ref code,
+            ..
+        } if code == "fixture-failure"
+    ));
+
+    let mut exited = fixture();
+    open_session(&mut exited);
+    exited
+        .send(&command(
+            "exit",
+            CommandBody::StartTurn {
+                session_id: "session-1".to_owned(),
+                turn_id: "exit".to_owned(),
+                task: json!({ "mode": "exit" }),
+                capability_sources: json!([]),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        exited.receive(TIMEOUT),
+        Err(ProcessError::UnexpectedExit { code: Some(17) })
+    ));
+}
+
+#[test]
+fn protocol_version_and_sequence_violations_are_distinct() {
+    let mut version = fixture();
+    open_session(&mut version);
+    version
+        .send(&command(
+            "version",
+            CommandBody::StartTurn {
+                session_id: "session-1".to_owned(),
+                turn_id: "version".to_owned(),
+                task: json!({ "mode": "unsupported-version" }),
+                capability_sources: json!([]),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        version.receive(TIMEOUT),
+        Err(ProcessError::UnsupportedVersion {
+            expected: PROTOCOL_VERSION,
+            actual
+        }) if actual == PROTOCOL_VERSION + 1
+    ));
+
+    let mut sequence = fixture();
+    open_session(&mut sequence);
+    sequence
+        .send(&command(
+            "sequence",
+            CommandBody::StartTurn {
+                session_id: "session-1".to_owned(),
+                turn_id: "sequence".to_owned(),
+                task: json!({ "mode": "repeat-sequence" }),
+                capability_sources: json!([]),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        sequence.receive(TIMEOUT),
+        Err(ProcessError::UnexpectedSequence {
+            expected: 3,
+            actual: 2
+        })
+    ));
+}

@@ -64,7 +64,9 @@ fn pty_session_preserves_visible_nushell_and_mcp_behavior() {
     shell
         .expect("agent-lab> ")
         .expect("prompt should open before the catalog changes");
-    std::thread::sleep(Duration::from_millis(750));
+    shell
+        .expect("[fixture capability change observed]")
+        .expect("the client should observe the change while the prompt is open");
     shell
         .send_line("tool fixture extra {}")
         .expect("new command should be submitted immediately after the change");

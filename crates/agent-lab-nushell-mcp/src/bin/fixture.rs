@@ -8,8 +8,8 @@ use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResult, ListToolsResult, ProgressNotificationParam,
-        ServerCapabilities, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResult, ListToolsResult, PingRequest,
+        ProgressNotificationParam, ServerCapabilities, ServerInfo, ServerRequest, Tool,
     },
     service::RequestContext,
 };
@@ -136,17 +136,7 @@ impl ServerHandler for Fixture {
                 notify_tools_changed(&context).await?;
                 Ok(CallToolResult::structured(json!({ "enabled": "extra" })))
             }
-            "schedule_extra" => {
-                let fixture = self.clone();
-                let peer = context.peer.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    fixture.extra_enabled.store(true, Ordering::SeqCst);
-                    fixture.extra_revision.store(1, Ordering::SeqCst);
-                    let _ = peer.notify_tool_list_changed().await;
-                });
-                Ok(CallToolResult::structured(json!({ "scheduled": "extra" })))
-            }
+            "schedule_extra" => Ok(self.schedule_extra(&context)),
             "disable_extra" => {
                 self.extra_enabled.store(false, Ordering::SeqCst);
                 notify_tools_changed(&context).await?;
@@ -173,6 +163,27 @@ impl ServerHandler for Fixture {
                 None,
             )),
         }
+    }
+}
+
+impl Fixture {
+    fn schedule_extra(&self, context: &RequestContext<rmcp::RoleServer>) -> CallToolResult {
+        let fixture = self.clone();
+        let peer = context.peer.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            fixture.extra_enabled.store(true, Ordering::SeqCst);
+            fixture.extra_revision.store(1, Ordering::SeqCst);
+            if peer.notify_tool_list_changed().await.is_ok()
+                && peer
+                    .send_request(ServerRequest::PingRequest(PingRequest::default()))
+                    .await
+                    .is_ok()
+            {
+                eprintln!("[fixture capability change observed]");
+            }
+        });
+        CallToolResult::structured(json!({ "scheduled": "extra" }))
     }
 }
 

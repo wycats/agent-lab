@@ -44,10 +44,16 @@ pub(crate) fn nu_record_to_json(
 }
 
 fn number_to_nu(value: &Number, span: Span) -> Value {
-    value.as_i64().map_or_else(
-        || Value::float(value.as_f64().expect("JSON numbers are finite"), span),
-        |value| Value::int(value, span),
-    )
+    if let Some(value) = value.as_i64() {
+        Value::int(value, span)
+    } else if value.as_u64().is_some() {
+        // Nushell integers are signed i64 values. Preserve oversized unsigned
+        // integers exactly as decimal text rather than silently rounding them
+        // through f64.
+        Value::string(value.to_string(), span)
+    } else {
+        Value::float(value.as_f64().expect("JSON numbers are finite"), span)
+    }
 }
 
 fn nu_to_json(value: Value) -> Result<JsonValue, ShellError> {
@@ -83,5 +89,20 @@ fn nu_to_json(value: Value) -> Result<JsonValue, ShellError> {
             format!("cannot encode {} as JSON", value.get_type()),
             span,
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nu_protocol::Span;
+    use serde_json::json;
+
+    use super::json_to_nu;
+
+    #[test]
+    fn oversized_unsigned_json_integer_preserves_its_exact_value() {
+        let value = json_to_nu(json!(u64::MAX), Span::unknown());
+
+        assert_eq!(value.as_str(), Ok("18446744073709551615"));
     }
 }

@@ -6,6 +6,7 @@ use std::{
         mpsc,
     },
     thread,
+    time::Duration,
 };
 
 #[allow(deprecated)]
@@ -25,6 +26,7 @@ use thiserror::Error;
 use tokio::{process::Command, sync::mpsc as tokio_mpsc};
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LifecycleEvent {
@@ -37,6 +39,8 @@ pub struct LifecycleEvent {
 pub enum BridgeError {
     #[error("MCP bridge startup failed: {0}")]
     Startup(String),
+    #[error("MCP bridge startup timed out after {timeout:?}")]
+    StartupTimeout { timeout: Duration },
     #[error("MCP bridge request channel closed")]
     ChannelClosed,
     #[error("MCP request failed: {0}")]
@@ -178,10 +182,17 @@ impl McpBridge {
             })
             .map_err(|error| BridgeError::Startup(error.to_string()))?;
 
-        ready_receiver
-            .recv()
-            .map_err(|_| BridgeError::ChannelClosed)?
-            .map_err(BridgeError::Startup)?;
+        match ready_receiver.recv_timeout(STARTUP_TIMEOUT) {
+            Ok(result) => result.map_err(BridgeError::Startup)?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(BridgeError::StartupTimeout {
+                    timeout: STARTUP_TIMEOUT,
+                });
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(BridgeError::ChannelClosed);
+            }
+        }
 
         events.record("bridge.ready", json!({ "runtimeId": runtime_id }));
 
@@ -278,7 +289,7 @@ impl McpBridge {
 
 impl Drop for BridgeInner {
     fn drop(&mut self) {
-        let _ = self.sender.blocking_send(Request::Shutdown);
+        let _ = self.sender.try_send(Request::Shutdown);
     }
 }
 

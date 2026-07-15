@@ -1,4 +1,7 @@
-use std::{thread, time::Duration};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
 use agent_lab_nushell_mcp::{HostError, McpBridge, NushellHost};
 use nu_protocol::Value;
@@ -159,13 +162,17 @@ fn lifecycle_and_discovery_changes_remain_observable() {
 }
 
 fn wait_for_stale_discovery(bridge: &McpBridge) {
-    for _ in 0..20 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
         if bridge.discovery_is_stale() {
             return;
         }
+        assert!(
+            Instant::now() < deadline,
+            "tool-list notification should mark discovery stale"
+        );
         thread::sleep(Duration::from_millis(10));
     }
-    panic!("tool-list notification should mark discovery stale");
 }
 
 fn strings(value: Value) -> Vec<String> {

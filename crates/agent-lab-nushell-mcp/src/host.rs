@@ -278,15 +278,14 @@ fn tool_result_to_pipeline(result: CallToolResult, span: Span) -> Result<Pipelin
         );
         return Err(shell_error("MCP tool failed", detail, span));
     }
-    let value = result.structured_content.map_or_else(
-        || {
-            json_to_nu(
-                serde_json::to_value(result.content).expect("MCP content blocks serialize"),
-                span,
-            )
-        },
-        |value| json_to_nu(value, span),
-    );
+    let value = if let Some(value) = result.structured_content {
+        json_to_nu(value, span)
+    } else {
+        let content = serde_json::to_value(result.content).map_err(|error| {
+            shell_error("MCP result serialization failed", error.to_string(), span)
+        })?;
+        json_to_nu(content, span)
+    };
     Ok(value.into_pipeline_data())
 }
 

@@ -36,8 +36,9 @@ the decisions, invariants, or boundaries that deserve the reviewer's attention.
 -->
 
 <!--
-The PR body is a reviewer-facing change story, not a session report. Routine
-validation belongs in CI, comments, or reviewer discussion. Include validation
-here only when an unexpected result, limitation, or exact artifact changes how
-the PR should be evaluated.
+The PR body is a reviewer-facing change story, not a session report. Keep exact
+validation evidence attached to the pull request: required CI represents
+routine checks, while local-only or unexpected results belong in a pull request
+comment or reviewer discussion. Include validation in the body only when a
+result, limitation, or exact artifact changes how the PR should be evaluated.
 -->

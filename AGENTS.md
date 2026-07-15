@@ -26,7 +26,11 @@ documented protocols and synthetic conformance fixtures.
 - Use pull requests for changes after the repository bootstrap.
 - Open pull requests ready for review unless the work is intentionally parked.
 - Keep each pull request attached to one evidence-producing boundary.
-- Use the repository pull request template and report the exact validation run.
+- Use the repository pull request template and keep the exact validation
+  evidence attached to the pull request. Required CI represents routine checks;
+  report local-only or unexpected results in a pull request comment, and include
+  validation in the body only when it changes how reviewers should evaluate the
+  change.
 
 ## Rust validation
 

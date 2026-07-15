@@ -1,2 +1,49 @@
 # agent-lab
-A Rust laboratory for exploring, running, and evaluating agents
+
+A Rust laboratory for exploring, running, and evaluating agents.
+
+Agent Lab is an experimental home for two related activities:
+
+- interactive, structured exploration of tools and capabilities;
+- reproducible execution and evaluation of agents against controlled hosts.
+
+The project begins with MCP and Nushell because they put useful pressure on
+discovery, structured data, completion, streaming, and session semantics. The
+architecture is intended to admit other capability sources, shell engines,
+workspace hosts, and agent implementations without making one of them the core
+contract.
+
+## Method
+
+Agent Lab advances through steel threads: small end-to-end slices that test one
+architectural hypothesis against real behavior. Each thread records its
+acceptance evidence and boundaries before the project generalizes the result.
+
+The initial sequence is:
+
+1. Embed Nushell and operate a modern MCP session without flattening structured
+   results.
+2. Define a neutral driver boundary for running an agent under controlled
+   workspace and capability conditions.
+3. Exercise real MCP servers and editor-semantic capabilities.
+4. Compare one agent, tool, context, or caching change through repeatable trials.
+
+See [RFC 0001](docs/rfcs/0001-product-thesis.md) for the provisional product
+thesis and [RFC 0002](docs/rfcs/0002-steel-thread-method.md) for the working
+method.
+
+## Public boundary
+
+This is a public repository. It contains general harness contracts,
+open-source integrations, synthetic fixtures, and evidence that is safe to
+publish.
+
+Private product adapters, proprietary tool definitions, private source code,
+credentials, logs, prompts, and derived evidence stay in their owning private
+repositories. They may connect to Agent Lab through a public protocol without
+being copied here.
+
+## Status
+
+The repository is at the bootstrap stage. Its names and contracts are
+provisional and expected to change as steel threads produce evidence.

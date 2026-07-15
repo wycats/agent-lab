@@ -1,0 +1,11 @@
+[package]
+name = "agent-lab"
+edition.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+agent-lab-core = { path = "../agent-lab-core" }
+
+[lints]
+workspace = true

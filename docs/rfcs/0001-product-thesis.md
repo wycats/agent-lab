@@ -393,28 +393,27 @@ evolving.
 
 ## Current evidence
 
-The public steel threads already on `main`, together with local integration
-work that has not yet been proposed for landing, have demonstrated:
+The public steel threads on `main` have demonstrated:
 
 - an embedded Nushell session with structured MCP discovery and invocation;
 - dynamic command refresh, help, pipelines, and native structured values;
-- an external agent-driver process boundary;
-- distinct capability, harness, workspace, and session identities;
-- browser-visible live activity;
-- a real-model run against an authenticated capability source and physical
-  workspace;
-- durable evidence that can reopen after the live driver and capability source
-  are gone.
+- browser-visible live activity through the same PTY boundary as the direct
+  interactive session.
 
-This evidence supports the architectural pieces, but it does not yet prove the
-complete product loop described by this RFC. In particular, the product has
-not yet demonstrated that a builder can begin with a legible question, explore
-the assembly, run more than one real harness, and promote a discovery into an
-evaluation through one coherent workbench.
+This evidence supports the structured human surface of the workbench. The
+public repository has not yet demonstrated a neutral external driver, a real
+harness bound to a controlled workspace, durable run replay, two independently
+integrated harnesses, or promotion of an exploratory discovery into an
+evaluation. Those remain validation boundaries rather than evidence for the
+current architecture.
 
-## Next validation boundary
+## Next product validation boundary
 
-Build the smallest "two harnesses, one workbench" experience using v0 and Eve.
+After the neutral driver and evidence foundation and a first runnable harness
+workbench have landed through the sequence in
+[RFC 0002](0002-steel-thread-method.md), build the smallest "two harnesses, one
+workbench" experience using v0 and Eve.
+
 Each harness should be independently inspectable, attach to the same kind of
 resettable seeded environment, run through its native loop, stream its native
 activity, produce attributable workspace effects, and receive a simple

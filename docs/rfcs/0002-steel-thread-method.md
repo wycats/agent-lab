@@ -49,10 +49,19 @@ unsupported direction.
 
 ## Initial sequence
 
-1. Embedded Nushell plus modern MCP behavior.
-2. Neutral external agent-driver boundary.
-3. Real capability sources and editor-semantic tools.
-4. Paired end-to-end evaluation of one agent-facing change.
+1. Embedded Nushell plus modern MCP behavior. Completed by the first public
+   steel thread.
+2. A browser feedback surface attached to the same real PTY boundary. Completed
+   by the visual-shell and browser-workbench steel threads.
+3. A neutral external agent-driver boundary with durable run and evidence
+   contracts.
+4. A first real harness bound to a controlled workspace and capability source
+   through the workbench.
+5. A second real harness exercised through the same workbench. The initial pair
+   is v0 and Eve, without forcing them to share one tool loop or native event
+   model.
+6. Real capability sources and editor-semantic tools.
+7. Paired end-to-end evaluation of one agent-facing change.
 
 Each item should land through reviewable pull requests rather than one framework
 construction pass.

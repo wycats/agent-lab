@@ -373,7 +373,11 @@ fn spawn_session_reader(
         let mut buffer = [0_u8; 8192];
         loop {
             match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(error) => {
+                    tracing::debug!(%error, "terminal reader stopped");
+                    break;
+                }
                 Ok(read) => {
                     if output_tx.blocking_send(buffer[..read].to_vec()).is_err() {
                         break;

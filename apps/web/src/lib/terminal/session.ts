@@ -77,7 +77,9 @@ export async function connectSession(
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: 'resize', cols, rows }));
     }
+    callbacks.onScreen(surface.readText());
   });
+  const scroll = surface.onScroll(() => callbacks.onScreen(surface.readText()));
 
   socket.addEventListener('open', () => callbacks.onState('connected'));
   socket.addEventListener('message', (message) => {
@@ -101,6 +103,7 @@ export async function connectSession(
     dispose() {
       input.dispose();
       resize.dispose();
+      scroll.dispose();
       socket.close();
     }
   };

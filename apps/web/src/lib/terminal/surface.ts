@@ -13,6 +13,7 @@ export interface TerminalSurface {
   readText(): string;
   onData(listener: (data: string) => void): Disposable;
   onResize(listener: (dimensions: TerminalDimensions) => void): Disposable;
+  onScroll(listener: () => void): Disposable;
   focus(): void;
   dispose(): void;
 }

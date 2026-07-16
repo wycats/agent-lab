@@ -28,7 +28,12 @@ class GhosttyTerminalSurface implements TerminalSurface {
   readText(): string {
     const buffer = this.#terminal.buffer.active;
     const lines: string[] = [];
-    for (let row = 0; row < buffer.length; row += 1) {
+    const firstRow = Math.max(
+      0,
+      buffer.length - this.#terminal.rows - buffer.viewportY
+    );
+    const lastRow = Math.min(buffer.length, firstRow + this.#terminal.rows);
+    for (let row = firstRow; row < lastRow; row += 1) {
       lines.push(buffer.getLine(row)?.translateToString(true) ?? '');
     }
     return lines.join('\n');
@@ -40,6 +45,10 @@ class GhosttyTerminalSurface implements TerminalSurface {
 
   onResize(listener: (dimensions: TerminalDimensions) => void): Disposable {
     return this.#terminal.onResize(listener);
+  }
+
+  onScroll(listener: () => void): Disposable {
+    return this.#terminal.onScroll(() => listener());
   }
 
   focus(): void {

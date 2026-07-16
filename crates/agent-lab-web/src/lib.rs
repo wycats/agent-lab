@@ -365,6 +365,42 @@ pub enum SessionEvent<'a> {
     Error { message: &'a str },
 }
 
+fn spawn_session_reader(
+    mut reader: Box<dyn Read + Send>,
+) -> (mpsc::Receiver<Vec<u8>>, tokio::task::JoinHandle<()>) {
+    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>(32);
+    let task = tokio::task::spawn_blocking(move || {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if output_tx.blocking_send(buffer[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    (output_rx, task)
+}
+
+fn spawn_session_writer(
+    session: Arc<dyn BrowserSession>,
+) -> (
+    mpsc::Sender<Vec<u8>>,
+    tokio::task::JoinHandle<Result<(), GatewayError>>,
+) {
+    let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(32);
+    let task = tokio::task::spawn_blocking(move || {
+        while let Some(bytes) = input_rx.blocking_recv() {
+            session.write(&bytes)?;
+        }
+        Ok(())
+    });
+    (input_tx, task)
+}
+
 async fn serve_terminal(
     socket: WebSocket,
     provider: Arc<dyn SessionProvider>,
@@ -386,11 +422,11 @@ async fn serve_terminal(
     })
     .expect("session event serialization cannot fail");
     if socket_tx.send(Message::Text(started.into())).await.is_err() {
+        session.terminate();
         return;
     }
 
-    let (pty_tx, mut pty_rx) = mpsc::channel::<Vec<u8>>(32);
-    let mut reader = match session.take_reader() {
+    let reader = match session.take_reader() {
         Ok(reader) => reader,
         Err(error) => {
             session.terminate();
@@ -402,22 +438,17 @@ async fn serve_terminal(
         }
     };
     let session: Arc<dyn BrowserSession> = Arc::from(session);
-    let read_task = tokio::task::spawn_blocking(move || {
-        let mut buffer = [0_u8; 8192];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => {
-                    if pty_tx.blocking_send(buffer[..read].to_vec()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
+    let (mut pty_rx, read_task) = spawn_session_reader(reader);
+    let (input_tx, mut write_task) = spawn_session_writer(Arc::clone(&session));
 
     loop {
         tokio::select! {
+            result = &mut write_task => {
+                if let Ok(Err(error)) = result {
+                    tracing::debug!(%error, "terminal writer stopped");
+                }
+                break;
+            },
             output = pty_rx.recv() => if let Some(bytes) = output {
                 if socket_tx.send(Message::Binary(bytes.into())).await.is_err() {
                     break;
@@ -430,11 +461,7 @@ async fn serve_terminal(
             },
             incoming = socket_rx.next() => match incoming {
                 Some(Ok(Message::Binary(bytes))) => {
-                    let session = Arc::clone(&session);
-                    let write_result = tokio::task::spawn_blocking(move || {
-                        session.write(&bytes)
-                    }).await;
-                    if !matches!(write_result, Ok(Ok(()))) {
+                    if input_tx.send(bytes.to_vec()).await.is_err() {
                         break;
                     }
                 }
@@ -468,8 +495,10 @@ async fn serve_terminal(
         }
     }
 
+    drop(input_tx);
     session.terminate();
     read_task.abort();
+    write_task.abort();
 }
 
 async fn send_open_error(mut socket: WebSocket, message: &str) {

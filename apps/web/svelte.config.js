@@ -9,9 +9,10 @@ export default {
       mode: 'hash',
       directives: {
         'default-src': ['self'],
-        'connect-src': ['self', 'ws:', 'data:'],
+        'connect-src': ['self', 'ws://127.0.0.1:*', 'data:'],
         'img-src': ['self', 'data:'],
-        'style-src': ['self', 'unsafe-inline'],
+        'style-src': ['self'],
+        'style-src-attr': ['unsafe-inline'],
         'script-src': ['self', 'wasm-unsafe-eval'],
         'object-src': ['none'],
         'base-uri': ['none']

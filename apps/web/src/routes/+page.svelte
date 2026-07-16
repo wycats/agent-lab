@@ -48,19 +48,19 @@
 </script>
 
 <svelte:head>
-  <title>Agent Lab — shared perception</title>
+  <title>Agent Lab — terminal workbench</title>
   <meta
     name="description"
-    content="A browser surface over Agent Lab's real Nushell and MCP fixture session"
+    content="An interactive browser workbench for Agent Lab's Nushell and MCP session"
   />
 </svelte:head>
 
 <main>
   <header>
     <div>
-      <p class="eyebrow">Agent Lab / steel thread</p>
-      <h1>Shared perception</h1>
-      <p class="lede">The browser is attached to the same PTY boundary as the native shell.</p>
+      <p class="eyebrow">Agent Lab</p>
+      <h1>Terminal workbench</h1>
+      <p class="lede">Explore a live Nushell session with MCP tools.</p>
     </div>
     <div class="connection" data-state={state} aria-live="polite">
       <span class="status-dot"></span>
@@ -86,8 +86,8 @@
     <aside class="evidence-panel">
       <div class="panel-heading">
         <div>
-          <span class="label">Evidence rail</span>
-          <span class="value">Session lifecycle</span>
+          <span class="label">Session details</span>
+          <span class="value">Live connection</span>
         </div>
       </div>
 
@@ -133,8 +133,7 @@
       {/if}
 
       <p class="note">
-        This rail intentionally starts with lifecycle evidence. Capability and agent events can use the
-        same typed channel without changing the terminal transport.
+        Connection and terminal events appear here as the session changes.
       </p>
     </aside>
   </section>

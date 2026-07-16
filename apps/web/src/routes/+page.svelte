@@ -81,7 +81,12 @@
       </div>
       <div class="terminal-frame">
         <div class="terminal-host" bind:this={terminalHost} data-testid="terminal"></div>
-        <pre class="screen-reader-output" data-testid="terminal-text" aria-live="polite">{screenText}</pre>
+        <pre
+          class="screen-reader-output"
+          data-testid="terminal-text"
+          role="region"
+          aria-label="Terminal output"
+        >{screenText}</pre>
       </div>
     </article>
 

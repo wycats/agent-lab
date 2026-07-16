@@ -29,10 +29,12 @@ SvelteKit lab bench
 
 PTY output uses binary WebSocket frames. Browser input is UTF-8 encoded into
 binary frames so text frames remain reserved for typed control messages and
-session evidence. The first control message resizes the child PTY; the first
-evidence events report session start, accepted resizes, exit, and startup
-failure. This leaves a deliberate extension point for future capability or
-agent events without making the terminal renderer the session model.
+session evidence. Initial dimensions travel with the authenticated WebSocket
+upgrade and size the PTY before the child starts. Later control messages resize
+the live PTY. Evidence events report session start, accepted resizes, exit, and
+session failures. This leaves a deliberate extension point for future
+capability or agent events without making the terminal renderer the session
+model.
 
 `ghostty-web` is behind `TerminalSurface`. Agent Lab depends on its terminal
 behavior, not its concrete API. The surface also reads Ghostty's public active

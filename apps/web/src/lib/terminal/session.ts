@@ -16,6 +16,40 @@ export interface SessionCallbacks {
 
 export interface BrowserSession extends Disposable {}
 
+function parseSessionEvent(payload: string): SessionEvent | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(payload);
+  } catch {
+    return undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+
+  const event = value as Record<string, unknown>;
+  if (event.type === 'exited') return { type: 'exited' };
+  if (event.type === 'error' && typeof event.message === 'string') {
+    return { type: 'error', message: event.message };
+  }
+  if (
+    (event.type === 'started' || event.type === 'resized') &&
+    Number.isSafeInteger(event.cols) &&
+    Number.isSafeInteger(event.rows)
+  ) {
+    if (event.type === 'resized') {
+      return { type: 'resized', cols: event.cols as number, rows: event.rows as number };
+    }
+    if (typeof event.provider === 'string') {
+      return {
+        type: 'started',
+        provider: event.provider,
+        cols: event.cols as number,
+        rows: event.rows as number
+      };
+    }
+  }
+  return undefined;
+}
+
 export async function connectSession(
   surface: TerminalSurface,
   callbacks: SessionCallbacks
@@ -48,7 +82,8 @@ export async function connectSession(
   socket.addEventListener('open', () => callbacks.onState('connected'));
   socket.addEventListener('message', (message) => {
     if (typeof message.data === 'string') {
-      callbacks.onEvent(JSON.parse(message.data) as SessionEvent);
+      const event = parseSessionEvent(message.data);
+      if (event) callbacks.onEvent(event);
     } else if (message.data instanceof ArrayBuffer) {
       surface.write(new Uint8Array(message.data));
       callbacks.onScreen(surface.readText());

@@ -50,8 +50,11 @@ or using the session. The server adds framing and content-type protections, and
 the static Svelte build supplies a hash-based content security policy.
 
 The only session provider in this thread launches the repository's fixture
-shell with `--fixture`. The command cannot be selected through HTTP, WebSocket,
-or command-line input.
+shell with `--fixture`. That flag fixes the MCP server to the synthetic fixture;
+it does not sandbox Nushell. The PTY retains Nushell's filesystem and external
+command capabilities, so possession of the browser session is equivalent to
+local shell access. The executable cannot be selected through HTTP or
+WebSocket input, and this gateway must remain local and trusted.
 
 ## Acceptance evidence
 
@@ -82,11 +85,12 @@ $ pnpm web:test
 
 ## Deliberate omissions
 
-This thread does not add arbitrary MCP configuration, a general local shell,
-remote binding, public hosting, persistent or reconnectable sessions, a v0
-driver, an agent loop, capability inspection UI, or a general observability
-schema. Public deployment will require a separate isolated session provider;
-it must not be achieved by exposing this loopback gateway.
+This thread does not add arbitrary MCP configuration, selectable shell
+executables, sandboxing, remote binding, public hosting, persistent or
+reconnectable sessions, a v0 driver, an agent loop, capability inspection UI,
+or a general observability schema. Public deployment will require a separate
+isolated session provider; it must not be achieved by exposing this loopback
+gateway.
 
 The evidence rail intentionally shows only the session lifecycle that the live
 path already proves. Richer evidence should be added alongside a real consumer

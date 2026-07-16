@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = Arc::new(FixtureSessionProvider::new(options.shell));
 
     println!("Agent Lab web surface: {origin}");
-    println!("Fixture-only PTY sessions; press Ctrl-C to stop.");
+    println!("Local Nushell + fixture MCP sessions; press Ctrl-C to stop.");
 
     axum::serve(listener, app(config, provider))
         .with_graceful_shutdown(shutdown_signal())

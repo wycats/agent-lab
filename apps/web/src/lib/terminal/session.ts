@@ -59,7 +59,16 @@ export async function connectSession(
   if (!tokenResponse.ok) {
     throw new Error(`session token request failed with HTTP ${tokenResponse.status}`);
   }
-  const { token } = (await tokenResponse.json()) as { token: string };
+  const tokenPayload: unknown = await tokenResponse.json();
+  if (
+    !tokenPayload ||
+    typeof tokenPayload !== 'object' ||
+    typeof (tokenPayload as Record<string, unknown>).token !== 'string' ||
+    !/^[0-9a-f]{64}$/.test((tokenPayload as Record<string, unknown>).token as string)
+  ) {
+    throw new Error('session token response was malformed');
+  }
+  const token = (tokenPayload as { token: string }).token;
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const dimensions = surface.dimensions;
   const url = new URL(`${protocol}//${location.host}/api/terminal`);

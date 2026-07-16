@@ -61,9 +61,13 @@ lab bench with:
 $ pnpm install
 $ pnpm web:demo
 Agent Lab web surface: http://127.0.0.1:…
-Fixture-only PTY sessions; press Ctrl-C to stop.
+Local Nushell + fixture MCP sessions; press Ctrl-C to stop.
 ```
 
-The server launches only the synthetic MCP fixture through the existing visual
-shell binary. It does not expose an arbitrary local shell or accept arbitrary
-MCP server configuration. Run the browser acceptance with `pnpm web:test`.
+The server fixes its provider to the repository's visual-shell binary and the
+synthetic MCP fixture; clients cannot select another executable or configure an
+arbitrary MCP server through the gateway. The visual shell is still a full
+local Nushell session, including filesystem and external-command capabilities.
+Treat access to the workbench as local shell access, and do not expose this
+gateway to untrusted or remote clients. Run the browser acceptance with
+`pnpm web:test`.

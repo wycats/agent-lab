@@ -1,3 +1,9 @@
 /target/
+/node_modules/
+/apps/web/.svelte-kit/
+/apps/web/build/
+/apps/web/node_modules/
+/apps/web/playwright-report/
+/apps/web/test-results/
 *.profraw
 .DS_Store

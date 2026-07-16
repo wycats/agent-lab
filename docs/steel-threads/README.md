@@ -11,3 +11,6 @@ implementation and record the result afterward.
 - [Visual shell feedback loop](visual-shell-feedback-loop.md): a PTY-driven
   surface for validating the visible behavior of steel thread 0001 before REPL
   polish.
+- [Browser shared perception](browser-shared-perception.md): a loopback-only
+  SvelteKit and Ghostty surface over the same real PTY, with semantic and pixel
+  browser evidence.

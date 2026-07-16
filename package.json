@@ -1,0 +1,12 @@
+{
+  "name": "agent-lab",
+  "private": true,
+  "packageManager": "pnpm@10.32.1",
+  "scripts": {
+    "web:build": "pnpm --filter @agent-lab/web build",
+    "web:check": "pnpm --filter @agent-lab/web check",
+    "web:demo": "pnpm web:build && cargo build -p agent-lab-nushell-mcp --bins -p agent-lab-web && cargo run -p agent-lab-web",
+    "web:test": "pnpm web:build && pnpm web:test:e2e",
+    "web:test:e2e": "pnpm --filter @agent-lab/web test:e2e"
+  }
+}

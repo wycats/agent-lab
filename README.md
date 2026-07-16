@@ -51,3 +51,19 @@ shell feedback loop now makes its prompt, structured rendering, generated help,
 live capability refresh, persistent state, and errors directly inspectable
 before REPL polish. Names and contracts remain provisional as later steel
 threads produce evidence.
+
+## Browser shared perception
+
+Install the web dependencies, then build and start the loopback-only SvelteKit
+lab bench with:
+
+```console
+$ pnpm install
+$ pnpm web:demo
+Agent Lab web surface: http://127.0.0.1:…
+Fixture-only PTY sessions; press Ctrl-C to stop.
+```
+
+The server launches only the synthetic MCP fixture through the existing visual
+shell binary. It does not expose an arbitrary local shell or accept arbitrary
+MCP server configuration. Run the browser acceptance with `pnpm web:test`.

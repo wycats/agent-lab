@@ -414,7 +414,7 @@ evaluation through one coherent workbench.
 
 ## Next validation boundary
 
-Build the smallest “two harnesses, one workbench” experience using v0 and Eve.
+Build the smallest "two harnesses, one workbench" experience using v0 and Eve.
 Each harness should be independently inspectable, attach to the same kind of
 resettable seeded environment, run through its native loop, stream its native
 activity, produce attributable workspace effects, and receive a simple

@@ -146,6 +146,7 @@ impl PtyTerminalSession {
         let mut command = CommandBuilder::new(shell);
         command.arg("--fixture");
         command.cwd(cwd);
+        command.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(command)?;
         drop(pair.slave);
 
@@ -414,6 +415,7 @@ fn spawn_session_reader(
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
+                Err(error) if is_pty_eof(&error) => break,
                 Err(error) => {
                     tracing::debug!(%error, "terminal reader stopped");
                     let _ = output_tx.blocking_send(Err(error));
@@ -431,6 +433,19 @@ fn spawn_session_reader(
         }
     });
     (output_rx, task)
+}
+
+fn is_pty_eof(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EIO)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn spawn_session_writer(
@@ -605,6 +620,25 @@ pub enum GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    struct EioReader;
+
+    #[cfg(unix)]
+    impl Read for EioReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_eio_is_treated_as_eof() {
+        let (mut output, task) = spawn_session_reader(Box::new(EioReader));
+
+        assert!(output.recv().await.is_none());
+        task.await.unwrap();
+    }
 
     #[test]
     fn terminal_sizes_are_bounded() {

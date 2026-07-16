@@ -31,9 +31,10 @@ class GhosttyTerminalSurface implements TerminalSurface {
   readText(): string {
     const buffer = this.#terminal.buffer.active;
     const lines: string[] = [];
+    const viewportOffset = Math.floor(this.#terminal.getViewportY());
     const firstRow = Math.max(
       0,
-      buffer.length - this.#terminal.rows - this.#terminal.viewportY
+      buffer.length - this.#terminal.rows - viewportOffset
     );
     const lastRow = Math.min(buffer.length, firstRow + this.#terminal.rows);
     for (let row = firstRow; row < lastRow; row += 1) {

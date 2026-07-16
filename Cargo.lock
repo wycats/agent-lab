@@ -43,6 +43,7 @@ dependencies = [
  "anyhow",
  "axum",
  "futures-util",
+ "libc",
  "portable-pty",
  "rand",
  "serde",

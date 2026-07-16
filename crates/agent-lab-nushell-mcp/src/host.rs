@@ -60,6 +60,12 @@ impl NushellHost {
             "PWD".to_owned(),
             Value::string(cwd.to_string_lossy(), Span::unknown()),
         );
+        if let Some(term) = std::env::var_os("TERM") {
+            stack.add_env_var(
+                "TERM".to_owned(),
+                Value::string(term.to_string_lossy(), Span::unknown()),
+            );
+        }
         Self {
             engine_state,
             stack,

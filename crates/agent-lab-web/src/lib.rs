@@ -325,7 +325,11 @@ fn terminal_request_is_authorized(
     headers
         .get(header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == auth_protocol)
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|protocol| protocol.trim() == auth_protocol)
+        })
         && request_is_same_origin(headers, &config.origin, true)
 }
 
@@ -649,7 +653,7 @@ mod tests {
         ));
         headers.insert(
             header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_str(&auth_protocol).unwrap(),
+            HeaderValue::from_str(&format!("unused, {auth_protocol}")).unwrap(),
         );
         assert!(terminal_request_is_authorized(
             &headers,

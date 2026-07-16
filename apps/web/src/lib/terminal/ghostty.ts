@@ -4,7 +4,10 @@ import type { TerminalSurface, TerminalDimensions, Disposable } from './surface'
 let initialization: Promise<void> | undefined;
 
 function initializeGhostty(): Promise<void> {
-  initialization ??= init();
+  initialization ??= init().catch((error: unknown) => {
+    initialization = undefined;
+    throw error;
+  });
   return initialization;
 }
 

@@ -68,6 +68,7 @@ export async function connectSession(
 
   const socket = new WebSocket(url, [`agent-lab.auth.${token}`]);
   socket.binaryType = 'arraybuffer';
+  let disposed = false;
   const encoder = new TextEncoder();
   const input = surface.onData((data) => {
     if (socket.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
@@ -80,8 +81,11 @@ export async function connectSession(
   });
   const scroll = surface.onScroll(() => callbacks.onScreen(surface.readText()));
 
-  socket.addEventListener('open', () => callbacks.onState('connected'));
+  socket.addEventListener('open', () => {
+    if (!disposed) callbacks.onState('connected');
+  });
   socket.addEventListener('message', (message) => {
+    if (disposed) return;
     if (typeof message.data === 'string') {
       const event = parseSessionEvent(message.data);
       if (event) callbacks.onEvent(event);
@@ -90,6 +94,7 @@ export async function connectSession(
       callbacks.onScreen(surface.readText());
     } else if (message.data instanceof Blob) {
       void message.data.arrayBuffer().then((data) => {
+        if (disposed) return;
         surface.write(new Uint8Array(data));
         callbacks.onScreen(surface.readText());
       });
@@ -98,14 +103,15 @@ export async function connectSession(
   let sawError = false;
   socket.addEventListener('error', () => {
     sawError = true;
-    callbacks.onState('error');
+    if (!disposed) callbacks.onState('error');
   });
   socket.addEventListener('close', () => {
-    if (!sawError) callbacks.onState('closed');
+    if (!disposed && !sawError) callbacks.onState('closed');
   });
 
   return {
     dispose() {
+      disposed = true;
       input.dispose();
       resize.dispose();
       scroll.dispose();

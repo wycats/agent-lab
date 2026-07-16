@@ -1,8 +1,13 @@
-use std::time::Duration;
+use std::{
+    fs,
+    path::PathBuf,
+    process::Command as ProcessCommand,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use agent_lab_driver_protocol::{
     CanonicalizationPolicy, CommandBody, ControllerCommand, DriverBody, DriverEvidenceBundle,
-    DriverFailureScope, DriverProcess, PROTOCOL_VERSION, ProcessError,
+    DriverFailureScope, DriverLaunch, DriverProcess, PROTOCOL_VERSION, ProcessError,
 };
 use serde_json::json;
 
@@ -271,6 +276,119 @@ fn raw_runs_remain_distinct_while_named_canonical_evidence_matches() {
         first.canonical.policy.removed_object_keys,
         ["processId".to_owned()].into_iter().collect()
     );
+}
+
+#[test]
+fn durable_evidence_reopens_and_rejects_tampering() {
+    let bundle = completed_fixture_bundle();
+    let root = temporary_root("durable-evidence");
+    let evidence = root.join("run-1");
+
+    bundle.write_to_dir(&evidence).unwrap();
+    assert_eq!(
+        fs::read(evidence.join("controller.jsonl")).unwrap(),
+        bundle
+            .transcript
+            .controller_records
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        fs::read(evidence.join("driver.jsonl")).unwrap(),
+        bundle
+            .transcript
+            .driver_records
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        DriverEvidenceBundle::read_from_dir(&evidence).unwrap(),
+        bundle
+    );
+    assert!(bundle.write_to_dir(&evidence).is_err());
+
+    fs::write(
+        evidence.join("canonical.json"),
+        br#"{"policy":{"name":"fixture-v1","removedObjectKeys":[]},"driverRecords":[]}"#,
+    )
+    .unwrap();
+    assert!(DriverEvidenceBundle::read_from_dir(&evidence).is_err());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn probe_can_finalize_fixture_evidence_for_direct_inspection() {
+    let root = temporary_root("probe-evidence");
+    let evidence = root.join("run-1");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-lab-driver-probe"))
+        .arg(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"))
+        .env("AGENT_LAB_EVIDENCE_DIR", &evidence)
+        .env("AGENT_LAB_CONTROLLER_REVISION", "test-controller")
+        .env(
+            "AGENT_LAB_CANONICAL_POLICY_JSON",
+            r#"{"name":"fixture-v1","removedObjectKeys":["processId"]}"#,
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["outcome"], "completed");
+    assert_eq!(summary["evidenceDir"], evidence.to_string_lossy().as_ref());
+    let bundle = DriverEvidenceBundle::read_from_dir(&evidence).unwrap();
+    assert_eq!(
+        bundle.controller_revision.as_deref(),
+        Some("test-controller")
+    );
+    assert_eq!(bundle.canonical.policy.name, "fixture-v1");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn clean_exit_drains_trailing_stderr_before_transcript_capture() {
+    let mut launch = DriverLaunch::new(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"));
+    launch
+        .env
+        .push(("AGENT_LAB_FIXTURE_TRAILING_STDERR".into(), "1".into()));
+    let mut process = DriverProcess::spawn_with(launch).unwrap();
+    open_session(&mut process);
+    process
+        .send(&command(
+            "close-stderr",
+            CommandBody::CloseSession {
+                session_id: "session-1".to_owned(),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        process.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::SessionClosed { .. }
+    ));
+    assert_eq!(process.wait_for_exit(TIMEOUT).unwrap(), Some(0));
+    assert_eq!(process.stderr(), b"fixture trailing stderr\n");
+}
+
+fn temporary_root(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "agent-lab-driver-{label}-{}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    root
 }
 
 fn completed_fixture_bundle() -> DriverEvidenceBundle {

@@ -35,11 +35,12 @@ being copied here.
 
 ## Status
 
-The first embedded Nushell/MCP steel thread is implemented. A PTY-driven visual
-shell feedback loop now makes its prompt, structured rendering, generated help,
-live capability refresh, persistent state, and errors directly inspectable
-before REPL polish. Names and contracts remain provisional as later steel
-threads produce evidence.
+The embedded Nushell/MCP and browser feedback threads are implemented. A
+neutral external-driver experiment now preserves process lifecycle, raw JSON
+Lines transcripts, stderr, and named comparison projections in reopenable
+evidence directories. The next boundary binds a real harness to a controlled
+workspace and capability source through the workbench. Names and contracts
+remain provisional as later steel threads produce evidence.
 
 ## Browser workbench
 

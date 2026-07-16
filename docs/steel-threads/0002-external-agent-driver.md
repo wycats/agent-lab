@@ -1,240 +1,243 @@
-# Steel thread 0002: External agent driver with a real v0 loop
+# Steel thread 0002: Neutral external agent driver and evidence
 
-- Status: Active
+- Status: Validated (public foundation)
 - Depends on: [Steel thread 0001](0001-nushell-mcp-session.md)
 
 ## Question
 
-Can Agent Lab run a real agent implementation as a long-lived external driver,
-stream its native behavior into reproducible evidence, and give it access to
-the same capability source used for human exploration—without making either
-side adopt the other's prompts, tool taxonomy, runtime, or internal types?
+Can Agent Lab start and observe an agent harness through a small process
+boundary while leaving the harness's prompts, tools, model loop, context
+policy, workspace host, checkpoints, and native event vocabulary under the
+harness's control?
+
+The boundary must preserve enough raw and structured evidence to replay and
+compare a run. It must not become a universal agent SDK before two real
+harnesses have tested the vocabulary.
 
 ## Hypotheses
 
-1. A small versioned process protocol can preserve driver identity, session and
-   turn identity, incremental events, cancellation, completion, and failure
-   without encoding one agent framework's loop or message types.
-2. The real v0 loop can implement that protocol in its owning repository while
-   all v0 prompt construction, model adapters, tool selection, and checkpoints
-   remain private to the driver.
-3. The deterministic MCP fixture from steel thread 0001 can be explored through
-   Nushell and invoked through the v0 driver while retaining the same capability
-   identity and structured arguments, results, and lifecycle evidence.
-4. Agent Lab can retain raw driver output and derive a separate canonical view
-   for comparison, so repeatability does not require discarding provenance or
-   unstable-but-diagnostic fields.
+1. A versioned JSON Lines protocol can preserve driver identity, session and
+   turn identity, incremental native events, cancellation, completion, and
+   failure without importing one harness's internal types.
+2. Agent Lab can retain the exact controller, driver, and stderr streams while
+   deriving a separate named projection for deterministic comparison.
+3. An explicit executable, argument, working-directory, and environment
+   launch description is enough for an owning repository to attach a real
+   harness without Agent Lab choosing its runtime or tool adapter.
+4. A synthetic fixture can establish process and evidence invariants. Real
+   v0 and Eve integrations must separately establish that the boundary
+   survives contact with their native loops.
 
-The thread should discover the smallest boundary supported by both the Rust
-controller and the real driver. The candidate messages below are inputs to the
-experiment, not a stable public API.
+The names and shapes in this thread remain experimental. The evidence supports
+a seam worth testing, not a stable public driver API.
 
-## Real path
+## Public boundary
 
-The public repository will contain a Rust protocol experiment, child-process
-controller, and deterministic driver fixture. The real adapter will live with
-v0 and use the actual v0 agent loop rather than a second agent implementation.
-Cross-repository acceptance will pin both revisions and record only evidence
-safe for the public repository.
+The public repository contains:
 
-The real path will reuse:
+- candidate protocol envelopes;
+- a child-process controller;
+- a deterministic driver fixture;
+- raw transcript capture;
+- a named canonical comparison projection;
+- an atomic, reopenable evidence directory;
+- synthetic tests for success and failure behavior.
 
-- the MCP fixture and typed lifecycle evidence from steel thread 0001;
-- v0's existing deterministic agent-loop harness and event observation seam;
-- v0's existing MCP-to-dynamic-tool behavior;
-- the bounded in-process shell host used by the v0 harness as one execution-host
-  implementation, not as the Agent Lab driver contract.
-
-This pairing is deliberate. The public fixture proves the protocol precisely;
-the v0 adapter proves that the protocol survives a demanding agent with its own
-tool, prompt, filesystem, and evidence assumptions.
+Public harnesses such as Eve may implement the process boundary here or in
+their own repository. The v0 adapter, prompts, tool definitions, and evidence
+remain in v0's owning repository. Agent Lab does not require either harness to
+adopt the other's tool loop, native event taxonomy, or workspace abstraction.
 
 ## Candidate process semantics
 
-The first candidate is newline-delimited JSON over stdio. Protocol output owns
-stdout; driver diagnostics use stderr. Every parsed message carries a protocol
-version and type. Session-, turn-, message-, and source-local sequence identity
-are present where applicable.
+The controller and driver exchange newline-delimited JSON over stdio. Protocol
+output owns stdout; diagnostics use stderr. Every message declares a protocol
+version and type. Controller commands also carry a message identity, and
+driver messages carry a contiguous source-local sequence and optional causal
+message identity.
 
-Controller commands need only express:
+Controller commands express only:
 
-- opening a session with an opaque driver configuration and declared limits;
-- starting a turn with a task and capability-source configuration;
+- opening a session with opaque driver configuration and declared limits;
+- starting a turn with an opaque task and capability-source configuration;
 - aborting an active turn;
 - closing the session.
 
-Driver output needs only express:
+Driver output expresses only:
 
 - readiness and a versioned driver descriptor;
 - session acceptance;
 - an incremental native event with an opaque structured payload;
-- turn completion with an outcome and evidence references;
-- driver or protocol failure.
+- turn completion with an outcome and opaque evidence;
+- driver, protocol, session, or turn failure;
+- session closure.
 
-Agent Lab records the exact input and output bytes alongside the parsed
-envelopes. Canonicalization is a named evidence transform, never a mutation of
-the raw record. A driver may expose an opaque checkpoint, but Agent Lab does not
-define its schema.
+The controller validates framing, protocol version, and driver-local sequence
+while retaining the exact bytes it observed. It does not reinterpret native
+events as Agent Lab tool events.
+
+## Durable evidence
+
+A successful protocol transcript can be finalized as an evidence directory:
+
+```text
+<run>/
+  manifest.json
+  controller.jsonl
+  driver.jsonl
+  driver.stderr.log
+  canonical.json
+```
+
+The manifest records the evidence schema, controller revision, driver
+descriptor, process identity, canonicalization policy, record counts, and
+stderr byte count. The JSON Lines files contain the exact protocol records,
+including their delimiters. Driver stderr remains separate.
+
+`canonical.json` is derived from the retained driver records using a named
+policy. The first policy can remove explicitly named object keys recursively;
+it does not mutate or replace the raw transcript. Finalization writes a new
+staging directory and renames it into place. Reopening validates the manifest,
+parses every typed record, and reproduces the canonical projection. An existing
+target or a tampered projection is rejected.
+
+This directory is the driver-level part of run evidence. Workspace snapshots,
+capability observations, model usage, scores, and scenario identity belong to
+the run controller that will compose it.
 
 ## Timebox and stopping conditions
 
-Stop the first pass when the public fixture and pinned v0 adapter have either
-met every acceptance check or produced a reproducible failure at a named
-boundary. Do not expand this pass into a general RPC framework, production
-scheduler, remote model service, or editor integration.
+The public-foundation pass stops after one synthetic driver proves the process
+lifecycle and durable evidence invariants. It does not add a scheduler, remote
+transport, workspace controller, MCP adapter, browser UI, or model service.
 
-Pause and record a negative result if the real path requires any of:
+Record a negative result and revisit the seam if a real harness requires:
 
-- serializing v0's internal agent input, prompt, tool, or checkpoint types into
-  the public protocol;
-- importing v0 or TypeScript runtime code into Agent Lab;
-- importing Agent Lab, Nushell, or the Rust MCP bridge into v0;
-- adopting AI SDK Harness, MCP, or any agent SDK as the generic driver wire
-  protocol;
-- reducing native events to display strings or retaining only normalized
-  evidence;
-- letting the driver silently widen execution permissions or limits;
-- hiding a reconnect, runtime replacement, or new process behind one session
-  identity.
+- serializing its prompt, tool, checkpoint, or agent-input types into the
+  public protocol;
+- importing the harness runtime into Agent Lab;
+- adopting MCP, AI SDK Harness, or another agent framework as the generic
+  driver wire format;
+- flattening native events to display strings;
+- retaining only normalized evidence;
+- silently widening permissions or execution limits;
+- hiding a process replacement behind one session identity.
 
 ## Acceptance evidence
 
-The thread is successful only when repository and cross-repository evidence
-demonstrates all of the following:
+The public foundation is successful when synthetic evidence demonstrates:
 
-1. A public fixture driver completes protocol negotiation, preserves one
-   process and session across at least two turns, streams events before turn
-   completion, and shuts down cleanly.
-2. The controller distinguishes malformed protocol output, driver-reported
-   failure, turn cancellation, unexpected process exit, and successful
-   completion.
-3. A pinned v0 adapter runs the real v0 loop through the same protocol. The
-   public wire contains no v0 prompt, tool-registry, filesystem, or agent-input
-   types.
-4. One scripted v0 trial exercises multiple native v0 tools and produces a raw
-   event stream, final workspace evidence, finish/usage evidence, and an opaque
-   checkpoint or explicit statement that checkpointing is unsupported.
-5. The v0 driver discovers and invokes at least one structured tool from the
-   steel-thread-0001 MCP fixture. The evidence correlates driver invocation with
-   the fixture's capability identity, arguments, result, and lifecycle events.
-6. At least one denied or unsupported operation proves that the declared
-   execution-host permissions and limits are enforced rather than descriptive.
-7. Two equivalent runs preserve their raw records and produce equal canonical
-   evidence. The transform and every removed or rewritten field are named.
-8. The evidence records exact repository revisions, driver and dependency
-   versions, process and runtime counts, protocol transcripts, permission
-   decisions, observed failures, and the architectural conclusion.
+1. One fixture process opens one session, streams multiple events before turn
+   completion, runs a second turn, handles explicit cancellation, closes, and
+   exits cleanly.
+2. The controller distinguishes malformed JSON, a driver-reported failure, an
+   unsupported protocol version, a repeated driver sequence, timeout, and
+   unexpected process exit.
+3. Controller records, driver records, and stderr are retained separately and
+   exactly.
+4. Two equivalent fixture runs keep distinct raw process identities while a
+   named projection compares equal after removing only the declared field.
+5. A finalized evidence directory reopens without a live driver and reproduces
+   the same bundle.
+6. Re-finalization over an existing target and reopening a tampered projection
+   both fail rather than silently changing evidence.
+7. The crate passes formatting, tests, and strict Clippy checks as part of the
+   full Agent Lab workspace.
 
 ## Non-goals
 
-This thread does not yet provide:
+This thread does not provide:
 
-- a stable public driver SDK;
-- a production v0 integration or published private adapter;
-- a universal task, prompt, model, tool, or checkpoint schema;
-- a shared virtual filesystem or shell API;
-- code-server, LSP, browser, or other editor/application capabilities;
-- statistical eval scoring or a benchmark suite;
-- detach and reconnect across controller processes.
+- a stable driver SDK or universal harness schema;
+- a production v0 or Eve integration;
+- a universal prompt, model, tool, capability, or checkpoint model;
+- a run controller, workspace host, or scenario manifest;
+- authorization or credential redaction policy;
+- detach and reconnect across controller processes;
+- code-server, LSP, browser, or editor integration;
+- statistical evaluation or benchmark scoring.
 
-## Architectural pressure
+## Architectural conclusions
 
-### Driver events are not capability events
+### Driver events and capability events remain distinct
 
-An agent's native event stream explains what the loop believed and emitted.
-Capability and execution-host events explain what effects were requested,
-allowed, performed, or rejected. Agent Lab must correlate these streams without
-pretending they share one native taxonomy. Evidence envelopes therefore need
-source identity and source-local order before a unified observation order can
-be derived.
+The driver stream explains what the harness emitted. Capability and execution
+host streams explain what effects were requested, allowed, performed, or
+rejected. A later run controller should correlate those sources without
+pretending they share one native taxonomy.
 
 ### Determinism is a projection
 
-Real agent events contain identifiers, clocks, provider metadata, and other
-values that can vary while behavior remains equivalent. Removing those fields
-can support comparison, but cannot be the only retained evidence. The thread
-must make the canonicalization policy reviewable and preserve the raw input
-that produced it.
+Process identities and future model/provider metadata vary even when behavior
+is equivalent. Comparison therefore needs a reviewable transform, but raw
+evidence remains authoritative. A score or canonical stream cannot replace the
+observations that produced it.
 
-### The first execution host belongs to the driver
+### The harness retains its execution host
 
-The initial v0 path may use its bounded in-process shell and filesystem because
-that is the shortest real route through the agent loop. The driver must declare
-that host and its unsupported features. Moving the workspace host behind an
-Agent Lab boundary is a later steel thread; the process protocol must not make
-the initial host permanent.
+The protocol carries opaque configuration rather than a shared filesystem or
+shell interface. A real driver may use a physical workspace, a virtual
+filesystem, a remote sandbox, or its own VM abstraction. Workspace identity
+and effects become run-level evidence without making the driver protocol own
+the host.
 
 ### Capability configuration is not a universal tool schema
 
-The first real trial uses MCP because both current experiments can reach it.
-The generic driver envelope carries structured, driver-interpreted capability
-configuration and stable source identity; it does not redefine MCP tools or AI
-SDK tools. A future driver may reach the same capability through another
-adapter without changing the controller lifecycle.
-
-## Exact implementation boundary
-
-The public implementation begins with one experimental Rust crate containing:
-
-1. serde types for the candidate envelopes;
-2. an incremental JSON Lines codec that retains raw records;
-3. a child-process controller with explicit lifecycle and cancellation;
-4. a deterministic fixture driver and integration tests for success, streaming,
-   malformed output, failure, cancellation, and process exit;
-5. an evidence bundle containing pinned identities, raw transcripts, parsed
-   envelopes, and a named canonical projection.
-
-In parallel, the v0 repository should add only the adapter needed to place its
-existing deterministic harness behind this process boundary and inject the
-steel-thread-0001 MCP fixture through v0's own dynamic-tool path. Any cleanup
-needed to avoid treating the harness as a subagent belongs in v0 and should be
-reviewed there.
-
-The cross-repository acceptance run is the gate for extracting a reusable Agent
-Lab driver contract. Until that run passes, the Rust types and message names
-remain experimental and must not move into `agent-lab-core`.
+The controller can pass structured capability-source configuration while the
+driver decides how to project it into its native loop. MCP is the first real
+capability protocol, not the generic driver contract.
 
 ## Evidence log
 
-### Public process fixture
-
-The first Rust pass implements the candidate envelopes, an incremental JSON
-Lines child-process controller, and a deterministic fixture driver in the
-experimental `agent-lab-driver-protocol` crate.
+The experimental `agent-lab-driver-protocol` crate exercises the complete
+public-foundation boundary:
 
 ```console
-$ cargo test -p agent-lab-driver-protocol --test process_protocol
-running 3 tests
-test one_process_streams_two_turns_and_cancels_the_second ... ok
+$ cargo test -p agent-lab-driver-protocol --all-features
+running 7 tests
+test clean_exit_drains_trailing_stderr_before_transcript_capture ... ok
+test durable_evidence_reopens_and_rejects_tampering ... ok
 test malformed_output_reported_failure_and_process_exit_are_distinct ... ok
+test one_process_streams_two_turns_and_cancels_the_second ... ok
+test probe_can_finalize_fixture_evidence_for_direct_inspection ... ok
 test protocol_version_and_sequence_violations_are_distinct ... ok
+test raw_runs_remain_distinct_while_named_canonical_evidence_matches ... ok
 
-test result: ok. 3 passed; 0 failed
+test result: ok. 7 passed; 0 failed
 ```
-
-Observed behavior:
-
-- the fixture's protocol-reported process ID matches the controller's child
-  process ID;
-- one process and session completes one turn, begins a second, receives an
-  explicit abort, reports the aborted outcome, and exits successfully after
-  `session.close`;
-- turn events arrive as individual records before `turn.finished`;
-- every sent and received record retains its exact bytes, including the JSON
-  Lines delimiter, alongside the parsed envelope;
-- driver-reported turn failure remains a parsed `driver.failed` message;
-- malformed JSON, protocol version 2, a repeated source sequence, and process
-  exit code 17 produce four distinct controller errors;
-- stderr is captured separately and poisoned diagnostic locks recover without
-  panicking the trial controller.
 
 The focused strict-Clippy gate also passes:
 
 ```console
-cargo clippy -p agent-lab-driver-protocol --all-targets --all-features -- -D warnings
+$ cargo clippy -p agent-lab-driver-protocol --all-targets --all-features -- -D warnings
+Finished `dev` profile
 ```
 
-This is partial evidence only. The crate does not yet produce a complete
-evidence bundle or canonical projection, and no real agent driver or MCP
-capability has crossed the protocol. The message names therefore remain
-candidate vocabulary rather than an architectural conclusion.
+The tests confirm that the fixture-reported PID matches the child process,
+incremental events precede completion, cancellation stays within the same
+process and session, protocol failures remain distinct, and raw records retain
+their JSON Lines delimiters. A clean process exit joins both reader threads so
+trailing stderr is present before transcript capture. Two fixture processes
+produce different raw records because their PIDs differ, while the
+`fixture-v1` projection matches after removing the explicitly named
+`processId` field. The finalized directory
+can be reopened byte-for-byte, and canonical tampering is detected.
+
+The probe provides the same boundary for direct inspection. Setting
+`AGENT_LAB_EVIDENCE_DIR` finalizes the run there; an optional
+`AGENT_LAB_CANONICAL_POLICY_JSON` names the comparison transform. The probe
+retains its inputs exactly, so this experimental command is intended for
+synthetic or otherwise publishable inputs until the run controller owns a
+credential-redaction policy.
+
+## Exact next boundary
+
+Bind one real harness to this experimental seam while a run controller owns a
+controlled workspace, capability-source identity, lifecycle events, and the
+larger evidence bundle. Use the current catalog-to-file scenario as the first
+vertical slice.
+
+The public path should use Eve or another open harness. The v0 path should use
+the same protocol from v0's owning repository. The pair should test whether
+the candidate messages preserve meaningful native differences before any type
+moves into `agent-lab-core` or is described as stable.

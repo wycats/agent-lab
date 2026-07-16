@@ -259,6 +259,9 @@ impl Fixture {
             return Ok(false);
         }
         self.emit(output, DriverBody::SessionClosed { session_id })?;
+        if std::env::var_os("AGENT_LAB_FIXTURE_TRAILING_STDERR").is_some() {
+            eprintln!("fixture trailing stderr");
+        }
         Ok(true)
     }
 }

@@ -1,9 +1,19 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    fs, io,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use thiserror::Error;
 
-use crate::{DriverDescriptor, DriverTranscript};
+use crate::{ControllerCommand, DriverDescriptor, DriverMessage, DriverTranscript};
+
+pub const EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,6 +40,20 @@ impl CanonicalizationPolicy {
 pub struct CanonicalProjection {
     pub policy: CanonicalizationPolicy,
     pub driver_records: Vec<JsonValue>,
+}
+
+/// Small index for a durable evidence directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceManifest {
+    pub schema_version: u32,
+    pub controller_revision: Option<String>,
+    pub driver: DriverDescriptor,
+    pub process_id: u32,
+    pub canonicalization: CanonicalizationPolicy,
+    pub controller_record_count: usize,
+    pub driver_record_count: usize,
+    pub stderr_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,6 +89,156 @@ impl DriverEvidenceBundle {
             canonical,
         })
     }
+
+    #[must_use]
+    pub fn manifest(&self) -> EvidenceManifest {
+        EvidenceManifest {
+            schema_version: EVIDENCE_SCHEMA_VERSION,
+            controller_revision: self.controller_revision.clone(),
+            driver: self.driver.clone(),
+            process_id: self.process_id,
+            canonicalization: self.canonical.policy.clone(),
+            controller_record_count: self.transcript.controller_records.len(),
+            driver_record_count: self.transcript.driver_records.len(),
+            stderr_bytes: self.transcript.driver_stderr.len(),
+        }
+    }
+
+    /// Atomically finalize an inspectable evidence directory.
+    ///
+    /// The directory contains `manifest.json`, exact controller and driver
+    /// JSON Lines transcripts, driver stderr, and the named canonical
+    /// projection. The target must not already exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid retained records, an inconsistent
+    /// canonical projection, filesystem failures, or an existing target.
+    pub fn write_to_dir(&self, target: impl AsRef<Path>) -> Result<(), EvidenceError> {
+        validate_bundle(self)?;
+        let target = target.as_ref();
+        if target.exists() {
+            return Err(EvidenceError::AlreadyExists(target.to_path_buf()));
+        }
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                EvidenceError::InvalidBundle("evidence target needs a file name".to_owned())
+            })?;
+        let staging = parent.join(format!(
+            ".{name}.tmp-{}-{}",
+            std::process::id(),
+            STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&staging)?;
+
+        let result = (|| -> Result<(), EvidenceError> {
+            write_json(&staging.join("manifest.json"), &self.manifest())?;
+            write_records(
+                &staging.join("controller.jsonl"),
+                &self.transcript.controller_records,
+            )?;
+            write_records(
+                &staging.join("driver.jsonl"),
+                &self.transcript.driver_records,
+            )?;
+            fs::write(
+                staging.join("driver.stderr.log"),
+                &self.transcript.driver_stderr,
+            )?;
+            write_json(&staging.join("canonical.json"), &self.canonical)?;
+            fs::rename(&staging, target)?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        result
+    }
+
+    /// Reopen and verify a durable evidence directory without running a driver.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when files are missing, records are malformed, counts
+    /// disagree, or the stored canonical projection cannot be reproduced.
+    pub fn read_from_dir(root: impl AsRef<Path>) -> Result<Self, EvidenceError> {
+        let root = root.as_ref();
+        let manifest: EvidenceManifest = read_json(&root.join("manifest.json"))?;
+        if manifest.schema_version != EVIDENCE_SCHEMA_VERSION {
+            return Err(EvidenceError::InvalidBundle(format!(
+                "unsupported evidence schema version {}",
+                manifest.schema_version
+            )));
+        }
+        let transcript = DriverTranscript {
+            controller_records: read_records(&root.join("controller.jsonl"))?,
+            driver_records: read_records(&root.join("driver.jsonl"))?,
+            driver_stderr: fs::read(root.join("driver.stderr.log"))?,
+        };
+        let canonical: CanonicalProjection = read_json(&root.join("canonical.json"))?;
+        let bundle = Self {
+            controller_revision: manifest.controller_revision.clone(),
+            driver: manifest.driver.clone(),
+            process_id: manifest.process_id,
+            transcript,
+            canonical,
+        };
+        if bundle.manifest() != manifest {
+            return Err(EvidenceError::InvalidBundle(
+                "manifest counts or identities do not match retained evidence".to_owned(),
+            ));
+        }
+        validate_bundle(&bundle)?;
+        Ok(bundle)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum EvidenceError {
+    #[error("evidence target already exists: {0}")]
+    AlreadyExists(PathBuf),
+    #[error("invalid evidence bundle: {0}")]
+    InvalidBundle(String),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
+fn validate_bundle(bundle: &DriverEvidenceBundle) -> Result<(), EvidenceError> {
+    validate_records::<ControllerCommand>("controller", &bundle.transcript.controller_records)?;
+    validate_records::<DriverMessage>("driver", &bundle.transcript.driver_records)?;
+    let expected =
+        canonicalize_driver_records(&bundle.transcript, bundle.canonical.policy.clone())?;
+    if expected != bundle.canonical {
+        return Err(EvidenceError::InvalidBundle(
+            "canonical projection does not match the retained driver records".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_records<T>(kind: &str, records: &[Vec<u8>]) -> Result<(), EvidenceError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    for (index, record) in records.iter().enumerate() {
+        if !record.ends_with(b"\n") {
+            return Err(EvidenceError::InvalidBundle(format!(
+                "{kind} record {} is not newline terminated",
+                index + 1
+            )));
+        }
+        serde_json::from_slice::<T>(record).map_err(|error| {
+            EvidenceError::InvalidBundle(format!("{kind} record {} is invalid: {error}", index + 1))
+        })?;
+    }
+    Ok(())
 }
 
 fn canonicalize_driver_records(
@@ -103,4 +277,33 @@ fn canonicalize_value(value: JsonValue, removed_keys: &BTreeSet<String>) -> Json
         ),
         value => value,
     }
+}
+
+fn write_json(path: &Path, value: &impl Serialize) -> Result<(), EvidenceError> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn read_json<T>(path: &Path) -> Result<T, EvidenceError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn write_records(path: &Path, records: &[Vec<u8>]) -> Result<(), EvidenceError> {
+    let bytes = records.iter().flatten().copied().collect::<Vec<_>>();
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn read_records(path: &Path) -> Result<Vec<Vec<u8>>, EvidenceError> {
+    let bytes = fs::read(path)?;
+    Ok(bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|record| !record.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
 }

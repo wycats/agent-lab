@@ -55,8 +55,9 @@ unsupported direction.
    by the [visual shell feedback loop](../steel-threads/visual-shell-feedback-loop.md)
    and [browser shared perception](../steel-threads/browser-shared-perception.md)
    threads.
-3. A neutral external agent-driver boundary with durable run and evidence
-   contracts.
+3. A neutral external agent-driver boundary with durable process evidence.
+   Completed by the [external agent driver and evidence](../steel-threads/0002-external-agent-driver.md)
+   thread.
 4. A first real harness bound to a controlled workspace and capability source
    through the workbench.
 5. A second real harness exercised through the same workbench. The initial pair

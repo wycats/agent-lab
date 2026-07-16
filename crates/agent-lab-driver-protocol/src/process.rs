@@ -1,7 +1,7 @@
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io::{BufRead, BufReader, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -59,11 +59,36 @@ enum ReaderItem {
     Eof,
 }
 
+/// Explicit process launch configuration supplied by the Agent Lab host.
+#[derive(Debug, Clone)]
+pub struct DriverLaunch {
+    pub executable: PathBuf,
+    pub args: Vec<OsString>,
+    pub cwd: Option<PathBuf>,
+    pub env: Vec<(OsString, OsString)>,
+    pub clear_env: bool,
+}
+
+impl DriverLaunch {
+    #[must_use]
+    pub fn new(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            clear_env: false,
+        }
+    }
+}
+
 pub struct DriverProcess {
     child: Child,
     stdin: ChildStdin,
     output: mpsc::Receiver<ReaderItem>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    stdout_reader: Option<thread::JoinHandle<Result<(), String>>>,
+    stderr_reader: Option<thread::JoinHandle<Result<(), String>>>,
     sent: Vec<Vec<u8>>,
     received: Vec<Vec<u8>>,
     last_sequence: u64,
@@ -79,8 +104,30 @@ impl DriverProcess {
         executable: impl AsRef<Path>,
         args: impl IntoIterator<Item = impl AsRef<OsStr>>,
     ) -> Result<Self, ProcessError> {
-        let mut child = Command::new(executable.as_ref())
-            .args(args)
+        let mut launch = DriverLaunch::new(executable.as_ref());
+        launch.args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_owned())
+            .collect();
+        Self::spawn_with(launch)
+    }
+
+    /// Spawn a driver with an explicit working directory and environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process or any required pipe cannot be opened.
+    pub fn spawn_with(launch: DriverLaunch) -> Result<Self, ProcessError> {
+        let mut command = Command::new(&launch.executable);
+        command.args(&launch.args);
+        if let Some(cwd) = &launch.cwd {
+            command.current_dir(cwd);
+        }
+        if launch.clear_env {
+            command.env_clear();
+        }
+        command.envs(launch.env);
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -100,35 +147,40 @@ impl DriverProcess {
             .ok_or_else(|| ProcessError::Spawn("driver stderr was not piped".to_owned()))?;
 
         let (sender, output) = mpsc::channel();
-        thread::Builder::new()
+        let stdout_reader = match thread::Builder::new()
             .name("agent-lab-driver-stdout".to_owned())
             .spawn(move || read_stdout(stdout, &sender))
-            .map_err(|error| ProcessError::Spawn(error.to_string()))?;
+        {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProcessError::Spawn(error.to_string()));
+            }
+        };
 
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let stderr_writer = stderr.clone();
-        thread::Builder::new()
+        let stderr_reader = match thread::Builder::new()
             .name("agent-lab-driver-stderr".to_owned())
-            .spawn(move || {
-                let mut reader = BufReader::new(child_stderr);
-                let mut chunk = [0_u8; 4096];
-                while let Ok(count) = reader.read(&mut chunk) {
-                    if count == 0 {
-                        break;
-                    }
-                    stderr_writer
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .extend_from_slice(&chunk[..count]);
-                }
-            })
-            .map_err(|error| ProcessError::Spawn(error.to_string()))?;
+            .spawn(move || read_stderr(child_stderr, &stderr_writer))
+        {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                return Err(ProcessError::Spawn(error.to_string()));
+            }
+        };
 
         Ok(Self {
             child,
             stdin,
             output,
             stderr,
+            stdout_reader: Some(stdout_reader),
+            stderr_reader: Some(stderr_reader),
             sent: Vec::new(),
             received: Vec::new(),
             last_sequence: 0,
@@ -216,6 +268,7 @@ impl DriverProcess {
                     .child
                     .wait()
                     .map_err(|error| ProcessError::Read(error.to_string()))?;
+                self.join_readers()?;
                 Err(ProcessError::UnexpectedExit {
                     code: status.code(),
                 })
@@ -238,6 +291,7 @@ impl DriverProcess {
                 .try_wait()
                 .map_err(|error| ProcessError::Read(error.to_string()))?
             {
+                self.join_readers()?;
                 return Ok(status.code());
             }
             if Instant::now() >= deadline {
@@ -245,6 +299,12 @@ impl DriverProcess {
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn join_readers(&mut self) -> Result<(), ProcessError> {
+        let stdout = join_reader(self.stdout_reader.take(), "stdout");
+        let stderr = join_reader(self.stderr_reader.take(), "stderr");
+        stdout.and(stderr)
     }
 }
 
@@ -254,27 +314,54 @@ impl Drop for DriverProcess {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+        let _ = self.join_readers();
     }
 }
 
-fn read_stdout(stdout: impl Read, sender: &mpsc::Sender<ReaderItem>) {
+fn join_reader(
+    reader: Option<thread::JoinHandle<Result<(), String>>>,
+    stream: &str,
+) -> Result<(), ProcessError> {
+    match reader.map(thread::JoinHandle::join) {
+        None | Some(Ok(Ok(()))) => Ok(()),
+        Some(Ok(Err(error))) => Err(ProcessError::Read(format!("driver {stream}: {error}"))),
+        Some(Err(_)) => Err(ProcessError::ReaderStopped),
+    }
+}
+
+fn read_stdout(stdout: impl Read, sender: &mpsc::Sender<ReaderItem>) -> Result<(), String> {
     let mut reader = BufReader::new(stdout);
     loop {
         let mut raw = Vec::new();
         match reader.read_until(b'\n', &mut raw) {
             Ok(0) => {
                 let _ = sender.send(ReaderItem::Eof);
-                return;
+                return Ok(());
             }
             Ok(_) => {
                 if sender.send(ReaderItem::Line(raw)).is_err() {
-                    return;
+                    return Ok(());
                 }
             }
             Err(error) => {
                 let _ = sender.send(ReaderItem::Error(error.to_string()));
-                return;
+                return Err(error.to_string());
             }
         }
+    }
+}
+
+fn read_stderr(stderr: impl Read, destination: &Mutex<Vec<u8>>) -> Result<(), String> {
+    let mut reader = BufReader::new(stderr);
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let count = reader.read(&mut chunk).map_err(|error| error.to_string())?;
+        if count == 0 {
+            return Ok(());
+        }
+        destination
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(&chunk[..count]);
     }
 }

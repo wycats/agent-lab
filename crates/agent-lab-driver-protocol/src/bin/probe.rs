@@ -1,7 +1,8 @@
-use std::{env, error::Error, io, time::Duration};
+use std::{env, error::Error, io, path::PathBuf, time::Duration};
 
 use agent_lab_driver_protocol::{
-    CommandBody, ControllerCommand, DriverBody, DriverProcess, PROTOCOL_VERSION,
+    CanonicalizationPolicy, CommandBody, ControllerCommand, DriverBody, DriverEvidenceBundle,
+    DriverProcess, PROTOCOL_VERSION,
 };
 use serde_json::{Value as JsonValue, json};
 
@@ -69,7 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ))?;
 
     let mut event_types = Vec::new();
-    let (outcome, evidence) = loop {
+    let (outcome, turn_evidence) = loop {
         let message = driver.receive(TIMEOUT)?;
         match message.parsed.body {
             DriverBody::TurnEvent { event_type, .. } => event_types.push(event_type),
@@ -95,6 +96,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let exit_code = driver.wait_for_exit(TIMEOUT)?;
     let transcript = driver.transcript();
+    let evidence_dir = env::var_os("AGENT_LAB_EVIDENCE_DIR").map(PathBuf::from);
+    if let Some(directory) = &evidence_dir {
+        let policy = serde_json::from_value::<CanonicalizationPolicy>(json_env(
+            "AGENT_LAB_CANONICAL_POLICY_JSON",
+            json!({ "name": "identity-v1", "removedObjectKeys": [] }),
+        )?)?;
+        DriverEvidenceBundle::new(
+            env::var("AGENT_LAB_CONTROLLER_REVISION").ok(),
+            descriptor.clone(),
+            process_id,
+            transcript.clone(),
+            policy,
+        )?
+        .write_to_dir(directory)?;
+    }
 
     serde_json::to_writer_pretty(
         io::stdout(),
@@ -103,7 +119,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             "processId": process_id,
             "eventTypes": event_types,
             "outcome": outcome,
-            "evidence": evidence,
+            "evidence": turn_evidence,
+            "evidenceDir": evidence_dir,
             "exitCode": exit_code,
             "controllerRecordCount": transcript.controller_records.len(),
             "driverRecordCount": transcript.driver_records.len(),

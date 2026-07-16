@@ -267,15 +267,21 @@ host capability rather than part of the workspace definition.
 
 Agent Lab should develop its shared vocabulary against multiple demanding
 harnesses rather than generalizing from one implementation. v0 and
-[Eve](https://github.com/vercel/eve) are strong initial integrations because
-they make different choices about tools, sessions, execution, durability,
-context, and evaluation.
+[Eve](https://github.com/vercel/eve) are a strong initial pair because they make
+different choices about tools, sessions, execution, durability, context, and
+evaluation.
 
-A useful early demonstration is intentionally simple: select v0 or Eve,
-inspect what the harness reports about itself, attach it to a resettable seeded
-workspace and capability source, run it, observe its native activity, and
-evaluate the outcome. The two harnesses do not need to share a tool loop for
-the workbench to make their common shape and important differences legible.
+Eve can integrate through public code in Agent Lab. The product-specific v0
+adapter remains in v0's owning repository and connects through Agent Lab's
+public protocol and synthetic conformance fixtures. No v0 prompts, tools,
+private evidence, or product-specific adapter code move into this repository.
+
+A useful early demonstration is intentionally simple: select Eve or v0 through
+their respective adapters, inspect what the harness reports about itself,
+attach it to a resettable seeded workspace and capability source, run it,
+observe its native activity, and evaluate the outcome. The two harnesses do not
+need to share a tool loop for the workbench to make their common shape and
+important differences legible.
 
 Eve is especially useful pressure on the design because its public inspection
 and session APIs expose instructions, tools, skills, model information,
@@ -412,7 +418,8 @@ current architecture.
 After the neutral driver and evidence foundation and a first runnable harness
 workbench have landed through the sequence in
 [RFC 0002](0002-steel-thread-method.md), build the smallest "two harnesses, one
-workbench" experience using v0 and Eve.
+workbench" experience using a public Eve integration and a v0 adapter retained
+in v0's owning repository.
 
 Each harness should be independently inspectable, attach to the same kind of
 resettable seeded environment, run through its native loop, stream its native

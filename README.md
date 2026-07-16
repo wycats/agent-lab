@@ -1,11 +1,9 @@
 # agent-lab
 
-A Rust laboratory for exploring, running, and evaluating agents.
-
-Agent Lab is an experimental home for two related activities:
-
-- interactive, structured exploration of tools and capabilities;
-- reproducible execution and evaluation of agents against controlled hosts.
+Agent Lab is an open workbench for understanding and improving agent harnesses.
+It lets builders explore the same workspaces and capabilities their agents use,
+run real harnesses under controlled conditions, and preserve what they learn as
+repeatable evaluations backed by inspectable evidence.
 
 The project begins with MCP and Nushell because they put useful pressure on
 discovery, structured data, completion, streaming, and session semantics. The
@@ -19,18 +17,9 @@ Agent Lab advances through steel threads: small end-to-end slices that test one
 architectural hypothesis against real behavior. Each thread records its
 acceptance evidence and boundaries before the project generalizes the result.
 
-The initial sequence is:
-
-1. Embed Nushell and operate a modern MCP session without flattening structured
-   results.
-2. Define a neutral driver boundary for running an agent under controlled
-   workspace and capability conditions.
-3. Exercise real MCP servers and editor-semantic capabilities.
-4. Compare one agent, tool, context, or caching change through repeatable trials.
-
 See [RFC 0001](docs/rfcs/0001-product-thesis.md) for the provisional product
 thesis and [RFC 0002](docs/rfcs/0002-steel-thread-method.md) for the working
-method. Active experiments are indexed under
+method and current evidence sequence. Active experiments are indexed under
 [steel threads](docs/steel-threads/README.md).
 
 ## Public boundary
@@ -52,7 +41,7 @@ live capability refresh, persistent state, and errors directly inspectable
 before REPL polish. Names and contracts remain provisional as later steel
 threads produce evidence.
 
-## Browser shared perception
+## Browser workbench
 
 Install the web dependencies, then build and start the loopback-only SvelteKit
 lab bench with:

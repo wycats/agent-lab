@@ -54,12 +54,13 @@ class GhosttyTerminalSurface implements TerminalSurface {
 
 export async function createGhosttySurface(host: HTMLElement): Promise<TerminalSurface> {
   await initializeGhostty();
+  await document.fonts.load('400 14px "Geist Mono Variable"');
   const terminal = new Terminal({
     cols: 100,
     rows: 30,
     cursorBlink: true,
     cursorStyle: 'bar',
-    fontFamily: '"Berkeley Mono", "SFMono-Regular", Consolas, monospace',
+    fontFamily: '"Geist Mono Variable", "Geist Mono", monospace',
     fontSize: 14,
     scrollback: 10_000,
     theme: {

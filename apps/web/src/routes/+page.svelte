@@ -1,4 +1,6 @@
 <script lang="ts">
+  import '@fontsource-variable/geist';
+  import '@fontsource-variable/geist-mono';
   import { onMount } from 'svelte';
   import { createGhosttySurface } from '$lib/terminal/ghostty';
   import { connectSession } from '$lib/terminal/session';
@@ -145,9 +147,10 @@
   }
 
   :global(html) {
+    --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+    --font-mono: "Geist Mono Variable", ui-monospace, monospace;
     color-scheme: dark;
-    font-family:
-      Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-family: var(--font-sans);
     background: #0b100e;
   }
 
@@ -193,11 +196,11 @@
   h1 {
     margin: 0;
     color: #f1f5f2;
-    font-family: Georgia, "Times New Roman", serif;
-    font-size: clamp(2.4rem, 6vw, 4.8rem);
-    font-weight: 400;
-    letter-spacing: -0.055em;
-    line-height: 0.95;
+    font-family: var(--font-sans);
+    font-size: clamp(2rem, 3vw, 3rem);
+    font-weight: 560;
+    letter-spacing: -0.045em;
+    line-height: 1;
   }
 
   .lede {
@@ -215,7 +218,7 @@
     border: 1px solid #27342f;
     border-radius: 999px;
     color: #aebbb4;
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 0.78rem;
   }
 
@@ -282,7 +285,7 @@
 
   .transport {
     color: #596a62;
-    font-family: monospace;
+    font-family: var(--font-mono);
     letter-spacing: 0.08em;
   }
 
@@ -337,7 +340,7 @@
   dd {
     margin: 0;
     color: #aebbb4;
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 0.76rem;
   }
 
@@ -355,7 +358,7 @@
     gap: 8px;
     padding: 9px 0;
     color: #617168;
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 0.72rem;
   }
 

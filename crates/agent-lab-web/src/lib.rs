@@ -12,7 +12,7 @@ use axum::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -262,7 +262,7 @@ struct TokenResponse<'a> {
 }
 
 async fn session_token(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !request_is_same_origin(&headers, &state.config.origin, false) {
+    if !request_is_same_origin(&headers, &state.config.origin, true) {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -330,10 +330,10 @@ fn terminal_request_is_authorized(
                 .split(',')
                 .any(|protocol| protocol.trim() == auth_protocol)
         })
-        && request_is_same_origin(headers, &config.origin, true)
+        && request_is_same_origin(headers, &config.origin, false)
 }
 
-fn request_is_same_origin(headers: &HeaderMap, expected: &str, require_origin: bool) -> bool {
+fn request_is_same_origin(headers: &HeaderMap, expected: &str, allow_referer: bool) -> bool {
     let host_matches = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
@@ -347,7 +347,18 @@ fn request_is_same_origin(headers: &HeaderMap, expected: &str, require_origin: b
         .and_then(|value| value.to_str().ok())
     {
         Some(origin) => origin == expected,
-        None => !require_origin,
+        None if allow_referer => headers
+            .get(header::REFERER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<Uri>().ok())
+            .is_some_and(|uri| {
+                uri.scheme_str()
+                    .zip(uri.authority())
+                    .is_some_and(|(scheme, authority)| {
+                        expected == format!("{scheme}://{authority}")
+                    })
+            }),
+        None => false,
     }
 }
 
@@ -619,6 +630,37 @@ mod tests {
         headers.insert(
             header::ORIGIN,
             HeaderValue::from_static("https://attacker.example"),
+        );
+        assert!(!request_is_same_origin(
+            &headers,
+            "http://127.0.0.1:4100",
+            true
+        ));
+    }
+
+    #[test]
+    fn same_origin_token_fetch_accepts_the_bound_referer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:4100"));
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("http://127.0.0.1:4100/workbench"),
+        );
+
+        assert!(request_is_same_origin(
+            &headers,
+            "http://127.0.0.1:4100",
+            true
+        ));
+        assert!(!request_is_same_origin(
+            &headers,
+            "http://127.0.0.1:4100",
+            false
+        ));
+
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("https://attacker.example/workbench"),
         );
         assert!(!request_is_same_origin(
             &headers,

@@ -28,6 +28,7 @@ use tower_http::{
 
 const DEFAULT_COLS: u16 = 100;
 const DEFAULT_ROWS: u16 = 30;
+const AUTH_PROTOCOL_PREFIX: &str = "agent-lab.auth.";
 
 /// A source capable of opening a terminal session for the web surface.
 pub trait SessionProvider: Send + Sync + 'static {
@@ -278,7 +279,6 @@ async fn session_token(State(state): State<AppState>, headers: HeaderMap) -> Res
 
 #[derive(Debug, Deserialize)]
 struct TerminalQuery {
-    token: String,
     #[serde(default = "default_cols")]
     cols: u16,
     #[serde(default = "default_rows")]
@@ -299,7 +299,8 @@ async fn upgrade_terminal(
     Query(query): Query<TerminalQuery>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    if !terminal_request_is_authorized(&headers, &query, &state.config) {
+    let auth_protocol = format!("{AUTH_PROTOCOL_PREFIX}{}", state.config.token);
+    if !terminal_request_is_authorized(&headers, &auth_protocol, &state.config) {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -311,15 +312,21 @@ async fn upgrade_terminal(
         return StatusCode::BAD_REQUEST.into_response();
     };
 
-    upgrade.on_upgrade(move |socket| serve_terminal(socket, state.provider, size))
+    upgrade
+        .protocols([auth_protocol])
+        .on_upgrade(move |socket| serve_terminal(socket, state.provider, size))
 }
 
 fn terminal_request_is_authorized(
     headers: &HeaderMap,
-    query: &TerminalQuery,
+    auth_protocol: &str,
     config: &ServerConfig,
 ) -> bool {
-    query.token == config.token && request_is_same_origin(headers, &config.origin, true)
+    headers
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == auth_protocol)
+        && request_is_same_origin(headers, &config.origin, true)
 }
 
 fn request_is_same_origin(headers: &HeaderMap, expected: &str, require_origin: bool) -> bool {
@@ -607,14 +614,25 @@ mod tests {
             header::ORIGIN,
             HeaderValue::from_static("http://127.0.0.1:4100"),
         );
-        let mut query = TerminalQuery {
-            token: "wrong-token".to_owned(),
-            cols: 80,
-            rows: 24,
-        };
+        let auth_protocol = format!("{AUTH_PROTOCOL_PREFIX}{}", config.token);
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("agent-lab.auth.wrong-token"),
+        );
 
-        assert!(!terminal_request_is_authorized(&headers, &query, &config));
-        query.token = config.token.clone();
-        assert!(terminal_request_is_authorized(&headers, &query, &config));
+        assert!(!terminal_request_is_authorized(
+            &headers,
+            &auth_protocol,
+            &config
+        ));
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_str(&auth_protocol).unwrap(),
+        );
+        assert!(terminal_request_is_authorized(
+            &headers,
+            &auth_protocol,
+            &config
+        ));
     }
 }

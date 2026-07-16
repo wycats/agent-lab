@@ -63,11 +63,10 @@ export async function connectSession(
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const dimensions = surface.dimensions;
   const url = new URL(`${protocol}//${location.host}/api/terminal`);
-  url.searchParams.set('token', token);
   url.searchParams.set('cols', String(dimensions.cols));
   url.searchParams.set('rows', String(dimensions.rows));
 
-  const socket = new WebSocket(url);
+  const socket = new WebSocket(url, [`agent-lab.auth.${token}`]);
   socket.binaryType = 'arraybuffer';
   const encoder = new TextEncoder();
   const input = surface.onData((data) => {

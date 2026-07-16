@@ -13,8 +13,12 @@ function dimensions(text: string): { columns: number; rows: number } {
 }
 
 test('the browser preserves the visual Nushell and MCP steel thread', async ({ page }) => {
+  const socketUrls: string[] = [];
+  page.on('websocket', (socket) => socketUrls.push(socket.url()));
   await page.goto('/');
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  expect(socketUrls).toHaveLength(1);
+  expect(new URL(socketUrls[0]).searchParams.has('token')).toBe(false);
   await expect(page.getByRole('definition').filter({ hasText: 'fixture' })).toBeVisible();
   await expect(page.locator('[data-testid="terminal"] canvas')).toBeVisible();
   const screen = page.getByTestId('terminal-text');

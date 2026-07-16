@@ -3,6 +3,7 @@ members = [
     "crates/agent-lab-cli",
     "crates/agent-lab-core",
     "crates/agent-lab-nushell-mcp",
+    "crates/agent-lab-web",
 ]
 resolver = "2"
 

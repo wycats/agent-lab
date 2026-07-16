@@ -1,0 +1,6 @@
+packages:
+  - apps/*
+
+onlyBuiltDependencies:
+  - '@playwright/browser-chromium'
+  - esbuild

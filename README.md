@@ -51,3 +51,23 @@ shell feedback loop now makes its prompt, structured rendering, generated help,
 live capability refresh, persistent state, and errors directly inspectable
 before REPL polish. Names and contracts remain provisional as later steel
 threads produce evidence.
+
+## Browser shared perception
+
+Install the web dependencies, then build and start the loopback-only SvelteKit
+lab bench with:
+
+```console
+$ pnpm install
+$ pnpm web:demo
+Agent Lab web surface: http://127.0.0.1:…
+Local Nushell + fixture MCP sessions; press Ctrl-C to stop.
+```
+
+The server fixes its provider to the repository's visual-shell binary and the
+synthetic MCP fixture; clients cannot select another executable or configure an
+arbitrary MCP server through the gateway. The visual shell is still a full
+local Nushell session, including filesystem and external-command capabilities.
+Treat access to the workbench as local shell access, and do not expose this
+gateway to untrusted or remote clients. Run the browser acceptance with
+`pnpm web:test`.

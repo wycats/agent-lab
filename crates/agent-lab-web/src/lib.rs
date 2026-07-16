@@ -372,10 +372,21 @@ pub enum SessionEvent<'a> {
     Error { message: &'a str },
 }
 
+fn session_event_message(event: &SessionEvent<'_>) -> Message {
+    Message::Text(
+        serde_json::to_string(event)
+            .expect("session event serialization cannot fail")
+            .into(),
+    )
+}
+
 fn spawn_session_reader(
     mut reader: Box<dyn Read + Send>,
-) -> (mpsc::Receiver<Vec<u8>>, tokio::task::JoinHandle<()>) {
-    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>(32);
+) -> (
+    mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (output_tx, output_rx) = mpsc::channel(32);
     let task = tokio::task::spawn_blocking(move || {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -383,10 +394,14 @@ fn spawn_session_reader(
                 Ok(0) => break,
                 Err(error) => {
                     tracing::debug!(%error, "terminal reader stopped");
+                    let _ = output_tx.blocking_send(Err(error));
                     break;
                 }
                 Ok(read) => {
-                    if output_tx.blocking_send(buffer[..read].to_vec()).is_err() {
+                    if output_tx
+                        .blocking_send(Ok(buffer[..read].to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -412,35 +427,36 @@ fn spawn_session_writer(
     (input_tx, task)
 }
 
+async fn open_session(
+    provider: Arc<dyn SessionProvider>,
+    initial_size: TerminalSize,
+) -> Result<Box<dyn BrowserSession>, String> {
+    match tokio::task::spawn_blocking(move || provider.open(initial_size)).await {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(error) => Err(format!("session provider task failed: {error}")),
+    }
+}
+
 async fn serve_terminal(
     socket: WebSocket,
     provider: Arc<dyn SessionProvider>,
     initial_size: TerminalSize,
 ) {
-    let open_provider = Arc::clone(&provider);
-    let session = match tokio::task::spawn_blocking(move || open_provider.open(initial_size)).await
-    {
-        Ok(Ok(session)) => session,
-        Ok(Err(error)) => {
-            let message = error.to_string();
-            send_open_error(socket, &message).await;
-            return;
-        }
-        Err(error) => {
-            let message = format!("session provider task failed: {error}");
+    let session = match open_session(Arc::clone(&provider), initial_size).await {
+        Ok(session) => session,
+        Err(message) => {
             send_open_error(socket, &message).await;
             return;
         }
     };
 
     let (mut socket_tx, mut socket_rx) = socket.split();
-    let started = serde_json::to_string(&SessionEvent::Started {
+    let started = session_event_message(&SessionEvent::Started {
         provider: provider.name(),
         cols: initial_size.cols,
         rows: initial_size.rows,
-    })
-    .expect("session event serialization cannot fail");
-    if socket_tx.send(Message::Text(started.into())).await.is_err() {
+    });
+    if socket_tx.send(started).await.is_err() {
         session.terminate();
         return;
     }
@@ -450,9 +466,8 @@ async fn serve_terminal(
         Err(error) => {
             session.terminate();
             let message = error.to_string();
-            let event = serde_json::to_string(&SessionEvent::Error { message: &message })
-                .expect("session event serialization cannot fail");
-            let _ = socket_tx.send(Message::Text(event.into())).await;
+            let event = session_event_message(&SessionEvent::Error { message: &message });
+            let _ = socket_tx.send(event).await;
             return;
         }
     };
@@ -468,15 +483,24 @@ async fn serve_terminal(
                 }
                 break;
             },
-            output = pty_rx.recv() => if let Some(bytes) = output {
-                if socket_tx.send(Message::Binary(bytes.into())).await.is_err() {
+            output = pty_rx.recv() => match output {
+                Some(Ok(bytes)) => {
+                    if socket_tx.send(Message::Binary(bytes.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Err(error)) => {
+                    let message = error.to_string();
+                    let event = session_event_message(&SessionEvent::Error { message: &message });
+                    let _ = socket_tx.send(event).await;
                     break;
                 }
-            } else {
-                let exited = serde_json::to_string(&SessionEvent::Exited)
-                    .expect("session event serialization cannot fail");
-                let _ = socket_tx.send(Message::Text(exited.into())).await;
-                break;
+                None => {
+                    let _ = socket_tx
+                        .send(session_event_message(&SessionEvent::Exited))
+                        .await;
+                    break;
+                }
             },
             incoming = socket_rx.next() => match incoming {
                 Some(Ok(Message::Binary(bytes))) => {
@@ -494,12 +518,11 @@ async fn serve_terminal(
                     if session.resize(size).is_err() {
                         break;
                     }
-                    let resized = serde_json::to_string(&SessionEvent::Resized {
+                    let resized = session_event_message(&SessionEvent::Resized {
                         cols: size.cols,
                         rows: size.rows,
-                    })
-                    .expect("session event serialization cannot fail");
-                    if socket_tx.send(Message::Text(resized.into())).await.is_err() {
+                    });
+                    if socket_tx.send(resized).await.is_err() {
                         break;
                     }
                 }
@@ -521,9 +544,8 @@ async fn serve_terminal(
 }
 
 async fn send_open_error(mut socket: WebSocket, message: &str) {
-    let event = serde_json::to_string(&SessionEvent::Error { message })
-        .expect("session event serialization cannot fail");
-    let _ = socket.send(Message::Text(event.into())).await;
+    let event = session_event_message(&SessionEvent::Error { message });
+    let _ = socket.send(event).await;
     let _ = socket.close().await;
 }
 

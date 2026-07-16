@@ -78,6 +78,9 @@ export async function connectSession(
   const socket = new WebSocket(url, [`agent-lab.auth.${token}`]);
   socket.binaryType = 'arraybuffer';
   let disposed = false;
+  const refreshScreen = () => {
+    if (!disposed) callbacks.onScreen(surface.readText());
+  };
   const encoder = new TextEncoder();
   const input = surface.onData((data) => {
     if (socket.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
@@ -99,13 +102,11 @@ export async function connectSession(
       const event = parseSessionEvent(message.data);
       if (event) callbacks.onEvent(event);
     } else if (message.data instanceof ArrayBuffer) {
-      surface.write(new Uint8Array(message.data));
-      callbacks.onScreen(surface.readText());
+      surface.write(new Uint8Array(message.data), refreshScreen);
     } else if (message.data instanceof Blob) {
       void message.data.arrayBuffer().then((data) => {
         if (disposed) return;
-        surface.write(new Uint8Array(data));
-        callbacks.onScreen(surface.readText());
+        surface.write(new Uint8Array(data), refreshScreen);
       });
     }
   });

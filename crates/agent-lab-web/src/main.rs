@@ -25,7 +25,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = listener.local_addr()?;
     let origin = format!("http://{address}");
     let config = ServerConfig::new(options.assets, origin.clone());
-    let provider = Arc::new(FixtureSessionProvider::new(options.shell));
+    let provider = Arc::new(FixtureSessionProvider::new(
+        options.shell,
+        env::current_dir()?,
+    ));
 
     println!("Agent Lab web surface: {origin}");
     println!("Local Nushell + fixture MCP sessions; press Ctrl-C to stop.");

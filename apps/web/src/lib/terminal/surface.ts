@@ -9,7 +9,7 @@ export interface TerminalDimensions {
 
 export interface TerminalSurface {
   readonly dimensions: TerminalDimensions;
-  write(data: string | Uint8Array): void;
+  write(data: string | Uint8Array, afterWrite?: () => void): void;
   readText(): string;
   onData(listener: (data: string) => void): Disposable;
   onResize(listener: (dimensions: TerminalDimensions) => void): Disposable;

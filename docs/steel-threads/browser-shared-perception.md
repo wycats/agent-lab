@@ -49,7 +49,10 @@ process, serves that token only from a no-store same-origin endpoint, and
 requires both the token and the exact browser `Origin` on WebSocket upgrades.
 Host validation prevents a page served under another hostname from acquiring
 or using the session. The server adds framing and content-type protections, and
-the static Svelte build supplies a hash-based content security policy.
+the static Svelte build supplies a hash-based content security policy. Its
+connection policy names loopback WebSockets explicitly because browsers differ
+on whether an HTTP `'self'` source also covers the corresponding `ws:` scheme;
+the upgrade still requires the exact bound Host, Origin, and process token.
 
 The only session provider in this thread launches the repository's fixture
 shell with `--fixture`. That flag fixes the MCP server to the synthetic fixture;

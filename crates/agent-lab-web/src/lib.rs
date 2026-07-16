@@ -74,14 +74,16 @@ pub trait BrowserSession: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct FixtureSessionProvider {
     shell: PathBuf,
+    cwd: PathBuf,
 }
 
 impl FixtureSessionProvider {
     /// Create a provider that launches the existing visual shell binary.
     #[must_use]
-    pub fn new(shell: impl Into<PathBuf>) -> Self {
+    pub fn new(shell: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             shell: shell.into(),
+            cwd: cwd.into(),
         }
     }
 }
@@ -92,7 +94,11 @@ impl SessionProvider for FixtureSessionProvider {
     }
 
     fn open(&self, size: TerminalSize) -> Result<Box<dyn BrowserSession>, GatewayError> {
-        Ok(Box::new(PtyTerminalSession::spawn(&self.shell, size)?))
+        Ok(Box::new(PtyTerminalSession::spawn(
+            &self.shell,
+            &self.cwd,
+            size,
+        )?))
     }
 }
 
@@ -131,7 +137,7 @@ struct PtyTerminalSession {
 }
 
 impl PtyTerminalSession {
-    fn spawn(shell: &Path, size: TerminalSize) -> Result<Self, GatewayError> {
+    fn spawn(shell: &Path, cwd: &Path, size: TerminalSize) -> Result<Self, GatewayError> {
         if !shell.is_file() {
             return Err(GatewayError::ShellNotFound(shell.to_path_buf()));
         }
@@ -139,6 +145,7 @@ impl PtyTerminalSession {
         let pair = NativePtySystem::default().openpty(size.into())?;
         let mut command = CommandBuilder::new(shell);
         command.arg("--fixture");
+        command.cwd(cwd);
         let child = pair.slave.spawn_command(command)?;
         drop(pair.slave);
 

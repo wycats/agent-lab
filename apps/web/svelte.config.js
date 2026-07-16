@@ -9,7 +9,7 @@ export default {
       mode: 'hash',
       directives: {
         'default-src': ['self'],
-        'connect-src': ['self', 'data:'],
+        'connect-src': ['self', 'ws://127.0.0.1:*', 'data:'],
         'img-src': ['self', 'data:'],
         'style-src': ['self'],
         'style-src-attr': ['unsafe-inline'],

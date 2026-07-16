@@ -24,8 +24,8 @@ class GhosttyTerminalSurface implements TerminalSurface {
     return { cols: this.#terminal.cols, rows: this.#terminal.rows };
   }
 
-  write(data: string | Uint8Array): void {
-    this.#terminal.write(data);
+  write(data: string | Uint8Array, afterWrite?: () => void): void {
+    this.#terminal.write(data, afterWrite);
   }
 
   readText(): string {
@@ -33,7 +33,7 @@ class GhosttyTerminalSurface implements TerminalSurface {
     const lines: string[] = [];
     const firstRow = Math.max(
       0,
-      buffer.length - this.#terminal.rows - buffer.viewportY
+      buffer.length - this.#terminal.rows - this.#terminal.viewportY
     );
     const lastRow = Math.min(buffer.length, firstRow + this.#terminal.rows);
     for (let row = firstRow; row < lastRow; row += 1) {

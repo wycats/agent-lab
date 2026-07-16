@@ -24,6 +24,11 @@ test('the browser preserves the visual Nushell and MCP steel thread', async ({ p
   const screen = page.getByTestId('terminal-text');
   await expect(screen).toContainText('Agent Lab visual shell');
   await expect(screen).toContainText('agent-lab>');
+  await submit(
+    page,
+    "if (open Cargo.toml | str contains 'crates/agent-lab-web') { 'workspace-cwd-ok' } else { 'workspace-cwd-wrong' }"
+  );
+  await expect(screen).toContainText('workspace-cwd-ok');
 
   const startedEvent = page.locator('.events li').filter({ hasText: 'started' });
   const initialSize = dimensions(await startedEvent.innerText());
@@ -58,6 +63,10 @@ test('the browser preserves the visual Nushell and MCP steel thread', async ({ p
   await submit(page, 'tool fixture fail {}');
   await expect(screen).toContainText('MCP tool failed');
   await expect(screen).toContainText('intentional tool failure');
+
+  await submit(page, '0..50 | each { |n| $"mirror-line-($n)" }');
+  await expect(screen).toContainText('mirror-line-50');
+  await expect(screen).toContainText('agent-lab>');
 
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
   await page.screenshot({ path: 'test-results/shared-perception.png', fullPage: true });

@@ -96,8 +96,14 @@ export async function connectSession(
       });
     }
   });
-  socket.addEventListener('error', () => callbacks.onState('error'));
-  socket.addEventListener('close', () => callbacks.onState('closed'));
+  let sawError = false;
+  socket.addEventListener('error', () => {
+    sawError = true;
+    callbacks.onState('error');
+  });
+  socket.addEventListener('close', () => {
+    if (!sawError) callbacks.onState('closed');
+  });
 
   return {
     dispose() {

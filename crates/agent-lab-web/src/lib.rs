@@ -410,10 +410,18 @@ async fn serve_terminal(
     provider: Arc<dyn SessionProvider>,
     initial_size: TerminalSize,
 ) {
-    let session = match provider.open(initial_size) {
-        Ok(session) => session,
+    let open_provider = Arc::clone(&provider);
+    let session = match tokio::task::spawn_blocking(move || open_provider.open(initial_size)).await
+    {
+        Ok(Ok(session)) => session,
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            send_open_error(socket, &message).await;
+            return;
+        }
         Err(error) => {
-            send_open_error(socket, &error.to_string()).await;
+            let message = format!("session provider task failed: {error}");
+            send_open_error(socket, &message).await;
             return;
         }
     };

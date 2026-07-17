@@ -592,11 +592,14 @@ fn terminal_request_is_authorized(
 }
 
 fn request_is_same_origin(headers: &HeaderMap, expected: &str, allow_referer: bool) -> bool {
-    let host_matches = headers
+    let Some(request_origin) = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|host| expected == format!("http://{host}"));
-    if !host_matches {
+        .map(|host| format!("http://{host}"))
+    else {
+        return false;
+    };
+    if !origin_reaches_bound_listener(&request_origin, expected) {
         return false;
     }
 
@@ -604,7 +607,7 @@ fn request_is_same_origin(headers: &HeaderMap, expected: &str, allow_referer: bo
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
     {
-        Some(origin) => origin == expected,
+        Some(origin) => origin == request_origin,
         None if allow_referer => headers
             .get(header::REFERER)
             .and_then(|value| value.to_str().ok())
@@ -613,11 +616,38 @@ fn request_is_same_origin(headers: &HeaderMap, expected: &str, allow_referer: bo
                 uri.scheme_str()
                     .zip(uri.authority())
                     .is_some_and(|(scheme, authority)| {
-                        expected == format!("{scheme}://{authority}")
+                        request_origin == format!("{scheme}://{authority}")
                     })
             }),
         None => false,
     }
+}
+
+fn origin_reaches_bound_listener(request_origin: &str, expected: &str) -> bool {
+    if request_origin == expected {
+        return true;
+    }
+
+    let Ok(request_uri) = request_origin.parse::<Uri>() else {
+        return false;
+    };
+    let Ok(expected_uri) = expected.parse::<Uri>() else {
+        return false;
+    };
+    let Some(request_authority) = request_uri.authority() else {
+        return false;
+    };
+    let Some(expected_authority) = expected_uri.authority() else {
+        return false;
+    };
+
+    request_uri.scheme_str() == Some("http")
+        && expected_uri.scheme_str() == Some("http")
+        && request_authority.port_u16() == expected_authority.port_u16()
+        && matches!(
+            (request_authority.host(), expected_authority.host()),
+            ("localhost", "127.0.0.1") | ("127.0.0.1", "localhost")
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -968,6 +998,61 @@ mod tests {
             &headers,
             "http://127.0.0.1:4100",
             true
+        ));
+    }
+
+    #[test]
+    fn same_origin_accepts_the_localhost_alias_for_the_bound_loopback_listener() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("localhost:4100"));
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("http://localhost:4100/workbench"),
+        );
+
+        assert!(request_is_same_origin(
+            &headers,
+            "http://127.0.0.1:4100",
+            true
+        ));
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://localhost:4100"),
+        );
+        assert!(request_is_same_origin(
+            &headers,
+            "http://127.0.0.1:4100",
+            false
+        ));
+    }
+
+    #[test]
+    fn same_origin_rejects_non_loopback_aliases_and_mismatched_ports() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("attacker.example:4100"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://attacker.example:4100"),
+        );
+        assert!(!request_is_same_origin(
+            &headers,
+            "http://127.0.0.1:4100",
+            false
+        ));
+
+        headers.insert(header::HOST, HeaderValue::from_static("localhost:4200"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://localhost:4200"),
+        );
+        assert!(!request_is_same_origin(
+            &headers,
+            "http://127.0.0.1:4100",
+            false
         ));
     }
 

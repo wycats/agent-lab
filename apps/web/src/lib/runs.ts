@@ -5,7 +5,49 @@ export interface ScenarioManifest {
   id: string;
   title: string;
   description: string;
+  question: string;
   prompt: string;
+}
+
+export interface DriverDescriptor {
+  name: string;
+  version: string;
+  revision?: string;
+  features: string[];
+}
+
+export interface AssemblySnapshot {
+  question: string;
+  scenario: {
+    id: string;
+    title: string;
+    description: string;
+    version: number;
+  };
+  harness: {
+    adapter: string;
+    modelId?: string;
+    driver?: DriverDescriptor;
+  };
+  workspace: {
+    id: string;
+    seed: string;
+    seedRevision: string;
+    attachment: string;
+    changeTracking: string;
+  };
+  capabilitySources: Array<{
+    id: string;
+    revision: string;
+    protocol: string;
+    projections: string[];
+  }>;
+  limits: {
+    maxDurationMs: number;
+    maxCommandCount: number;
+    maxOrchestratorInvocations: number;
+    maxToolInvocations: number;
+  };
 }
 
 export interface RunSummary {
@@ -29,6 +71,7 @@ export interface RunEvent {
 
 export interface RunDetail {
   summary: RunSummary;
+  assembly: AssemblySnapshot;
   events: RunEvent[];
   score?: unknown;
   output?: unknown;

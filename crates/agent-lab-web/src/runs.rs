@@ -11,8 +11,8 @@ use std::{
 
 use agent_lab_catalog_source::{AnalysisSource, CatalogSource, SourceObserver};
 use agent_lab_driver_protocol::{
-    CommandBody, ControllerCommand, DriverBody, DriverLaunch, DriverProcess, DriverTranscript,
-    PROTOCOL_VERSION,
+    CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverLaunch, DriverProcess,
+    DriverTranscript, PROTOCOL_VERSION,
 };
 use axum::{
     Router,
@@ -40,6 +40,7 @@ pub struct ScenarioManifest {
     pub id: String,
     pub title: String,
     pub description: String,
+    pub question: String,
     pub seed: PathBuf,
     pub prompt: String,
     pub output: PathBuf,
@@ -125,10 +126,58 @@ pub struct RunEvent {
     pub payload: JsonValue,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssemblySnapshot {
+    pub question: String,
+    pub scenario: AssemblyScenario,
+    pub harness: HarnessAssembly,
+    pub workspace: WorkspaceAssembly,
+    pub capability_sources: Vec<CapabilityAssembly>,
+    pub limits: ScenarioLimits,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssemblyScenario {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessAssembly {
+    pub adapter: String,
+    pub model_id: Option<String>,
+    pub driver: Option<DriverDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceAssembly {
+    pub id: String,
+    pub seed: PathBuf,
+    pub seed_revision: String,
+    pub attachment: String,
+    pub change_tracking: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityAssembly {
+    pub id: String,
+    pub revision: String,
+    pub protocol: String,
+    pub projections: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunDetail {
     pub summary: RunSummary,
+    pub assembly: AssemblySnapshot,
     pub events: Vec<RunEvent>,
     pub score: Option<JsonValue>,
     pub output: Option<JsonValue>,
@@ -173,6 +222,7 @@ impl Drop for ControllerInner {
 
 struct RunState {
     summary: Mutex<RunSummary>,
+    assembly: Mutex<AssemblySnapshot>,
     events: Mutex<Vec<RunEvent>>,
     sender: broadcast::Sender<RunEvent>,
     cancel: CancellationToken,
@@ -279,6 +329,7 @@ impl RunController {
         let output = read_optional_json(&confined_child(&evidence_root, &state.output)?)?;
         Ok(RunDetail {
             summary,
+            assembly: lock(&state.assembly).clone(),
             events,
             score,
             output,
@@ -370,6 +421,7 @@ impl RunController {
             if lock(&state.capabilities).is_empty() {
                 let capabilities = start_capability_sources(state.clone()).await?;
                 lock(&state.capabilities).clone_from(&capabilities);
+                update_assembly_capabilities(&state, &capabilities)?;
             }
             return Ok(lock(&state.summary).clone());
         }
@@ -394,8 +446,10 @@ impl RunController {
             error: None,
         };
         let (sender, _) = broadcast::channel(256);
+        let assembly = initial_assembly(&summary, &scenario);
         let state = Arc::new(RunState {
             summary: Mutex::new(summary),
+            assembly: Mutex::new(assembly),
             events: Mutex::new(Vec::new()),
             sender,
             cancel: CancellationToken::new(),
@@ -406,9 +460,11 @@ impl RunController {
         });
         lock(&self.inner.runs).insert(id, state.clone());
         persist_manifest(&state)?;
+        persist_assembly(&state)?;
         record_event(&state, "run.prepared", json!({ "scenario": scenario.id }))?;
         let capabilities = start_capability_sources(state.clone()).await?;
         lock(&state.capabilities).clone_from(&capabilities);
+        update_assembly_capabilities(&state, &capabilities)?;
         Ok(lock(&state.summary).clone())
     }
 
@@ -435,11 +491,13 @@ impl RunController {
                 .get(&summary.scenario_id)
                 .cloned()
                 .ok_or_else(|| RunError::UnknownScenario(summary.scenario_id.clone()))?;
-            summary.model_id = request.model_id;
+            summary.model_id.clone_from(&request.model_id);
             summary.status = RunStatus::Starting;
             scenario
         };
+        lock(&state.assembly).harness.model_id = Some(request.model_id);
         persist_manifest(&state)?;
+        persist_assembly(&state)?;
         record_event(
             &state,
             "run.status",
@@ -640,6 +698,8 @@ fn run_driver(
         let DriverBody::Ready { driver: descriptor } = ready.parsed.body else {
             return Err(RunError::Protocol("expected driver.ready".to_owned()));
         };
+        lock(&state.assembly).harness.driver = Some(descriptor.clone());
+        persist_assembly(state)?;
         record_event(state, "driver.ready", serde_json::to_value(&descriptor)?)?;
 
         let summary = lock(&state.summary).clone();
@@ -903,6 +963,55 @@ fn persist_manifest(state: &RunState) -> Result<(), RunError> {
     )
 }
 
+fn persist_assembly(state: &RunState) -> Result<(), RunError> {
+    write_json_atomic(
+        &state.bundle_dir.join("assembly.json"),
+        &serde_json::to_value(lock(&state.assembly).clone())?,
+    )
+}
+
+fn initial_assembly(summary: &RunSummary, scenario: &ScenarioManifest) -> AssemblySnapshot {
+    AssemblySnapshot {
+        question: scenario.question.clone(),
+        scenario: AssemblyScenario {
+            id: scenario.id.clone(),
+            title: scenario.title.clone(),
+            description: scenario.description.clone(),
+            version: scenario.version,
+        },
+        harness: HarnessAssembly {
+            adapter: "external-driver".to_owned(),
+            model_id: (!summary.model_id.is_empty()).then(|| summary.model_id.clone()),
+            driver: None,
+        },
+        workspace: WorkspaceAssembly {
+            id: format!("{}/workspace", summary.id),
+            seed: scenario.seed.clone(),
+            seed_revision: format!("{}@{}", scenario.id, scenario.version),
+            attachment: "root-confined-physical".to_owned(),
+            change_tracking: "initial-and-final-snapshots".to_owned(),
+        },
+        capability_sources: Vec::new(),
+        limits: scenario.limits.clone(),
+    }
+}
+
+fn update_assembly_capabilities(
+    state: &RunState,
+    capabilities: &[CapabilityEndpoint],
+) -> Result<(), RunError> {
+    lock(&state.assembly).capability_sources = capabilities
+        .iter()
+        .map(|capability| CapabilityAssembly {
+            id: capability.id.clone(),
+            revision: capability.revision.clone(),
+            protocol: "mcp-streamable-http".to_owned(),
+            projections: vec!["nushell".to_owned(), "agent-mcp".to_owned()],
+        })
+        .collect();
+    persist_assembly(state)
+}
+
 fn command(message_id: &str, body: CommandBody) -> ControllerCommand {
     ControllerCommand {
         protocol_version: PROTOCOL_VERSION,
@@ -969,12 +1078,18 @@ fn load_runs(
         if !workspace.is_dir() {
             continue;
         }
+        let assembly = if bundle_dir.join("assembly.json").is_file() {
+            serde_json::from_slice(&fs::read(bundle_dir.join("assembly.json"))?)?
+        } else {
+            initial_assembly(&summary, scenario)
+        };
         let events = read_events(&bundle_dir.join("events.jsonl"))?;
         let interrupted = matches!(summary.status, RunStatus::Starting | RunStatus::Running);
         summary.event_count = events.len() as u64;
         let (sender, _) = broadcast::channel(256);
         let state = Arc::new(RunState {
             summary: Mutex::new(summary),
+            assembly: Mutex::new(assembly),
             events: Mutex::new(events),
             sender,
             cancel: CancellationToken::new(),
@@ -1318,6 +1433,7 @@ version = 1
 id = "catalog"
 title = "Catalog"
 description = "test"
+question = "How does the harness produce the expected catalog artifact?"
 seed = "catalog/workspace"
 prompt = "write output"
 output = "result.json"
@@ -1368,6 +1484,13 @@ totalScore = 11
         assert_eq!(prepared.status, RunStatus::Exploring);
         assert!(prepared.model_id.is_empty());
         assert!(controller.list().is_empty());
+        let assembly = controller.get(&prepared.id).unwrap().assembly;
+        assert_eq!(
+            assembly.question,
+            "How does the harness produce the expected catalog artifact?"
+        );
+        assert_eq!(assembly.capability_sources.len(), 2);
+        assert_eq!(assembly.capability_sources[0].projections.len(), 2);
         let binding = controller.terminal_binding(&prepared.id).unwrap();
         assert_eq!(binding.sources.len(), 2);
         let workspace = binding.workspace;
@@ -1428,9 +1551,29 @@ totalScore = 11
             event_count: 1,
             error: None,
         };
+        let scenario: ScenarioManifest =
+            toml::from_str(&fs::read_to_string(scenarios.join("catalog.toml")).unwrap()).unwrap();
+        let mut assembly = initial_assembly(&summary, &scenario);
+        assembly.harness.driver = Some(DriverDescriptor {
+            name: "fixture-driver".to_owned(),
+            version: "1.0.0".to_owned(),
+            revision: None,
+            features: vec!["streaming".to_owned()],
+        });
+        assembly.capability_sources.push(CapabilityAssembly {
+            id: "catalog".to_owned(),
+            revision: "catalog-v2".to_owned(),
+            protocol: "mcp-streamable-http".to_owned(),
+            projections: vec!["nushell".to_owned(), "agent-mcp".to_owned()],
+        });
         fs::write(
             bundle.join("manifest.json"),
             serde_json::to_vec(&summary).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            bundle.join("assembly.json"),
+            serde_json::to_vec(&assembly).unwrap(),
         )
         .unwrap();
         let event = RunEvent {
@@ -1457,6 +1600,11 @@ totalScore = 11
         assert_eq!(detail.events.len(), 1);
         assert_eq!(detail.output.unwrap()["totalScore"], 11);
         assert_eq!(detail.score.unwrap()["passed"], true);
+        assert_eq!(
+            detail.assembly.harness.driver.unwrap().name,
+            "fixture-driver"
+        );
+        assert_eq!(detail.assembly.capability_sources[0].revision, "catalog-v2");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1481,6 +1629,34 @@ totalScore = 11
                 finished_at_ms: None,
                 event_count: 0,
                 error: None,
+            }),
+            assembly: Mutex::new(AssemblySnapshot {
+                question: "How does the harness create a file?".to_owned(),
+                scenario: AssemblyScenario {
+                    id: "catalog".to_owned(),
+                    title: "Catalog".to_owned(),
+                    description: "test".to_owned(),
+                    version: 1,
+                },
+                harness: HarnessAssembly {
+                    adapter: "external-driver".to_owned(),
+                    model_id: Some("test/model".to_owned()),
+                    driver: None,
+                },
+                workspace: WorkspaceAssembly {
+                    id: "run-diff/workspace".to_owned(),
+                    seed: "catalog/workspace".into(),
+                    seed_revision: "catalog@1".to_owned(),
+                    attachment: "root-confined-physical".to_owned(),
+                    change_tracking: "initial-and-final-snapshots".to_owned(),
+                },
+                capability_sources: Vec::new(),
+                limits: ScenarioLimits {
+                    max_duration_ms: 1_000,
+                    max_command_count: 1,
+                    max_orchestrator_invocations: 1,
+                    max_tool_invocations: 1,
+                },
             }),
             events: Mutex::new(Vec::new()),
             sender,

@@ -97,15 +97,16 @@
   }
 
   async function beginRun(): Promise<void> {
-    if (!activeRun || activeRun.status !== 'exploring' || !modelId.trim() || starting) return;
+    if (!selectedRun || selectedRun.summary.status !== 'exploring' || !modelId.trim() || starting) return;
     starting = true;
     actionError = '';
     activeTab = 'agent';
     eventStream?.abort();
     try {
-      const summary = await runClient.startPrepared(activeRun.id, modelId.trim());
+      const summary = await runClient.startPrepared(selectedRun.summary.id, modelId.trim());
       selectedRun = {
         summary,
+        assembly: selectedRun.assembly,
         events: runEvents,
         score: selectedRun?.score,
         output: selectedRun?.output
@@ -295,6 +296,53 @@
 
       <div class="tab-content">
         {#if activeTab === 'agent'}
+          {#if selectedRun?.assembly}
+            <section class="assembly" data-testid="assembly">
+              <div class="question">
+                <span class="label">Question</span>
+                <p>{selectedRun.assembly.question}</p>
+              </div>
+              <dl class="assembly-grid">
+                <div>
+                  <dt>Harness</dt>
+                  <dd>{selectedRun.assembly.harness.driver?.name ?? 'External driver'}</dd>
+                  <small>{selectedRun.assembly.harness.driver ? `v${selectedRun.assembly.harness.driver.version}` : 'waiting for run'}</small>
+                </div>
+                <div>
+                  <dt>Model</dt>
+                  <dd>{selectedRun.assembly.harness.modelId ?? (modelId.trim() || 'Choose a model')}</dd>
+                  <small>{selectedRun.assembly.harness.adapter}</small>
+                </div>
+                <div>
+                  <dt>Workspace</dt>
+                  <dd>{shortId(selectedRun.assembly.workspace.id.replace('/workspace', ''))}</dd>
+                  <small>{selectedRun.assembly.workspace.attachment.replaceAll('-', ' ')}</small>
+                </div>
+                <div>
+                  <dt>Seed revision</dt>
+                  <dd>{selectedRun.assembly.workspace.seedRevision}</dd>
+                  <small>{selectedRun.assembly.workspace.changeTracking.replaceAll('-', ' ')}</small>
+                </div>
+              </dl>
+              <div class="capabilities">
+                <span class="label">Capability sources</span>
+                <ul>
+                  {#each selectedRun.assembly.capabilitySources as source}
+                    <li>
+                      <span><strong>{source.id}</strong><small>{source.revision}</small></span>
+                      <em>{source.projections.join(' + ')}</em>
+                    </li>
+                  {:else}
+                    <li class="waiting">Preparing capability sources…</li>
+                  {/each}
+                </ul>
+              </div>
+            </section>
+            <div class="activity-heading">
+              <span class="label">Activity</span>
+              <span>{runEvents.length} events</span>
+            </div>
+          {/if}
           <ol class="run-events" aria-label="Agent run events">
             {#each runEvents as event}
               <li>
@@ -413,6 +461,23 @@
   .tabs button.active::after { position: absolute; right: 8px; bottom: -1px; left: 8px; height: 2px; background: #91b976; content: ''; }
   .run-status { padding: 4px 8px; border: 1px solid #34443c; border-radius: 999px; color: #a9b6af; font-family: var(--font-mono); font-size: 0.63rem; }
   .tab-content { min-height: 0; overflow: auto; contain: layout paint; }
+  .assembly { padding: 16px 17px 14px; border-bottom: 1px solid #27342f; }
+  .question { padding: 12px 13px; border: 1px solid #293832; border-radius: 7px; background: #111916; }
+  .question p { margin: 6px 0 0; color: #c5d0ca; font-size: 0.76rem; line-height: 1.48; }
+  .assembly-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; margin: 13px 0 0; overflow: hidden; border: 1px solid #24312c; border-radius: 7px; background: #24312c; }
+  .assembly-grid > div { display: grid; gap: 3px; min-width: 0; padding: 10px 11px; background: #0e1512; }
+  .assembly-grid dt { color: #68776f; font-size: 0.57rem; font-weight: 680; letter-spacing: 0.1em; text-transform: uppercase; }
+  .assembly-grid dd { overflow: hidden; margin: 0; color: #b9c5bf; font-family: var(--font-mono); font-size: 0.67rem; text-overflow: ellipsis; white-space: nowrap; }
+  .assembly-grid small { overflow: hidden; color: #56655d; font-size: 0.59rem; text-overflow: ellipsis; white-space: nowrap; }
+  .capabilities { margin-top: 13px; }
+  .capabilities ul { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; padding: 0; list-style: none; }
+  .capabilities li { display: flex; align-items: center; gap: 12px; min-width: 180px; padding: 7px 9px; border: 1px solid #26352f; border-radius: 6px; background: #0d1411; }
+  .capabilities li > span { display: grid; gap: 1px; }
+  .capabilities strong { color: #aebbb4; font-family: var(--font-mono); font-size: 0.66rem; font-weight: 540; }
+  .capabilities small, .capabilities em { color: #5f6f66; font-family: var(--font-mono); font-size: 0.56rem; font-style: normal; }
+  .capabilities em { margin-left: auto; color: #78966c; }
+  .capabilities .waiting { color: #617068; font-size: 0.65rem; }
+  .activity-heading { display: flex; justify-content: space-between; padding: 11px 17px 0; color: #596760; font-size: 0.6rem; }
   .run-events { margin: 0; padding: 8px 17px 20px; list-style: none; }
   .run-events li { display: grid; grid-template-columns: 27px minmax(0, 1fr); gap: 7px; padding: 11px 0; border-bottom: 1px solid #1d2924; content-visibility: auto; contain-intrinsic-block-size: 72px; }
   .run-events .sequence { color: #536159; font-family: var(--font-mono); font-size: 0.65rem; }

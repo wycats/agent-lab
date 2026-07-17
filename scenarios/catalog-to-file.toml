@@ -2,6 +2,7 @@ version = 1
 id = "catalog-to-file"
 title = "Catalog to file"
 description = "Discover shared catalog tools, analyze active items, and persist the structured result."
+question = "How does this harness discover and compose shared capabilities to produce a checked workspace artifact?"
 seed = "catalog-to-file/workspace"
 output = "result.json"
 prompt = """

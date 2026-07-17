@@ -24,6 +24,11 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await expect(screen).toContainText('agent-lab>');
   await expect(screen).toContainText('MCP namespaces: analysis, catalog');
   await expect(page.locator('.terminal-footer')).not.toContainText('local fixture');
+  const assembly = page.getByTestId('assembly');
+  await expect(assembly).toContainText('How does this harness discover and compose shared capabilities');
+  await expect(assembly).toContainText('catalog-v2');
+  await expect(assembly).toContainText('analysis-v1');
+  await expect(assembly).toContainText('nushell + agent-mcp');
 
   const input = page.locator('[data-testid="terminal"] textarea');
   await input.pressSequentially('mcp cat', { delay: 8 });
@@ -50,6 +55,8 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await page.getByLabel('Model ID').fill('fixture/model');
   await page.getByRole('button', { name: 'Run', exact: true }).click();
   await expect(page.locator('.run-status')).toHaveText('passed');
+  await expect(assembly).toContainText('agent-lab-fixture');
+  await expect(assembly).toContainText('fixture/model');
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
   await expect(screen).toContainText('MCP namespaces: analysis, catalog');
 
@@ -125,6 +132,8 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   const historyRun = page.locator('.history-list button').filter({ hasText: 'fixture/model' }).first();
   await expect(historyRun).toContainText('passed');
   await historyRun.click();
+  await expect(page.getByTestId('assembly')).toContainText('agent-lab-fixture');
+  await expect(page.getByTestId('assembly')).toContainText('catalog-v2');
   await page.getByRole('button', { name: 'Evidence' }).click();
   await expect(page.locator('.artifact')).toContainText('"passed": true');
 });

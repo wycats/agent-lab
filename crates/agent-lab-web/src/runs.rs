@@ -31,7 +31,11 @@ use tokio::{net::TcpListener, sync::broadcast};
 use tokio_util::sync::CancellationToken;
 
 const DRIVER_POLL: Duration = Duration::from_millis(250);
-const DRIVER_START_TIMEOUT: Duration = Duration::from_secs(30);
+// The extracted v0 adapter loads the production agent module graph before it
+// can announce readiness. A cold TypeScript process can take over a minute on
+// a development checkout, while subsequent protocol replies remain fast.
+const DRIVER_READY_TIMEOUT: Duration = Duration::from_mins(2);
+const DRIVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -263,6 +267,7 @@ struct RunState {
     workspace: PathBuf,
     output: PathBuf,
     capabilities: Mutex<Vec<CapabilityEndpoint>>,
+    replay_failed: bool,
 }
 
 impl Drop for RunState {
@@ -353,7 +358,7 @@ impl RunController {
         let summary = lock(&state.summary).clone();
         let events = lock(&state.events).clone();
         let score = read_optional_json(&state.bundle_dir.join("score.json"))?;
-        let review = if summary.status.is_finished() {
+        let review = if summary.status.is_finished() && !state.replay_failed {
             match read_optional_json(&state.bundle_dir.join("review.json"))? {
                 Some(value) => serde_json::from_value(value)?,
                 None => build_review(&summary, &events),
@@ -499,6 +504,7 @@ impl RunController {
             workspace,
             output: scenario.output.clone(),
             capabilities: Mutex::new(Vec::new()),
+            replay_failed: false,
         });
         lock(&self.inner.runs).insert(id, state.clone());
         persist_manifest(&state)?;
@@ -736,7 +742,7 @@ fn run_driver(
     );
     let mut driver = DriverProcess::spawn_with(driver_launch)?;
     let result = (|| -> Result<(), RunError> {
-        let ready = driver.receive(DRIVER_START_TIMEOUT)?;
+        let ready = driver.receive(DRIVER_READY_TIMEOUT)?;
         let DriverBody::Ready { driver: descriptor } = ready.parsed.body else {
             return Err(RunError::Protocol("expected driver.ready".to_owned()));
         };
@@ -774,7 +780,7 @@ fn run_driver(
                 limits: serde_json::to_value(&scenario.limits)?,
             },
         ))?;
-        let opened = driver.receive(DRIVER_START_TIMEOUT)?;
+        let opened = driver.receive(DRIVER_RESPONSE_TIMEOUT)?;
         if !matches!(opened.parsed.body, DriverBody::SessionOpened { .. }) {
             return Err(RunError::Protocol("expected session.opened".to_owned()));
         }
@@ -856,8 +862,8 @@ fn run_driver(
             "run-close",
             CommandBody::CloseSession { session_id },
         ))?;
-        let _ = driver.receive(DRIVER_START_TIMEOUT)?;
-        let _ = driver.wait_for_exit(DRIVER_START_TIMEOUT)?;
+        let _ = driver.receive(DRIVER_RESPONSE_TIMEOUT)?;
+        let _ = driver.wait_for_exit(DRIVER_RESPONSE_TIMEOUT)?;
         write_json_atomic(
             &state.bundle_dir.join("evidence.json"),
             &redact_value(evidence, &secret_values)?,
@@ -988,16 +994,17 @@ fn record_event(state: &RunState, kind: &str, payload: JsonValue) -> Result<(), 
             kind: kind.to_owned(),
             payload,
         };
+        let mut line = serde_json::to_vec(&event)?;
+        line.push(b'\n');
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(state.bundle_dir.join("events.jsonl"))?;
+        file.write_all(&line)?;
         events.push(event.clone());
         event
     };
     lock(&state.summary).event_count = event.sequence;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(state.bundle_dir.join("events.jsonl"))?;
-    serde_json::to_writer(&mut file, &event)?;
-    file.write_all(b"\n")?;
     let _ = state.sender.send(event);
     Ok(())
 }
@@ -1087,6 +1094,32 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
             "v0.turn-finish" => {
                 if let Some(index) = current_turn.take() {
                     review.steps[index].event_sequences.push(event.sequence);
+                }
+            }
+            "v0.orchestrator-error" => {
+                let model = json_string(&event.payload, "modelId").unwrap_or("Model provider");
+                let detail = json_string(&event.payload, "message")
+                    .map(|message| format!("{model}: {message}"));
+                if let Some(index) = current_turn {
+                    "failed".clone_into(&mut review.steps[index].status);
+                    review.steps[index].event_sequences.push(event.sequence);
+                    if let Some(detail) = detail {
+                        if review.steps[index].detail.is_some() {
+                            append_review_detail(&mut review.steps[index], "\n");
+                        }
+                        append_review_detail(&mut review.steps[index], &detail);
+                    }
+                } else {
+                    push_review_step(
+                        &mut review,
+                        "model-turn",
+                        "Model provider failed".to_owned(),
+                        detail,
+                        "failed",
+                        vec![event.sequence],
+                        None,
+                        None,
+                    );
                 }
             }
             "mcp.tool.started" => {
@@ -1459,7 +1492,27 @@ fn load_runs(
         if !workspace.is_dir() {
             continue;
         }
-        let events = read_events(&bundle_dir.join("events.jsonl"))?;
+        let (events, replay_failed) = match read_events(&bundle_dir.join("events.jsonl")) {
+            Ok(events) => (events, false),
+            Err(error) => {
+                let message = format!("stored event replay failed: {error}");
+                summary.status = RunStatus::Failed;
+                summary.error = Some(message.clone());
+                (
+                    vec![RunEvent {
+                        sequence: 1,
+                        at_ms: now_ms(),
+                        kind: "run.finished".to_owned(),
+                        payload: json!({
+                            "status": RunStatus::Failed,
+                            "error": message,
+                            "recovered": true,
+                        }),
+                    }],
+                    true,
+                )
+            }
+        };
         let assembly = if bundle_dir.join("assembly.json").is_file() {
             serde_json::from_slice(&fs::read(bundle_dir.join("assembly.json"))?)?
         } else {
@@ -1478,6 +1531,7 @@ fn load_runs(
             workspace,
             output: scenario.output.clone(),
             capabilities: Mutex::new(Vec::new()),
+            replay_failed,
         });
         if interrupted {
             let score = json!({ "passed": false, "cancelled": true, "recovered": true });
@@ -1853,12 +1907,110 @@ totalScore = 11
         .unwrap();
     }
 
+    fn test_run_state(root: &Path) -> RunState {
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let (sender, _) = broadcast::channel(1);
+        RunState {
+            summary: Mutex::new(RunSummary {
+                id: "run-events".to_owned(),
+                scenario_id: "catalog".to_owned(),
+                scenario_title: "Catalog".to_owned(),
+                model_id: "test/model".to_owned(),
+                status: RunStatus::Running,
+                started_at_ms: 1,
+                finished_at_ms: None,
+                event_count: 0,
+                error: None,
+            }),
+            assembly: Mutex::new(AssemblySnapshot {
+                question: "How does the harness create a file?".to_owned(),
+                scenario: AssemblyScenario {
+                    id: "catalog".to_owned(),
+                    title: "Catalog".to_owned(),
+                    description: "test".to_owned(),
+                    version: 1,
+                },
+                harness: HarnessAssembly {
+                    adapter: "external-driver".to_owned(),
+                    model_id: Some("test/model".to_owned()),
+                    driver: None,
+                },
+                workspace: WorkspaceAssembly {
+                    id: "run-events/workspace".to_owned(),
+                    seed: "catalog/workspace".into(),
+                    seed_revision: "catalog@1".to_owned(),
+                    attachment: "root-confined-physical".to_owned(),
+                    change_tracking: "initial-and-final-snapshots".to_owned(),
+                },
+                capability_sources: Vec::new(),
+                limits: ScenarioLimits {
+                    max_duration_ms: 1_000,
+                    max_command_count: 1,
+                    max_orchestrator_invocations: 1,
+                    max_tool_invocations: 1,
+                },
+            }),
+            events: Mutex::new(Vec::new()),
+            sender,
+            cancel: CancellationToken::new(),
+            bundle_dir: root.to_path_buf(),
+            workspace,
+            output: "result.json".into(),
+            capabilities: Mutex::new(Vec::new()),
+            replay_failed: false,
+        }
+    }
+
     #[test]
     fn confined_children_reject_parent_and_absolute_escapes() {
         let root = Path::new("/tmp/agent-lab-root");
         assert!(confined_child(root, "workspace/result.json").is_ok());
         assert!(confined_child(root, "../outside").is_err());
         assert!(confined_child(root, "/outside").is_err());
+    }
+
+    #[test]
+    fn concurrent_events_remain_ordered_replayable_json_lines() {
+        const THREADS: usize = 8;
+        const EVENTS_PER_THREAD: usize = 50;
+
+        let root = temporary_root("concurrent-events");
+        let state = test_run_state(&root);
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+
+        std::thread::scope(|scope| {
+            for thread_index in 0..THREADS {
+                let barrier = Arc::clone(&barrier);
+                let state = &state;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for event_index in 0..EVENTS_PER_THREAD {
+                        record_event(
+                            state,
+                            "test.concurrent",
+                            json!({
+                                "thread": thread_index,
+                                "event": event_index,
+                                "detail": "x".repeat(8_192),
+                            }),
+                        )
+                        .unwrap();
+                    }
+                });
+            }
+        });
+
+        let expected_count = THREADS * EVENTS_PER_THREAD;
+        let events = read_events(&root.join("events.jsonl")).unwrap();
+        assert_eq!(events.len(), expected_count);
+        assert_eq!(lock(&state.events).len(), expected_count);
+        assert_eq!(lock(&state.summary).event_count, expected_count as u64);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.sequence, index as u64 + 1);
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -2022,6 +2174,64 @@ totalScore = 11
     }
 
     #[test]
+    fn malformed_event_evidence_fails_only_that_replayed_run() {
+        let root = temporary_root("malformed-replay");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+
+        let bundle = data.join("run-malformed");
+        fs::create_dir_all(bundle.join("workspace")).unwrap();
+        fs::create_dir_all(bundle.join("final")).unwrap();
+        fs::write(bundle.join("workspace/result.json"), br"{}").unwrap();
+        fs::write(bundle.join("final/result.json"), br"{}").unwrap();
+        let summary = RunSummary {
+            id: "run-malformed".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "test/model".to_owned(),
+            status: RunStatus::Passed,
+            started_at_ms: 1,
+            finished_at_ms: Some(2),
+            event_count: 2,
+            error: None,
+        };
+        let manifest = serde_json::to_vec(&summary).unwrap();
+        let malformed_events = br#"{"sequence":1}{"sequence":2}\n"#;
+        fs::write(bundle.join("manifest.json"), &manifest).unwrap();
+        fs::write(bundle.join("events.jsonl"), malformed_events).unwrap();
+
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-replay"),
+        })
+        .unwrap();
+        let detail = controller.get("run-malformed").unwrap();
+        assert_eq!(detail.summary.status, RunStatus::Failed);
+        assert!(
+            detail
+                .summary
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("stored event replay failed:")
+        );
+        assert_eq!(detail.review.status, RunStatus::Failed);
+        assert_eq!(detail.events.len(), 1);
+        assert_eq!(detail.events[0].payload["recovered"], true);
+        assert_eq!(fs::read(bundle.join("manifest.json")).unwrap(), manifest);
+        assert_eq!(
+            fs::read(bundle.join("events.jsonl")).unwrap(),
+            malformed_events
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn finalized_workspace_records_a_replayable_diff() {
         let root = temporary_root("diff");
         fs::create_dir(root.join("initial")).unwrap();
@@ -2077,6 +2287,7 @@ totalScore = 11
             workspace: root.join("workspace"),
             output: "result.json".into(),
             capabilities: Mutex::new(Vec::new()),
+            replay_failed: false,
         };
         finalize_workspace(&state).unwrap();
         let diff = read_optional_json(&root.join("diff.json"))
@@ -2178,6 +2389,52 @@ totalScore = 11
         assert_eq!(
             review.steps[5].detail.as_deref(),
             Some("2 active items · total score 11")
+        );
+    }
+
+    #[test]
+    fn causal_review_explains_model_provider_failures() {
+        let summary = RunSummary {
+            id: "run-provider-failure".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "test/model".to_owned(),
+            status: RunStatus::Failed,
+            started_at_ms: 10,
+            finished_at_ms: Some(30),
+            event_count: 4,
+            error: None,
+        };
+        let events = vec![
+            event(1, "v0.turn-start", json!({})),
+            event(
+                2,
+                "v0.orchestrator-error",
+                json!({
+                    "message": "provider credential is missing",
+                    "modelId": "test/model"
+                }),
+            ),
+            event(3, "v0.turn-finish", json!({})),
+            event(
+                4,
+                "run.finished",
+                json!({ "status": "failed", "error": "result.json is missing" }),
+            ),
+        ];
+
+        let review = build_review(&summary, &events);
+        assert_eq!(review.steps.len(), 2);
+        assert_eq!(review.steps[0].title, "Model turn 1");
+        assert_eq!(review.steps[0].status, "failed");
+        assert_eq!(
+            review.steps[0].detail.as_deref(),
+            Some("test/model: provider credential is missing")
+        );
+        assert_eq!(review.steps[1].title, "Evaluation failed");
+        assert_eq!(
+            review.steps[1].detail.as_deref(),
+            Some("result.json is missing")
         );
     }
 

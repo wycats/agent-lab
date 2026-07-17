@@ -21,12 +21,13 @@ use reedline::{
     StyledText, Suggestion, default_emacs_keybindings,
 };
 use rmcp::model::{CallToolResult, Tool};
+use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 use crate::{
     McpBridge,
     bridge::BridgeError,
-    value::{json_to_nu, nu_record_to_json},
+    value::{json_to_nu, json_to_nu_tool_result, nu_record_to_json, nu_to_json},
 };
 
 #[derive(Debug, Error)]
@@ -612,7 +613,7 @@ impl Command for McpToolCommand {
             None if matches!(input, PipelineData::Empty) => None,
             None => Some(input.into_value(call.head)?),
         };
-        let arguments = nu_record_to_json(arguments, call.head)?;
+        let arguments = tool_arguments_to_json(arguments, &self.tool, call.head)?;
         let result = self
             .bridge
             .call_tool(self.tool.name.to_string(), arguments)
@@ -679,7 +680,7 @@ fn tool_result_to_pipeline(result: CallToolResult, span: Span) -> Result<Pipelin
         return Err(shell_error("MCP tool failed", detail, span));
     }
     let value = if let Some(value) = result.structured_content {
-        json_to_nu(value, span)
+        json_to_nu_tool_result(value, span)
     } else {
         let content = serde_json::to_value(result.content).map_err(|error| {
             shell_error("MCP result serialization failed", error.to_string(), span)
@@ -687,6 +688,33 @@ fn tool_result_to_pipeline(result: CallToolResult, span: Span) -> Result<Pipelin
         json_to_nu(content, span)
     };
     Ok(value.into_pipeline_data())
+}
+
+fn tool_arguments_to_json(
+    arguments: Option<Value>,
+    tool: &Tool,
+    span: Span,
+) -> Result<serde_json::Map<String, JsonValue>, ShellError> {
+    if matches!(arguments, Some(Value::List { .. }))
+        && let Some(parameter) = single_collection_parameter(tool)
+    {
+        let mut wrapped = serde_json::Map::new();
+        wrapped.insert(
+            parameter,
+            nu_to_json(arguments.expect("list arguments were matched above"))?,
+        );
+        return Ok(wrapped);
+    }
+    nu_record_to_json(arguments, span)
+}
+
+fn single_collection_parameter(tool: &Tool) -> Option<String> {
+    let properties = tool.input_schema.get("properties")?.as_object()?;
+    if properties.len() != 1 {
+        return None;
+    }
+    let (name, schema) = properties.iter().next()?;
+    (schema.get("type")?.as_str()? == "array").then(|| name.clone())
 }
 
 fn shell_error(title: &'static str, detail: String, span: Span) -> ShellError {

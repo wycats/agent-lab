@@ -21,6 +21,7 @@
   let screenText = '';
   let startupError = '';
   let scenarios: ScenarioManifest[] = [];
+  let models: string[] = [];
   let scenarioId = '';
   let modelId = '';
   let runs: RunSummary[] = [];
@@ -66,7 +67,7 @@
 
   async function load(): Promise<void> {
     try {
-      [scenarios, runs] = await Promise.all([runClient.scenarios(), runClient.runs()]);
+      [models, scenarios, runs] = await Promise.all([runClient.models(), runClient.scenarios(), runClient.runs()]);
       scenarioId ||= scenarios[0]?.id ?? '';
     } catch (error) {
       actionError = message(error);
@@ -241,8 +242,13 @@
         </select>
       </label>
       <label class="model-field">
-        <span>Model ID</span>
-        <input bind:value={modelId} placeholder="provider/model" aria-label="Model ID" />
+        <span>Model</span>
+        <select bind:value={modelId} aria-label="Model" disabled={preparing || running}>
+          <option value="" disabled>Choose a model</option>
+          {#each models as model}
+            <option value={model}>{model}</option>
+          {/each}
+        </select>
       </label>
       <button class="primary" disabled={activeRun?.status !== 'exploring' || !modelId.trim() || preparing || starting || running} on:click={() => void beginRun()}>
         {starting ? 'Starting…' : 'Run'}
@@ -467,7 +473,7 @@
     color: #d9e0dc;
     background: radial-gradient(circle at 12% -10%, rgba(62, 111, 90, 0.16), transparent 30rem), #0a0e0d;
   }
-  button, input, select { font: inherit; }
+  button, select { font: inherit; }
   main { width: min(1600px, calc(100% - 40px)); margin: 0 auto; padding: 22px 0 30px; }
   header { display: grid; grid-template-columns: auto minmax(460px, 1fr) auto; align-items: end; gap: 24px; margin-bottom: 16px; }
   .identity { display: flex; align-items: center; gap: 11px; }
@@ -477,10 +483,10 @@
   .run-controls { display: flex; justify-content: flex-end; align-items: end; gap: 8px; }
   label { display: grid; gap: 5px; }
   label > span, .label, .transport { color: #73847b; font-size: 0.62rem; font-weight: 680; letter-spacing: 0.12em; text-transform: uppercase; }
-  input, select { min-height: 34px; border: 1px solid #293730; border-radius: 6px; padding: 0 10px; color: #cbd5cf; background: #111715; outline: none; }
-  input:focus, select:focus { border-color: #4b6d5e; }
+  select { min-height: 34px; border: 1px solid #293730; border-radius: 6px; padding: 0 10px; color: #cbd5cf; background: #111715; outline: none; }
+  select:focus { border-color: #4b6d5e; }
   select { min-width: 165px; }
-  .model-field { min-width: 220px; }
+  .model-field { min-width: 250px; }
   .run-controls button { height: 34px; margin: 0; padding: 0 15px; }
   button { border: 0; color: inherit; background: transparent; cursor: pointer; }
   button:disabled { cursor: not-allowed; opacity: 0.45; }
@@ -489,9 +495,9 @@
   .danger { color: #df8c8c; }
   .connection { display: flex; align-items: center; gap: 7px; padding-bottom: 9px; color: #89968f; font-family: var(--font-mono); font-size: 0.68rem; }
   .status-dot, .history-status { width: 6px; height: 6px; border-radius: 50%; background: #d1a85e; }
-  .connection[data-state="connected"] .status-dot, [data-status="passed"] { background: #91b976; }
-  .connection[data-state="error"] .status-dot, .connection[data-state="closed"] .status-dot, [data-status="failed"] { background: #d26d73; }
-  [data-status="cancelled"] { background: #8d9691; }
+  .connection[data-state="connected"] .status-dot, .history-status[data-status="passed"] { background: #91b976; }
+  .connection[data-state="error"] .status-dot, .connection[data-state="closed"] .status-dot, .history-status[data-status="failed"] { background: #d26d73; }
+  .history-status[data-status="cancelled"] { background: #8d9691; }
   .banner { margin-bottom: 12px; padding: 9px 12px; border: 1px solid #653d40; border-radius: 6px; color: #e4a2a5; background: #251719; font-size: 0.75rem; }
   .bench { display: grid; grid-template-columns: minmax(0, 1.18fr) minmax(430px, 0.82fr); height: max(600px, calc(100dvh - 120px)); min-height: 0; overflow: hidden; border: 1px solid #27342f; border-radius: 12px; background: #101614; box-shadow: 0 28px 80px rgba(0, 0, 0, 0.26); }
   .terminal-panel { display: grid; grid-template-rows: 58px minmax(0, 1fr) 34px; min-width: 0; min-height: 0; }
@@ -511,6 +517,9 @@
   .tabs button.active { color: #d2dad6; }
   .tabs button.active::after { position: absolute; right: 8px; bottom: -1px; left: 8px; height: 2px; background: #91b976; content: ''; }
   .run-status { padding: 4px 8px; border: 1px solid #34443c; border-radius: 999px; color: #a9b6af; font-family: var(--font-mono); font-size: 0.63rem; }
+  .run-status[data-status="passed"] { border-color: #46604f; color: #b8d5a8; background: #16211a; }
+  .run-status[data-status="failed"] { border-color: #684146; color: #e09ba0; background: #251719; }
+  .run-status[data-status="cancelled"] { border-color: #4a5550; color: #b2bbb6; background: #171d1a; }
   .tab-content { min-block-size: 0; overflow: auto; overscroll-behavior-block: contain; scrollbar-color: #405048 transparent; scrollbar-gutter: stable; contain: layout paint; }
   .assembly { padding: 16px 17px 14px; border-bottom: 1px solid #27342f; }
   .question { padding: 12px 13px; border: 1px solid #293832; border-radius: 7px; background: #111916; }
@@ -539,16 +548,16 @@
   .review-metrics dt { overflow: hidden; color: #65736c; font-size: 0.53rem; font-weight: 650; letter-spacing: 0.07em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
   .review-metrics dd { margin: 0; color: #b7c2bc; font-family: var(--font-mono); font-size: 0.7rem; }
   .review-steps { margin: 0; padding: 0; list-style: none; }
-  .review-steps li { position: relative; display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 8px; padding: 10px 0; }
-  .review-steps li:not(:last-child)::after { position: absolute; top: 29px; bottom: -5px; left: 12px; width: 1px; background: #293730; content: ''; }
-  .review-marker { z-index: 1; display: grid; place-items: center; align-self: start; width: 25px; height: 20px; border: 1px solid #34443c; border-radius: 999px; color: #75837b; background: #0d1311; font-family: var(--font-mono); font-size: 0.56rem; }
+  .review-steps li { position: relative; display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 8px; padding: 8px 0; }
+  .review-steps li:not(:last-child)::after { position: absolute; top: 27px; bottom: -4px; left: 12px; width: 1px; background: #293730; content: ''; }
+  .review-marker { z-index: 1; display: grid; place-items: center; align-self: start; width: 25px; height: 20px; border: 1px solid #405048; border-radius: 999px; color: #87968e; background: #0d1311; font-family: var(--font-mono); font-size: 0.56rem; }
   .review-steps li[data-status="passed"] .review-marker, .review-steps li[data-status="completed"] .review-marker { border-color: #405b4b; color: #96b783; }
   .review-steps li[data-status="failed"] .review-marker { border-color: #6b3e42; color: #d5868b; }
   .review-step-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
   .review-step-heading strong { color: #c2ccc7; font-size: 0.72rem; font-weight: 540; }
-  .review-step-heading span { color: #65746c; font-size: 0.54rem; letter-spacing: 0.06em; text-transform: uppercase; }
-  .review-steps p { margin: 4px 0; color: #84938b; font-size: 0.67rem; line-height: 1.45; }
-  .review-steps small { color: #536159; font-family: var(--font-mono); font-size: 0.54rem; }
+  .review-step-heading span { color: #829189; font-size: 0.54rem; letter-spacing: 0.06em; text-transform: uppercase; }
+  .review-steps p { margin: 2px 0; color: #94a39b; font-size: 0.67rem; line-height: 1.42; }
+  .review-steps small { color: #718078; font-family: var(--font-mono); font-size: 0.54rem; }
   .review-empty { margin-top: 2px; padding: 22px 15px; border: 1px dashed #2a3832; border-radius: 7px; color: #738179; }
   .review-empty strong { color: #b9c4be; font-size: 0.76rem; font-weight: 540; }
   .review-empty p { margin: 6px 0 12px; font-size: 0.67rem; line-height: 1.5; }
@@ -584,7 +593,7 @@
     main { width: calc(100% - 20px); padding-top: 14px; }
     .run-controls { display: grid; grid-template-columns: 1fr 1fr; }
     .run-controls label { min-width: 0; }
-    input, select { width: 100%; min-width: 0; }
+    select { width: 100%; min-width: 0; }
     .bench { min-height: 600px; }
     .terminal-panel { height: clamp(400px, calc(100dvh - 167px), 620px); }
     .review-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }

@@ -305,6 +305,8 @@ pub struct ServerConfig {
     pub origin: String,
     /// Per-process bearer token required by the WebSocket upgrade.
     pub token: String,
+    /// Model identifiers exposed by the configured agent harness.
+    pub models: Vec<String>,
     shutdown: CancellationToken,
 }
 
@@ -316,8 +318,16 @@ impl ServerConfig {
             assets: assets.into(),
             origin,
             token: generate_token(),
+            models: Vec::new(),
             shutdown: CancellationToken::new(),
         }
+    }
+
+    /// Publish the models supported by this server's configured harness.
+    #[must_use]
+    pub fn with_models(mut self, models: Vec<String>) -> Self {
+        self.models = models;
+        self
     }
 
     /// Signal all long-lived browser sessions to stop during server shutdown.
@@ -355,6 +365,7 @@ pub fn app_with_runs(
     Router::new()
         .route("/api/session-token", get(session_token))
         .route("/api/terminal", get(upgrade_terminal))
+        .route("/api/models", get(list_models))
         .route("/api/scenarios", get(list_scenarios))
         .route("/api/explore", post(prepare_run))
         .route("/api/runs", get(list_runs).post(start_run))
@@ -372,6 +383,13 @@ pub fn app_with_runs(
             HeaderValue::from_static("nosniff"),
         ))
         .with_state(state)
+}
+
+async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authorized_runs(&state, &headers).is_none() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    Json(state.config.models.clone()).into_response()
 }
 
 async fn list_scenarios(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -396,6 +414,9 @@ async fn start_run(
     let Some(runs) = authorized_runs(&state, &headers) else {
         return StatusCode::FORBIDDEN.into_response();
     };
+    if !model_is_available(&state.config, &request.model_id) {
+        return unavailable_model_response(&request.model_id);
+    }
     match runs.start(request).await {
         Ok(summary) => (StatusCode::CREATED, Json(summary)).into_response(),
         Err(error) => run_error_response(error),
@@ -425,10 +446,27 @@ async fn start_prepared_run(
     let Some(runs) = authorized_runs(&state, &headers) else {
         return StatusCode::FORBIDDEN.into_response();
     };
+    if !model_is_available(&state.config, &request.model_id) {
+        return unavailable_model_response(&request.model_id);
+    }
     match runs.start_prepared(&id, request) {
         Ok(summary) => Json(summary).into_response(),
         Err(error) => run_error_response(error),
     }
+}
+
+fn model_is_available(config: &ServerConfig, model_id: &str) -> bool {
+    config.models.is_empty() || config.models.iter().any(|model| model == model_id)
+}
+
+fn unavailable_model_response(model_id: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": format!("model is not available from this harness: {model_id}")
+        })),
+    )
+        .into_response()
 }
 
 async fn get_run(
@@ -1057,11 +1095,21 @@ mod tests {
     }
 
     #[test]
+    fn configured_model_catalog_rejects_free_form_ids() {
+        let config = ServerConfig::new(PathBuf::new(), "http://127.0.0.1:4100".to_owned())
+            .with_models(vec!["supported/model".to_owned()]);
+
+        assert!(model_is_available(&config, "supported/model"));
+        assert!(!model_is_available(&config, "invented/model"));
+    }
+
+    #[test]
     fn terminal_upgrade_requires_the_process_token() {
         let config = ServerConfig {
             assets: PathBuf::new(),
             origin: "http://127.0.0.1:4100".to_owned(),
             token: "process-secret".to_owned(),
+            models: Vec::new(),
             shutdown: CancellationToken::new(),
         };
         let mut headers = HeaderMap::new();

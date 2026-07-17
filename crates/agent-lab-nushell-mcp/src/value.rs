@@ -24,6 +24,16 @@ pub(crate) fn json_to_nu(value: JsonValue, span: Span) -> Value {
     }
 }
 
+pub(crate) fn json_to_nu_tool_result(value: JsonValue, span: Span) -> Value {
+    if let JsonValue::Object(values) = &value
+        && values.len() == 1
+        && let Some(JsonValue::Array(items)) = values.values().next()
+    {
+        return json_to_nu(JsonValue::Array(items.clone()), span);
+    }
+    json_to_nu(value, span)
+}
+
 pub(crate) fn nu_record_to_json(
     value: Option<Value>,
     span: Span,
@@ -56,7 +66,7 @@ fn number_to_nu(value: &Number, span: Span) -> Value {
     }
 }
 
-fn nu_to_json(value: Value) -> Result<JsonValue, ShellError> {
+pub(crate) fn nu_to_json(value: Value) -> Result<JsonValue, ShellError> {
     let span = value.span();
     match value {
         Value::Nothing { .. } => Ok(JsonValue::Null),
@@ -97,12 +107,32 @@ mod tests {
     use nu_protocol::Span;
     use serde_json::json;
 
-    use super::json_to_nu;
+    use super::{json_to_nu, json_to_nu_tool_result};
 
     #[test]
     fn oversized_unsigned_json_integer_preserves_its_exact_value() {
         let value = json_to_nu(json!(u64::MAX), Span::unknown());
 
         assert_eq!(value.as_str(), Ok("18446744073709551615"));
+    }
+
+    #[test]
+    fn sole_nested_collection_is_projected_as_a_table() {
+        let value = json_to_nu_tool_result(
+            json!({ "items": [{ "name": "alpha" }, { "name": "gamma" }] }),
+            Span::unknown(),
+        );
+
+        assert_eq!(value.into_list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn result_envelopes_with_other_fields_remain_records() {
+        let value = json_to_nu_tool_result(
+            json!({ "items": [{ "name": "alpha" }], "nextCursor": null }),
+            Span::unknown(),
+        );
+
+        assert!(value.into_record().is_ok());
     }
 }

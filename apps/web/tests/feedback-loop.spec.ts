@@ -52,7 +52,8 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   expect(layout.benchHeight).toBeLessThan(layout.viewportHeight);
   expect(layout.canvasHeight).toBeLessThanOrEqual(layout.viewportHeight * layout.devicePixelRatio * 2);
 
-  await page.getByLabel('Model ID').fill('fixture/model');
+  await expect(page.getByLabel('Model')).toHaveValue('');
+  await page.getByLabel('Model').selectOption('fixture/model');
   await page.getByRole('button', { name: 'Run', exact: true }).click();
   await expect(page.locator('.run-status')).toHaveText('passed');
   await expect(assembly).toContainText('agent-lab-fixture');
@@ -122,6 +123,8 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await expect(screen).toContainText('"name": "summarize"');
   await submit(page, 'help catalog list');
   await expect(screen).toContainText('Return the controlled product catalog');
+  await submit(page, 'catalog list | where active | get name | str join ","');
+  await expect(screen).toContainText('alpha,gamma');
   await submit(
     page,
     'catalog list | analysis summarize | to json'

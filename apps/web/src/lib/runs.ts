@@ -101,6 +101,7 @@ export interface RunDetail {
 }
 
 export interface RunClient {
+  models(): Promise<string[]>;
   scenarios(): Promise<ScenarioManifest[]>;
   runs(): Promise<RunSummary[]>;
   prepare(scenarioId: string): Promise<RunSummary>;
@@ -178,6 +179,7 @@ async function streamEvents(
 
 export function createRunClient(): RunClient {
   return {
+    models: () => request('/api/models'),
     scenarios: () => request('/api/scenarios'),
     runs: () => request('/api/runs'),
     prepare: (scenarioId) =>

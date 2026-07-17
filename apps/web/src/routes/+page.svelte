@@ -511,7 +511,7 @@
   .tabs button.active { color: #d2dad6; }
   .tabs button.active::after { position: absolute; right: 8px; bottom: -1px; left: 8px; height: 2px; background: #91b976; content: ''; }
   .run-status { padding: 4px 8px; border: 1px solid #34443c; border-radius: 999px; color: #a9b6af; font-family: var(--font-mono); font-size: 0.63rem; }
-  .tab-content { min-height: 0; overflow: auto; contain: layout paint; }
+  .tab-content { min-block-size: 0; overflow: auto; overscroll-behavior-block: contain; scrollbar-color: #405048 transparent; scrollbar-gutter: stable; contain: layout paint; }
   .assembly { padding: 16px 17px 14px; border-bottom: 1px solid #27342f; }
   .question { padding: 12px 13px; border: 1px solid #293832; border-radius: 7px; background: #111916; }
   .question p { margin: 6px 0 0; color: #c5d0ca; font-size: 0.76rem; line-height: 1.48; }
@@ -564,9 +564,9 @@
   .empty-state { max-width: 370px; padding: 34px 20px; color: #7c8a83; }
   .empty-state strong { color: #bbc5c0; font-size: 0.82rem; }
   .empty-state p { font-size: 0.73rem; line-height: 1.55; }
-  .history { max-height: 190px; border-top: 1px solid #27342f; }
+  .history { display: grid; grid-template-rows: auto minmax(0, 1fr); max-block-size: min(190px, 25dvb); border-top: 1px solid #27342f; }
   .history-title { display: flex; justify-content: space-between; padding: 10px 16px 6px; color: #596760; font-size: 0.65rem; }
-  .history-list { max-height: 150px; overflow: auto; padding: 0 7px 7px; }
+  .history-list { min-block-size: 0; overflow: auto; overscroll-behavior-block: contain; padding: 0 7px 7px; scrollbar-color: #405048 transparent; scrollbar-gutter: stable; }
   .history-list button { display: grid; grid-template-columns: 7px minmax(0, 1fr) auto; align-items: center; gap: 9px; width: 100%; padding: 8px 9px; border-radius: 5px; text-align: left; }
   .history-list button:hover, .history-list button.selected { background: #141d19; }
   .history-list button > span:nth-child(2) { display: grid; gap: 2px; min-width: 0; }
@@ -578,7 +578,7 @@
     .run-controls { grid-row: 2; grid-column: 1 / -1; justify-content: flex-start; }
     .bench { grid-template-columns: 1fr; height: auto; min-height: 720px; }
     .terminal-panel { height: clamp(430px, calc(100dvh - 175px), 682px); }
-    .run-panel { min-height: 620px; border-top: 1px solid #27342f; border-left: 0; }
+    .run-panel { block-size: 100dvb; min-block-size: 0; border-top: 1px solid #27342f; border-left: 0; }
   }
   @media (max-width: 620px) {
     main { width: calc(100% - 20px); padding-top: 14px; }

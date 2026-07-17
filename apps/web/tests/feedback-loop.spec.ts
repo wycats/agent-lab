@@ -152,7 +152,7 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await expect(page.locator('.artifact')).toContainText('"passed": true');
 });
 
-test('stacked terminal keeps its footer visible while scrollback remains usable', async ({ page }) => {
+test('stacked surfaces keep their scroll owners inside the viewport', async ({ page }) => {
   await page.setViewportSize({ width: 824, height: 639 });
   await page.goto('/');
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
@@ -176,4 +176,28 @@ test('stacked terminal keeps its footer visible while scrollback remains usable'
 
   await expect(footer).toBeInViewport();
   expect(await page.evaluate(() => window.scrollY)).toBe(0);
+
+  await page.setViewportSize({ width: 593, height: 406 });
+  await page.getByRole('button', { name: 'Workspace' }).click();
+  const runPanel = page.locator('.run-panel');
+  await runPanel.evaluate((element) => element.scrollIntoView({ block: 'start' }));
+  const runBounds = await runPanel.evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    return { top: bounds.top, bottom: bounds.bottom, height: bounds.height };
+  });
+  expect(runBounds.top).toBeGreaterThanOrEqual(-1);
+  expect(runBounds.bottom).toBeLessThanOrEqual(407);
+  expect(runBounds.height).toBeLessThanOrEqual(407);
+
+  const content = page.locator('.tab-content');
+  const contentSize = await content.evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight
+  }));
+  expect(contentSize.clientHeight).toBeGreaterThan(180);
+  expect(contentSize.scrollHeight).toBeGreaterThan(contentSize.clientHeight);
+  await content.hover();
+  await page.mouse.wheel(0, 500);
+  await expect.poll(() => content.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  await expect(page.locator('.history')).toBeInViewport();
 });

@@ -151,3 +151,29 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await page.getByRole('button', { name: 'Evidence' }).click();
   await expect(page.locator('.artifact')).toContainText('"passed": true');
 });
+
+test('stacked terminal keeps its footer visible while scrollback remains usable', async ({ page }) => {
+  await page.setViewportSize({ width: 824, height: 639 });
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+
+  const terminal = page.getByTestId('terminal');
+  const screen = page.getByTestId('terminal-text');
+  const footer = page.locator('.terminal-footer');
+  await expect(terminal.locator('canvas')).toBeVisible();
+  await expect(footer).toBeInViewport();
+
+  await submit(page, 'help');
+  await expect(screen).toContainText('You can also learn more');
+  const bottomView = await screen.textContent();
+
+  const canvas = await terminal.locator('canvas').boundingBox();
+  expect(canvas).not.toBeNull();
+  await page.mouse.move(canvas!.x + canvas!.width / 2, canvas!.y + canvas!.height / 2);
+  await page.mouse.wheel(0, -800);
+  await expect.poll(() => screen.textContent()).not.toBe(bottomView);
+  await expect(screen).toContainText('Agent Lab visual shell');
+
+  await expect(footer).toBeInViewport();
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
+});

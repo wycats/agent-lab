@@ -499,7 +499,7 @@
   .panel-heading > div, .run-heading > div { display: grid; gap: 4px; min-width: 0; }
   .value, .run-heading strong { overflow: hidden; color: #cbd4cf; font-size: 0.78rem; font-weight: 480; text-overflow: ellipsis; white-space: nowrap; }
   .transport { color: #526159; font-family: var(--font-mono); }
-  .terminal-frame { position: relative; min-width: 0; min-height: 590px; overflow: hidden; contain: layout paint; }
+  .terminal-frame { position: relative; min-width: 0; min-height: 0; overflow: hidden; contain: layout paint; }
   .terminal-host { position: absolute; inset: 14px; overflow: hidden; border-radius: 4px; outline: none; background: #101614; }
   :global(.terminal-host canvas) { display: block; }
   .screen-reader-output { position: absolute; width: 1px; height: 1px; overflow: hidden; contain: strict; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: pre; }
@@ -577,6 +577,7 @@
     header { grid-template-columns: 1fr auto; }
     .run-controls { grid-row: 2; grid-column: 1 / -1; justify-content: flex-start; }
     .bench { grid-template-columns: 1fr; height: auto; min-height: 720px; }
+    .terminal-panel { height: clamp(430px, calc(100dvh - 175px), 682px); }
     .run-panel { min-height: 620px; border-top: 1px solid #27342f; border-left: 0; }
   }
   @media (max-width: 620px) {
@@ -585,7 +586,7 @@
     .run-controls label { min-width: 0; }
     input, select { width: 100%; min-width: 0; }
     .bench { min-height: 600px; }
-    .terminal-frame { min-height: 460px; }
+    .terminal-panel { height: clamp(400px, calc(100dvh - 167px), 620px); }
     .review-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .review-metrics > div:nth-child(4) { border-left: 0; }
   }

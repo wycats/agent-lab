@@ -1,11 +1,14 @@
 use std::{process::Command, time::Duration};
 
-use expectrl::{Eof, Expect, Session};
+use expectrl::{Eof, Expect, Session, session::OsSession};
 
 #[test]
 fn pty_session_preserves_visible_nushell_and_mcp_behavior() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-lab-nushell-mcp-shell"));
-    command.arg("--fixture").env("NO_COLOR", "1");
+    command
+        .arg("--fixture")
+        .env("NO_COLOR", "1")
+        .env("AGENT_LAB_PLAIN_REPL", "1");
     let mut shell = Session::spawn(command).expect("visual shell should start in a PTY");
     shell.set_expect_timeout(Some(Duration::from_secs(10)));
 
@@ -34,7 +37,7 @@ fn pty_session_preserves_visible_nushell_and_mcp_behavior() {
     shell.expect("agent-lab> ").expect("prompt should return");
 
     shell
-        .send_line("tool fixture catalog { probe: 'visual' } | get items | where active | get name")
+        .send_line("fixture catalog { probe: 'visual' } | get items | where active | get name")
         .expect("structured pipeline should be submitted");
     shell
         .expect("╭")
@@ -48,15 +51,17 @@ fn pty_session_preserves_visible_nushell_and_mcp_behavior() {
     shell.expect("agent-lab> ").expect("prompt should return");
 
     shell
-        .send_line("help tool fixture catalog")
+        .send_line("help fixture catalog")
         .expect("help should be submitted");
     shell
         .expect("Return a nested structured catalog")
         .expect("dynamic command help should be visible");
     shell.expect("agent-lab> ").expect("prompt should return");
 
+    assert_discovery_and_unknown_command_behavior(&mut shell);
+
     shell
-        .send_line("tool fixture schedule_extra {}")
+        .send_line("fixture schedule_extra {}")
         .expect("delayed catalog mutation should be submitted");
     shell
         .expect("scheduled")
@@ -68,7 +73,7 @@ fn pty_session_preserves_visible_nushell_and_mcp_behavior() {
         .expect("[fixture capability change observed]")
         .expect("the client should observe the change while the prompt is open");
     shell
-        .send_line("tool fixture extra {}")
+        .send_line("fixture extra {}")
         .expect("new command should be submitted immediately after the change");
     shell
         .expect("[capabilities refreshed: fixture]")
@@ -79,7 +84,7 @@ fn pty_session_preserves_visible_nushell_and_mcp_behavior() {
     shell.expect("agent-lab> ").expect("prompt should return");
 
     shell
-        .send_line("tool fixture fail {}")
+        .send_line("fixture fail {}")
         .expect("tool error should be submitted");
     shell
         .expect("MCP tool failed")
@@ -105,4 +110,22 @@ fn pty_session_preserves_visible_nushell_and_mcp_behavior() {
             "shell should exit with status 0, got {status:?}"
         );
     }
+}
+
+fn assert_discovery_and_unknown_command_behavior(shell: &mut OsSession) {
+    shell
+        .send_line("mcp fixture")
+        .expect("namespace discovery should be submitted");
+    shell
+        .expect("catalog")
+        .expect("namespace discovery should list tools without a suffix");
+    shell.expect("agent-lab> ").expect("prompt should return");
+
+    shell
+        .send_line("mcp fix")
+        .expect("an incomplete command should be submitted");
+    shell
+        .expect("Unknown Agent Lab command")
+        .expect("the REPL should own unresolved-command errors");
+    shell.expect("agent-lab> ").expect("prompt should recover");
 }

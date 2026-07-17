@@ -1,5 +1,7 @@
 //! Local browser gateway for Agent Lab terminal sessions.
 
+mod runs;
+
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -9,21 +11,29 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        Query, State,
+        Path as AxumPath, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
-    response::{IntoResponse, Response},
-    routing::get,
+    response::{IntoResponse, Response, Sse, sse::Event},
+    routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_util::sync::CancellationToken;
 use tower_http::{
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,
+};
+
+pub use runs::{
+    PrepareRunRequest, RunController, RunControllerConfig, RunDetail, RunError, RunEvent,
+    RunStatus, RunSummary, ScenarioManifest, StartPreparedRunRequest, StartRunRequest,
+    TerminalBinding, TerminalCapabilityBinding,
 };
 
 const DEFAULT_COLS: u16 = 100;
@@ -40,7 +50,11 @@ pub trait SessionProvider: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns an error when the provider cannot create its bounded session.
-    fn open(&self, size: TerminalSize) -> Result<Box<dyn BrowserSession>, GatewayError>;
+    fn open(
+        &self,
+        size: TerminalSize,
+        run_id: Option<&str>,
+    ) -> Result<Box<dyn BrowserSession>, GatewayError>;
 }
 
 /// A bidirectional terminal session independent of its process or transport.
@@ -93,11 +107,68 @@ impl SessionProvider for FixtureSessionProvider {
         "fixture"
     }
 
-    fn open(&self, size: TerminalSize) -> Result<Box<dyn BrowserSession>, GatewayError> {
+    fn open(
+        &self,
+        size: TerminalSize,
+        _run_id: Option<&str>,
+    ) -> Result<Box<dyn BrowserSession>, GatewayError> {
         Ok(Box::new(PtyTerminalSession::spawn(
             &self.shell,
             &self.cwd,
             size,
+            &["--fixture".to_owned()],
+            &[],
+        )?))
+    }
+}
+
+/// A Nushell provider that can attach to the workspace and MCP source owned by a run.
+#[derive(Clone)]
+pub struct RunSessionProvider {
+    shell: PathBuf,
+    runs: RunController,
+}
+
+impl RunSessionProvider {
+    #[must_use]
+    pub fn new(shell: impl Into<PathBuf>, runs: RunController) -> Self {
+        Self {
+            shell: shell.into(),
+            runs,
+        }
+    }
+}
+
+impl SessionProvider for RunSessionProvider {
+    fn name(&self) -> &'static str {
+        "nushell"
+    }
+
+    fn open(
+        &self,
+        size: TerminalSize,
+        run_id: Option<&str>,
+    ) -> Result<Box<dyn BrowserSession>, GatewayError> {
+        let run_id = run_id.ok_or(GatewayError::RunRequired)?;
+        let binding = self.runs.terminal_binding(run_id)?;
+        let mut args = Vec::new();
+        let mut environment = Vec::new();
+        for (index, source) in binding.sources.into_iter().enumerate() {
+            let token_env = format!("AGENT_LAB_MCP_TOKEN_{index}");
+            args.extend([
+                "--mcp-http".to_owned(),
+                source.id,
+                source.url,
+                token_env.clone(),
+            ]);
+            environment.push((token_env, source.token));
+        }
+        Ok(Box::new(PtyTerminalSession::spawn(
+            &self.shell,
+            &binding.workspace,
+            size,
+            &args,
+            &environment,
         )?))
     }
 }
@@ -137,14 +208,25 @@ struct PtyTerminalSession {
 }
 
 impl PtyTerminalSession {
-    fn spawn(shell: &Path, cwd: &Path, size: TerminalSize) -> Result<Self, GatewayError> {
+    fn spawn(
+        shell: &Path,
+        cwd: &Path,
+        size: TerminalSize,
+        args: &[String],
+        environment: &[(String, String)],
+    ) -> Result<Self, GatewayError> {
         if !shell.is_file() {
             return Err(GatewayError::ShellNotFound(shell.to_path_buf()));
         }
 
         let pair = NativePtySystem::default().openpty(size.into())?;
         let mut command = CommandBuilder::new(shell);
-        command.arg("--fixture");
+        for argument in args {
+            command.arg(argument);
+        }
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         command.cwd(cwd);
         command.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(command)?;
@@ -223,6 +305,7 @@ pub struct ServerConfig {
     pub origin: String,
     /// Per-process bearer token required by the WebSocket upgrade.
     pub token: String,
+    shutdown: CancellationToken,
 }
 
 impl ServerConfig {
@@ -233,7 +316,13 @@ impl ServerConfig {
             assets: assets.into(),
             origin,
             token: generate_token(),
+            shutdown: CancellationToken::new(),
         }
+    }
+
+    /// Signal all long-lived browser sessions to stop during server shutdown.
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
     }
 }
 
@@ -241,17 +330,38 @@ impl ServerConfig {
 struct AppState {
     config: ServerConfig,
     provider: Arc<dyn SessionProvider>,
+    runs: Option<RunController>,
 }
 
 /// Build the HTTP application around one bounded session provider.
 pub fn app(config: ServerConfig, provider: Arc<dyn SessionProvider>) -> Router {
+    app_with_runs(config, provider, None)
+}
+
+/// Build the browser application with the optional scenario run controller.
+pub fn app_with_runs(
+    config: ServerConfig,
+    provider: Arc<dyn SessionProvider>,
+    runs: Option<RunController>,
+) -> Router {
     let index = config.assets.join("index.html");
     let assets = ServeDir::new(&config.assets).not_found_service(ServeFile::new(index));
-    let state = AppState { config, provider };
+    let state = AppState {
+        config,
+        provider,
+        runs,
+    };
 
     Router::new()
         .route("/api/session-token", get(session_token))
         .route("/api/terminal", get(upgrade_terminal))
+        .route("/api/scenarios", get(list_scenarios))
+        .route("/api/explore", post(prepare_run))
+        .route("/api/runs", get(list_runs).post(start_run))
+        .route("/api/runs/{id}", get(get_run))
+        .route("/api/runs/{id}/start", post(start_prepared_run))
+        .route("/api/runs/{id}/cancel", post(cancel_run))
+        .route("/api/runs/{id}/events", get(run_events))
         .fallback_service(assets)
         .layer(SetResponseHeaderLayer::if_not_present(
             header::X_FRAME_OPTIONS,
@@ -262,6 +372,136 @@ pub fn app(config: ServerConfig, provider: Arc<dyn SessionProvider>) -> Router {
             HeaderValue::from_static("nosniff"),
         ))
         .with_state(state)
+}
+
+async fn list_scenarios(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    Json(runs.scenarios()).into_response()
+}
+
+async fn list_runs(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    Json(runs.list()).into_response()
+}
+
+async fn start_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<StartRunRequest>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.start(request).await {
+        Ok(summary) => (StatusCode::CREATED, Json(summary)).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn prepare_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PrepareRunRequest>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.prepare(request).await {
+        Ok(summary) => (StatusCode::CREATED, Json(summary)).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn start_prepared_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<StartPreparedRunRequest>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.start_prepared(&id, request) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn get_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.get(&id) {
+        Ok(run) => Json(run).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn cancel_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.cancel(&id) {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn run_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Ok((history, receiver)) = runs.subscribe(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let history = futures_util::stream::iter(history);
+    let live = BroadcastStream::new(receiver).filter_map(|event| async move { event.ok() });
+    let stream = history
+        .chain(live)
+        .map(|event| {
+            Event::default()
+                .id(event.sequence.to_string())
+                .event(&event.kind)
+                .json_data(event)
+        })
+        .take_until(state.config.shutdown.cancelled_owned());
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
+fn authorized_runs(state: &AppState, headers: &HeaderMap) -> Option<RunController> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if bearer != Some(state.config.token.as_str())
+        || !request_is_same_origin(headers, &state.config.origin, true)
+    {
+        return None;
+    }
+    state.runs.clone()
+}
+
+fn run_error_response(error: RunError) -> Response {
+    let (status, message): (StatusCode, String) = error.into();
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
 #[derive(Serialize)]
@@ -291,6 +531,8 @@ struct TerminalQuery {
     cols: u16,
     #[serde(default = "default_rows")]
     rows: u16,
+    #[serde(rename = "runId")]
+    run_id: Option<String>,
 }
 
 const fn default_cols() -> u16 {
@@ -322,7 +564,15 @@ async fn upgrade_terminal(
 
     upgrade
         .protocols([auth_protocol])
-        .on_upgrade(move |socket| serve_terminal(socket, state.provider, size))
+        .on_upgrade(move |socket| {
+            serve_terminal(
+                socket,
+                state.provider,
+                size,
+                query.run_id,
+                state.config.shutdown,
+            )
+        })
 }
 
 fn terminal_request_is_authorized(
@@ -467,8 +717,10 @@ fn spawn_session_writer(
 async fn open_session(
     provider: Arc<dyn SessionProvider>,
     initial_size: TerminalSize,
+    run_id: Option<String>,
 ) -> Result<Box<dyn BrowserSession>, String> {
-    match tokio::task::spawn_blocking(move || provider.open(initial_size)).await {
+    match tokio::task::spawn_blocking(move || provider.open(initial_size, run_id.as_deref())).await
+    {
         Ok(result) => result.map_err(|error| error.to_string()),
         Err(error) => Err(format!("session provider task failed: {error}")),
     }
@@ -478,8 +730,10 @@ async fn serve_terminal(
     socket: WebSocket,
     provider: Arc<dyn SessionProvider>,
     initial_size: TerminalSize,
+    run_id: Option<String>,
+    shutdown: CancellationToken,
 ) {
-    let session = match open_session(Arc::clone(&provider), initial_size).await {
+    let session = match open_session(Arc::clone(&provider), initial_size, run_id).await {
         Ok(session) => session,
         Err(message) => {
             send_open_error(socket, &message).await;
@@ -514,6 +768,7 @@ async fn serve_terminal(
 
     loop {
         tokio::select! {
+            () = shutdown.cancelled() => break,
             result = &mut write_task => {
                 if let Ok(Err(error)) = result {
                     tracing::debug!(%error, "terminal writer stopped");
@@ -609,12 +864,18 @@ pub enum GatewayError {
     /// A session resource was already consumed or became unavailable.
     #[error("terminal session became unavailable")]
     SessionUnavailable,
+    /// Agent Lab terminals are always attached to one prepared scenario workspace.
+    #[error("a prepared scenario run is required for this terminal")]
+    RunRequired,
     /// Operating-system PTY failure.
     #[error("PTY operation failed: {0}")]
     Pty(#[from] anyhow::Error),
     /// Terminal I/O failure.
     #[error("terminal I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    /// The requested run could not provide its workspace or capability source.
+    #[error(transparent)]
+    Run(#[from] RunError),
 }
 
 #[cfg(test)]
@@ -716,6 +977,7 @@ mod tests {
             assets: PathBuf::new(),
             origin: "http://127.0.0.1:4100".to_owned(),
             token: "process-secret".to_owned(),
+            shutdown: CancellationToken::new(),
         };
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:4100"));

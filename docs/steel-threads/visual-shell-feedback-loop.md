@@ -75,7 +75,7 @@ $ target/debug/agent-lab-nushell-mcp-shell \
 
 A direct PTY run rendered the fixture catalog as a box-drawn Nushell table. A
 pipeline over the structured catalog rendered two rows, `alpha` with score `3`
-and `gamma` with score `8`. After `tool fixture enable_extra {}`, the screen
+and `gamma` with score `8`. After `fixture enable_extra {}`, the screen
 showed:
 
 ```text
@@ -83,9 +83,9 @@ showed:
 agent-lab>
 ```
 
-At that prompt, `help tool fixture extra` rendered the live description, usage,
-parameter, and input/output sections, and `tool fixture extra {}` rendered an
-`available: true` record. `tool fixture fail {}` rendered a source-anchored
+At that prompt, `help fixture extra` rendered the live description, usage,
+parameter, and input/output sections, and `fixture extra {}` rendered an
+`available: true` record. `fixture fail {}` rendered a source-anchored
 Nushell diagnostic with the stable title `MCP tool failed` and the fixture's
 structured error detail, then returned to the prompt. A mutable `answer`
 variable advanced from `41` to `42` across separate submissions. `exit` ended

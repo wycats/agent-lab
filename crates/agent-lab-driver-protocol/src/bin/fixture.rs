@@ -1,4 +1,8 @@
-use std::io::{self, BufRead, BufWriter, Write};
+use std::{
+    fs,
+    io::{self, BufRead, BufWriter, Write},
+    path::PathBuf,
+};
 
 use agent_lab_driver_protocol::{
     CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverFailureScope,
@@ -11,6 +15,7 @@ struct Fixture {
     caused_by: Option<String>,
     session_id: Option<String>,
     active_turn: Option<String>,
+    workspace_root: Option<PathBuf>,
 }
 
 impl Fixture {
@@ -20,6 +25,7 @@ impl Fixture {
             caused_by: None,
             session_id: None,
             active_turn: None,
+            workspace_root: None,
         }
     }
 
@@ -59,8 +65,10 @@ impl Fixture {
 
     fn handle(&mut self, output: &mut impl Write, body: CommandBody) -> io::Result<bool> {
         match body {
-            CommandBody::OpenSession { session_id, .. } => {
-                self.open_session(output, session_id)?;
+            CommandBody::OpenSession {
+                session_id, config, ..
+            } => {
+                self.open_session(output, session_id, &config)?;
                 Ok(false)
             }
             CommandBody::StartTurn {
@@ -84,7 +92,12 @@ impl Fixture {
         }
     }
 
-    fn open_session(&mut self, output: &mut impl Write, session_id: String) -> io::Result<()> {
+    fn open_session(
+        &mut self,
+        output: &mut impl Write,
+        session_id: String,
+        config: &JsonValue,
+    ) -> io::Result<()> {
         if self.session_id.is_some() {
             return self.fail(
                 output,
@@ -96,6 +109,10 @@ impl Fixture {
             );
         }
         self.session_id = Some(session_id.clone());
+        self.workspace_root = config
+            .get("workspaceRoot")
+            .and_then(JsonValue::as_str)
+            .map(PathBuf::from);
         self.emit(
             output,
             DriverBody::SessionOpened {
@@ -202,6 +219,7 @@ impl Fixture {
         task: &JsonValue,
         capability_sources: JsonValue,
     ) -> io::Result<()> {
+        let scenario_mode = task.get("mode").and_then(JsonValue::as_str) == Some("real");
         self.emit(
             output,
             DriverBody::TurnEvent {
@@ -220,6 +238,9 @@ impl Fixture {
                 payload: capability_sources,
             },
         )?;
+        if scenario_mode {
+            self.complete_catalog_scenario(output, &session_id, &turn_id)?;
+        }
         self.emit(
             output,
             DriverBody::TurnFinished {
@@ -229,6 +250,57 @@ impl Fixture {
                 evidence: json!({ "fixture": true }),
             },
         )
+    }
+
+    fn complete_catalog_scenario(
+        &mut self,
+        output: &mut impl Write,
+        session_id: &str,
+        turn_id: &str,
+    ) -> io::Result<()> {
+        self.emit(
+            output,
+            DriverBody::TurnEvent {
+                session_id: session_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                event_type: "tool.call".to_owned(),
+                payload: json!({ "source": "catalog", "tool": "list" }),
+            },
+        )?;
+        self.emit(
+            output,
+            DriverBody::TurnEvent {
+                session_id: session_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                event_type: "tool.call".to_owned(),
+                payload: json!({ "source": "analysis", "tool": "summarize" }),
+            },
+        )?;
+
+        if let Some(workspace_root) = &self.workspace_root {
+            let result = json!({
+                "active": [
+                    { "name": "alpha", "active": true, "score": 3 },
+                    { "name": "gamma", "active": true, "score": 8 }
+                ],
+                "activeCount": 2,
+                "totalScore": 11
+            });
+            fs::write(
+                workspace_root.join("result.json"),
+                serde_json::to_vec_pretty(&result).map_err(io::Error::other)?,
+            )?;
+            self.emit(
+                output,
+                DriverBody::TurnEvent {
+                    session_id: session_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    event_type: "workspace.changed".to_owned(),
+                    payload: json!({ "path": "result.json", "kind": "created" }),
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn abort_turn(

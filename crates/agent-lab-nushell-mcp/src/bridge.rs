@@ -19,6 +19,9 @@ use rmcp::{
         ProgressToken, Tool,
     },
     service::NotificationContext,
+    transport::{
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -185,15 +188,35 @@ impl McpBridge {
         args: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self, BridgeError> {
         Self::connect_with_timeout(
-            executable.as_ref().to_owned(),
-            args.into_iter().map(Into::into).collect(),
+            ActorTransport::Child {
+                executable: executable.as_ref().to_owned(),
+                args: args.into_iter().map(Into::into).collect(),
+            },
+            STARTUP_TIMEOUT,
+        )
+    }
+
+    /// Connect to an authenticated Streamable HTTP MCP endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime, HTTP transport, initialization, or
+    /// initial discovery cannot start.
+    pub fn connect_http(
+        url: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, BridgeError> {
+        Self::connect_with_timeout(
+            ActorTransport::Http {
+                url: url.into(),
+                token: token.into(),
+            },
             STARTUP_TIMEOUT,
         )
     }
 
     fn connect_with_timeout(
-        executable: std::path::PathBuf,
-        args: Vec<String>,
+        transport: ActorTransport,
         startup_timeout: Duration,
     ) -> Result<Self, BridgeError> {
         let runtime_id = NEXT_RUNTIME_ID.fetch_add(1, Ordering::SeqCst);
@@ -216,8 +239,7 @@ impl McpBridge {
                     .build();
                 let result = match runtime {
                     Ok(runtime) => runtime.block_on(run_actor(
-                        executable,
-                        args,
+                        transport,
                         handler,
                         receiver,
                         ready_sender.clone(),
@@ -354,6 +376,17 @@ impl McpBridge {
     }
 }
 
+enum ActorTransport {
+    Child {
+        executable: std::path::PathBuf,
+        args: Vec<String>,
+    },
+    Http {
+        url: String,
+        token: String,
+    },
+}
+
 impl Drop for BridgeInner {
     fn drop(&mut self) {
         self.events
@@ -364,54 +397,79 @@ impl Drop for BridgeInner {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_actor(
-    executable: std::path::PathBuf,
-    args: Vec<String>,
+    transport: ActorTransport,
     handler: RecordingClient,
     mut receiver: tokio_mpsc::UnboundedReceiver<Request>,
     ready_sender: mpsc::SyncSender<Result<(), String>>,
     mut lifecycle_cancel: oneshot::Receiver<()>,
 ) -> Result<(), String> {
-    let mut command = Command::new(executable);
-    command
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
-    let child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "MCP child stdout was not piped".to_owned())?;
-    let child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "MCP child stdin was not piped".to_owned())?;
-    let startup_result = {
-        let startup = async {
-            let service = handler
-                .serve((child_stdout, child_stdin))
-                .await
-                .map_err(|error| error.to_string())?;
-            service
-                .peer()
-                .list_all_tools()
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok::<_, String>(service)
-        };
-        tokio::pin!(startup);
-        tokio::select! {
-            result = &mut startup => Some(result),
-            _ = &mut lifecycle_cancel => None,
+    let (mut service, mut child) = match transport {
+        ActorTransport::Child { executable, args } => {
+            let mut command = Command::new(executable);
+            command
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true);
+            let mut child = command.spawn().map_err(|error| error.to_string())?;
+            let child_stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| "MCP child stdout was not piped".to_owned())?;
+            let child_stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "MCP child stdin was not piped".to_owned())?;
+            let startup = async {
+                let service = handler
+                    .serve((child_stdout, child_stdin))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                service
+                    .peer()
+                    .list_all_tools()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(service)
+            };
+            tokio::pin!(startup);
+            let service = tokio::select! {
+                result = &mut startup => result?,
+                _ = &mut lifecycle_cancel => {
+                    terminate_child(&mut child).await?;
+                    return Err("bridge startup cancelled".to_owned());
+                }
+            };
+            (service, Some(child))
         }
-    };
-    let mut service = if let Some(result) = startup_result {
-        result?
-    } else {
-        terminate_child(&mut child).await?;
-        return Err("bridge startup cancelled".to_owned());
+        ActorTransport::Http { url, token } => {
+            let transport = StreamableHttpClientTransport::from_config(
+                StreamableHttpClientTransportConfig::with_uri(url).auth_header(token),
+            );
+            let startup = async {
+                let service = handler
+                    .serve(transport)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                service
+                    .peer()
+                    .list_all_tools()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(service)
+            };
+            tokio::pin!(startup);
+            let service = tokio::select! {
+                result = &mut startup => result?,
+                _ = &mut lifecycle_cancel => {
+                    return Err("bridge startup cancelled".to_owned());
+                }
+            };
+            (service, None)
+        }
     };
     ready_sender
         .send(Ok(()))
@@ -466,14 +524,23 @@ async fn run_actor(
     }
 
     let _ = tokio::time::timeout(Duration::from_millis(100), service.close()).await;
-    terminate_child(&mut child).await?;
+    if let Some(child) = &mut child {
+        terminate_child(child).await?;
+    }
     Ok(())
 }
 
 async fn terminate_child(child: &mut tokio::process::Child) -> Result<(), String> {
-    match child.try_wait().map_err(|error| error.to_string())? {
-        Some(_) => Ok(()),
-        None => child.kill().await.map_err(|error| error.to_string()),
+    if child
+        .try_wait()
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        Ok(())
+    } else {
+        child.kill().await.map_err(|error| error.to_string())?;
+        child.wait().await.map_err(|error| error.to_string())?;
+        Ok(())
     }
 }
 
@@ -500,20 +567,25 @@ mod tests {
         ));
         let script = r#"echo $$ > "$1"; exec sleep 30"#;
         let error = McpBridge::connect_with_timeout(
-            "/bin/sh".into(),
-            vec![
-                "-c".to_owned(),
-                script.to_owned(),
-                "agent-lab-timeout".to_owned(),
-                marker.to_string_lossy().into_owned(),
-            ],
-            std::time::Duration::from_millis(500),
+            super::ActorTransport::Child {
+                executable: "/bin/sh".into(),
+                args: vec![
+                    "-c".to_owned(),
+                    script.to_owned(),
+                    "agent-lab-timeout".to_owned(),
+                    marker.to_string_lossy().into_owned(),
+                ],
+            },
+            // Give the actor thread enough time to spawn the child even when the
+            // workspace test suite is saturating the machine. The child still
+            // intentionally never completes the MCP handshake.
+            std::time::Duration::from_secs(2),
         )
         .err()
         .expect("hung startup should time out");
         assert!(matches!(error, BridgeError::StartupTimeout { .. }));
 
-        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
         let pid = loop {
             if let Ok(pid) = fs::read_to_string(&marker) {
                 break pid.trim().to_owned();

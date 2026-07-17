@@ -71,7 +71,9 @@ export async function createGhosttySurface(host: HTMLElement): Promise<TerminalS
   const terminal = new Terminal({
     cols: 100,
     rows: 30,
-    cursorBlink: true,
+    // Ghostty redraws the full canvas for every blink. A steady cursor keeps
+    // focus visible without doing terminal-sized work while the workbench idles.
+    cursorBlink: false,
     cursorStyle: 'bar',
     fontFamily: '"Geist Mono Variable", "Geist Mono", monospace',
     fontSize: 14,

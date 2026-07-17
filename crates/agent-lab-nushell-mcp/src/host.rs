@@ -1,9 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
-    io::{self, IsTerminal, Write},
+    io::{self, BufRead, IsTerminal, Write},
+    sync::Arc,
 };
 
+use nu_ansi_term::{Color, Style};
 use nu_engine::CallExt;
+use nu_parser::FlatShape;
 use nu_protocol::{
     IntoPipelineData, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
     debugger::WithoutDebug,
@@ -11,6 +14,11 @@ use nu_protocol::{
     report_error::report_compile_error,
     report_parse_error, report_shell_error,
     shell_error::generic::GenericError,
+};
+use reedline::{
+    ColumnarMenu, Completer, DefaultPrompt, DefaultPromptSegment, Emacs, Highlighter, KeyCode,
+    KeyModifiers, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span as ReedlineSpan,
+    StyledText, Suggestion, default_emacs_keybindings,
 };
 use rmcp::model::{CallToolResult, Tool};
 use thiserror::Error;
@@ -39,6 +47,8 @@ pub enum HostError {
     InteractiveTerminalRequired,
     #[error("interactive shell I/O failed: {0}")]
     InteractiveIo(#[from] io::Error),
+    #[error("interactive line editor failed: {0}")]
+    LineEditor(#[from] reedline::ReedlineError),
 }
 
 pub struct NushellHost {
@@ -50,10 +60,21 @@ pub struct NushellHost {
 }
 
 impl NushellHost {
+    /// Create an Agent Lab Nushell host with workspace-safe command handling.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Nushell cannot merge Agent Lab's built-in unresolved-command
+    /// guard into a freshly created default engine state.
     #[must_use]
     pub fn new() -> Self {
-        let engine_state =
+        let mut engine_state =
             nu_command::add_shell_command_context(nu_cmd_lang::create_default_context());
+        let mut working_set = StateWorkingSet::new(&engine_state);
+        working_set.add_decl(Box::new(AgentLabExternalGuard));
+        engine_state
+            .merge_delta(working_set.render())
+            .expect("Agent Lab command guard should merge into the default Nushell context");
         let mut stack = Stack::new().collect_value();
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
         stack.add_env_var(
@@ -131,18 +152,23 @@ impl NushellHost {
                 namespace: namespace.to_owned(),
                 bridge: bridge.clone(),
             }));
+            working_set.add_decl(Box::new(ListToolsCommand {
+                name: format!("mcp {namespace}"),
+                namespace: namespace.to_owned(),
+                bridge: bridge.clone(),
+            }));
         }
 
         for (tool_name, previous) in &previous_tools {
             if current_tools.get(tool_name) != Some(previous) {
-                let name = format!("tool {namespace} {tool_name}");
+                let name = format!("{namespace} {tool_name}");
                 working_set.hide_decl(name.as_bytes());
             }
         }
 
         for (tool_name, tool) in &current_tools {
             if previous_tools.get(tool_name) != Some(tool) {
-                let name = format!("tool {namespace} {tool_name}");
+                let name = format!("{namespace} {tool_name}");
                 working_set.add_decl(Box::new(McpToolCommand {
                     name,
                     tool: tool.clone(),
@@ -214,20 +240,17 @@ impl NushellHost {
 
     /// Run the evidence-oriented interactive shell on a real terminal.
     ///
-    /// This intentionally owns only line submission, visible prompts, and the
-    /// between-line capability refresh boundary. Nushell continues to own
-    /// parsing, evaluation, help, structured values, tables, and error
-    /// rendering. Line editing, completion, history, and multiline input are
-    /// later product work rather than part of this feedback harness.
+    /// Nushell owns parsing, highlighting, completion, evaluation, help,
+    /// structured values, tables, and error rendering. This host owns the
+    /// between-line capability refresh boundary.
     ///
     /// # Errors
     ///
     /// Returns an error for non-terminal input/output, terminal I/O failure, or
     /// capability refresh failure.
     pub fn run_interactive(mut self) -> Result<(), HostError> {
-        let stdin = io::stdin();
         let mut stdout = io::stdout();
-        if !stdin.is_terminal() || !stdout.is_terminal() {
+        if !io::stdin().is_terminal() || !stdout.is_terminal() {
             return Err(HostError::InteractiveTerminalRequired);
         }
 
@@ -244,30 +267,89 @@ impl NushellHost {
             "Nushell evaluates each submitted line; `exit` leaves."
         )?;
 
-        let mut source = String::new();
+        // Raw PTY test harnesses do not emulate terminal cursor-position
+        // responses. Keep a deliberately explicit headless path for them;
+        // browser and real-terminal sessions always use Reedline below.
+        if std::env::var_os("AGENT_LAB_PLAIN_REPL").is_some() {
+            return self.run_headless_interactive(&mut stdout);
+        }
+
+        let prompt = DefaultPrompt::new(
+            DefaultPromptSegment::Basic("agent-lab".to_owned()),
+            DefaultPromptSegment::Empty,
+        );
+        let mut line_editor = self.line_editor();
+        loop {
+            let refreshed = self.refresh_stale()?;
+            for namespace in &refreshed {
+                writeln!(stdout, "[capabilities refreshed: {namespace}]")?;
+            }
+            if !refreshed.is_empty() {
+                line_editor = self.line_editor();
+            }
+            let source = match line_editor.read_line(&prompt)? {
+                Signal::Success(source) => source,
+                Signal::CtrlD => break,
+                _ => continue,
+            };
+            if matches!(source.trim(), "exit" | "quit") {
+                break;
+            }
+
+            // A capability notification may arrive while the prompt blocks on input.
+            let refreshed = self.refresh_stale()?;
+            for namespace in &refreshed {
+                writeln!(stdout, "[capabilities refreshed: {namespace}]")?;
+            }
+            if !refreshed.is_empty() {
+                line_editor = self.line_editor();
+            }
+            self.eval_and_print(&source);
+        }
+        Ok(())
+    }
+
+    fn run_headless_interactive(&mut self, stdout: &mut impl Write) -> Result<(), HostError> {
+        let stdin = io::stdin();
+        let mut lines = stdin.lock().lines();
         loop {
             for namespace in self.refresh_stale()? {
                 writeln!(stdout, "[capabilities refreshed: {namespace}]")?;
             }
             write!(stdout, "agent-lab> ")?;
             stdout.flush()?;
-
-            source.clear();
-            if stdin.read_line(&mut source)? == 0 {
-                writeln!(stdout)?;
+            let Some(source) = lines.next().transpose()? else {
                 break;
-            }
+            };
             if matches!(source.trim(), "exit" | "quit") {
                 break;
             }
-
-            // A capability notification may arrive while the prompt blocks on input.
             for namespace in self.refresh_stale()? {
                 writeln!(stdout, "[capabilities refreshed: {namespace}]")?;
             }
             self.eval_and_print(&source);
         }
         Ok(())
+    }
+
+    fn line_editor(&self) -> Reedline {
+        let engine_state = Arc::new(self.engine_state.clone());
+        let completion_menu = Box::new(ColumnarMenu::default().with_name("completion_menu"));
+        let mut keybindings = default_emacs_keybindings();
+        keybindings.add_binding(
+            KeyModifiers::NONE,
+            KeyCode::Tab,
+            ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::Menu("completion_menu".to_owned()),
+                ReedlineEvent::MenuNext,
+            ]),
+        );
+        Reedline::create()
+            .with_highlighter(Box::new(AgentLabHighlighter::new(engine_state.clone())))
+            .with_completer(Box::new(AgentLabCompleter::new(&engine_state)))
+            .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+            .with_edit_mode(Box::new(Emacs::new(keybindings)))
+            .with_quick_completions(true)
     }
 
     fn eval_and_print(&mut self, source: &str) {
@@ -313,6 +395,179 @@ impl NushellHost {
     }
 }
 
+/// Nushell syntax colors without enabling Nushell's operating-system command
+/// execution path. Agent Lab deliberately treats unresolved commands as REPL
+/// errors instead of falling through to an ambient shell.
+struct AgentLabHighlighter {
+    engine_state: Arc<EngineState>,
+}
+
+impl AgentLabHighlighter {
+    fn new(engine_state: Arc<EngineState>) -> Self {
+        Self { engine_state }
+    }
+}
+
+impl Highlighter for AgentLabHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        let mut working_set = StateWorkingSet::new(&self.engine_state);
+        let block = nu_parser::parse(&mut working_set, None, line.as_bytes(), false);
+        let offset = self.engine_state.next_span_start();
+        let mut end = offset;
+        let mut styled = StyledText::new();
+
+        for (span, shape) in nu_parser::flatten_block(&working_set, &block) {
+            if span.start < offset || span.end <= end || span.end - offset > line.len() {
+                continue;
+            }
+            if span.start > end {
+                styled.push((
+                    Style::new(),
+                    line[(end - offset)..(span.start - offset)].to_owned(),
+                ));
+            }
+            styled.push((
+                style_for_shape(&shape),
+                line[(span.start - offset)..(span.end - offset)].to_owned(),
+            ));
+            end = span.end;
+        }
+
+        if end - offset < line.len() {
+            styled.push((Style::new(), line[(end - offset)..].to_owned()));
+        }
+        styled
+    }
+}
+
+fn style_for_shape(shape: &FlatShape) -> Style {
+    match shape {
+        FlatShape::InternalCall(_) => Style::new().fg(Color::Rgb(137, 180, 250)).bold(),
+        FlatShape::String | FlatShape::RawString | FlatShape::StringInterpolation => {
+            Style::new().fg(Color::Rgb(166, 227, 161))
+        }
+        FlatShape::Int | FlatShape::Float | FlatShape::Range => {
+            Style::new().fg(Color::Rgb(203, 166, 247))
+        }
+        FlatShape::Variable(_) | FlatShape::VarDecl(_) => {
+            Style::new().fg(Color::Rgb(249, 226, 175))
+        }
+        FlatShape::Operator | FlatShape::Pipe | FlatShape::Redirection => {
+            Style::new().fg(Color::Rgb(137, 220, 235)).bold()
+        }
+        FlatShape::Flag => Style::new().fg(Color::Rgb(148, 226, 213)),
+        FlatShape::Keyword | FlatShape::Bool | FlatShape::Nothing => {
+            Style::new().fg(Color::Rgb(245, 194, 231))
+        }
+        FlatShape::Garbage | FlatShape::External(_) | FlatShape::ExternalResolved => {
+            Style::new().fg(Color::Rgb(243, 139, 168)).bold()
+        }
+        _ => Style::new().fg(Color::Rgb(205, 214, 244)),
+    }
+}
+
+struct AgentLabCompleter {
+    commands: Vec<String>,
+}
+
+#[derive(Clone)]
+struct AgentLabExternalGuard;
+
+impl Command for AgentLabExternalGuard {
+    fn name(&self) -> &'static str {
+        "run-external"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Any, Type::Any)
+            .rest(
+                "command",
+                SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::Any]),
+                "command that was not resolved by the Agent Lab workspace",
+            )
+    }
+
+    fn description(&self) -> &'static str {
+        "Reports commands that are not available in this Agent Lab workspace"
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let command = call
+            .rest::<Value>(engine_state, stack, 0)?
+            .into_iter()
+            .filter_map(|value| value.coerce_str().ok().map(std::borrow::Cow::into_owned))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command = if command.is_empty() {
+            "that command".to_owned()
+        } else {
+            format!("`{command}`")
+        };
+        Err(ShellError::Generic(
+            GenericError::new(
+                "Unknown Agent Lab command",
+                format!("{command} is not available in this workspace"),
+                call.head,
+            )
+            .with_code("agent_lab::command::unknown")
+            .with_help("Press Tab to complete available commands, or use `help commands`."),
+        ))
+    }
+}
+
+impl AgentLabCompleter {
+    fn new(engine_state: &EngineState) -> Self {
+        let mut commands = engine_state
+            .get_decls_sorted(false)
+            .into_iter()
+            .filter_map(|(name, _)| String::from_utf8(name).ok())
+            .collect::<Vec<_>>();
+        let canonical_commands = commands.iter().cloned().collect::<HashSet<_>>();
+        commands.retain(|command| {
+            let is_mcp_namespace_root = command
+                .strip_prefix("mcp ")
+                .is_some_and(|suffix| !suffix.contains(' '));
+            !is_mcp_namespace_root || !canonical_commands.contains(&format!("{command} tools"))
+        });
+        Self { commands }
+    }
+}
+
+impl Completer for AgentLabCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        let before_cursor = &line[..pos.min(line.len())];
+        let segment_start = before_cursor.rfind('|').map_or(0, |index| index + 1);
+        let segment = &before_cursor[segment_start..];
+        let leading = segment.len() - segment.trim_start().len();
+        let mut replace_start = segment_start + leading;
+        let mut prefix = &before_cursor[replace_start..];
+
+        if let Some(help_target) = prefix.strip_prefix("help ") {
+            replace_start += "help ".len();
+            prefix = help_target;
+        }
+
+        self.commands
+            .iter()
+            .filter(|command| command.starts_with(prefix) && command.as_str() != prefix)
+            .map(|command| Suggestion {
+                value: command.clone(),
+                description: Some("Nushell command".to_owned()),
+                span: ReedlineSpan::new(replace_start, pos),
+                append_whitespace: true,
+                ..Suggestion::default()
+            })
+            .collect()
+    }
+}
+
 impl Default for NushellHost {
     fn default() -> Self {
         Self::new()
@@ -333,7 +588,7 @@ impl Command for McpToolCommand {
 
     fn signature(&self) -> Signature {
         Signature::build(&self.name)
-            .input_output_type(Type::Nothing, Type::Any)
+            .input_output_type(Type::Any, Type::Any)
             .optional(
                 "arguments",
                 SyntaxShape::Any,
@@ -350,9 +605,13 @@ impl Command for McpToolCommand {
         engine_state: &EngineState,
         stack: &mut Stack,
         call: &nu_protocol::engine::Call<'_>,
-        _input: PipelineData,
+        input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let arguments = call.opt::<Value>(engine_state, stack, 0)?;
+        let arguments = match call.opt::<Value>(engine_state, stack, 0)? {
+            Some(arguments) => Some(arguments),
+            None if matches!(input, PipelineData::Empty) => None,
+            None => Some(input.into_value(call.head)?),
+        };
         let arguments = nu_record_to_json(arguments, call.head)?;
         let result = self
             .bridge

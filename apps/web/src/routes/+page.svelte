@@ -9,6 +9,7 @@
   import type { TerminalSurface } from '$lib/terminal/surface';
 
   type Tab = 'agent' | 'workspace' | 'editor' | 'evidence';
+  type AgentView = 'review' | 'raw';
 
   const runClient = createRunClient();
   let terminalHost: HTMLDivElement;
@@ -26,6 +27,7 @@
   let selectedRun: RunDetail | undefined;
   let runEvents: RunEvent[] = [];
   let activeTab: Tab = 'agent';
+  let agentView: AgentView = 'review';
   let actionError = '';
   let preparing = false;
   let starting = false;
@@ -82,6 +84,7 @@
       selectedRun = detail;
       runEvents = detail.events;
       activeTab = 'agent';
+      agentView = 'review';
       watchRun(summary.id);
       await startTerminal(summary.id);
     } catch (error) {
@@ -107,6 +110,7 @@
       selectedRun = {
         summary,
         assembly: selectedRun.assembly,
+        review: selectedRun.review,
         events: runEvents,
         score: selectedRun?.score,
         output: selectedRun?.output
@@ -163,6 +167,7 @@
       selectedRun = detail;
       runEvents = detail.events;
       activeTab = 'agent';
+      agentView = 'review';
       if (detail.summary.status === 'starting' || detail.summary.status === 'running') watchRun(id);
       await startTerminal(id);
     } catch (error) {
@@ -193,6 +198,12 @@
 
   function eventLabel(type: string): string {
     return type.replaceAll('.', ' · ').replaceAll('-', ' ');
+  }
+
+  function duration(milliseconds: number | null): string {
+    if (milliseconds === null) return '—';
+    if (milliseconds < 1_000) return `${milliseconds}ms`;
+    return `${(milliseconds / 1_000).toFixed(milliseconds < 10_000 ? 1 : 0)}s`;
   }
 
   onMount(() => {
@@ -339,25 +350,65 @@
               </div>
             </section>
             <div class="activity-heading">
-              <span class="label">Activity</span>
-              <span>{runEvents.length} events</span>
+              <span class="label">{agentView === 'review' ? 'Run review' : 'Raw trace'}</span>
+              <div class="agent-view-toggle" aria-label="Agent run detail">
+                <button class:active={agentView === 'review'} on:click={() => (agentView = 'review')}>Review</button>
+                <button class:active={agentView === 'raw'} on:click={() => (agentView = 'raw')}>Raw trace</button>
+              </div>
             </div>
           {/if}
-          <ol class="run-events" aria-label="Agent run events">
-            {#each runEvents as event}
-              <li>
-                <span class="sequence">{String(event.sequence).padStart(2, '0')}</span>
-                <div>
-                  <strong>{eventLabel(event.type)}</strong>
-                  {#if event.payload !== null}
-                    <pre>{pretty(event.payload)}</pre>
-                  {/if}
+          {#if agentView === 'review'}
+            <section class="review" data-testid="run-review">
+              {#if selectedRun?.review.steps.length}
+                <dl class="review-metrics">
+                  <div><dt>Turns</dt><dd>{selectedRun.review.metrics.modelTurns}</dd></div>
+                  <div><dt>Capabilities</dt><dd>{selectedRun.review.metrics.capabilityCalls}</dd></div>
+                  <div><dt>Native actions</dt><dd>{selectedRun.review.metrics.nativeActions}</dd></div>
+                  <div><dt>Effects</dt><dd>{selectedRun.review.metrics.workspaceChanges}</dd></div>
+                  <div><dt>Duration</dt><dd>{duration(selectedRun.review.metrics.durationMs)}</dd></div>
+                </dl>
+                <ol class="review-steps" aria-label="Causal run review">
+                  {#each selectedRun.review.steps as step}
+                    <li data-kind={step.kind} data-status={step.status}>
+                      <span class="review-marker">{String(step.ordinal).padStart(2, '0')}</span>
+                      <div>
+                        <div class="review-step-heading">
+                          <strong>{step.title}</strong>
+                          <span>{step.kind.replaceAll('-', ' ')}</span>
+                        </div>
+                        {#if step.detail}<p>{step.detail}</p>{/if}
+                        <small>
+                          {step.source ? `source ${step.source} · ` : ''}{step.path ? `${step.path} · ` : ''}events {step.eventSequences.join(', ')}
+                        </small>
+                      </div>
+                    </li>
+                  {/each}
+                </ol>
+              {:else}
+                <div class="review-empty">
+                  <strong>Ready to investigate</strong>
+                  <p>Explore the assembly on the left, then run the harness to build a causal review.</p>
+                  <button on:click={() => (agentView = 'raw')}>Inspect preparation events</button>
                 </div>
-              </li>
-            {:else}
-              <li class="empty">Model, tool, and workspace activity will stream here.</li>
-            {/each}
-          </ol>
+              {/if}
+            </section>
+          {:else}
+            <ol class="run-events" aria-label="Agent run events">
+              {#each runEvents as event}
+                <li>
+                  <span class="sequence">{String(event.sequence).padStart(2, '0')}</span>
+                  <div>
+                    <strong>{eventLabel(event.type)}</strong>
+                    {#if event.payload !== null}
+                      <pre>{pretty(event.payload)}</pre>
+                    {/if}
+                  </div>
+                </li>
+              {:else}
+                <li class="empty">Model, tool, and workspace activity will stream here.</li>
+              {/each}
+            </ol>
+          {/if}
         {:else if activeTab === 'workspace'}
           <section class="artifact">
             <span class="label">result.json</span>
@@ -477,7 +528,31 @@
   .capabilities small, .capabilities em { color: #5f6f66; font-family: var(--font-mono); font-size: 0.56rem; font-style: normal; }
   .capabilities em { margin-left: auto; color: #78966c; }
   .capabilities .waiting { color: #617068; font-size: 0.65rem; }
-  .activity-heading { display: flex; justify-content: space-between; padding: 11px 17px 0; color: #596760; font-size: 0.6rem; }
+  .activity-heading { display: flex; align-items: center; justify-content: space-between; padding: 10px 17px 8px; color: #596760; font-size: 0.6rem; }
+  .agent-view-toggle { display: flex; gap: 2px; padding: 2px; border: 1px solid #26342e; border-radius: 6px; background: #0a100e; }
+  .agent-view-toggle button { padding: 4px 8px; border-radius: 4px; color: #65746c; font-size: 0.59rem; }
+  .agent-view-toggle button.active { color: #c3cec8; background: #18221e; }
+  .review { padding: 0 17px 20px; }
+  .review-metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); margin: 0 0 10px; overflow: hidden; border: 1px solid #24312c; border-radius: 7px; }
+  .review-metrics > div { display: grid; gap: 3px; min-width: 0; padding: 8px 9px; border-left: 1px solid #24312c; background: #0c1210; }
+  .review-metrics > div:first-child { border-left: 0; }
+  .review-metrics dt { overflow: hidden; color: #65736c; font-size: 0.53rem; font-weight: 650; letter-spacing: 0.07em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+  .review-metrics dd { margin: 0; color: #b7c2bc; font-family: var(--font-mono); font-size: 0.7rem; }
+  .review-steps { margin: 0; padding: 0; list-style: none; }
+  .review-steps li { position: relative; display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 8px; padding: 10px 0; }
+  .review-steps li:not(:last-child)::after { position: absolute; top: 29px; bottom: -5px; left: 12px; width: 1px; background: #293730; content: ''; }
+  .review-marker { z-index: 1; display: grid; place-items: center; align-self: start; width: 25px; height: 20px; border: 1px solid #34443c; border-radius: 999px; color: #75837b; background: #0d1311; font-family: var(--font-mono); font-size: 0.56rem; }
+  .review-steps li[data-status="passed"] .review-marker, .review-steps li[data-status="completed"] .review-marker { border-color: #405b4b; color: #96b783; }
+  .review-steps li[data-status="failed"] .review-marker { border-color: #6b3e42; color: #d5868b; }
+  .review-step-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .review-step-heading strong { color: #c2ccc7; font-size: 0.72rem; font-weight: 540; }
+  .review-step-heading span { color: #65746c; font-size: 0.54rem; letter-spacing: 0.06em; text-transform: uppercase; }
+  .review-steps p { margin: 4px 0; color: #84938b; font-size: 0.67rem; line-height: 1.45; }
+  .review-steps small { color: #536159; font-family: var(--font-mono); font-size: 0.54rem; }
+  .review-empty { margin-top: 2px; padding: 22px 15px; border: 1px dashed #2a3832; border-radius: 7px; color: #738179; }
+  .review-empty strong { color: #b9c4be; font-size: 0.76rem; font-weight: 540; }
+  .review-empty p { margin: 6px 0 12px; font-size: 0.67rem; line-height: 1.5; }
+  .review-empty button { padding: 6px 9px; border: 1px solid #324139; border-radius: 5px; color: #91aa9d; font-size: 0.62rem; }
   .run-events { margin: 0; padding: 8px 17px 20px; list-style: none; }
   .run-events li { display: grid; grid-template-columns: 27px minmax(0, 1fr); gap: 7px; padding: 11px 0; border-bottom: 1px solid #1d2924; content-visibility: auto; contain-intrinsic-block-size: 72px; }
   .run-events .sequence { color: #536159; font-family: var(--font-mono); font-size: 0.65rem; }
@@ -511,5 +586,7 @@
     input, select { width: 100%; min-width: 0; }
     .bench { min-height: 600px; }
     .terminal-frame { min-height: 460px; }
+    .review-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .review-metrics > div:nth-child(4) { border-left: 0; }
   }
 </style>

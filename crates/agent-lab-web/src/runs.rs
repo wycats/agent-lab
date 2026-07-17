@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::OsString,
     fs,
     io::Write,
@@ -128,6 +128,38 @@ pub struct RunEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RunReview {
+    pub version: u32,
+    pub status: RunStatus,
+    pub metrics: ReviewMetrics,
+    pub steps: Vec<ReviewStep>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewMetrics {
+    pub model_turns: u32,
+    pub capability_calls: u32,
+    pub native_actions: u32,
+    pub workspace_changes: u32,
+    pub duration_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewStep {
+    pub ordinal: u32,
+    pub kind: String,
+    pub title: String,
+    pub detail: Option<String>,
+    pub status: String,
+    pub event_sequences: Vec<u64>,
+    pub source: Option<String>,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AssemblySnapshot {
     pub question: String,
     pub scenario: AssemblyScenario,
@@ -178,6 +210,7 @@ pub struct CapabilityAssembly {
 pub struct RunDetail {
     pub summary: RunSummary,
     pub assembly: AssemblySnapshot,
+    pub review: RunReview,
     pub events: Vec<RunEvent>,
     pub score: Option<JsonValue>,
     pub output: Option<JsonValue>,
@@ -320,6 +353,14 @@ impl RunController {
         let summary = lock(&state.summary).clone();
         let events = lock(&state.events).clone();
         let score = read_optional_json(&state.bundle_dir.join("score.json"))?;
+        let review = if summary.status.is_finished() {
+            match read_optional_json(&state.bundle_dir.join("review.json"))? {
+                Some(value) => serde_json::from_value(value)?,
+                None => build_review(&summary, &events),
+            }
+        } else {
+            build_review(&summary, &events)
+        };
         let evidence_root =
             if summary.status.is_finished() && state.bundle_dir.join("final").is_dir() {
                 state.bundle_dir.join("final")
@@ -330,6 +371,7 @@ impl RunController {
         Ok(RunDetail {
             summary,
             assembly: lock(&state.assembly).clone(),
+            review,
             events,
             score,
             output,
@@ -789,7 +831,7 @@ fn run_driver(
                         event_type,
                         payload,
                         ..
-                    } => record_event(state, &event_type, payload)?,
+                    } => record_event(state, &event_type, redact_value(payload, &secret_values)?)?,
                     DriverBody::TurnFinished {
                         outcome: result,
                         evidence: result_evidence,
@@ -816,7 +858,10 @@ fn run_driver(
         ))?;
         let _ = driver.receive(DRIVER_START_TIMEOUT)?;
         let _ = driver.wait_for_exit(DRIVER_START_TIMEOUT)?;
-        write_json_atomic(&state.bundle_dir.join("evidence.json"), &evidence)?;
+        write_json_atomic(
+            &state.bundle_dir.join("evidence.json"),
+            &redact_value(evidence, &secret_values)?,
+        )?;
 
         if timed_out {
             let message = format!(
@@ -922,6 +967,7 @@ fn finish_run(state: &RunState, status: RunStatus, error: Option<&str>, score: &
         "run.finished",
         json!({ "status": status, "error": error, "score": score }),
     );
+    let _ = persist_review(state);
     let _ = persist_manifest(state);
     state.cancel.cancel();
 }
@@ -970,6 +1016,298 @@ fn persist_assembly(state: &RunState) -> Result<(), RunError> {
     )
 }
 
+fn persist_review(state: &RunState) -> Result<(), RunError> {
+    let summary = lock(&state.summary).clone();
+    let events = lock(&state.events).clone();
+    write_json_atomic(
+        &state.bundle_dir.join("review.json"),
+        &serde_json::to_value(build_review(&summary, &events))?,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
+    let mut review = RunReview {
+        version: 1,
+        status: summary.status,
+        metrics: ReviewMetrics {
+            duration_ms: summary
+                .finished_at_ms
+                .map(|finished| finished.saturating_sub(summary.started_at_ms)),
+            ..ReviewMetrics::default()
+        },
+        steps: Vec::new(),
+    };
+    let mut current_turn = None;
+    let mut pending_capabilities: HashMap<(String, String), u64> = HashMap::new();
+    let mut native_actions = HashSet::new();
+
+    for event in events {
+        match event.kind.as_str() {
+            "driver.ready" => {
+                let name = json_string(&event.payload, "name").unwrap_or("External driver");
+                let version = json_string(&event.payload, "version");
+                push_review_step(
+                    &mut review,
+                    "harness",
+                    "Harness ready".to_owned(),
+                    Some(match version {
+                        Some(version) => format!("{name} v{version}"),
+                        None => name.to_owned(),
+                    }),
+                    "completed",
+                    vec![event.sequence],
+                    None,
+                    None,
+                );
+            }
+            "v0.turn-start" => {
+                review.metrics.model_turns += 1;
+                let turn = review.metrics.model_turns;
+                push_review_step(
+                    &mut review,
+                    "model-turn",
+                    format!("Model turn {turn}"),
+                    None,
+                    "completed",
+                    vec![event.sequence],
+                    None,
+                    None,
+                );
+                current_turn = review.steps.len().checked_sub(1);
+            }
+            "v0.mdx" => {
+                if let (Some(index), Some(content)) =
+                    (current_turn, json_string(&event.payload, "content"))
+                {
+                    append_review_detail(&mut review.steps[index], content);
+                    review.steps[index].event_sequences.push(event.sequence);
+                }
+            }
+            "v0.turn-finish" => {
+                if let Some(index) = current_turn.take() {
+                    review.steps[index].event_sequences.push(event.sequence);
+                }
+            }
+            "mcp.tool.started" => {
+                if let Some(key) = capability_key(&event.payload) {
+                    pending_capabilities.insert(key, event.sequence);
+                }
+            }
+            "mcp.tool.completed" => {
+                if let Some((source, name)) = capability_key(&event.payload) {
+                    let mut sequences = Vec::new();
+                    if let Some(started) =
+                        pending_capabilities.remove(&(source.clone(), name.clone()))
+                    {
+                        sequences.push(started);
+                    }
+                    sequences.push(event.sequence);
+                    let failed = event.payload["isError"].as_bool() == Some(true);
+                    review.metrics.capability_calls += 1;
+                    push_review_step(
+                        &mut review,
+                        "capability",
+                        format!("{source} · {name}"),
+                        Some(if failed {
+                            "Capability returned an error".to_owned()
+                        } else {
+                            "Capability completed".to_owned()
+                        }),
+                        if failed { "failed" } else { "completed" },
+                        sequences,
+                        Some(source),
+                        None,
+                    );
+                }
+            }
+            "tool.call" => {
+                if let Some((source, name)) = capability_key(&event.payload) {
+                    review.metrics.capability_calls += 1;
+                    push_review_step(
+                        &mut review,
+                        "capability",
+                        format!("{source} · {name}"),
+                        Some("Capability completed".to_owned()),
+                        "completed",
+                        vec![event.sequence],
+                        Some(source),
+                        None,
+                    );
+                }
+            }
+            "workspace.finalized" => add_workspace_steps(&mut review, event),
+            "run.finished" => {
+                add_outcome_step(&mut review, event);
+                break;
+            }
+            kind if is_completed_native_action(kind, &event.payload) => {
+                let id = json_string(&event.payload, "id").unwrap_or(kind);
+                if native_actions.insert(id.to_owned()) {
+                    review.metrics.native_actions += 1;
+                    let title = json_string(&event.payload, "taskNameComplete")
+                        .unwrap_or("Native action completed")
+                        .to_owned();
+                    let path = native_action_path(&event.payload);
+                    push_review_step(
+                        &mut review,
+                        "native-action",
+                        title,
+                        Some("Harness-native tool completed".to_owned()),
+                        "completed",
+                        vec![event.sequence],
+                        None,
+                        path,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    for step in &mut review.steps {
+        if step.kind == "model-turn" {
+            normalize_review_detail(step);
+        }
+    }
+    review
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_review_step(
+    review: &mut RunReview,
+    kind: &str,
+    title: String,
+    detail: Option<String>,
+    status: &str,
+    event_sequences: Vec<u64>,
+    source: Option<String>,
+    path: Option<String>,
+) {
+    let ordinal = u32::try_from(review.steps.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    review.steps.push(ReviewStep {
+        ordinal,
+        kind: kind.to_owned(),
+        title,
+        detail,
+        status: status.to_owned(),
+        event_sequences,
+        source,
+        path,
+    });
+}
+
+fn append_review_detail(step: &mut ReviewStep, content: &str) {
+    let detail = step.detail.get_or_insert_with(String::new);
+    detail.push_str(content);
+}
+
+fn normalize_review_detail(step: &mut ReviewStep) {
+    if let Some(detail) = &mut step.detail {
+        let normalized = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+        *detail = normalized.chars().take(500).collect();
+        if detail.is_empty() {
+            step.detail = None;
+        }
+    }
+}
+
+fn json_string<'a>(value: &'a JsonValue, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(JsonValue::as_str)
+}
+
+fn capability_key(payload: &JsonValue) -> Option<(String, String)> {
+    Some((
+        json_string(payload, "source")?.to_owned(),
+        json_string(payload, "name")
+            .or_else(|| json_string(payload, "tool"))?
+            .to_owned(),
+    ))
+}
+
+fn is_completed_native_action(kind: &str, payload: &JsonValue) -> bool {
+    kind.starts_with("v0.task-")
+        && !kind.contains("dynamic-tool")
+        && !kind.contains("waiting")
+        && !kind.contains("programmatic-result")
+        && !kind.contains("finished-file-edits")
+        && payload
+            .get("finishedAt")
+            .is_some_and(|value| !value.is_null())
+}
+
+fn native_action_path(payload: &JsonValue) -> Option<String> {
+    json_string(payload, "filePath")
+        .map(str::to_owned)
+        .or_else(|| {
+            payload["parts"].as_array().and_then(|parts| {
+                parts
+                    .iter()
+                    .rev()
+                    .find_map(|part| json_string(part, "filePath").map(str::to_owned))
+            })
+        })
+}
+
+fn add_workspace_steps(review: &mut RunReview, event: &RunEvent) {
+    let Some(changes) = event.payload["changes"].as_array() else {
+        return;
+    };
+    for change in changes {
+        let Some(path) = json_string(change, "path") else {
+            continue;
+        };
+        let operation = json_string(change, "kind").unwrap_or("changed");
+        let title = match operation {
+            "created" => format!("Created {path}"),
+            "removed" => format!("Removed {path}"),
+            _ => format!("Updated {path}"),
+        };
+        review.metrics.workspace_changes += 1;
+        push_review_step(
+            review,
+            "workspace-effect",
+            title,
+            Some("Effect captured in the finalized workspace".to_owned()),
+            "completed",
+            vec![event.sequence],
+            None,
+            Some(path.to_owned()),
+        );
+    }
+}
+
+fn add_outcome_step(review: &mut RunReview, event: &RunEvent) {
+    let status = json_string(&event.payload, "status").unwrap_or("failed");
+    let title = match status {
+        "passed" => "Evaluation passed",
+        "cancelled" => "Run cancelled",
+        _ => "Evaluation failed",
+    };
+    let score = &event.payload["score"];
+    let detail = match (
+        score["activeNames"].as_array(),
+        score["totalScore"].as_i64(),
+    ) {
+        (Some(active), Some(total)) => Some(format!(
+            "{} active items · total score {total}",
+            active.len()
+        )),
+        _ => json_string(&event.payload, "error").map(str::to_owned),
+    };
+    push_review_step(
+        review,
+        "outcome",
+        title.to_owned(),
+        detail,
+        status,
+        vec![event.sequence],
+        None,
+        None,
+    );
+}
+
 fn initial_assembly(summary: &RunSummary, scenario: &ScenarioManifest) -> AssemblySnapshot {
     AssemblySnapshot {
         question: scenario.question.clone(),
@@ -994,6 +1332,49 @@ fn initial_assembly(summary: &RunSummary, scenario: &ScenarioManifest) -> Assemb
         capability_sources: Vec::new(),
         limits: scenario.limits.clone(),
     }
+}
+
+fn recover_legacy_assembly(
+    summary: &RunSummary,
+    scenario: &ScenarioManifest,
+    events: &[RunEvent],
+) -> AssemblySnapshot {
+    let mut assembly = initial_assembly(summary, scenario);
+    for event in events {
+        match event.kind.as_str() {
+            "driver.ready" if assembly.harness.driver.is_none() => {
+                assembly.harness.driver = serde_json::from_value(event.payload.clone()).ok();
+            }
+            "capability.source.started" => {
+                let Some(id) = json_string(&event.payload, "id") else {
+                    continue;
+                };
+                if assembly
+                    .capability_sources
+                    .iter()
+                    .any(|source| source.id == id)
+                {
+                    continue;
+                }
+                let revision = json_string(&event.payload, "revision")
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let protocol = match json_string(&event.payload, "transport") {
+                    Some("streamable-http") => "mcp-streamable-http",
+                    Some(transport) => transport,
+                    None => "mcp",
+                };
+                assembly.capability_sources.push(CapabilityAssembly {
+                    id: id.to_owned(),
+                    revision,
+                    protocol: protocol.to_owned(),
+                    projections: vec!["nushell".to_owned(), "agent-mcp".to_owned()],
+                });
+            }
+            _ => {}
+        }
+    }
+    assembly
 }
 
 fn update_assembly_capabilities(
@@ -1078,12 +1459,12 @@ fn load_runs(
         if !workspace.is_dir() {
             continue;
         }
+        let events = read_events(&bundle_dir.join("events.jsonl"))?;
         let assembly = if bundle_dir.join("assembly.json").is_file() {
             serde_json::from_slice(&fs::read(bundle_dir.join("assembly.json"))?)?
         } else {
-            initial_assembly(&summary, scenario)
+            recover_legacy_assembly(&summary, scenario, &events)
         };
-        let events = read_events(&bundle_dir.join("events.jsonl"))?;
         let interrupted = matches!(summary.status, RunStatus::Starting | RunStatus::Running);
         summary.event_count = events.len() as u64;
         let (sender, _) = broadcast::channel(256);
@@ -1118,7 +1499,11 @@ fn read_events(path: &Path) -> Result<Vec<RunEvent>, RunError> {
     source
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).map_err(RunError::from))
+        .map(|line| {
+            let mut event: RunEvent = serde_json::from_str(line)?;
+            redact_json(&mut event.payload);
+            Ok(event)
+        })
         .collect()
 }
 
@@ -1301,6 +1686,13 @@ fn redact_transcript(mut transcript: DriverTranscript, secrets: &[Vec<u8>]) -> D
     transcript
 }
 
+fn redact_value(mut value: JsonValue, secrets: &[Vec<u8>]) -> Result<JsonValue, RunError> {
+    redact_json(&mut value);
+    let mut bytes = serde_json::to_vec(&value)?;
+    replace_secrets(&mut bytes, secrets);
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 fn redact_json(value: &mut JsonValue) {
     match value {
         JsonValue::Object(object) => {
@@ -1413,6 +1805,15 @@ fn _assert_send_sync() {
 mod tests {
     use super::*;
 
+    fn event(sequence: u64, kind: &str, payload: JsonValue) -> RunEvent {
+        RunEvent {
+            sequence,
+            at_ms: u128::from(sequence),
+            kind: kind.to_owned(),
+            payload,
+        }
+    }
+
     fn temporary_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "agent-lab-{label}-{}-{}",
@@ -1519,7 +1920,7 @@ totalScore = 11
     }
 
     #[test]
-    fn completed_bundles_reopen_without_a_driver_or_capability_source() {
+    fn legacy_bundles_recover_their_assembly_from_events() {
         let root = temporary_root("replay");
         let scenarios = root.join("scenarios");
         let data = root.join("runs");
@@ -1551,40 +1952,47 @@ totalScore = 11
             event_count: 1,
             error: None,
         };
-        let scenario: ScenarioManifest =
-            toml::from_str(&fs::read_to_string(scenarios.join("catalog.toml")).unwrap()).unwrap();
-        let mut assembly = initial_assembly(&summary, &scenario);
-        assembly.harness.driver = Some(DriverDescriptor {
-            name: "fixture-driver".to_owned(),
-            version: "1.0.0".to_owned(),
-            revision: None,
-            features: vec!["streaming".to_owned()],
-        });
-        assembly.capability_sources.push(CapabilityAssembly {
-            id: "catalog".to_owned(),
-            revision: "catalog-v2".to_owned(),
-            protocol: "mcp-streamable-http".to_owned(),
-            projections: vec!["nushell".to_owned(), "agent-mcp".to_owned()],
-        });
         fs::write(
             bundle.join("manifest.json"),
             serde_json::to_vec(&summary).unwrap(),
         )
         .unwrap();
-        fs::write(
-            bundle.join("assembly.json"),
-            serde_json::to_vec(&assembly).unwrap(),
-        )
-        .unwrap();
-        let event = RunEvent {
-            sequence: 1,
-            at_ms: 2,
-            kind: "run.finished".to_owned(),
-            payload: json!({ "status": "passed" }),
-        };
+        let events = [
+            RunEvent {
+                sequence: 1,
+                at_ms: 1,
+                kind: "driver.ready".to_owned(),
+                payload: json!({
+                    "name": "fixture-driver",
+                    "version": "1.0.0",
+                    "features": ["streaming"]
+                }),
+            },
+            RunEvent {
+                sequence: 2,
+                at_ms: 1,
+                kind: "capability.source.started".to_owned(),
+                payload: json!({
+                    "id": "catalog",
+                    "revision": "catalog-v2",
+                    "transport": "streamable-http"
+                }),
+            },
+            RunEvent {
+                sequence: 3,
+                at_ms: 2,
+                kind: "run.finished".to_owned(),
+                payload: json!({ "status": "passed" }),
+            },
+        ];
         fs::write(
             bundle.join("events.jsonl"),
-            format!("{}\n", serde_json::to_string(&event).unwrap()),
+            events
+                .iter()
+                .map(|event| serde_json::to_string(event).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
         )
         .unwrap();
         fs::write(bundle.join("score.json"), br#"{"passed":true}"#).unwrap();
@@ -1597,7 +2005,7 @@ totalScore = 11
         .unwrap();
         let detail = controller.get("run-replay").unwrap();
         assert_eq!(detail.summary.status, RunStatus::Passed);
-        assert_eq!(detail.events.len(), 1);
+        assert_eq!(detail.events.len(), 3);
         assert_eq!(detail.output.unwrap()["totalScore"], 11);
         assert_eq!(detail.score.unwrap()["passed"], true);
         assert_eq!(
@@ -1605,6 +2013,10 @@ totalScore = 11
             "fixture-driver"
         );
         assert_eq!(detail.assembly.capability_sources[0].revision, "catalog-v2");
+        assert_eq!(
+            detail.assembly.capability_sources[0].protocol,
+            "mcp-streamable-http"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1672,8 +2084,123 @@ totalScore = 11
             .unwrap();
         assert_eq!(diff["changes"][0]["path"], "result.json");
         assert_eq!(diff["changes"][0]["kind"], "created");
+        finish_run(&state, RunStatus::Passed, None, &json!({ "passed": true }));
+        let review = read_optional_json(&root.join("review.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(review["version"], 1);
+        assert_eq!(review["steps"][0]["title"], "Created result.json");
+        assert_eq!(review["steps"][1]["title"], "Evaluation passed");
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn causal_review_projects_real_harness_activity_without_post_finish_duplicates() {
+        let summary = RunSummary {
+            id: "run-review".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "test/model".to_owned(),
+            status: RunStatus::Passed,
+            started_at_ms: 10,
+            finished_at_ms: Some(30),
+            event_count: 11,
+            error: None,
+        };
+        let events = vec![
+            event(
+                1,
+                "driver.ready",
+                json!({ "name": "v0-driver", "version": "1.0.0" }),
+            ),
+            event(2, "v0.turn-start", json!({})),
+            event(3, "v0.mdx", json!({ "content": "I will inspect " })),
+            event(4, "v0.mdx", json!({ "content": "the catalog." })),
+            event(5, "v0.turn-finish", json!({})),
+            event(
+                6,
+                "mcp.tool.started",
+                json!({ "source": "catalog", "name": "list" }),
+            ),
+            event(
+                7,
+                "mcp.tool.completed",
+                json!({ "source": "catalog", "name": "list", "isError": false }),
+            ),
+            event(
+                8,
+                "v0.task-write-file-v1",
+                json!({
+                    "id": "write-1",
+                    "taskNameComplete": "Wrote result file",
+                    "filePath": "result.json",
+                    "finishedAt": 20
+                }),
+            ),
+            event(
+                9,
+                "workspace.finalized",
+                json!({ "changes": [{ "path": "result.json", "kind": "created" }] }),
+            ),
+            event(
+                10,
+                "run.finished",
+                json!({
+                    "status": "passed",
+                    "score": { "activeNames": ["alpha", "gamma"], "totalScore": 11 }
+                }),
+            ),
+            event(
+                11,
+                "mcp.tool.completed",
+                json!({ "source": "catalog", "name": "list", "isError": false }),
+            ),
+        ];
+
+        let review = build_review(&summary, &events);
+        assert_eq!(review.version, 1);
+        assert_eq!(review.metrics.model_turns, 1);
+        assert_eq!(review.metrics.capability_calls, 1);
+        assert_eq!(review.metrics.native_actions, 1);
+        assert_eq!(review.metrics.workspace_changes, 1);
+        assert_eq!(review.metrics.duration_ms, Some(20));
+        assert_eq!(review.steps.len(), 6);
+        assert_eq!(review.steps[0].title, "Harness ready");
+        assert_eq!(
+            review.steps[1].detail.as_deref(),
+            Some("I will inspect the catalog.")
+        );
+        assert_eq!(review.steps[2].title, "catalog · list");
+        assert_eq!(review.steps[3].title, "Wrote result file");
+        assert_eq!(review.steps[4].title, "Created result.json");
+        assert_eq!(review.steps[5].title, "Evaluation passed");
+        assert_eq!(
+            review.steps[5].detail.as_deref(),
+            Some("2 active items · total score 11")
+        );
+    }
+
+    #[test]
+    fn native_event_redaction_removes_sensitive_fields_and_known_literals() {
+        let redacted = redact_value(
+            json!({
+                "transport": {
+                    "headers": { "Authorization": "Bearer mcp-secret" }
+                },
+                "note": "driver saw environment-secret"
+            }),
+            &[b"mcp-secret".to_vec(), b"environment-secret".to_vec()],
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert_eq!(
+            redacted["transport"]["headers"]["Authorization"],
+            "[REDACTED]"
+        );
+        assert!(!serialized.contains("mcp-secret"));
+        assert!(!serialized.contains("environment-secret"));
+        assert!(serialized.contains("[REDACTED]"));
     }
 
     #[test]

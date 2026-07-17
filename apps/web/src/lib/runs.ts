@@ -69,9 +69,32 @@ export interface RunEvent {
   payload: unknown;
 }
 
+export interface RunReview {
+  version: number;
+  status: RunStatus;
+  metrics: {
+    modelTurns: number;
+    capabilityCalls: number;
+    nativeActions: number;
+    workspaceChanges: number;
+    durationMs: number | null;
+  };
+  steps: Array<{
+    ordinal: number;
+    kind: string;
+    title: string;
+    detail: string | null;
+    status: string;
+    eventSequences: number[];
+    source: string | null;
+    path: string | null;
+  }>;
+}
+
 export interface RunDetail {
   summary: RunSummary;
   assembly: AssemblySnapshot;
+  review: RunReview;
   events: RunEvent[];
   score?: unknown;
   output?: unknown;

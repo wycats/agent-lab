@@ -57,6 +57,18 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await expect(page.locator('.run-status')).toHaveText('passed');
   await expect(assembly).toContainText('agent-lab-fixture');
   await expect(assembly).toContainText('fixture/model');
+  const review = page.getByTestId('run-review');
+  await expect(review).toContainText('Harness ready');
+  await expect(review).toContainText('catalog · list');
+  await expect(review).toContainText('analysis · summarize');
+  await expect(review).toContainText('Created result.json');
+  await expect(review).toContainText('Evaluation passed');
+  await expect(review).toContainText('2 active items · total score 11');
+  await page.getByRole('button', { name: 'Raw trace' }).click();
+  await expect(page.getByRole('list', { name: 'Agent run events' })).toContainText('run · finished');
+  await expect(page.getByRole('list', { name: 'Agent run events' })).toContainText('[REDACTED]');
+  await expect(page.getByRole('list', { name: 'Agent run events' })).not.toContainText('Bearer 000000');
+  await page.getByRole('button', { name: 'Review', exact: true }).click();
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
   await expect(screen).toContainText('MCP namespaces: analysis, catalog');
 
@@ -134,6 +146,8 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await historyRun.click();
   await expect(page.getByTestId('assembly')).toContainText('agent-lab-fixture');
   await expect(page.getByTestId('assembly')).toContainText('catalog-v2');
+  await expect(page.getByTestId('run-review')).toContainText('Evaluation passed');
+  await expect(page.getByTestId('run-review')).toContainText('Created result.json');
   await page.getByRole('button', { name: 'Evidence' }).click();
   await expect(page.locator('.artifact')).toContainText('"passed": true');
 });

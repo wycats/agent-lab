@@ -118,6 +118,9 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await expect(review).toContainText('Harness ready');
   await expect(review).toContainText('catalog · list');
   await expect(review).toContainText('analysis · summarize');
+  await expect(
+    review.locator('.review-metrics div').filter({ hasText: 'Capabilities' }).locator('dd')
+  ).toHaveText('2');
   await expect(review).toContainText('Created result.json');
   await expect(review).toContainText('Evaluation passed');
   await expect(review).toContainText('2 active items · total score 11');

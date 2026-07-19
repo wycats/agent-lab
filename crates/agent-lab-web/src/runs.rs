@@ -612,13 +612,19 @@ impl RunController {
             scenario
         };
         lock(&state.assembly).harness.model_id = Some(request.model_id);
-        persist_manifest(&state)?;
-        persist_assembly(&state)?;
-        record_event(
-            &state,
-            "run.status",
-            json!({ "status": RunStatus::Starting }),
-        )?;
+        let persist_start = (|| -> Result<(), RunError> {
+            persist_manifest(&state)?;
+            persist_assembly(&state)?;
+            record_event(
+                &state,
+                "run.status",
+                json!({ "status": RunStatus::Starting }),
+            )
+        })();
+        if let Err(error) = persist_start {
+            rollback_prepared_start(&state);
+            return Err(error);
+        }
         let summary = lock(&state.summary).clone();
         let driver = self.inner.driver.clone();
         tokio::task::spawn_blocking(move || {
@@ -654,6 +660,22 @@ impl RunController {
             .cloned()
             .ok_or_else(|| RunError::UnknownRun(id.to_owned()))
     }
+}
+
+fn rollback_prepared_start(state: &RunState) {
+    {
+        let mut summary = lock(&state.summary);
+        summary.status = RunStatus::Exploring;
+        summary.model_id.clear();
+    }
+    lock(&state.assembly).harness.model_id = None;
+    let _ = persist_manifest(state);
+    let _ = persist_assembly(state);
+    let _ = record_event(
+        state,
+        "run.status",
+        json!({ "status": RunStatus::Exploring, "reason": "start persistence failed" }),
+    );
 }
 
 fn validate_model_id(model_id: &str) -> Result<(), RunError> {
@@ -1107,7 +1129,11 @@ fn run_driver(
                             &turn_id,
                             "turn.event",
                         )?;
-                        record_event(state, &event_type, redact_value(payload, &secret_values))?;
+                        record_event(
+                            state,
+                            &driver_event_kind(&event_type),
+                            redact_value(payload, &secret_values),
+                        )?;
                     }
                     DriverBody::TurnFinished {
                         session_id: finished_session,
@@ -1249,6 +1275,18 @@ fn require_successful_driver_exit(exit_code: Option<i32>) -> Result<(), RunError
         Err(RunError::Protocol(format!(
             "driver exited unsuccessfully after session.close: {exit_code:?}"
         )))
+    }
+}
+
+fn driver_event_kind(event_type: &str) -> String {
+    const CONTROLLER_PREFIXES: &[&str] = &["controller.", "driver.", "mcp.", "run.", "workspace."];
+    if CONTROLLER_PREFIXES
+        .iter()
+        .any(|prefix| event_type.starts_with(prefix))
+    {
+        format!("driver.event.{event_type}")
+    } else {
+        event_type.to_owned()
     }
 }
 
@@ -1530,8 +1568,12 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
     let mut pending_capabilities: HashMap<(String, String), VecDeque<u64>> = HashMap::new();
     let mut native_actions = HashSet::new();
     let mut driver_turn_active = false;
+    let mut outcome_recorded = false;
 
     for event in events {
+        if outcome_recorded && event.kind != "run.persistence-failed" {
+            continue;
+        }
         match event.kind.as_str() {
             "driver.ready" => {
                 let name = json_string(&event.payload, "name").unwrap_or("External driver");
@@ -1674,9 +1716,10 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
                 }
             }
             "workspace.finalized" => add_workspace_steps(&mut review, event),
-            "run.finished" => {
+            "run.finished" | "run.persistence-failed" => {
+                review.steps.retain(|step| step.kind != "outcome");
                 add_outcome_step(&mut review, event);
-                break;
+                outcome_recorded = true;
             }
             kind if is_completed_native_action(kind, &event.payload) => {
                 let id = json_string(&event.payload, "id").unwrap_or(kind);
@@ -2195,6 +2238,9 @@ fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
             .collect::<Vec<_>>();
         let diff = json!({ "changes": changes });
         write_json_atomic(&state.bundle_dir.join("diff.json"), &diff)?;
+        // The workspace is part of the run bundle too. Keep it usable for an attached shell while
+        // applying the same redaction boundary as the immutable final snapshot.
+        redact_tree(&state.workspace, &secret_values)?;
         fs::rename(&staging_dir, final_dir)?;
         Ok(diff)
     })();
@@ -2885,6 +2931,23 @@ totalScore = 11
     }
 
     #[test]
+    fn driver_events_cannot_claim_controller_owned_kinds() {
+        assert_eq!(driver_event_kind("v0.mdx"), "v0.mdx");
+        for reserved in [
+            "run.finished",
+            "mcp.tool.completed",
+            "workspace.finalized",
+            "driver.ready",
+            "controller.limit-exceeded",
+        ] {
+            assert_eq!(
+                driver_event_kind(reserved),
+                format!("driver.event.{reserved}")
+            );
+        }
+    }
+
+    #[test]
     fn only_a_zero_driver_exit_is_successful() {
         assert!(require_successful_driver_exit(Some(0)).is_ok());
         assert!(require_successful_driver_exit(Some(17)).is_err());
@@ -3232,6 +3295,54 @@ totalScore = 11
             .await
             .unwrap();
         assert_ne!(replacement.id, prepared.id);
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_start_persistence_rolls_back_to_exploring() {
+        let root = temporary_root("start-rollback");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-must-not-start"),
+        })
+        .unwrap();
+        let prepared = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = controller.state(&prepared.id).unwrap();
+        fs::create_dir(state.bundle_dir.join("assembly.json.tmp")).unwrap();
+
+        controller
+            .start_prepared(
+                &prepared.id,
+                StartPreparedRunRequest {
+                    model_id: "test/model".to_owned(),
+                },
+            )
+            .unwrap_err();
+
+        let detail = controller.get(&prepared.id).unwrap();
+        assert_eq!(detail.summary.status, RunStatus::Exploring);
+        assert!(detail.summary.model_id.is_empty());
+        assert!(detail.assembly.harness.model_id.is_none());
+        let manifest: RunSummary =
+            serde_json::from_slice(&fs::read(state.bundle_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.status, RunStatus::Exploring);
+        assert!(manifest.model_id.is_empty());
+        assert!(!state.cancel.is_cancelled());
+        assert!(!lock(&state.capabilities).is_empty());
 
         drop(controller);
         fs::remove_dir_all(root).unwrap();
@@ -3769,6 +3880,9 @@ totalScore = 11
         let finalized = fs::read_to_string(root.join("final/result.json")).unwrap();
         assert!(!finalized.contains("workspace-secret"));
         assert!(!finalized.contains("environment-secret"));
+        let retained_workspace = fs::read_to_string(root.join("workspace/result.json")).unwrap();
+        assert!(!retained_workspace.contains("workspace-secret"));
+        assert!(!retained_workspace.contains("environment-secret"));
         assert!(
             !serde_json::to_string(&diff)
                 .unwrap()
@@ -3824,7 +3938,7 @@ totalScore = 11
     fn persistence_failures_mark_the_in_memory_run_failed() {
         let root = temporary_root("persistence-failure");
         fs::create_dir(root.join("initial")).unwrap();
-        fs::create_dir(root.join("score.json.tmp")).unwrap();
+        fs::create_dir(root.join("review.json.tmp")).unwrap();
         let state = test_run_state(&root);
 
         let error =
@@ -3838,8 +3952,20 @@ totalScore = 11
                 .error
                 .as_deref()
                 .unwrap()
-                .contains("score.json could not be written")
+                .contains("review.json could not be written")
         );
+        let score = read_optional_json(&root.join("score.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(score["passed"], false);
+        let review = build_review(&summary, &lock(&state.events));
+        let outcomes = review
+            .steps
+            .iter()
+            .filter(|step| step.kind == "outcome")
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].title, "Evaluation failed");
         assert!(state.cancel.is_cancelled());
 
         fs::remove_dir_all(root).unwrap();

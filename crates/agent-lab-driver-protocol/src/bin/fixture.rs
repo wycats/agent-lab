@@ -271,25 +271,6 @@ impl Fixture {
         turn_id: &str,
         capability_sources: &JsonValue,
     ) -> io::Result<()> {
-        self.emit(
-            output,
-            DriverBody::TurnEvent {
-                session_id: session_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                event_type: "tool.call".to_owned(),
-                payload: json!({ "source": "catalog", "tool": "list" }),
-            },
-        )?;
-        self.emit(
-            output,
-            DriverBody::TurnEvent {
-                session_id: session_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                event_type: "tool.call".to_owned(),
-                payload: json!({ "source": "analysis", "tool": "summarize" }),
-            },
-        )?;
-
         let result = call_catalog_capabilities(capability_sources)?;
 
         if let Some(workspace_root) = &self.workspace_root {

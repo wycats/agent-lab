@@ -24,8 +24,13 @@ pub(crate) fn json_to_nu(value: JsonValue, span: Span) -> Value {
     }
 }
 
-pub(crate) fn json_to_nu_tool_result(value: JsonValue, span: Span) -> Value {
-    if let JsonValue::Object(values) = &value
+pub(crate) fn json_to_nu_tool_result(
+    value: JsonValue,
+    span: Span,
+    project_single_collection: bool,
+) -> Value {
+    if project_single_collection
+        && let JsonValue::Object(values) = &value
         && values.len() == 1
         && let Some(JsonValue::Array(items)) = values.values().next()
     {
@@ -117,10 +122,11 @@ mod tests {
     }
 
     #[test]
-    fn sole_nested_collection_is_projected_as_a_table() {
+    fn explicitly_projected_sole_collection_becomes_a_table() {
         let value = json_to_nu_tool_result(
             json!({ "items": [{ "name": "alpha" }, { "name": "gamma" }] }),
             Span::unknown(),
+            true,
         );
 
         assert_eq!(value.into_list().unwrap().len(), 2);
@@ -131,6 +137,18 @@ mod tests {
         let value = json_to_nu_tool_result(
             json!({ "items": [{ "name": "alpha" }], "nextCursor": null }),
             Span::unknown(),
+            true,
+        );
+
+        assert!(value.into_record().is_ok());
+    }
+
+    #[test]
+    fn exact_result_envelopes_are_preserved_by_default() {
+        let value = json_to_nu_tool_result(
+            json!({ "items": [{ "name": "alpha" }] }),
+            Span::unknown(),
+            false,
         );
 
         assert!(value.into_record().is_ok());

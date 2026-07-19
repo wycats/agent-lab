@@ -3,6 +3,7 @@
 mod runs;
 
 use std::{
+    collections::VecDeque,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -23,7 +24,6 @@ use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, P
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -386,24 +386,36 @@ pub fn app_with_runs(
 }
 
 async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if authorized_runs(&state, &headers).is_none() {
+    if !run_request_is_authorized(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
     Json(state.config.models.clone()).into_response()
 }
 
 async fn list_scenarios(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(runs) = authorized_runs(&state, &headers) else {
+    if !run_request_is_authorized(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
-    };
-    Json(runs.scenarios()).into_response()
+    }
+    Json(
+        state
+            .runs
+            .as_ref()
+            .map_or_else(Vec::new, RunController::scenarios),
+    )
+    .into_response()
 }
 
 async fn list_runs(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(runs) = authorized_runs(&state, &headers) else {
+    if !run_request_is_authorized(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
-    };
-    Json(runs.list()).into_response()
+    }
+    Json(
+        state
+            .runs
+            .as_ref()
+            .map_or_else(Vec::new, RunController::list),
+    )
+    .into_response()
 }
 
 async fn start_run(
@@ -508,15 +520,7 @@ async fn run_events(
     let Ok((history, receiver)) = runs.subscribe(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let live_after_sequence = history.last().map_or(0, |event| event.sequence);
-    let history = futures_util::stream::iter(history);
-    let live = BroadcastStream::new(receiver).filter_map(move |event| async move {
-        event
-            .ok()
-            .filter(|event| event_is_after_history(event, live_after_sequence))
-    });
-    let stream = history
-        .chain(live)
+    let stream = run_event_stream(runs, id, history, receiver)
         .map(|event| {
             Event::default()
                 .id(event.sequence.to_string())
@@ -529,21 +533,55 @@ async fn run_events(
         .into_response()
 }
 
+fn run_event_stream(
+    runs: RunController,
+    id: String,
+    history: Vec<RunEvent>,
+    receiver: tokio::sync::broadcast::Receiver<RunEvent>,
+) -> impl futures_util::Stream<Item = RunEvent> {
+    futures_util::stream::unfold(
+        (VecDeque::from(history), receiver, runs, id, 0_u64),
+        |(mut pending, mut receiver, runs, id, mut last_sequence)| async move {
+            loop {
+                if let Some(event) = pending.pop_front() {
+                    if event_is_after_history(&event, last_sequence) {
+                        last_sequence = event.sequence;
+                        return Some((event, (pending, receiver, runs, id, last_sequence)));
+                    }
+                    continue;
+                }
+                match receiver.recv().await {
+                    Ok(event) => pending.push_back(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let Ok(events) = runs.events_after(&id, last_sequence) else {
+                            return None;
+                        };
+                        pending.extend(events);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
+}
+
 fn event_is_after_history(event: &RunEvent, live_after_sequence: u64) -> bool {
     event.sequence > live_after_sequence
 }
 
 fn authorized_runs(state: &AppState, headers: &HeaderMap) -> Option<RunController> {
+    run_request_is_authorized(state, headers)
+        .then(|| state.runs.clone())
+        .flatten()
+}
+
+fn run_request_is_authorized(state: &AppState, headers: &HeaderMap) -> bool {
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    if bearer != Some(state.config.token.as_str())
-        || !request_is_same_origin(headers, &state.config.origin, true)
-    {
-        return None;
-    }
-    state.runs.clone()
+    bearer == Some(state.config.token.as_str())
+        && request_is_same_origin(headers, &state.config.origin, true)
 }
 
 fn run_error_response(error: RunError) -> Response {
@@ -1008,6 +1046,49 @@ mod tests {
         };
         assert!(!event_is_after_history(&duplicate, 7));
         assert!(event_is_after_history(&next, 7));
+    }
+
+    #[tokio::test]
+    async fn fixture_only_app_metadata_routes_remain_bootable_without_runs() {
+        let config = ServerConfig {
+            assets: PathBuf::new(),
+            origin: "http://127.0.0.1:4100".to_owned(),
+            token: "process-secret".to_owned(),
+            models: Vec::new(),
+            shutdown: CancellationToken::new(),
+        };
+        let state = AppState {
+            config,
+            provider: Arc::new(FixtureSessionProvider::new("/fixture-shell", "/workspace")),
+            runs: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:4100"));
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("http://127.0.0.1:4100/"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer process-secret"),
+        );
+
+        assert_eq!(
+            list_models(State(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            list_scenarios(State(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            list_runs(State(state), headers).await.status(),
+            StatusCode::OK
+        );
     }
 
     #[test]

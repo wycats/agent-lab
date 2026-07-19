@@ -590,6 +590,11 @@ impl Command for McpToolCommand {
     fn signature(&self) -> Signature {
         Signature::build(&self.name)
             .input_output_type(Type::Any, Type::Any)
+            .switch(
+                "envelope",
+                "preserve the exact MCP structured result envelope",
+                None,
+            )
             .optional(
                 "arguments",
                 SyntaxShape::Any,
@@ -618,7 +623,9 @@ impl Command for McpToolCommand {
             .bridge
             .call_tool(self.tool.name.to_string(), arguments)
             .map_err(|error| shell_error("MCP request failed", error.to_string(), call.head))?;
-        tool_result_to_pipeline(result, call.head)
+        let project_single_collection = !call.has_flag(engine_state, stack, "envelope")?
+            && tool_projects_single_collection(&self.tool);
+        tool_result_to_pipeline(result, call.head, project_single_collection)
     }
 }
 
@@ -671,7 +678,11 @@ impl Command for ListToolsCommand {
     }
 }
 
-fn tool_result_to_pipeline(result: CallToolResult, span: Span) -> Result<PipelineData, ShellError> {
+fn tool_result_to_pipeline(
+    result: CallToolResult,
+    span: Span,
+    project_single_collection: bool,
+) -> Result<PipelineData, ShellError> {
     if result.is_error.unwrap_or(false) {
         let detail = result.structured_content.map_or_else(
             || format!("{:?}", result.content),
@@ -680,7 +691,7 @@ fn tool_result_to_pipeline(result: CallToolResult, span: Span) -> Result<Pipelin
         return Err(shell_error("MCP tool failed", detail, span));
     }
     let value = if let Some(value) = result.structured_content {
-        json_to_nu_tool_result(value, span)
+        json_to_nu_tool_result(value, span, project_single_collection)
     } else {
         let content = serde_json::to_value(result.content).map_err(|error| {
             shell_error("MCP result serialization failed", error.to_string(), span)
@@ -688,6 +699,14 @@ fn tool_result_to_pipeline(result: CallToolResult, span: Span) -> Result<Pipelin
         json_to_nu(content, span)
     };
     Ok(value.into_pipeline_data())
+}
+
+fn tool_projects_single_collection(tool: &Tool) -> bool {
+    tool.meta
+        .as_ref()
+        .and_then(|meta| meta.0.get("io.agent-lab/nushellProjection"))
+        .and_then(JsonValue::as_str)
+        == Some("soleCollection")
 }
 
 fn tool_arguments_to_json(

@@ -241,6 +241,7 @@ struct ControllerInner {
     data_dir: PathBuf,
     driver: DriverLaunch,
     runs: Mutex<HashMap<String, Arc<RunState>>>,
+    prepare_lock: tokio::sync::Mutex<()>,
 }
 
 impl Drop for ControllerInner {
@@ -272,6 +273,12 @@ struct RunState {
     capabilities: Mutex<Vec<CapabilityEndpoint>>,
     secret_values: Mutex<Vec<Vec<u8>>>,
     replay_failed: bool,
+}
+
+struct RunCompletion {
+    status: RunStatus,
+    error: Option<String>,
+    score: JsonValue,
 }
 
 impl Drop for RunState {
@@ -334,6 +341,7 @@ impl RunController {
                 data_dir,
                 driver: config.driver,
                 runs: Mutex::new(runs),
+                prepare_lock: tokio::sync::Mutex::new(()),
             }),
         })
     }
@@ -410,6 +418,20 @@ impl RunController {
         Ok((events.clone(), receiver))
     }
 
+    /// Re-read the durable event suffix after a streaming receiver reports lag.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run is unknown.
+    pub fn events_after(&self, id: &str, sequence: u64) -> Result<Vec<RunEvent>, RunError> {
+        let state = self.state(id)?;
+        Ok(lock(&state.events)
+            .iter()
+            .filter(|event| event.sequence > sequence)
+            .cloned()
+            .collect())
+    }
+
     /// Request cancellation for an active run.
     ///
     /// # Errors
@@ -470,6 +492,7 @@ impl RunController {
             .get(&request.scenario_id)
             .cloned()
             .ok_or_else(|| RunError::UnknownScenario(request.scenario_id.clone()))?;
+        let _prepare = self.inner.prepare_lock.lock().await;
         let existing = lock(&self.inner.runs)
             .values()
             .find(|state| {
@@ -869,17 +892,15 @@ fn run_driver(
     );
     lock(&state.secret_values).clone_from(&secret_values);
     let mut driver = DriverProcess::spawn_with(driver_launch)?;
-    let result = (|| -> Result<(), RunError> {
+    let result = (|| -> Result<RunCompletion, RunError> {
         let Some(ready) =
             receive_with_cancellation(&mut driver, DRIVER_READY_TIMEOUT, &state.cancel)?
         else {
-            finish_run(
-                state,
-                RunStatus::Cancelled,
-                None,
-                &json!({ "passed": false, "cancelled": true }),
-            );
-            return Ok(());
+            return Ok(RunCompletion {
+                status: RunStatus::Cancelled,
+                error: None,
+                score: json!({ "passed": false, "cancelled": true }),
+            });
         };
         let DriverBody::Ready { driver: descriptor } = ready.parsed.body else {
             return Err(RunError::Protocol("expected driver.ready".to_owned()));
@@ -1078,7 +1099,7 @@ fn run_driver(
                 ));
             }
         }
-        let _ = driver.wait_for_exit(DRIVER_RESPONSE_TIMEOUT)?;
+        require_successful_driver_exit(driver.wait_for_exit(DRIVER_RESPONSE_TIMEOUT)?)?;
         write_json_atomic(
             &state.bundle_dir.join("evidence.json"),
             &redact_value(evidence, &secret_values),
@@ -1089,45 +1110,70 @@ fn run_driver(
                 "scenario exceeded its {} ms execution limit",
                 scenario.limits.max_duration_ms
             );
-            let score = json!({ "passed": false, "timedOut": true });
-            finish_run(state, RunStatus::Failed, Some(&message), &score);
-            return Ok(());
+            return Ok(RunCompletion {
+                status: RunStatus::Failed,
+                error: Some(message),
+                score: json!({ "passed": false, "timedOut": true }),
+            });
         }
         if let Some(message) = limit_error {
-            let score = json!({ "passed": false, "limitExceeded": true });
-            finish_run(state, RunStatus::Failed, Some(&message), &score);
-            return Ok(());
+            return Ok(RunCompletion {
+                status: RunStatus::Failed,
+                error: Some(message),
+                score: json!({ "passed": false, "limitExceeded": true }),
+            });
         }
         if abort_sent || outcome.as_deref() == Some("aborted") {
-            let score = json!({ "passed": false, "cancelled": true });
-            finish_run(state, RunStatus::Cancelled, None, &score);
-            return Ok(());
+            return Ok(RunCompletion {
+                status: RunStatus::Cancelled,
+                error: None,
+                score: json!({ "passed": false, "cancelled": true }),
+            });
         }
         let score = score_catalog(state, scenario)?;
         let passed =
             score["passed"].as_bool() == Some(true) && outcome.as_deref() == Some("completed");
-        finish_run(
-            state,
-            if passed {
+        Ok(RunCompletion {
+            status: if passed {
                 RunStatus::Passed
             } else {
                 RunStatus::Failed
             },
-            None,
-            &score,
-        );
-        Ok(())
+            error: None,
+            score,
+        })
     })();
     let transcript = redact_transcript(driver.transcript(), &secret_values);
-    fs::write(
-        state.bundle_dir.join("driver.stderr.log"),
-        &transcript.driver_stderr,
-    )?;
-    let transcript = write_json_atomic(
-        &state.bundle_dir.join("driver.json"),
-        &serde_json::to_value(transcript)?,
+    let transcript_result = (|| -> Result<(), RunError> {
+        fs::write(
+            state.bundle_dir.join("driver.stderr.log"),
+            &transcript.driver_stderr,
+        )?;
+        write_json_atomic(
+            &state.bundle_dir.join("driver.json"),
+            &serde_json::to_value(transcript)?,
+        )
+    })();
+    drop(driver);
+    let completion = result?;
+    transcript_result?;
+    finish_run(
+        state,
+        completion.status,
+        completion.error.as_deref(),
+        &completion.score,
     );
-    result.and(transcript)
+    Ok(())
+}
+
+fn require_successful_driver_exit(exit_code: Option<i32>) -> Result<(), RunError> {
+    if exit_code == Some(0) {
+        Ok(())
+    } else {
+        Err(RunError::Protocol(format!(
+            "driver exited unsuccessfully after session.close: {exit_code:?}"
+        )))
+    }
 }
 
 fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonValue, RunError> {
@@ -2508,6 +2554,13 @@ totalScore = 11
     }
 
     #[test]
+    fn only_a_zero_driver_exit_is_successful() {
+        assert!(require_successful_driver_exit(Some(0)).is_ok());
+        assert!(require_successful_driver_exit(Some(17)).is_err());
+        assert!(require_successful_driver_exit(None).is_err());
+    }
+
+    #[test]
     fn configured_limits_count_only_activity_after_the_turn_starts() {
         let limits = ScenarioLimits {
             max_duration_ms: 1_000,
@@ -2768,6 +2821,32 @@ totalScore = 11
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn concurrent_prepare_calls_share_one_scenario_workspace() {
+        let root = temporary_root("concurrent-prepare");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-exploration"),
+        })
+        .unwrap();
+        let request = || PrepareRunRequest {
+            scenario_id: "catalog".to_owned(),
+        };
+        let (first, second) =
+            tokio::join!(controller.prepare(request()), controller.prepare(request()));
+        assert_eq!(first.unwrap().id, second.unwrap().id);
+        assert_eq!(lock(&controller.inner.runs).len(), 1);
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn interrupted_runs_discard_workspace_evidence_without_redaction_material() {
         let root = temporary_root("interrupted-redaction");
@@ -2872,6 +2951,51 @@ totalScore = 11
         let live = receiver.try_recv().unwrap();
         assert_eq!(live.kind, "test.after-subscribe");
         assert!(live.sequence > history.last().map_or(0, |event| event.sequence));
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lagged_subscriptions_replay_the_missing_durable_suffix() {
+        use futures_util::StreamExt;
+
+        let root = temporary_root("lagged-subscribe");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-exploration"),
+        })
+        .unwrap();
+        let prepared = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let (history, receiver) = controller.subscribe(&prepared.id).unwrap();
+        let state = controller.state(&prepared.id).unwrap();
+        for index in 0..300 {
+            record_event(&state, "test.lag", json!({ "index": index })).unwrap();
+        }
+        let expected = lock(&state.events).len();
+        let events =
+            crate::run_event_stream(controller.clone(), prepared.id.clone(), history, receiver)
+                .take(expected)
+                .collect::<Vec<_>>()
+                .await;
+        assert_eq!(events.len(), expected);
+        assert!(
+            events
+                .iter()
+                .enumerate()
+                .all(|(index, event)| event.sequence == index as u64 + 1)
+        );
 
         drop(controller);
         fs::remove_dir_all(root).unwrap();

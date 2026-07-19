@@ -34,12 +34,13 @@
   let actionError = '';
   let preparing = false;
   let starting = false;
+  let fixtureOnly = false;
 
   $: activeRun = selectedRun?.summary;
   $: running = activeRun?.status === 'starting' || activeRun?.status === 'running';
   $: finished = activeRun?.status === 'passed' || activeRun?.status === 'failed' || activeRun?.status === 'cancelled';
 
-  async function startTerminal(run: RunSummary): Promise<void> {
+  async function startTerminal(run?: RunSummary): Promise<void> {
     startupError = '';
     connectionState = 'starting';
     sessionEvents = [];
@@ -59,7 +60,7 @@
             screenText = text;
           }
         },
-        run.id
+        run?.id
       );
       terminalRun = run;
       surface.focus();
@@ -72,6 +73,7 @@
   async function load(): Promise<void> {
     try {
       [models, scenarios, runs] = await Promise.all([runClient.models(), runClient.scenarios(), runClient.runs()]);
+      fixtureOnly = scenarios.length === 0;
       scenarioId ||= scenarios[0]?.id ?? '';
     } catch (error) {
       actionError = message(error);
@@ -101,7 +103,11 @@
 
   async function initialize(): Promise<void> {
     await load();
-    await prepareScenario();
+    if (fixtureOnly) {
+      await startTerminal();
+    } else {
+      await prepareScenario();
+    }
   }
 
   async function beginRun(): Promise<void> {
@@ -277,37 +283,39 @@
       </div>
     </div>
 
-    <div class="run-controls">
-      <label>
-        <span>Scenario</span>
-        <select bind:value={scenarioId} aria-label="Scenario" disabled={preparing || running} on:change={() => void prepareScenario()}>
-          {#each scenarios as scenario}
-            <option value={scenario.id}>{scenario.title}</option>
-          {/each}
-        </select>
-      </label>
-      <label class="model-field">
-        <span>Model</span>
-        <select bind:value={modelId} aria-label="Model" disabled={preparing || running}>
-          <option value="" disabled>Choose a model</option>
-          {#each models as model}
-            <option value={model}>{model}</option>
-          {/each}
-        </select>
-      </label>
-      {#if finished}
-        <button class="primary" disabled={preparing} on:click={() => void prepareScenario()}>
-          {preparing ? 'Preparing…' : 'New workspace'}
-        </button>
-      {:else}
-        <button class="primary" disabled={activeRun?.status !== 'exploring' || !modelId.trim() || preparing || starting || running} on:click={() => void beginRun()}>
-          {starting ? 'Starting…' : 'Run'}
-        </button>
-      {/if}
-      {#if running}
-        <button class="quiet danger" on:click={() => void cancelRun()}>Cancel</button>
-      {/if}
-    </div>
+    {#if !fixtureOnly}
+      <div class="run-controls">
+        <label>
+          <span>Scenario</span>
+          <select bind:value={scenarioId} aria-label="Scenario" disabled={preparing || running} on:change={() => void prepareScenario()}>
+            {#each scenarios as scenario}
+              <option value={scenario.id}>{scenario.title}</option>
+            {/each}
+          </select>
+        </label>
+        <label class="model-field">
+          <span>Model</span>
+          <select bind:value={modelId} aria-label="Model" disabled={preparing || running}>
+            <option value="" disabled>Choose a model</option>
+            {#each models as model}
+              <option value={model}>{model}</option>
+            {/each}
+          </select>
+        </label>
+        {#if finished}
+          <button class="primary" disabled={preparing} on:click={() => void prepareScenario()}>
+            {preparing ? 'Preparing…' : 'New workspace'}
+          </button>
+        {:else}
+          <button class="primary" disabled={activeRun?.status !== 'exploring' || !modelId.trim() || preparing || starting || running} on:click={() => void beginRun()}>
+            {starting ? 'Starting…' : 'Run'}
+          </button>
+        {/if}
+        {#if running}
+          <button class="quiet danger" on:click={() => void cancelRun()}>Cancel</button>
+        {/if}
+      </div>
+    {/if}
 
     <div class="connection" data-state={connectionState} aria-live="polite">
       <span class="status-dot"></span>
@@ -324,7 +332,7 @@
       <div class="panel-heading">
         <div>
           <span class="label">Explore</span>
-          <span class="value">{terminalRun ? `${terminalRun.scenarioTitle} workspace` : 'Preparing workspace…'}</span>
+          <span class="value">{terminalRun ? `${terminalRun.scenarioTitle} workspace` : fixtureOnly ? 'Fixture shell' : 'Preparing workspace…'}</span>
         </div>
         <span class="transport">PTY · Ghostty</span>
       </div>
@@ -334,7 +342,7 @@
       </div>
       <footer class="terminal-footer">
         <span>{sessionEvents.find((event) => event.type === 'started')?.provider ?? 'waiting'}</span>
-        <span>{terminalRun ? `run ${shortId(terminalRun.id)}` : 'preparing'}</span>
+        <span>{terminalRun ? `run ${shortId(terminalRun.id)}` : fixtureOnly ? 'fixture' : 'preparing'}</span>
         <span>loopback only</span>
       </footer>
     </article>

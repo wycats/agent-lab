@@ -12,7 +12,10 @@ agent driver, execution host, or MCP sessions into one runtime.
 
 The catalog-to-file scenario provides two authenticated loopback MCP sources:
 `catalog` lists structured items and `analysis` summarizes a selected table.
-Nushell projects both as structured commands. The run controller gives an
+Nushell projects both as structured commands. The catalog tool explicitly
+declares its sole collection as table-first for direct pipelines, while
+`--envelope` preserves the exact MCP structured result for schema-sensitive
+inspection. The run controller gives an
 external driver a separate MCP session, a root-confined physical workspace,
 declared limits, and a prompt requiring a checked `result.json` artifact.
 

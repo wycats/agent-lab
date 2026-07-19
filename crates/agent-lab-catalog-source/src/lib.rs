@@ -3,8 +3,8 @@ use std::sync::Arc;
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, ListToolsResult, ServerCapabilities, ServerInfo,
-        Tool,
+        CallToolRequestParams, CallToolResult, ListToolsResult, Meta, ServerCapabilities,
+        ServerInfo, Tool,
     },
     service::RequestContext,
 };
@@ -39,11 +39,18 @@ impl ServerHandler for CatalogSource {
         _context: RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         self.record("mcp.tools.listed", json!({ "count": 1 }));
-        Ok(ListToolsResult::with_all_items(vec![tool(
-            "list",
-            "Return the controlled product catalog",
-            &json!({ "type": "object", "properties": {}, "additionalProperties": false }),
-        )]))
+        let projection = json!({ "io.agent-lab/nushellProjection": "soleCollection" })
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        Ok(ListToolsResult::with_all_items(vec![
+            tool(
+                "list",
+                "Return the controlled product catalog",
+                &json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            )
+            .with_meta(Meta(projection)),
+        ]))
     }
 
     async fn call_tool(

@@ -25,7 +25,8 @@ test('the browser preserves the visual Nushell and MCP steel thread', async ({ p
   await expect(screen).toContainText('Agent Lab visual shell');
   await expect(screen).toContainText('agent-lab>');
   await submit(page, '$env.PWD');
-  await expect(screen).toContainText('/agent-lab');
+  await submit(page, 'ls Cargo.toml | get name | path basename');
+  await expect(screen).toContainText('Cargo.toml');
   await submit(page, '$env.TERM');
   await expect(screen).toContainText('xterm-256color');
 

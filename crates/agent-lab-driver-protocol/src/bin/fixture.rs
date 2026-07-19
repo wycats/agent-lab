@@ -40,6 +40,7 @@ impl Fixture {
         &mut self,
         output: &mut impl Write,
         scope: DriverFailureScope,
+        session_id: Option<String>,
         turn_id: Option<String>,
         code: &str,
         message: &str,
@@ -48,7 +49,7 @@ impl Fixture {
             output,
             DriverBody::Failed {
                 scope,
-                session_id: self.session_id.clone(),
+                session_id,
                 turn_id,
                 code: code.to_owned(),
                 message: message.to_owned(),
@@ -88,6 +89,7 @@ impl Fixture {
             return self.fail(
                 output,
                 DriverFailureScope::Session,
+                self.session_id.clone(),
                 None,
                 "session-already-open",
                 "fixture supports one session",
@@ -115,7 +117,8 @@ impl Fixture {
             return self.fail(
                 output,
                 DriverFailureScope::Session,
-                Some(turn_id),
+                Some(session_id),
+                None,
                 "unknown-session",
                 "turn session does not match the open session",
             );
@@ -159,6 +162,7 @@ impl Fixture {
             Some("fail") => self.fail(
                 output,
                 DriverFailureScope::Turn,
+                Some(session_id),
                 Some(turn_id),
                 "fixture-failure",
                 "intentional fixture turn failure",
@@ -229,6 +233,7 @@ impl Fixture {
             return self.fail(
                 output,
                 DriverFailureScope::Turn,
+                Some(session_id),
                 Some(turn_id),
                 "turn-not-active",
                 "cannot abort an inactive turn",
@@ -261,6 +266,7 @@ impl Fixture {
             self.fail(
                 output,
                 DriverFailureScope::Session,
+                Some(session_id.to_owned()),
                 None,
                 "unknown-session",
                 "close session does not match the open session",
@@ -370,6 +376,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         },
     )?;
+    if std::env::var_os("AGENT_LAB_FIXTURE_EXIT_AFTER_READY").is_some() {
+        return Ok(());
+    }
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -380,6 +389,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fixture.fail(
                     &mut output,
                     DriverFailureScope::Protocol,
+                    None,
                     None,
                     "invalid-command",
                     &error.to_string(),
@@ -392,6 +402,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fixture.fail(
                 &mut output,
                 DriverFailureScope::Protocol,
+                None,
                 None,
                 "unsupported-version",
                 &format!("received {}", command.protocol_version),

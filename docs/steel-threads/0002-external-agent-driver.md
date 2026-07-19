@@ -199,7 +199,7 @@ test evidence::tests::finalization_does_not_replace_an_existing_empty_directory 
 
 test result: ok. 1 passed; 0 failed
 
-running 24 tests
+running 26 tests
 test clean_exit_closes_stdin_for_eof_driven_drivers ... ok
 test clean_exit_drains_queued_stdout_before_transcript_capture ... ok
 test clean_exit_drains_trailing_stderr_before_transcript_capture ... ok
@@ -212,6 +212,8 @@ test evidence_rejects_a_session_closed_with_an_unfinished_turn ... ok
 test evidence_rejects_invalid_failure_and_causal_identities ... ok
 test evidence_rejects_post_terminal_turn_and_session_activity ... ok
 test evidence_rejects_protocol_and_manifest_identity_mismatches ... ok
+test fast_driver_exit_preserves_its_final_valid_message ... ok
+test fixture_failures_use_scope_appropriate_identities ... ok
 test malformed_output_reported_failure_and_process_exit_are_distinct ... ok
 test one_process_streams_two_turns_and_cancels_the_second ... ok
 test oversized_driver_records_are_bounded_before_buffering ... ok
@@ -225,7 +227,7 @@ test receive_reports_a_crashed_driver_even_when_a_descendant_holds_stdout ... ok
 test total_driver_transcript_retention_is_bounded ... ok
 test unterminated_driver_records_are_rejected_before_parsing ... ok
 
-test result: ok. 24 passed; 0 failed
+test result: ok. 26 passed; 0 failed
 ```
 
 The focused strict-Clippy gate also passes:
@@ -246,8 +248,10 @@ distinct from output timeouts, and post-close records receive normal protocol
 validation. Oversized stdout frames, total driver transcript retention, and
 stderr fail at explicit bounds. Waiting closes the command pipe so EOF-driven
 drivers can exit, durable validation rejects activity after terminal lifecycle
-records and untrustworthy causal identities, and final publication uses an
-atomic no-replace rename.
+records and verifies causal links against the matching command identity,
+scope-specific fixture failures remain protocol-valid, and final publication
+uses an atomic no-replace rename. Valid output remains receivable when process
+exit races with the stdout reader.
 Two fixture processes produce different raw records because their PIDs differ, while the
 `fixture-v1` projection matches after removing the explicitly named
 `processId` field. The finalized directory

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -234,35 +234,153 @@ fn validate_bundle(bundle: &DriverEvidenceBundle) -> Result<(), EvidenceError> {
 }
 
 struct ControllerLifecycle {
-    message_ids: BTreeSet<String>,
+    commands: BTreeMap<String, CommandIdentity>,
     sessions: BTreeSet<String>,
     turns: BTreeSet<(String, String)>,
+}
+
+impl ControllerLifecycle {
+    fn retain_command(
+        &mut self,
+        record: &ControllerCommand,
+        record_number: usize,
+    ) -> Result<(), EvidenceError> {
+        if record.protocol_version != PROTOCOL_VERSION {
+            return Err(EvidenceError::InvalidBundle(format!(
+                "controller record {record_number} has protocol version {}; expected {PROTOCOL_VERSION}",
+                record.protocol_version
+            )));
+        }
+        if self
+            .commands
+            .insert(
+                record.message_id.clone(),
+                CommandIdentity::from_body(&record.body),
+            )
+            .is_some()
+        {
+            return Err(EvidenceError::InvalidBundle(format!(
+                "controller record {record_number} repeats message ID {}",
+                record.message_id
+            )));
+        }
+        Ok(())
+    }
+}
+
+enum CommandIdentity {
+    OpenSession { session_id: String },
+    StartTurn { session_id: String, turn_id: String },
+    AbortTurn { session_id: String, turn_id: String },
+    CloseSession { session_id: String },
+}
+
+impl CommandIdentity {
+    fn from_body(body: &CommandBody) -> Self {
+        match body {
+            CommandBody::OpenSession { session_id, .. } => Self::OpenSession {
+                session_id: session_id.clone(),
+            },
+            CommandBody::StartTurn {
+                session_id,
+                turn_id,
+                ..
+            } => Self::StartTurn {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+            },
+            CommandBody::AbortTurn {
+                session_id,
+                turn_id,
+                ..
+            } => Self::AbortTurn {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+            },
+            CommandBody::CloseSession { session_id } => Self::CloseSession {
+                session_id: session_id.clone(),
+            },
+        }
+    }
+
+    fn session_id(&self) -> &str {
+        match self {
+            Self::OpenSession { session_id }
+            | Self::StartTurn { session_id, .. }
+            | Self::AbortTurn { session_id, .. }
+            | Self::CloseSession { session_id } => session_id,
+        }
+    }
+
+    fn matches_turn(&self, expected_session: &str, expected_turn: &str) -> bool {
+        matches!(
+            self,
+            Self::StartTurn {
+                session_id,
+                turn_id,
+            } | Self::AbortTurn {
+                session_id,
+                turn_id,
+            } if session_id == expected_session && turn_id == expected_turn
+        )
+    }
+}
+
+fn command_causes_driver_body(command: &CommandIdentity, body: &DriverBody) -> bool {
+    match body {
+        DriverBody::Ready { .. } => false,
+        DriverBody::SessionOpened { session_id, .. } => matches!(
+            command,
+            CommandIdentity::OpenSession {
+                session_id: expected,
+            } if expected == session_id
+        ),
+        DriverBody::TurnEvent {
+            session_id,
+            turn_id,
+            ..
+        }
+        | DriverBody::TurnFinished {
+            session_id,
+            turn_id,
+            ..
+        } => command.matches_turn(session_id, turn_id),
+        DriverBody::SessionClosed { session_id } => matches!(
+            command,
+            CommandIdentity::CloseSession {
+                session_id: expected,
+            } if expected == session_id
+        ),
+        DriverBody::Failed {
+            scope,
+            session_id,
+            turn_id,
+            ..
+        } => match scope {
+            DriverFailureScope::Driver | DriverFailureScope::Protocol => true,
+            DriverFailureScope::Session => session_id
+                .as_deref()
+                .is_some_and(|session_id| command.session_id() == session_id),
+            DriverFailureScope::Turn => session_id.as_deref().is_some_and(|session_id| {
+                turn_id
+                    .as_deref()
+                    .is_some_and(|turn_id| command.matches_turn(session_id, turn_id))
+            }),
+        },
+    }
 }
 
 fn validate_controller_records(
     records: &[ControllerCommand],
 ) -> Result<ControllerLifecycle, EvidenceError> {
     let mut lifecycle = ControllerLifecycle {
-        message_ids: BTreeSet::new(),
+        commands: BTreeMap::new(),
         sessions: BTreeSet::new(),
         turns: BTreeSet::new(),
     };
     let mut closed_sessions = BTreeSet::new();
     for (index, record) in records.iter().enumerate() {
-        if record.protocol_version != PROTOCOL_VERSION {
-            return Err(EvidenceError::InvalidBundle(format!(
-                "controller record {} has protocol version {}; expected {PROTOCOL_VERSION}",
-                index + 1,
-                record.protocol_version
-            )));
-        }
-        if !lifecycle.message_ids.insert(record.message_id.clone()) {
-            return Err(EvidenceError::InvalidBundle(format!(
-                "controller record {} repeats message ID {}",
-                index + 1,
-                record.message_id
-            )));
-        }
+        lifecycle.retain_command(record, index + 1)?;
         match &record.body {
             CommandBody::OpenSession { session_id, .. } => {
                 if !lifecycle.sessions.insert(session_id.clone()) {
@@ -386,12 +504,17 @@ fn validate_driver_records(
                 record.sequence
             )));
         }
-        if let Some(caused_by) = &record.caused_by
-            && !lifecycle.message_ids.contains(caused_by)
-        {
-            return Err(EvidenceError::InvalidBundle(format!(
-                "driver record {record_number} references unknown controller message {caused_by}"
-            )));
+        if let Some(caused_by) = &record.caused_by {
+            let command = lifecycle.commands.get(caused_by).ok_or_else(|| {
+                EvidenceError::InvalidBundle(format!(
+                    "driver record {record_number} references unknown controller message {caused_by}"
+                ))
+            })?;
+            if !command_causes_driver_body(command, &record.body) {
+                return Err(EvidenceError::InvalidBundle(format!(
+                    "driver record {record_number} has a causal command that does not match its lifecycle identity"
+                )));
+            }
         }
         state.validate_body(bundle, lifecycle, record_number, &record.body)?;
     }

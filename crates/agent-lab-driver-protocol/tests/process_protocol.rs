@@ -186,6 +186,70 @@ fn clean_exit_closes_stdin_for_eof_driven_drivers() {
 }
 
 #[test]
+fn fast_driver_exit_preserves_its_final_valid_message() {
+    for _ in 0..4 {
+        let mut launch = DriverLaunch::new(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"));
+        launch
+            .env
+            .push(("AGENT_LAB_FIXTURE_EXIT_AFTER_READY".into(), "1".into()));
+        let mut driver = DriverProcess::spawn_with(launch).unwrap();
+        assert!(matches!(
+            driver.receive(TIMEOUT).unwrap().parsed.body,
+            DriverBody::Ready { .. }
+        ));
+        assert!(matches!(
+            driver.receive(TIMEOUT),
+            Err(ProcessError::UnexpectedExit { code: Some(0) })
+        ));
+    }
+}
+
+#[test]
+fn fixture_failures_use_scope_appropriate_identities() {
+    let mut driver = fixture();
+    open_session(&mut driver);
+
+    let mut unsupported = command(
+        "unsupported-command",
+        CommandBody::CloseSession {
+            session_id: "session-1".to_owned(),
+        },
+    );
+    unsupported.protocol_version += 1;
+    driver.send(&unsupported).unwrap();
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::Failed {
+            scope: DriverFailureScope::Protocol,
+            session_id: None,
+            turn_id: None,
+            ..
+        }
+    ));
+
+    driver
+        .send(&command(
+            "failed-turn",
+            CommandBody::StartTurn {
+                session_id: "session-1".to_owned(),
+                turn_id: "failed-turn".to_owned(),
+                task: json!({ "mode": "fail" }),
+                capability_sources: json!([]),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::Failed {
+            scope: DriverFailureScope::Turn,
+            session_id: Some(ref session_id),
+            turn_id: Some(ref turn_id),
+            ..
+        } if session_id == "session-1" && turn_id == "failed-turn"
+    ));
+}
+
+#[test]
 fn malformed_output_reported_failure_and_process_exit_are_distinct() {
     let mut malformed = fixture();
     open_session(&mut malformed);
@@ -655,6 +719,22 @@ fn evidence_rejects_invalid_failure_and_causal_identities() {
             bundle.driver.clone(),
             bundle.process_id,
             unknown_cause,
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
+
+    let mut mismatched_cause = bundle.transcript.clone();
+    let mut opened: DriverMessage =
+        serde_json::from_slice(&mismatched_cause.driver_records[1]).unwrap();
+    opened.caused_by = Some("close-evidence".to_owned());
+    mismatched_cause.driver_records[1] = driver_record(&opened);
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id,
+            mismatched_cause,
             bundle.canonical.policy.clone(),
         )
         .is_err()

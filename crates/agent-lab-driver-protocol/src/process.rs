@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     ffi::{OsStr, OsString},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -119,6 +120,7 @@ pub struct DriverProcess {
     stderr_reader: Option<thread::JoinHandle<Result<(), String>>>,
     sent: Vec<Vec<u8>>,
     received: Vec<Vec<u8>>,
+    pending_received: VecDeque<RawDriverMessage>,
     received_bytes: usize,
     last_sequence: u64,
     stdout_eof: bool,
@@ -231,6 +233,7 @@ impl DriverProcess {
             stderr_reader: Some(stderr_reader),
             sent: Vec::new(),
             received: Vec::new(),
+            pending_received: VecDeque::new(),
             received_bytes: 0,
             last_sequence: 0,
             stdout_eof: false,
@@ -293,6 +296,9 @@ impl DriverProcess {
     /// Returns distinct errors for timeout, reader failure, malformed output,
     /// protocol mismatch, sequence violation, and unexpected process exit.
     pub fn receive(&mut self, timeout: Duration) -> Result<RawDriverMessage, ProcessError> {
+        if let Some(message) = self.pending_received.pop_front() {
+            return Ok(message);
+        }
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = remaining_before(deadline, false)?;
@@ -326,9 +332,11 @@ impl DriverProcess {
                 .try_wait()
                 .map_err(|error| ProcessError::Read(error.to_string()))?
             {
-                self.finish_after_exit(deadline, false)?;
-                return Err(ProcessError::UnexpectedExit {
-                    code: status.code(),
+                self.finish_after_exit_for_receive(deadline)?;
+                return self.pending_received.pop_front().ok_or_else(|| {
+                    ProcessError::UnexpectedExit {
+                        code: status.code(),
+                    }
                 });
             }
         }
@@ -466,6 +474,55 @@ impl DriverProcess {
             Err(error) => Err(error),
             Ok(()) => joined,
         }
+    }
+
+    fn finish_after_exit_for_receive(&mut self, deadline: Instant) -> Result<(), ProcessError> {
+        // Output emitted before the process exited is still an ordinary
+        // receive result even when the child status becomes visible before the
+        // stdout reader enqueues it.
+        let _ = self.child.start_kill();
+        let pending = self.drain_stdout_for_receive_before(deadline);
+        self.wait_for_readers_before(deadline, false)?;
+        let joined = self.join_readers();
+        match pending {
+            Err(error) => Err(error),
+            Ok(()) => joined,
+        }
+    }
+
+    fn drain_stdout_for_receive_before(&mut self, deadline: Instant) -> Result<(), ProcessError> {
+        let mut pending = None;
+        while !self.stdout_eof {
+            let remaining = remaining_before(deadline, false)?;
+            match self.output.recv_timeout(remaining) {
+                Ok(ReaderItem::Line(raw)) => match self.accept_line(raw) {
+                    Ok(message) => self.pending_received.push_back(message),
+                    Err(error) => {
+                        pending.get_or_insert(error);
+                    }
+                },
+                Ok(ReaderItem::Error(error)) => {
+                    pending.get_or_insert(ProcessError::Read(error));
+                }
+                Ok(ReaderItem::OutputLimitExceeded) => {
+                    pending.get_or_insert(ProcessError::OutputLimitExceeded {
+                        limit: MAX_DRIVER_RECORD_BYTES,
+                    });
+                }
+                Ok(ReaderItem::StderrLimitExceeded) => {
+                    pending.get_or_insert(ProcessError::StderrLimitExceeded {
+                        limit: MAX_DRIVER_STDERR_BYTES,
+                    });
+                }
+                Ok(ReaderItem::Eof) => self.stdout_eof = true,
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err(ProcessError::Timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    pending.get_or_insert(ProcessError::ReaderStopped);
+                    break;
+                }
+            }
+        }
+        pending.map_or(Ok(()), Err)
     }
 
     fn drain_stdout_before(

@@ -399,7 +399,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        if fixture.handle(&mut output, command.body)? {
+        if fixture.handle(&mut output, command.body)?
+            && std::env::var_os("AGENT_LAB_FIXTURE_WAIT_FOR_STDIN_EOF_AFTER_CLOSE").is_none()
+        {
             break;
         }
     }

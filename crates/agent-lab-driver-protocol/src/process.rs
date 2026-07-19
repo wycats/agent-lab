@@ -111,7 +111,7 @@ impl DriverLaunch {
 
 pub struct DriverProcess {
     child: Box<dyn ChildWrapper>,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     output: mpsc::Receiver<ReaderItem>,
     reader_completion: mpsc::Receiver<ReaderCompletion>,
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -223,7 +223,7 @@ impl DriverProcess {
 
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             output,
             reader_completion,
             stderr,
@@ -274,9 +274,13 @@ impl DriverProcess {
     pub fn send(&mut self, command: &ControllerCommand) -> Result<(), ProcessError> {
         let mut raw = serde_json::to_vec(command)?;
         raw.push(b'\n');
-        self.stdin
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| ProcessError::Write("driver stdin is closed".to_owned()))?;
+        stdin
             .write_all(&raw)
-            .and_then(|()| self.stdin.flush())
+            .and_then(|()| stdin.flush())
             .map_err(|error| ProcessError::Write(error.to_string()))?;
         self.sent.push(raw);
         Ok(())
@@ -336,6 +340,9 @@ impl DriverProcess {
     ///
     /// Returns an error when polling the child fails or the deadline expires.
     pub fn wait_for_exit(&mut self, timeout: Duration) -> Result<Option<i32>, ProcessError> {
+        // A clean protocol close is the final command. Closing the pipe here
+        // lets drivers whose command loop terminates on EOF complete normally.
+        self.stdin.take();
         let deadline = Instant::now() + timeout;
         let mut pending = None;
         loop {

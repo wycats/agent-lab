@@ -10,8 +10,8 @@ use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 use crate::{
-    CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverMessage, DriverTranscript,
-    PROTOCOL_VERSION,
+    CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverFailureScope,
+    DriverMessage, DriverTranscript, PROTOCOL_VERSION,
 };
 
 pub const EVIDENCE_SCHEMA_VERSION: u32 = 1;
@@ -156,7 +156,7 @@ impl DriverEvidenceBundle {
                 &self.transcript.driver_stderr,
             )?;
             write_json(&staging.join("canonical.json"), &self.canonical)?;
-            fs::rename(&staging, target)?;
+            finalize_no_replace(&staging, target)?;
             Ok(())
         })();
 
@@ -234,6 +234,7 @@ fn validate_bundle(bundle: &DriverEvidenceBundle) -> Result<(), EvidenceError> {
 }
 
 struct ControllerLifecycle {
+    message_ids: BTreeSet<String>,
     sessions: BTreeSet<String>,
     turns: BTreeSet<(String, String)>,
 }
@@ -242,6 +243,7 @@ fn validate_controller_records(
     records: &[ControllerCommand],
 ) -> Result<ControllerLifecycle, EvidenceError> {
     let mut lifecycle = ControllerLifecycle {
+        message_ids: BTreeSet::new(),
         sessions: BTreeSet::new(),
         turns: BTreeSet::new(),
     };
@@ -252,6 +254,13 @@ fn validate_controller_records(
                 "controller record {} has protocol version {}; expected {PROTOCOL_VERSION}",
                 index + 1,
                 record.protocol_version
+            )));
+        }
+        if !lifecycle.message_ids.insert(record.message_id.clone()) {
+            return Err(EvidenceError::InvalidBundle(format!(
+                "controller record {} repeats message ID {}",
+                index + 1,
+                record.message_id
             )));
         }
         match &record.body {
@@ -295,6 +304,12 @@ fn validate_controller_records(
                 turn_id,
                 ..
             } => {
+                if closed_sessions.contains(session_id) {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "controller record {} aborts a turn after session {session_id} closed",
+                        index + 1
+                    )));
+                }
                 if !lifecycle
                     .turns
                     .contains(&(session_id.clone(), turn_id.clone()))
@@ -371,6 +386,13 @@ fn validate_driver_records(
                 record.sequence
             )));
         }
+        if let Some(caused_by) = &record.caused_by
+            && !lifecycle.message_ids.contains(caused_by)
+        {
+            return Err(EvidenceError::InvalidBundle(format!(
+                "driver record {record_number} references unknown controller message {caused_by}"
+            )));
+        }
         state.validate_body(bundle, lifecycle, record_number, &record.body)?;
     }
     state.finish(lifecycle, records)
@@ -436,36 +458,12 @@ impl DriverLifecycleState {
                 session_id,
                 turn_id,
                 ..
-            } => {
-                validate_open_turn_reference(
-                    lifecycle,
-                    &self.opened_sessions,
-                    record_number,
-                    session_id,
-                    turn_id,
-                )?;
-            }
+            } => self.validate_turn_event(lifecycle, record_number, session_id, turn_id)?,
             DriverBody::TurnFinished {
                 session_id,
                 turn_id,
                 ..
-            } => {
-                validate_open_turn_reference(
-                    lifecycle,
-                    &self.opened_sessions,
-                    record_number,
-                    session_id,
-                    turn_id,
-                )?;
-                if !self
-                    .finished_turns
-                    .insert((session_id.clone(), turn_id.clone()))
-                {
-                    return Err(EvidenceError::InvalidBundle(format!(
-                        "driver record {record_number} finishes duplicate turn {session_id}/{turn_id}"
-                    )));
-                }
-            }
+            } => self.validate_turn_finished(lifecycle, record_number, session_id, turn_id)?,
             DriverBody::SessionClosed { session_id } => {
                 if !self.opened_sessions.contains(session_id) {
                     return Err(EvidenceError::InvalidBundle(format!(
@@ -485,9 +483,113 @@ impl DriverLifecycleState {
                     )));
                 }
             }
-            DriverBody::Failed { .. } => {}
+            DriverBody::Failed {
+                scope,
+                session_id,
+                turn_id,
+                ..
+            } => self.validate_failure_identity(
+                lifecycle,
+                record_number,
+                *scope,
+                session_id.as_deref(),
+                turn_id.as_deref(),
+            )?,
         }
         Ok(())
+    }
+
+    fn validate_turn_event(
+        &self,
+        lifecycle: &ControllerLifecycle,
+        record_number: usize,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<(), EvidenceError> {
+        self.validate_turn_reference(lifecycle, record_number, session_id, turn_id)?;
+        if self
+            .finished_turns
+            .contains(&(session_id.to_owned(), turn_id.to_owned()))
+        {
+            Err(EvidenceError::InvalidBundle(format!(
+                "driver record {record_number} emits an event after turn {session_id}/{turn_id} finished"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_turn_finished(
+        &mut self,
+        lifecycle: &ControllerLifecycle,
+        record_number: usize,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<(), EvidenceError> {
+        self.validate_turn_reference(lifecycle, record_number, session_id, turn_id)?;
+        if self
+            .finished_turns
+            .insert((session_id.to_owned(), turn_id.to_owned()))
+        {
+            Ok(())
+        } else {
+            Err(EvidenceError::InvalidBundle(format!(
+                "driver record {record_number} finishes duplicate turn {session_id}/{turn_id}"
+            )))
+        }
+    }
+
+    fn validate_turn_reference(
+        &self,
+        lifecycle: &ControllerLifecycle,
+        record_number: usize,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<(), EvidenceError> {
+        validate_open_turn_reference(
+            lifecycle,
+            &self.opened_sessions,
+            &self.closed_sessions,
+            record_number,
+            session_id,
+            turn_id,
+        )
+    }
+
+    fn validate_failure_identity(
+        &self,
+        lifecycle: &ControllerLifecycle,
+        record_number: usize,
+        scope: DriverFailureScope,
+        session_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> Result<(), EvidenceError> {
+        let valid = match (scope, session_id, turn_id) {
+            (DriverFailureScope::Driver | DriverFailureScope::Protocol, None, None) => true,
+            (DriverFailureScope::Session, Some(session_id), None) => {
+                self.opened_sessions.contains(session_id)
+                    && !self.closed_sessions.contains(session_id)
+                    && lifecycle.sessions.contains(session_id)
+            }
+            (DriverFailureScope::Turn, Some(session_id), Some(turn_id)) => {
+                self.opened_sessions.contains(session_id)
+                    && !self.closed_sessions.contains(session_id)
+                    && lifecycle
+                        .turns
+                        .contains(&(session_id.to_owned(), turn_id.to_owned()))
+                    && !self
+                        .finished_turns
+                        .contains(&(session_id.to_owned(), turn_id.to_owned()))
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(EvidenceError::InvalidBundle(format!(
+                "driver record {record_number} has invalid {scope:?} failure identity session={session_id:?} turn={turn_id:?}"
+            )))
+        }
     }
 
     fn finish(
@@ -524,14 +626,68 @@ impl DriverLifecycleState {
     }
 }
 
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn finalize_no_replace(staging: &Path, target: &Path) -> Result<(), EvidenceError> {
+    use rustix::{
+        fs::{CWD, RenameFlags, renameat_with},
+        io::Errno,
+    };
+
+    match renameat_with(CWD, staging, CWD, target, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(Errno::EXIST) => Err(EvidenceError::AlreadyExists(target.to_path_buf())),
+        Err(error) => Err(EvidenceError::Io(error.into())),
+    }
+}
+
+#[cfg(windows)]
+fn finalize_no_replace(staging: &Path, target: &Path) -> Result<(), EvidenceError> {
+    match fs::rename(staging, target) {
+        Ok(()) => Ok(()),
+        Err(_) if target.exists() => Err(EvidenceError::AlreadyExists(target.to_path_buf())),
+        Err(error) => Err(EvidenceError::Io(error)),
+    }
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn finalize_no_replace(staging: &Path, target: &Path) -> Result<(), EvidenceError> {
+    let _ = staging;
+    Err(EvidenceError::Io(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "atomic no-replace evidence finalization is unsupported for {}",
+            target.display()
+        ),
+    )))
+}
+
 fn validate_open_turn_reference(
     lifecycle: &ControllerLifecycle,
     opened_sessions: &BTreeSet<String>,
+    closed_sessions: &BTreeSet<String>,
     record_number: usize,
     session_id: &str,
     turn_id: &str,
 ) -> Result<(), EvidenceError> {
     if opened_sessions.contains(session_id)
+        && !closed_sessions.contains(session_id)
         && lifecycle
             .turns
             .contains(&(session_id.to_owned(), turn_id.to_owned()))
@@ -609,4 +765,32 @@ fn read_records(path: &Path) -> Result<Vec<Vec<u8>>, EvidenceError> {
         .filter(|record| !record.is_empty())
         .map(<[u8]>::to_vec)
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalization_does_not_replace_an_existing_empty_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-lab-evidence-no-replace-{}-{}",
+            std::process::id(),
+            STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let staging = root.join("staging");
+        let target = root.join("target");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("payload"), b"staged").unwrap();
+        fs::create_dir(&target).unwrap();
+
+        assert!(matches!(
+            finalize_no_replace(&staging, &target),
+            Err(EvidenceError::AlreadyExists(path)) if path == target
+        ));
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        assert_eq!(fs::read(staging.join("payload")).unwrap(), b"staged");
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }

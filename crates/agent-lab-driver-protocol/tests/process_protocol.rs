@@ -153,6 +153,39 @@ fn one_process_streams_two_turns_and_cancels_the_second() {
 }
 
 #[test]
+fn clean_exit_closes_stdin_for_eof_driven_drivers() {
+    let mut launch = DriverLaunch::new(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"));
+    launch.env.push((
+        "AGENT_LAB_FIXTURE_WAIT_FOR_STDIN_EOF_AFTER_CLOSE".into(),
+        "1".into(),
+    ));
+    let mut driver = DriverProcess::spawn_with(launch).unwrap();
+    open_session(&mut driver);
+    driver
+        .send(&command(
+            "close-1",
+            CommandBody::CloseSession {
+                session_id: "session-1".to_owned(),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::SessionClosed { .. }
+    ));
+    assert_eq!(driver.wait_for_exit(TIMEOUT).unwrap(), Some(0));
+    assert!(matches!(
+        driver.send(&command(
+            "after-close",
+            CommandBody::CloseSession {
+                session_id: "session-1".to_owned(),
+            },
+        )),
+        Err(ProcessError::Write(ref message)) if message == "driver stdin is closed"
+    ));
+}
+
+#[test]
 fn malformed_output_reported_failure_and_process_exit_are_distinct() {
     let mut malformed = fixture();
     open_session(&mut malformed);
@@ -520,6 +553,131 @@ fn evidence_rejects_a_session_closed_with_an_unfinished_turn() {
 }
 
 #[test]
+fn evidence_rejects_post_terminal_turn_and_session_activity() {
+    let bundle = completed_fixture_bundle_with_turn();
+
+    let mut post_finish = bundle.transcript.clone();
+    let mut closed: DriverMessage =
+        serde_json::from_slice(post_finish.driver_records.last().unwrap()).unwrap();
+    closed.sequence += 1;
+    *post_finish.driver_records.last_mut().unwrap() = driver_record(&closed);
+    post_finish.driver_records.insert(
+        post_finish.driver_records.len() - 1,
+        driver_record(&DriverMessage {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: closed.sequence - 1,
+            caused_by: Some("turn-evidence".to_owned()),
+            body: DriverBody::TurnEvent {
+                session_id: "evidence-session".to_owned(),
+                turn_id: "turn-evidence".to_owned(),
+                event_type: "too-late".to_owned(),
+                payload: json!({}),
+            },
+        }),
+    );
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id,
+            post_finish,
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
+
+    let mut abort_after_close = bundle.transcript.clone();
+    abort_after_close
+        .controller_records
+        .push(controller_record(&command(
+            "abort-after-close",
+            CommandBody::AbortTurn {
+                session_id: "evidence-session".to_owned(),
+                turn_id: "turn-evidence".to_owned(),
+                reason: None,
+            },
+        )));
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id,
+            abort_after_close,
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn evidence_rejects_invalid_failure_and_causal_identities() {
+    let bundle = completed_fixture_bundle_with_turn();
+
+    let mut invalid_failure = bundle.transcript.clone();
+    let mut closed: DriverMessage =
+        serde_json::from_slice(invalid_failure.driver_records.last().unwrap()).unwrap();
+    closed.sequence += 1;
+    *invalid_failure.driver_records.last_mut().unwrap() = driver_record(&closed);
+    invalid_failure.driver_records.insert(
+        invalid_failure.driver_records.len() - 1,
+        driver_record(&DriverMessage {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: closed.sequence - 1,
+            caused_by: Some("turn-evidence".to_owned()),
+            body: DriverBody::Failed {
+                scope: DriverFailureScope::Turn,
+                session_id: Some("bogus-session".to_owned()),
+                turn_id: Some("bogus-turn".to_owned()),
+                code: "bogus".to_owned(),
+                message: "bogus identity".to_owned(),
+            },
+        }),
+    );
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id,
+            invalid_failure,
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
+
+    let mut unknown_cause = bundle.transcript.clone();
+    let mut opened: DriverMessage =
+        serde_json::from_slice(&unknown_cause.driver_records[1]).unwrap();
+    opened.caused_by = Some("unknown-command".to_owned());
+    unknown_cause.driver_records[1] = driver_record(&opened);
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id,
+            unknown_cause,
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
+
+    let mut duplicate_cause = bundle.transcript.clone();
+    let mut close: ControllerCommand =
+        serde_json::from_slice(duplicate_cause.controller_records.last().unwrap()).unwrap();
+    close.message_id = "open-evidence".to_owned();
+    *duplicate_cause.controller_records.last_mut().unwrap() = controller_record(&close);
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id,
+            duplicate_cause,
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn probe_can_finalize_fixture_evidence_for_direct_inspection() {
     let root = temporary_root("probe-evidence");
     let evidence = root.join("run-1");
@@ -829,6 +987,63 @@ fn completed_fixture_bundle() -> DriverEvidenceBundle {
         process.process_id(),
         process.transcript(),
         CanonicalizationPolicy::new("fixture-v1", ["processId"]),
+    )
+    .unwrap()
+}
+
+fn completed_fixture_bundle_with_turn() -> DriverEvidenceBundle {
+    let bundle = completed_fixture_bundle();
+    let mut transcript = bundle.transcript.clone();
+    transcript.controller_records.insert(
+        1,
+        controller_record(&command(
+            "turn-evidence",
+            CommandBody::StartTurn {
+                session_id: "evidence-session".to_owned(),
+                turn_id: "turn-evidence".to_owned(),
+                task: json!({}),
+                capability_sources: json!([]),
+            },
+        )),
+    );
+    let mut closed: DriverMessage =
+        serde_json::from_slice(transcript.driver_records.last().unwrap()).unwrap();
+    closed.sequence = 5;
+    *transcript.driver_records.last_mut().unwrap() = driver_record(&closed);
+    transcript.driver_records.insert(
+        2,
+        driver_record(&DriverMessage {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: 3,
+            caused_by: Some("turn-evidence".to_owned()),
+            body: DriverBody::TurnEvent {
+                session_id: "evidence-session".to_owned(),
+                turn_id: "turn-evidence".to_owned(),
+                event_type: "fixture.started".to_owned(),
+                payload: json!({}),
+            },
+        }),
+    );
+    transcript.driver_records.insert(
+        3,
+        driver_record(&DriverMessage {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: 4,
+            caused_by: Some("turn-evidence".to_owned()),
+            body: DriverBody::TurnFinished {
+                session_id: "evidence-session".to_owned(),
+                turn_id: "turn-evidence".to_owned(),
+                outcome: "completed".to_owned(),
+                evidence: json!({}),
+            },
+        }),
+    );
+    DriverEvidenceBundle::new(
+        bundle.controller_revision.clone(),
+        bundle.driver.clone(),
+        bundle.process_id,
+        transcript,
+        bundle.canonical.policy.clone(),
     )
     .unwrap()
 }

@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -1327,12 +1327,14 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
     let capability_evidence_complete = CATALOG_REQUIRED_SOURCES
         .iter()
         .all(|source| capability_sources_used.contains(*source));
+    let catalog_analysis_composed = catalog_analysis_composed(&lock(&state.events));
     Ok(json!({
         "passed": output.is_some()
             && schema_valid
             && names_match
             && score_matches
-            && capability_evidence_complete,
+            && capability_evidence_complete
+            && catalog_analysis_composed,
         "outputPresent": output.is_some(),
         "schemaValid": schema_valid,
         "activeNames": active_names,
@@ -1344,7 +1346,40 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
         "capabilitySourcesUsed": capability_sources_used,
         "expectedCapabilitySources": CATALOG_REQUIRED_SOURCES,
         "capabilityEvidenceComplete": capability_evidence_complete,
+        "catalogAnalysisComposed": catalog_analysis_composed,
     }))
+}
+
+fn catalog_analysis_composed(events: &[RunEvent]) -> bool {
+    let mut catalog_results = Vec::new();
+    for event in events {
+        let is_agent = event.payload["actor"].as_str() == Some("agent");
+        let source = event.payload["source"].as_str();
+        let name = event.payload["name"].as_str();
+        if event.kind == "mcp.tool.completed"
+            && is_agent
+            && source == Some("catalog")
+            && name == Some("list")
+            && event.payload["isError"].as_bool() != Some(true)
+        {
+            if let Some(items) = event.payload["result"]["items"].as_array() {
+                catalog_results.push(items.clone());
+            }
+        } else if event.kind == "mcp.tool.completed"
+            && is_agent
+            && source == Some("analysis")
+            && name == Some("summarize")
+            && event.payload["isError"].as_bool() != Some(true)
+        {
+            let Some(items) = event.payload["arguments"]["items"].as_array() else {
+                continue;
+            };
+            if catalog_results.iter().any(|result| result == items) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn catalog_output_schema_valid(output: &JsonValue) -> bool {
@@ -2124,7 +2159,7 @@ fn load_runs(
             secret_values: Mutex::new(Vec::new()),
             replay_failed,
         });
-        if interrupted {
+        if interrupted && !recover_finalized_run(&state)? {
             recover_interrupted_run(&state, malformed_event_log)?;
         }
         let id = lock(&state.summary).id.clone();
@@ -2133,20 +2168,74 @@ fn load_runs(
     Ok(runs)
 }
 
+fn recover_finalized_run(state: &RunState) -> Result<bool, RunError> {
+    let terminal_event = lock(&state.events)
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.kind.as_str(),
+                "run.finished" | "run.persistence-failed"
+            )
+        })
+        .cloned();
+    let Some(terminal_event) = terminal_event else {
+        return Ok(false);
+    };
+    let Ok(status) = serde_json::from_value::<RunStatus>(terminal_event.payload["status"].clone())
+    else {
+        return Ok(false);
+    };
+    if !status.is_finished() {
+        return Ok(false);
+    }
+    let final_dir = state.bundle_dir.join("final");
+    if validate_evidence_tree(&final_dir).is_err() {
+        return Ok(false);
+    }
+    let Ok(final_files) = snapshot_tree(&final_dir) else {
+        return Ok(false);
+    };
+    let Ok(workspace_files) = snapshot_tree(&state.workspace) else {
+        return Ok(false);
+    };
+    if final_files != workspace_files
+        || read_optional_json(&state.bundle_dir.join("diff.json"))
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        return Ok(false);
+    }
+    let Some(score) = terminal_event.payload.get("score").cloned() else {
+        return Ok(false);
+    };
+    write_json_atomic(&state.bundle_dir.join("score.json"), &score)?;
+    {
+        let mut summary = lock(&state.summary);
+        summary.status = status;
+        summary.finished_at_ms = Some(terminal_event.at_ms);
+        summary.error = terminal_event
+            .payload
+            .get("error")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned);
+    }
+    persist_review(state)?;
+    persist_manifest(state)?;
+    state.cancel.cancel();
+    Ok(true)
+}
+
 fn recover_interrupted_run(state: &RunState, reset_event_log: bool) -> Result<(), RunError> {
     for directory in [
         state.workspace.clone(),
         state.bundle_dir.join("final"),
         state.bundle_dir.join("final.tmp"),
     ] {
-        if directory.exists() {
-            fs::remove_dir_all(directory)?;
-        }
+        remove_evidence_entry(&directory)?;
     }
-    let diff = state.bundle_dir.join("diff.json");
-    if diff.exists() {
-        fs::remove_file(diff)?;
-    }
+    remove_evidence_entry(&state.bundle_dir.join("diff.json"))?;
     let score = json!({
         "passed": false,
         "cancelled": true,
@@ -2201,14 +2290,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
     let final_dir = state.bundle_dir.join("final");
-    if final_dir.exists() {
-        return Ok(read_optional_json(&state.bundle_dir.join("diff.json"))?
-            .unwrap_or_else(|| json!({ "changes": [] })));
-    }
+    // A driver can address paths outside its declared workspace. Rebuild the controller-owned
+    // snapshot every time instead of trusting anything already present at the sibling path.
+    remove_evidence_entry(&final_dir)?;
     let staging_dir = state.bundle_dir.join("final.tmp");
-    if staging_dir.exists() {
-        fs::remove_dir_all(&staging_dir)?;
-    }
+    remove_evidence_entry(&staging_dir)?;
     let result = (|| {
         validate_evidence_tree(&state.workspace)?;
         copy_tree(&state.workspace, &staging_dir)?;
@@ -2248,10 +2334,24 @@ fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
         fs::rename(&staging_dir, final_dir)?;
         Ok(diff)
     })();
-    if result.is_err() && staging_dir.exists() {
-        let _ = fs::remove_dir_all(staging_dir);
+    if result.is_err() {
+        let _ = remove_evidence_entry(&staging_dir);
     }
     result
+}
+
+fn remove_evidence_entry(path: &Path) -> Result<(), RunError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn redact_tree(root: &Path, secrets: &[Vec<u8>]) -> Result<(), RunError> {
@@ -3040,20 +3140,53 @@ totalScore = 11
         );
         assert_eq!(without_capability_evidence["passed"], false);
 
+        let catalog_items = json!([
+            { "name": "alpha", "active": true, "score": 3 },
+            { "name": "beta", "active": false, "score": 5 },
+            { "name": "gamma", "active": true, "score": 8 }
+        ]);
         lock(&state.events).extend([
             event(
                 1,
                 "mcp.tool.completed",
-                json!({ "source": "catalog", "actor": "agent", "isError": false }),
+                json!({
+                    "source": "catalog",
+                    "name": "list",
+                    "actor": "agent",
+                    "isError": false,
+                    "result": { "items": catalog_items.clone() },
+                }),
             ),
             event(
                 2,
                 "mcp.tool.completed",
-                json!({ "source": "analysis", "actor": "agent", "isError": false }),
+                json!({
+                    "source": "analysis",
+                    "name": "summarize",
+                    "actor": "agent",
+                    "isError": false,
+                    "arguments": { "items": [{ "name": "fabricated", "active": true, "score": 11 }] },
+                }),
             ),
         ]);
+        let fabricated = score_catalog(&state, &scenario).unwrap();
+        assert_eq!(fabricated["capabilityEvidenceComplete"], true);
+        assert_eq!(fabricated["catalogAnalysisComposed"], false);
+        assert_eq!(fabricated["passed"], false);
+
+        lock(&state.events).push(event(
+            3,
+            "mcp.tool.completed",
+            json!({
+                "source": "analysis",
+                "name": "summarize",
+                "actor": "agent",
+                "isError": false,
+                "arguments": { "items": catalog_items },
+            }),
+        ));
         let complete = score_catalog(&state, &scenario).unwrap();
-        assert_eq!(complete["capabilityEvidenceComplete"], true);
+        assert_eq!(complete["catalogAnalysisComposed"], true);
         assert_eq!(complete["passed"], true);
 
         fs::remove_dir_all(root).unwrap();
@@ -3486,6 +3619,82 @@ totalScore = 11
             RunStatus::Cancelled
         );
         drop(replayed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_manifest_recovers_an_already_finalized_run() {
+        let root = temporary_root("finalized-recovery");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let scenario = load_scenarios(&scenarios).unwrap()["catalog"].clone();
+        let bundle = data.join("run-finalized");
+        fs::create_dir_all(bundle.join("workspace")).unwrap();
+        fs::create_dir_all(bundle.join("initial")).unwrap();
+        fs::create_dir_all(bundle.join("final")).unwrap();
+        let output = br#"{"active":[],"activeCount":0,"totalScore":0}"#;
+        fs::write(bundle.join("workspace/result.json"), output).unwrap();
+        fs::write(bundle.join("final/result.json"), output).unwrap();
+        write_json_atomic(
+            &bundle.join("diff.json"),
+            &json!({ "changes": [{ "path": "result.json", "kind": "created" }] }),
+        )
+        .unwrap();
+        let summary = RunSummary {
+            id: "run-finalized".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "test/model".to_owned(),
+            status: RunStatus::Running,
+            started_at_ms: 1,
+            finished_at_ms: None,
+            event_count: 0,
+            error: None,
+        };
+        write_json_atomic(
+            &bundle.join("manifest.json"),
+            &serde_json::to_value(&summary).unwrap(),
+        )
+        .unwrap();
+        write_json_atomic(
+            &bundle.join("assembly.json"),
+            &serde_json::to_value(initial_assembly(&summary, &scenario)).unwrap(),
+        )
+        .unwrap();
+        let finished = event(
+            1,
+            "run.finished",
+            json!({ "status": RunStatus::Passed, "error": null, "score": { "passed": true } }),
+        );
+        fs::write(
+            bundle.join("events.jsonl"),
+            format!("{}\n", serde_json::to_string(&finished).unwrap()),
+        )
+        .unwrap();
+
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-replay"),
+        })
+        .unwrap();
+        let detail = controller.get("run-finalized").unwrap();
+        assert_eq!(detail.summary.status, RunStatus::Passed);
+        assert_eq!(detail.summary.finished_at_ms, Some(1));
+        assert_eq!(detail.score.unwrap()["passed"], true);
+        assert!(bundle.join("workspace/result.json").is_file());
+        assert!(bundle.join("final/result.json").is_file());
+        assert_eq!(
+            serde_json::from_slice::<RunSummary>(&fs::read(bundle.join("manifest.json")).unwrap())
+                .unwrap()
+                .status,
+            RunStatus::Passed
+        );
+
+        drop(controller);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4029,6 +4238,36 @@ totalScore = 11
         ));
         assert!(!root.join("final.tmp").exists());
         assert!(!root.join("final").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finalization_replaces_a_preexisting_driver_controlled_snapshot() {
+        let root = temporary_root("preexisting-final");
+        fs::create_dir(root.join("initial")).unwrap();
+        fs::create_dir(root.join("final")).unwrap();
+        fs::write(
+            root.join("final/result.json"),
+            br#"{"origin":"driver-controlled"}"#,
+        )
+        .unwrap();
+        fs::write(root.join("final/stale.txt"), b"stale").unwrap();
+        write_json_atomic(&root.join("diff.json"), &json!({ "changes": [] })).unwrap();
+        let state = test_run_state(&root);
+        fs::write(
+            state.workspace.join("result.json"),
+            br#"{"origin":"workspace"}"#,
+        )
+        .unwrap();
+
+        let diff = finalize_workspace(&state).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("final/result.json")).unwrap(),
+            r#"{"origin":"workspace"}"#
+        );
+        assert!(!root.join("final/stale.txt").exists());
+        assert_eq!(diff["changes"][0]["path"], "result.json");
 
         fs::remove_dir_all(root).unwrap();
     }

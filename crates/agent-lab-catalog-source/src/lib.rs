@@ -64,14 +64,13 @@ impl ServerHandler for CatalogSource {
             "mcp.tool.started",
             json!({ "name": name, "arguments": arguments }),
         );
+        let mut structured_result = None;
         let result = match name.as_str() {
-            "list" => Ok(CallToolResult::structured(json!({
-                "items": [
-                    { "name": "alpha", "active": true, "score": 3 },
-                    { "name": "beta", "active": false, "score": 5 },
-                    { "name": "gamma", "active": true, "score": 8 }
-                ]
-            }))),
+            "list" => {
+                let value = json!({ "items": catalog_items() });
+                structured_result = Some(value.clone());
+                Ok(CallToolResult::structured(value))
+            }
             name => Err(McpError::invalid_params(
                 format!("unknown catalog tool: {name}"),
                 None,
@@ -79,10 +78,18 @@ impl ServerHandler for CatalogSource {
         };
         self.record(
             "mcp.tool.completed",
-            json!({ "name": name, "isError": result.is_err() }),
+            json!({ "name": name, "isError": result.is_err(), "result": structured_result }),
         );
         result
     }
+}
+
+fn catalog_items() -> JsonValue {
+    json!([
+        { "name": "alpha", "active": true, "score": 3 },
+        { "name": "beta", "active": false, "score": 5 },
+        { "name": "gamma", "active": true, "score": 8 }
+    ])
 }
 
 #[derive(Clone)]
@@ -182,7 +189,7 @@ impl ServerHandler for AnalysisSource {
         };
         self.record(
             "mcp.tool.completed",
-            json!({ "name": name, "isError": result.is_err() }),
+            json!({ "name": name, "arguments": arguments, "isError": result.is_err() }),
         );
         result
     }

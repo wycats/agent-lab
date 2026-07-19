@@ -8,7 +8,19 @@ use agent_lab_driver_protocol::{
     CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverFailureScope,
     DriverMessage, MAX_DRIVER_RECORD_BYTES, MAX_DRIVER_STDERR_BYTES, PROTOCOL_VERSION,
 };
-use serde_json::{Value as JsonValue, json};
+use rmcp::{
+    ClientHandler, ServiceExt,
+    model::CallToolRequestParams,
+    transport::{
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    },
+};
+use serde_json::{Map, Value as JsonValue, json};
+
+#[derive(Clone)]
+struct FixtureMcpClient;
+
+impl ClientHandler for FixtureMcpClient {}
 
 struct Fixture {
     sequence: u64,
@@ -77,7 +89,7 @@ impl Fixture {
                 task,
                 capability_sources,
             } => {
-                self.start_turn(output, session_id, turn_id, &task, capability_sources)?;
+                self.start_turn(output, session_id, turn_id, &task, &capability_sources)?;
                 Ok(false)
             }
             CommandBody::AbortTurn {
@@ -128,7 +140,7 @@ impl Fixture {
         session_id: String,
         turn_id: String,
         task: &JsonValue,
-        capability_sources: JsonValue,
+        capability_sources: &JsonValue,
     ) -> io::Result<()> {
         if self.session_id.as_deref() != Some(&session_id) {
             return self.fail(
@@ -217,7 +229,7 @@ impl Fixture {
         session_id: String,
         turn_id: String,
         task: &JsonValue,
-        capability_sources: JsonValue,
+        capability_sources: &JsonValue,
     ) -> io::Result<()> {
         let scenario_mode = task.get("mode").and_then(JsonValue::as_str) == Some("real");
         self.emit(
@@ -235,11 +247,11 @@ impl Fixture {
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 event_type: "fixture.capabilities".to_owned(),
-                payload: capability_sources,
+                payload: (*capability_sources).clone(),
             },
         )?;
         if scenario_mode {
-            self.complete_catalog_scenario(output, &session_id, &turn_id)?;
+            self.complete_catalog_scenario(output, &session_id, &turn_id, capability_sources)?;
         }
         self.emit(
             output,
@@ -257,6 +269,7 @@ impl Fixture {
         output: &mut impl Write,
         session_id: &str,
         turn_id: &str,
+        capability_sources: &JsonValue,
     ) -> io::Result<()> {
         self.emit(
             output,
@@ -277,15 +290,9 @@ impl Fixture {
             },
         )?;
 
+        let result = call_catalog_capabilities(capability_sources)?;
+
         if let Some(workspace_root) = &self.workspace_root {
-            let result = json!({
-                "active": [
-                    { "name": "alpha", "active": true, "score": 3 },
-                    { "name": "gamma", "active": true, "score": 8 }
-                ],
-                "activeCount": 2,
-                "totalScore": 11
-            });
             fs::write(
                 workspace_root.join("result.json"),
                 serde_json::to_vec_pretty(&result).map_err(io::Error::other)?,
@@ -399,6 +406,78 @@ impl Fixture {
         }
         Ok(true)
     }
+}
+
+fn call_catalog_capabilities(capability_sources: &JsonValue) -> io::Result<JsonValue> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(io::Error::other)?;
+    runtime.block_on(async {
+        let catalog = call_capability(capability_sources, "catalog", "list", Map::new()).await?;
+        let items = catalog
+            .get("items")
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .ok_or_else(|| io::Error::other("catalog fixture result omitted items"))?;
+        call_capability(
+            capability_sources,
+            "analysis",
+            "summarize",
+            json!({ "items": items })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        )
+        .await
+    })
+}
+
+async fn call_capability(
+    capability_sources: &JsonValue,
+    source_id: &str,
+    tool: &str,
+    arguments: Map<String, JsonValue>,
+) -> io::Result<JsonValue> {
+    let source = capability_sources
+        .as_array()
+        .and_then(|sources| {
+            sources
+                .iter()
+                .find(|source| source.get("id").and_then(JsonValue::as_str) == Some(source_id))
+        })
+        .ok_or_else(|| io::Error::other(format!("fixture source is unavailable: {source_id}")))?;
+    let transport = source
+        .get("transport")
+        .ok_or_else(|| io::Error::other(format!("fixture source has no transport: {source_id}")))?;
+    let url = transport
+        .get("url")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| io::Error::other(format!("fixture source has no URL: {source_id}")))?;
+    let token = transport
+        .pointer("/headers/Authorization")
+        .and_then(JsonValue::as_str)
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| {
+            io::Error::other(format!("fixture source has no bearer token: {source_id}"))
+        })?;
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(url).auth_header(token),
+    );
+    let service = FixtureMcpClient
+        .serve(transport)
+        .await
+        .map_err(io::Error::other)?;
+    let result = service
+        .peer()
+        .call_tool(CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments))
+        .await
+        .map_err(io::Error::other)?;
+    let structured = result.structured_content.ok_or_else(|| {
+        io::Error::other(format!("fixture tool returned no structured data: {tool}"))
+    })?;
+    service.cancel().await.map_err(io::Error::other)?;
+    Ok(structured)
 }
 
 fn fixture_event(session_id: String, turn_id: String, event_type: &str) -> DriverBody {

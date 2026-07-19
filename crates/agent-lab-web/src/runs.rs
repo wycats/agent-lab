@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs,
-    io::Write,
+    io::{Read, Write},
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -36,6 +36,9 @@ const DRIVER_POLL: Duration = Duration::from_millis(250);
 // a development checkout, while subsequent protocol replies remain fast.
 const DRIVER_READY_TIMEOUT: Duration = Duration::from_mins(2);
 const DRIVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_EVIDENCE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_EVIDENCE_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const CATALOG_REQUIRED_SOURCES: &[&str] = &["catalog", "analysis"];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -444,6 +447,25 @@ impl RunController {
     /// Returns an error when the run is unknown.
     pub fn cancel(&self, id: &str) -> Result<(), RunError> {
         let state = self.state(id)?;
+        let cancel_prepared = {
+            let mut summary = lock(&state.summary);
+            if summary.status == RunStatus::Exploring {
+                // Claim the transition before releasing the lock so a concurrent start cannot
+                // attach a driver to a workspace that cancellation is finalizing.
+                summary.status = RunStatus::Cancelled;
+                true
+            } else {
+                false
+            }
+        };
+        if cancel_prepared {
+            return finish_run(
+                &state,
+                RunStatus::Cancelled,
+                None,
+                &json!({ "passed": false, "cancelled": true }),
+            );
+        }
         state.cancel.cancel();
         Ok(())
     }
@@ -846,10 +868,17 @@ fn execute_run(
     capabilities: &[CapabilityEndpoint],
 ) {
     if let Err(error) = run_driver(state, scenario, driver_launch, capabilities) {
-        let message = error.to_string();
+        if lock(&state.summary).status.is_finished() {
+            return;
+        }
+        let message = redacted_run_error(state, &error);
         let score = json!({ "passed": false });
-        finish_run(state, RunStatus::Failed, Some(&message), &score);
+        let _ = finish_run(state, RunStatus::Failed, Some(&message), &score);
     }
+}
+
+fn redacted_run_error(state: &RunState, error: &RunError) -> String {
+    redact_string(&error.to_string(), &lock(&state.secret_values).clone())
 }
 
 fn receive_with_cancellation(
@@ -1210,8 +1239,7 @@ fn run_driver(
         completion.status,
         completion.error.as_deref(),
         &completion.score,
-    );
-    Ok(())
+    )
 }
 
 fn require_successful_driver_exit(exit_code: Option<i32>) -> Result<(), RunError> {
@@ -1245,8 +1273,24 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
         .and_then(JsonValue::as_i64);
     let names_match = active_names == scenario.assertions.active_names;
     let score_matches = total_score == Some(scenario.assertions.total_score);
+    let capability_sources_used = lock(&state.events)
+        .iter()
+        .filter(|event| {
+            event.kind == "mcp.tool.completed"
+                && event.payload["actor"].as_str() == Some("agent")
+                && event.payload["isError"].as_bool() != Some(true)
+        })
+        .filter_map(|event| event.payload["source"].as_str().map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
+    let capability_evidence_complete = CATALOG_REQUIRED_SOURCES
+        .iter()
+        .all(|source| capability_sources_used.contains(*source));
     Ok(json!({
-        "passed": output.is_some() && schema_valid && names_match && score_matches,
+        "passed": output.is_some()
+            && schema_valid
+            && names_match
+            && score_matches
+            && capability_evidence_complete,
         "outputPresent": output.is_some(),
         "schemaValid": schema_valid,
         "activeNames": active_names,
@@ -1255,6 +1299,9 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
         "totalScore": total_score,
         "expectedTotalScore": scenario.assertions.total_score,
         "scoreMatches": score_matches,
+        "capabilitySourcesUsed": capability_sources_used,
+        "expectedCapabilitySources": CATALOG_REQUIRED_SOURCES,
+        "capabilityEvidenceComplete": capability_evidence_complete,
     }))
 }
 
@@ -1303,13 +1350,23 @@ fn catalog_output_schema_valid(output: &JsonValue) -> bool {
     score_sum == total_score
 }
 
-fn finish_run(state: &RunState, status: RunStatus, error: Option<&str>, score: &JsonValue) {
+fn finish_run(
+    state: &RunState,
+    status: RunStatus,
+    error: Option<&str>,
+    score: &JsonValue,
+) -> Result<(), RunError> {
     let mut status = status;
     let mut error = error.map(str::to_owned);
     let mut score = score.clone();
+    let mut persistence_errors = Vec::new();
     match finalize_workspace(state) {
         Ok(diff) => {
-            let _ = record_event(state, "workspace.finalized", diff);
+            if let Err(event_error) = record_event(state, "workspace.finalized", diff) {
+                persistence_errors.push(format!(
+                    "workspace.finalized event could not be written: {event_error}"
+                ));
+            }
         }
         Err(finalization_error) => {
             status = RunStatus::Failed;
@@ -1321,24 +1378,83 @@ fn finish_run(state: &RunState, status: RunStatus, error: Option<&str>, score: &
             }
         }
     }
-    let _ = write_json_atomic(&state.bundle_dir.join("score.json"), &score);
+    if let Err(score_error) = write_json_atomic(&state.bundle_dir.join("score.json"), &score) {
+        persistence_errors.push(format!("score.json could not be written: {score_error}"));
+    }
+    apply_persistence_failure(&mut status, &mut error, &mut score, &persistence_errors);
     {
         let mut summary = lock(&state.summary);
         summary.status = status;
         summary.finished_at_ms = Some(now_ms());
         summary.error.clone_from(&error);
     }
-    let _ = record_event(
+    if let Err(event_error) = record_event(
         state,
         "run.finished",
         json!({ "status": status, "error": error, "score": score }),
-    );
-    let _ = persist_review(state);
-    let _ = persist_manifest(state);
+    ) {
+        persistence_errors.push(format!(
+            "run.finished event could not be written: {event_error}"
+        ));
+    }
+    if let Err(review_error) = persist_review(state) {
+        persistence_errors.push(format!("review.json could not be written: {review_error}"));
+    }
+    if let Err(manifest_error) = persist_manifest(state) {
+        persistence_errors.push(format!(
+            "manifest.json could not be written: {manifest_error}"
+        ));
+    }
+
+    if !persistence_errors.is_empty() {
+        apply_persistence_failure(&mut status, &mut error, &mut score, &persistence_errors);
+        {
+            let mut summary = lock(&state.summary);
+            summary.status = status;
+            summary.finished_at_ms = Some(now_ms());
+            summary.error.clone_from(&error);
+        }
+        // These corrective writes are best-effort because the original storage failure may still
+        // be active. The in-memory state and returned error remain authoritative either way.
+        let _ = write_json_atomic(&state.bundle_dir.join("score.json"), &score);
+        let _ = record_event(
+            state,
+            "run.persistence-failed",
+            json!({ "status": status, "error": error, "score": score }),
+        );
+        let _ = persist_review(state);
+        let _ = persist_manifest(state);
+    }
     for capability in lock(&state.capabilities).drain(..) {
         capability.cancel.cancel();
     }
     state.cancel.cancel();
+    if persistence_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(RunError::EvidencePersistence(persistence_errors.join("; ")))
+    }
+}
+
+fn apply_persistence_failure(
+    status: &mut RunStatus,
+    error: &mut Option<String>,
+    score: &mut JsonValue,
+    persistence_errors: &[String],
+) {
+    if persistence_errors.is_empty() {
+        return;
+    }
+    *status = RunStatus::Failed;
+    let message = format!(
+        "failed to persist run evidence: {}",
+        persistence_errors.join("; ")
+    );
+    *error = Some(message.clone());
+    if let Some(score) = score.as_object_mut() {
+        score.insert("passed".to_owned(), JsonValue::Bool(false));
+        score.insert("persistenceError".to_owned(), JsonValue::String(message));
+    }
 }
 
 fn update_status(state: &RunState, status: RunStatus) -> Result<(), RunError> {
@@ -2047,6 +2163,7 @@ fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
         fs::remove_dir_all(&staging_dir)?;
     }
     let result = (|| {
+        validate_evidence_tree(&state.workspace)?;
         copy_tree(&state.workspace, &staging_dir)?;
         let secret_values = lock(&state.secret_values).clone();
         redact_tree(&staging_dir, &secret_values)?;
@@ -2088,24 +2205,31 @@ fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
 }
 
 fn redact_tree(root: &Path, secrets: &[Vec<u8>]) -> Result<(), RunError> {
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            return Err(RunError::PathEscape(entry.path()));
-        }
-        if file_type.is_dir() {
-            redact_tree(&entry.path(), secrets)?;
-        } else if file_type.is_file() {
-            reject_multiply_linked_file(&entry.path(), &entry.metadata()?)?;
-            let original = fs::read(entry.path())?;
-            let redacted = redact_evidence_bytes(&original, secrets);
-            if redacted != original {
-                fs::write(entry.path(), redacted)?;
+    fn visit(
+        directory: &Path,
+        secrets: &[Vec<u8>],
+        retained_bytes: &mut u64,
+    ) -> Result<(), RunError> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(RunError::PathEscape(entry.path()));
+            }
+            if file_type.is_dir() {
+                visit(&entry.path(), secrets, retained_bytes)?;
+            } else if file_type.is_file() {
+                let original = read_evidence_file(&entry.path(), retained_bytes)?;
+                let redacted = redact_evidence_bytes(&original, secrets);
+                if redacted != original {
+                    fs::write(entry.path(), redacted)?;
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
+
+    visit(root, secrets, &mut 0)
 }
 
 fn redacted_evidence_text(bytes: &[u8], secrets: &[Vec<u8>]) -> Option<String> {
@@ -2132,6 +2256,7 @@ fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, RunError> {
         root: &Path,
         directory: &Path,
         files: &mut BTreeMap<String, Vec<u8>>,
+        retained_bytes: &mut u64,
     ) -> Result<(), RunError> {
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
@@ -2140,24 +2265,89 @@ fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, RunError> {
                 return Err(RunError::PathEscape(entry.path()));
             }
             if file_type.is_dir() {
-                visit(root, &entry.path(), files)?;
+                visit(root, &entry.path(), files, retained_bytes)?;
             } else if file_type.is_file() {
-                reject_multiply_linked_file(&entry.path(), &entry.metadata()?)?;
                 let relative = entry
                     .path()
                     .strip_prefix(root)
                     .map_err(|_| RunError::PathEscape(entry.path()))?
                     .to_string_lossy()
                     .into_owned();
-                files.insert(relative, fs::read(entry.path())?);
+                files.insert(relative, read_evidence_file(&entry.path(), retained_bytes)?);
             }
         }
         Ok(())
     }
 
     let mut files = BTreeMap::new();
-    visit(root, root, &mut files)?;
+    visit(root, root, &mut files, &mut 0)?;
     Ok(files)
+}
+
+fn validate_evidence_tree(root: &Path) -> Result<(), RunError> {
+    fn visit(directory: &Path, retained_bytes: &mut u64) -> Result<(), RunError> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(RunError::PathEscape(entry.path()));
+            }
+            if file_type.is_dir() {
+                visit(&entry.path(), retained_bytes)?;
+            } else if file_type.is_file() {
+                validate_evidence_file(&entry.path(), &entry.metadata()?, retained_bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    visit(root, &mut 0)
+}
+
+fn validate_evidence_file(
+    path: &Path,
+    metadata: &fs::Metadata,
+    retained_bytes: &mut u64,
+) -> Result<(), RunError> {
+    reject_multiply_linked_file(path, metadata)?;
+    let file_bytes = metadata.len();
+    if file_bytes > MAX_EVIDENCE_FILE_BYTES {
+        return Err(RunError::EvidenceLimit(format!(
+            "{} is {file_bytes} bytes; per-file limit is {MAX_EVIDENCE_FILE_BYTES}",
+            path.display()
+        )));
+    }
+    let total = retained_bytes
+        .checked_add(file_bytes)
+        .ok_or_else(|| RunError::EvidenceLimit("workspace byte count overflowed".to_owned()))?;
+    if total > MAX_EVIDENCE_TOTAL_BYTES {
+        return Err(RunError::EvidenceLimit(format!(
+            "workspace retains {total} bytes; total limit is {MAX_EVIDENCE_TOTAL_BYTES}"
+        )));
+    }
+    *retained_bytes = total;
+    Ok(())
+}
+
+fn read_evidence_file(path: &Path, retained_bytes: &mut u64) -> Result<Vec<u8>, RunError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(RunError::PathEscape(path.to_path_buf()));
+    }
+    validate_evidence_file(path, &metadata, retained_bytes)?;
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| RunError::EvidenceLimit("file size does not fit this platform".to_owned()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    fs::File::open(path)?
+        .take(MAX_EVIDENCE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_EVIDENCE_FILE_BYTES {
+        return Err(RunError::EvidenceLimit(format!(
+            "{} grew beyond the per-file limit while being read",
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), RunError> {
@@ -2287,7 +2477,8 @@ fn read_optional_confined_json(
     if canonical_path != canonical_root && !canonical_path.starts_with(&canonical_root) {
         return Err(RunError::PathEscape(path));
     }
-    read_optional_json(&canonical_path)
+    let bytes = read_evidence_file(&canonical_path, &mut 0)?;
+    Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
 fn redact_transcript(mut transcript: DriverTranscript, secrets: &[Vec<u8>]) -> DriverTranscript {
@@ -2439,6 +2630,10 @@ pub enum RunError {
     PathEscape(PathBuf),
     #[error("driver protocol failed: {0}")]
     Protocol(String),
+    #[error("failed to persist run evidence: {0}")]
+    EvidencePersistence(String),
+    #[error("workspace evidence exceeds its retention limit: {0}")]
+    EvidenceLimit(String),
     #[error(transparent)]
     Process(#[from] agent_lab_driver_protocol::ProcessError),
     #[error(transparent)]
@@ -2770,8 +2965,28 @@ totalScore = 11
             br#"{"active":[{"name":"alpha","active":true,"score":3},{"name":"gamma","active":true,"score":8}],"activeCount":2,"totalScore":11}"#,
         )
         .unwrap();
+        let without_capability_evidence = score_catalog(&state, &scenario).unwrap();
+        assert_eq!(without_capability_evidence["schemaValid"], true);
+        assert_eq!(
+            without_capability_evidence["capabilityEvidenceComplete"],
+            false
+        );
+        assert_eq!(without_capability_evidence["passed"], false);
+
+        lock(&state.events).extend([
+            event(
+                1,
+                "mcp.tool.completed",
+                json!({ "source": "catalog", "actor": "agent", "isError": false }),
+            ),
+            event(
+                2,
+                "mcp.tool.completed",
+                json!({ "source": "analysis", "actor": "agent", "isError": false }),
+            ),
+        ]);
         let complete = score_catalog(&state, &scenario).unwrap();
-        assert_eq!(complete["schemaValid"], true);
+        assert_eq!(complete["capabilityEvidenceComplete"], true);
         assert_eq!(complete["passed"], true);
 
         fs::remove_dir_all(root).unwrap();
@@ -2964,6 +3179,61 @@ totalScore = 11
         );
 
         drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_exploration_finalizes_it_and_releases_its_sources() {
+        let root = temporary_root("cancel-exploration");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-exploration"),
+        })
+        .unwrap();
+        let prepared = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = controller.state(&prepared.id).unwrap();
+        let source_cancellations = lock(&state.capabilities)
+            .iter()
+            .map(|source| source.cancel.clone())
+            .collect::<Vec<_>>();
+
+        controller.cancel(&prepared.id).unwrap();
+
+        let cancelled = controller.get(&prepared.id).unwrap();
+        assert_eq!(cancelled.summary.status, RunStatus::Cancelled);
+        assert_eq!(cancelled.score.unwrap()["cancelled"], true);
+        assert!(state.cancel.is_cancelled());
+        assert!(lock(&state.capabilities).is_empty());
+        assert!(
+            source_cancellations
+                .iter()
+                .all(CancellationToken::is_cancelled)
+        );
+        assert!(matches!(
+            controller.terminal_binding(&prepared.id),
+            Err(RunError::RunUnavailable(_))
+        ));
+
+        let replacement = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_ne!(replacement.id, prepared.id);
+
+        drop(controller);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3504,7 +3774,7 @@ totalScore = 11
                 .unwrap()
                 .contains("environment-secret")
         );
-        finish_run(&state, RunStatus::Passed, None, &json!({ "passed": true }));
+        finish_run(&state, RunStatus::Passed, None, &json!({ "passed": true })).unwrap();
         assert!(capability_cancel.is_cancelled());
         assert!(lock(&state.capabilities).is_empty());
         let review = read_optional_json(&root.join("review.json"))
@@ -3513,6 +3783,85 @@ totalScore = 11
         assert_eq!(review["version"], 1);
         assert_eq!(review["steps"][0]["title"], "Created result.json");
         assert_eq!(review["steps"][1]["title"], "Evaluation passed");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn driver_failure_messages_are_redacted_before_final_evidence() {
+        let root = temporary_root("driver-failure-redaction");
+        fs::create_dir(root.join("initial")).unwrap();
+        let state = test_run_state(&root);
+        lock(&state.secret_values).push(b"provider-secret".to_vec());
+        let error = RunError::Protocol(
+            "driver failed: provider_error: request contained provider-secret".to_owned(),
+        );
+
+        let message = redacted_run_error(&state, &error);
+        finish_run(
+            &state,
+            RunStatus::Failed,
+            Some(&message),
+            &json!({ "passed": false }),
+        )
+        .unwrap();
+
+        assert!(!message.contains("provider-secret"));
+        assert!(message.contains("[REDACTED]"));
+        for path in ["manifest.json", "events.jsonl", "review.json"] {
+            assert!(
+                !fs::read_to_string(root.join(path))
+                    .unwrap()
+                    .contains("provider-secret"),
+                "{path} retained the driver failure secret"
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persistence_failures_mark_the_in_memory_run_failed() {
+        let root = temporary_root("persistence-failure");
+        fs::create_dir(root.join("initial")).unwrap();
+        fs::create_dir(root.join("score.json.tmp")).unwrap();
+        let state = test_run_state(&root);
+
+        let error =
+            finish_run(&state, RunStatus::Passed, None, &json!({ "passed": true })).unwrap_err();
+
+        assert!(matches!(error, RunError::EvidencePersistence(_)));
+        let summary = lock(&state.summary).clone();
+        assert_eq!(summary.status, RunStatus::Failed);
+        assert!(
+            summary
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("score.json could not be written")
+        );
+        assert!(state.cancel.is_cancelled());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_workspace_files_are_rejected_before_snapshotting() {
+        let root = temporary_root("oversized-evidence");
+        fs::create_dir(root.join("initial")).unwrap();
+        let state = test_run_state(&root);
+        let oversized = state.workspace.join("oversized.bin");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_EVIDENCE_FILE_BYTES + 1)
+            .unwrap();
+
+        assert!(matches!(
+            finalize_workspace(&state),
+            Err(RunError::EvidenceLimit(_))
+        ));
+        assert!(!root.join("final.tmp").exists());
+        assert!(!root.join("final").exists());
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -32,10 +32,12 @@ name = "agent-lab-driver-protocol"
 version = "0.0.0"
 dependencies = [
  "process-wrap",
+ "rmcp",
  "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

@@ -23,6 +23,7 @@ export interface AssemblySnapshot {
     title: string;
     description: string;
     version: number;
+    output: string;
   };
   harness: {
     adapter: string;
@@ -98,6 +99,7 @@ export interface RunDetail {
   events: RunEvent[];
   score?: unknown;
   output?: unknown;
+  outputError?: string;
 }
 
 export interface RunClient {

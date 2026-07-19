@@ -16,6 +16,7 @@
   let surface: TerminalSurface | undefined;
   let session: BrowserSession | undefined;
   let eventStream: AbortController | undefined;
+  let reviewRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let connectionState: ConnectionState = 'starting';
   let sessionEvents: SessionEvent[] = [];
   let screenText = '';
@@ -26,6 +27,7 @@
   let modelId = '';
   let runs: RunSummary[] = [];
   let selectedRun: RunDetail | undefined;
+  let terminalRun: RunSummary | undefined;
   let runEvents: RunEvent[] = [];
   let activeTab: Tab = 'agent';
   let agentView: AgentView = 'review';
@@ -35,8 +37,9 @@
 
   $: activeRun = selectedRun?.summary;
   $: running = activeRun?.status === 'starting' || activeRun?.status === 'running';
+  $: finished = activeRun?.status === 'passed' || activeRun?.status === 'failed' || activeRun?.status === 'cancelled';
 
-  async function startTerminal(runId: string): Promise<void> {
+  async function startTerminal(run: RunSummary): Promise<void> {
     startupError = '';
     connectionState = 'starting';
     sessionEvents = [];
@@ -56,8 +59,9 @@
             screenText = text;
           }
         },
-        runId
+        run.id
       );
+      terminalRun = run;
       surface.focus();
     } catch (error) {
       connectionState = 'error';
@@ -87,7 +91,7 @@
       activeTab = 'agent';
       agentView = 'review';
       watchRun(summary.id);
-      await startTerminal(summary.id);
+      await startTerminal(summary);
     } catch (error) {
       actionError = message(error);
     } finally {
@@ -129,9 +133,9 @@
     eventStream?.abort();
     eventStream = runClient.events(id, (event) => {
       const lastSequence = runEvents.at(-1)?.sequence ?? -1;
-      if (event.sequence > lastSequence) {
-        runEvents = [...runEvents, event];
-      }
+      if (event.sequence <= lastSequence) return;
+      runEvents = [...runEvents, event];
+      scheduleReviewRefresh(id);
       if (
         event.type === 'run.status' &&
         event.payload &&
@@ -146,8 +150,45 @@
         };
         runs = runs.map((run) => (run.id === id ? { ...run, status } : run));
       }
-      if (event.type === 'run.finished') void refreshRun(id);
+      if (event.type === 'run.finished') {
+        if (reviewRefreshTimer !== undefined) clearTimeout(reviewRefreshTimer);
+        reviewRefreshTimer = undefined;
+        void refreshRun(id);
+      }
     });
+  }
+
+  function scheduleReviewRefresh(id: string): void {
+    if (reviewRefreshTimer !== undefined) return;
+    reviewRefreshTimer = setTimeout(() => {
+      reviewRefreshTimer = undefined;
+      void refreshReview(id);
+    }, 100);
+  }
+
+  async function refreshReview(id: string): Promise<void> {
+    try {
+      const detail = await runClient.detail(id);
+      if (selectedRun?.summary.id !== id) return;
+      const currentSequence = runEvents.at(-1)?.sequence ?? 0;
+      const detailSequence = detail.events.at(-1)?.sequence ?? 0;
+      if (detailSequence < currentSequence) {
+        scheduleReviewRefresh(id);
+        return;
+      }
+      selectedRun = {
+        ...selectedRun,
+        summary: detail.summary,
+        assembly: detail.assembly,
+        review: detail.review,
+        score: detail.score,
+        output: detail.output,
+        outputError: detail.outputError
+      };
+      runs = runs.map((run) => (run.id === id ? detail.summary : run));
+    } catch (error) {
+      actionError = message(error);
+    }
   }
 
   async function refreshRun(id: string): Promise<void> {
@@ -170,8 +211,10 @@
       runEvents = detail.events;
       activeTab = 'agent';
       agentView = 'review';
-      if (detail.summary.status === 'starting' || detail.summary.status === 'running') watchRun(id);
-      await startTerminal(id);
+      if (detail.summary.status === 'exploring' || detail.summary.status === 'starting' || detail.summary.status === 'running') {
+        watchRun(id);
+        await startTerminal(detail.summary);
+      }
     } catch (error) {
       actionError = message(error);
     }
@@ -212,6 +255,7 @@
     void initialize();
     return () => {
       eventStream?.abort();
+      if (reviewRefreshTimer !== undefined) clearTimeout(reviewRefreshTimer);
       session?.dispose();
       surface?.dispose();
     };
@@ -251,9 +295,15 @@
           {/each}
         </select>
       </label>
-      <button class="primary" disabled={activeRun?.status !== 'exploring' || !modelId.trim() || preparing || starting || running} on:click={() => void beginRun()}>
-        {starting ? 'Starting…' : 'Run'}
-      </button>
+      {#if finished}
+        <button class="primary" disabled={preparing} on:click={() => void prepareScenario()}>
+          {preparing ? 'Preparing…' : 'New workspace'}
+        </button>
+      {:else}
+        <button class="primary" disabled={activeRun?.status !== 'exploring' || !modelId.trim() || preparing || starting || running} on:click={() => void beginRun()}>
+          {starting ? 'Starting…' : 'Run'}
+        </button>
+      {/if}
       {#if running}
         <button class="quiet danger" on:click={() => void cancelRun()}>Cancel</button>
       {/if}
@@ -274,7 +324,7 @@
       <div class="panel-heading">
         <div>
           <span class="label">Explore</span>
-          <span class="value">{activeRun ? `${activeRun.scenarioTitle} workspace` : 'Preparing workspace…'}</span>
+          <span class="value">{terminalRun ? `${terminalRun.scenarioTitle} workspace` : 'Preparing workspace…'}</span>
         </div>
         <span class="transport">PTY · Ghostty</span>
       </div>
@@ -284,7 +334,7 @@
       </div>
       <footer class="terminal-footer">
         <span>{sessionEvents.find((event) => event.type === 'started')?.provider ?? 'waiting'}</span>
-        <span>{activeRun ? `run ${shortId(activeRun.id)}` : 'preparing'}</span>
+        <span>{terminalRun ? `run ${shortId(terminalRun.id)}` : 'preparing'}</span>
         <span>loopback only</span>
       </footer>
     </article>
@@ -419,7 +469,11 @@
         {:else if activeTab === 'workspace'}
           <section class="artifact">
             <span class="label">result.json</span>
-            <pre>{pretty(selectedRun?.output)}</pre>
+            {#if selectedRun?.outputError}
+              <p class="artifact-error">Output could not be parsed: {selectedRun.outputError}</p>
+            {:else}
+              <pre>{pretty(selectedRun?.output)}</pre>
+            {/if}
           </section>
         {:else if activeTab === 'editor'}
           <section class="empty-state">
@@ -571,6 +625,7 @@
   .run-events .empty { display: block; padding: 28px 0; color: #5f6b65; font-size: 0.75rem; }
   .artifact { padding: 18px; }
   .artifact > pre { min-height: 280px; margin-top: 12px; padding: 14px; border: 1px solid #202d27; border-radius: 6px; color: #aebbb4; background: #0a0f0d; }
+  .artifact-error { margin-top: 12px; padding: 14px; border: 1px solid #56373a; border-radius: 6px; color: #cf8b90; background: #160f10; font-size: 0.7rem; line-height: 1.5; }
   .empty-state { max-width: 370px; padding: 34px 20px; color: #7c8a83; }
   .empty-state strong { color: #bbc5c0; font-size: 0.82rem; }
   .empty-state p { font-size: 0.73rem; line-height: 1.55; }

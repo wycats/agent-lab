@@ -52,30 +52,29 @@ impl ServerHandler for CatalogSource {
         _context: RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let arguments = request.arguments.unwrap_or_default();
+        let name = request.name.into_owned();
         self.record(
             "mcp.tool.started",
-            json!({ "name": request.name, "arguments": arguments }),
+            json!({ "name": name, "arguments": arguments }),
         );
-        let result = match request.name.as_ref() {
-            "list" => CallToolResult::structured(json!({
+        let result = match name.as_str() {
+            "list" => Ok(CallToolResult::structured(json!({
                 "items": [
                     { "name": "alpha", "active": true, "score": 3 },
                     { "name": "beta", "active": false, "score": 5 },
                     { "name": "gamma", "active": true, "score": 8 }
                 ]
-            })),
-            name => {
-                return Err(McpError::invalid_params(
-                    format!("unknown catalog tool: {name}"),
-                    None,
-                ));
-            }
+            }))),
+            name => Err(McpError::invalid_params(
+                format!("unknown catalog tool: {name}"),
+                None,
+            )),
         };
         self.record(
             "mcp.tool.completed",
-            json!({ "name": request.name, "isError": false }),
+            json!({ "name": name, "isError": result.is_err() }),
         );
-        Ok(result)
+        result
     }
 }
 
@@ -139,43 +138,46 @@ impl ServerHandler for AnalysisSource {
         _context: RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let arguments = request.arguments.unwrap_or_default();
+        let name = request.name.into_owned();
         self.record(
             "mcp.tool.started",
-            json!({ "name": request.name, "arguments": arguments }),
+            json!({ "name": name, "arguments": arguments }),
         );
-        let result = match request.name.as_ref() {
-            "summarize" => {
-                let items = arguments
-                    .get("items")
-                    .and_then(JsonValue::as_array)
-                    .ok_or_else(|| McpError::invalid_params("items must be an array", None))?;
-                let active = items
-                    .iter()
-                    .filter(|item| item.get("active").and_then(JsonValue::as_bool) == Some(true))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let total_score = active
-                    .iter()
-                    .filter_map(|item| item.get("score").and_then(JsonValue::as_i64))
-                    .sum::<i64>();
-                CallToolResult::structured(json!({
-                    "active": active,
-                    "activeCount": active.len(),
-                    "totalScore": total_score
-                }))
-            }
-            name => {
-                return Err(McpError::invalid_params(
-                    format!("unknown analysis tool: {name}"),
-                    None,
-                ));
-            }
+        let result = match name.as_str() {
+            "summarize" => arguments
+                .get("items")
+                .and_then(JsonValue::as_array)
+                .map_or_else(
+                    || Err(McpError::invalid_params("items must be an array", None)),
+                    |items| {
+                        let active = items
+                            .iter()
+                            .filter(|item| {
+                                item.get("active").and_then(JsonValue::as_bool) == Some(true)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let total_score = active
+                            .iter()
+                            .filter_map(|item| item.get("score").and_then(JsonValue::as_i64))
+                            .sum::<i64>();
+                        Ok(CallToolResult::structured(json!({
+                            "active": active,
+                            "activeCount": active.len(),
+                            "totalScore": total_score
+                        })))
+                    },
+                ),
+            name => Err(McpError::invalid_params(
+                format!("unknown analysis tool: {name}"),
+                None,
+            )),
         };
         self.record(
             "mcp.tool.completed",
-            json!({ "name": request.name, "isError": false }),
+            json!({ "name": name, "isError": result.is_err() }),
         );
-        Ok(result)
+        result
     }
 }
 

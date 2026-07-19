@@ -52,27 +52,6 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   expect(layout.benchHeight).toBeLessThan(layout.viewportHeight);
   expect(layout.canvasHeight).toBeLessThanOrEqual(layout.viewportHeight * layout.devicePixelRatio * 2);
 
-  await expect(page.getByLabel('Model')).toHaveValue('');
-  await page.getByLabel('Model').selectOption('fixture/model');
-  await page.getByRole('button', { name: 'Run', exact: true }).click();
-  await expect(page.locator('.run-status')).toHaveText('passed');
-  await expect(assembly).toContainText('agent-lab-fixture');
-  await expect(assembly).toContainText('fixture/model');
-  const review = page.getByTestId('run-review');
-  await expect(review).toContainText('Harness ready');
-  await expect(review).toContainText('catalog · list');
-  await expect(review).toContainText('analysis · summarize');
-  await expect(review).toContainText('Created result.json');
-  await expect(review).toContainText('Evaluation passed');
-  await expect(review).toContainText('2 active items · total score 11');
-  await page.getByRole('button', { name: 'Raw trace' }).click();
-  await expect(page.getByRole('list', { name: 'Agent run events' })).toContainText('run · finished');
-  await expect(page.getByRole('list', { name: 'Agent run events' })).toContainText('[REDACTED]');
-  await expect(page.getByRole('list', { name: 'Agent run events' })).not.toContainText('Bearer 000000');
-  await page.getByRole('button', { name: 'Review', exact: true }).click();
-  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
-  await expect(screen).toContainText('MCP namespaces: analysis, catalog');
-
   await input.focus();
   await expect(input).toBeFocused();
   terminalFrames.length = 0;
@@ -125,14 +104,32 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await expect(screen).toContainText('Return the controlled product catalog');
   await submit(page, 'catalog list | where active | get name | str join ","');
   await expect(screen).toContainText('alpha,gamma');
-  await submit(
-    page,
-    'catalog list | analysis summarize | to json'
-  );
+  await submit(page, 'catalog list | analysis summarize | to json');
   await expect(screen).toContainText('"activeCount": 2');
   await expect(screen).toContainText('"totalScore": 11');
 
-  await page.getByRole('button', { name: 'Workspace' }).click();
+  await expect(page.getByLabel('Model')).toHaveValue('');
+  await page.getByLabel('Model').selectOption('fixture/model');
+  await page.getByRole('button', { name: 'Run', exact: true }).click();
+  await expect(page.locator('.run-status')).toHaveText('passed');
+  await expect(assembly).toContainText('agent-lab-fixture');
+  await expect(assembly).toContainText('fixture/model');
+  const review = page.getByTestId('run-review');
+  await expect(review).toContainText('Harness ready');
+  await expect(review).toContainText('catalog · list');
+  await expect(review).toContainText('analysis · summarize');
+  await expect(review).toContainText('Created result.json');
+  await expect(review).toContainText('Evaluation passed');
+  await expect(review).toContainText('2 active items · total score 11');
+  await expect(page.getByRole('button', { name: 'New workspace' })).toBeVisible();
+  await page.getByRole('button', { name: 'Raw trace' }).click();
+  await expect(page.getByRole('list', { name: 'Agent run events' })).toContainText('run · finished');
+  await expect(page.getByRole('list', { name: 'Agent run events' })).toContainText('[REDACTED]');
+  await expect(page.getByRole('list', { name: 'Agent run events' })).not.toContainText('Bearer 000000');
+  await page.getByRole('button', { name: 'Review', exact: true }).click();
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+
+  await page.getByRole('button', { name: 'Workspace', exact: true }).click();
   await expect(page.locator('.artifact')).toContainText('result.json');
   await expect(page.locator('.artifact')).toContainText('alpha');
   await expect(page.locator('.artifact')).toContainText('gamma');
@@ -142,8 +139,15 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   expect(socketUrls).toHaveLength(1);
   for (const url of socketUrls) expect(new URL(url).searchParams.has('token')).toBe(false);
 
+  const completedRunId = await page.locator('.terminal-footer span').nth(1).textContent();
+  await page.getByRole('button', { name: 'New workspace' }).click();
+  await expect(page.locator('.run-status')).toHaveText('exploring');
+  await expect(page.getByRole('button', { name: 'Run', exact: true })).toBeVisible();
+  await expect(page.locator('.terminal-footer span').nth(1)).not.toHaveText(completedRunId ?? '');
+
   await page.reload();
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const socketsBeforeReplay = socketUrls.length;
   const historyRun = page.locator('.history-list button').filter({ hasText: 'fixture/model' }).first();
   await expect(historyRun).toContainText('passed');
   await historyRun.click();
@@ -151,6 +155,8 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await expect(page.getByTestId('assembly')).toContainText('catalog-v2');
   await expect(page.getByTestId('run-review')).toContainText('Evaluation passed');
   await expect(page.getByTestId('run-review')).toContainText('Created result.json');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  expect(socketUrls).toHaveLength(socketsBeforeReplay);
   await page.getByRole('button', { name: 'Evidence' }).click();
   await expect(page.locator('.artifact')).toContainText('"passed": true');
 });
@@ -181,7 +187,7 @@ test('stacked surfaces keep their scroll owners inside the viewport', async ({ p
   expect(await page.evaluate(() => window.scrollY)).toBe(0);
 
   await page.setViewportSize({ width: 593, height: 406 });
-  await page.getByRole('button', { name: 'Workspace' }).click();
+  await page.getByRole('button', { name: 'Workspace', exact: true }).click();
   const runPanel = page.locator('.run-panel');
   await runPanel.evaluate((element) => element.scrollIntoView({ block: 'start' }));
   const runBounds = await runPanel.evaluate((element) => {

@@ -180,6 +180,8 @@ pub struct AssemblyScenario {
     pub title: String,
     pub description: String,
     pub version: u32,
+    #[serde(default)]
+    pub output: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +220,7 @@ pub struct RunDetail {
     pub events: Vec<RunEvent>,
     pub score: Option<JsonValue>,
     pub output: Option<JsonValue>,
+    pub output_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,8 +287,10 @@ impl Drop for RunState {
 struct CapabilityEndpoint {
     id: String,
     revision: String,
-    url: String,
-    token: String,
+    human_url: String,
+    human_token: String,
+    agent_url: String,
+    agent_token: String,
     cancel: CancellationToken,
 }
 
@@ -372,7 +377,11 @@ impl RunController {
             } else {
                 state.workspace.clone()
             };
-        let output = read_optional_json(&confined_child(&evidence_root, &state.output)?)?;
+        let (output, output_error) =
+            match read_optional_confined_json(&evidence_root, &state.output) {
+                Ok(output) => (output, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
         Ok(RunDetail {
             summary,
             assembly: lock(&state.assembly).clone(),
@@ -380,6 +389,7 @@ impl RunController {
             events,
             score,
             output,
+            output_error,
         })
     }
 
@@ -393,8 +403,9 @@ impl RunController {
         id: &str,
     ) -> Result<(Vec<RunEvent>, broadcast::Receiver<RunEvent>), RunError> {
         let state = self.state(id)?;
+        let receiver = state.sender.subscribe();
         let events = lock(&state.events).clone();
-        Ok((events, state.sender.subscribe()))
+        Ok((events, receiver))
     }
 
     /// Request cancellation for an active run.
@@ -434,8 +445,8 @@ impl RunController {
                 .into_iter()
                 .map(|capability| TerminalCapabilityBinding {
                     id: capability.id,
-                    url: capability.url,
-                    token: capability.token,
+                    url: capability.human_url,
+                    token: capability.human_token,
                 })
                 .collect(),
         })
@@ -601,6 +612,70 @@ fn validate_model_id(model_id: &str) -> Result<(), RunError> {
     Ok(())
 }
 
+fn validate_turn_identity(
+    actual_session: &str,
+    actual_turn: &str,
+    expected_session: &str,
+    expected_turn: &str,
+    message_kind: &str,
+) -> Result<(), RunError> {
+    if actual_session == expected_session && actual_turn == expected_turn {
+        return Ok(());
+    }
+    Err(RunError::Protocol(format!(
+        "{message_kind} identity {actual_session}/{actual_turn} does not match active turn {expected_session}/{expected_turn}"
+    )))
+}
+
+fn configured_limit_error(
+    events: &[RunEvent],
+    after_sequence: u64,
+    limits: &ScenarioLimits,
+) -> Option<String> {
+    let relevant = events
+        .iter()
+        .filter(|event| event.sequence > after_sequence);
+    let mut commands = HashSet::new();
+    let mut orchestrator_invocations = 0_u32;
+    let mut tool_invocations = 0_u32;
+    for event in relevant {
+        if is_native_action_event(&event.kind, &event.payload) {
+            commands.insert(json_string(&event.payload, "id").map_or_else(
+                || format!("{}:{}", event.kind, event.sequence),
+                str::to_owned,
+            ));
+        }
+        if event.kind.ends_with(".turn-start") || event.kind == "model.turn.started" {
+            orchestrator_invocations = orchestrator_invocations.saturating_add(1);
+        }
+        if (event.kind == "mcp.tool.started" && capability_event_is_agent(&event.payload))
+            || event.kind == "tool.call"
+        {
+            tool_invocations = tool_invocations.saturating_add(1);
+        }
+    }
+    let command_count = u32::try_from(commands.len()).unwrap_or(u32::MAX);
+    [
+        ("command", command_count, limits.max_command_count),
+        (
+            "orchestrator invocation",
+            orchestrator_invocations,
+            limits.max_orchestrator_invocations,
+        ),
+        (
+            "tool invocation",
+            tool_invocations,
+            limits.max_tool_invocations,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(name, actual, maximum)| {
+        (actual > maximum).then(|| {
+            format!("scenario exceeded max {name} count: observed {actual}, allowed {maximum}")
+        })
+    })
+}
+
 async fn start_capability_sources(
     state: Arc<RunState>,
 ) -> Result<Vec<CapabilityEndpoint>, RunError> {
@@ -608,14 +683,16 @@ async fn start_capability_sources(
         state.clone(),
         "catalog",
         "catalog-v2",
-        CatalogSource::new(source_observer(state.clone(), "catalog")),
+        CatalogSource::new(source_observer(state.clone(), "catalog", "human")),
+        CatalogSource::new(source_observer(state.clone(), "catalog", "agent")),
     )
     .await?;
     let analysis = match start_mcp_source(
         state.clone(),
         "analysis",
         "analysis-v1",
-        AnalysisSource::new(source_observer(state, "analysis")),
+        AnalysisSource::new(source_observer(state.clone(), "analysis", "human")),
+        AnalysisSource::new(source_observer(state, "analysis", "agent")),
     )
     .await
     {
@@ -628,10 +705,15 @@ async fn start_capability_sources(
     Ok(vec![catalog, analysis])
 }
 
-fn source_observer(state: Arc<RunState>, source: &'static str) -> SourceObserver {
+fn source_observer(
+    state: Arc<RunState>,
+    source: &'static str,
+    actor: &'static str,
+) -> SourceObserver {
     Arc::new(move |kind, mut payload| {
         if let Some(payload) = payload.as_object_mut() {
             payload.insert("source".to_owned(), JsonValue::String(source.to_owned()));
+            payload.insert("actor".to_owned(), JsonValue::String(actor.to_owned()));
         }
         let _ = record_event(&state, kind, payload);
     })
@@ -641,25 +723,41 @@ async fn start_mcp_source<S>(
     state: Arc<RunState>,
     id: &'static str,
     revision: &'static str,
-    source: S,
+    human_source: S,
+    agent_source: S,
 ) -> Result<CapabilityEndpoint, RunError>
 where
     S: rmcp::ServerHandler + Clone + Send + Sync + 'static,
 {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let address = listener.local_addr()?;
-    let token = random_token();
-    let service: StreamableHttpService<S, LocalSessionManager> = StreamableHttpService::new(
-        move || Ok(source.clone()),
+    let human_token = random_token();
+    let agent_token = random_token();
+    let human_service: StreamableHttpService<S, LocalSessionManager> = StreamableHttpService::new(
+        move || Ok(human_source.clone()),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default().with_allowed_hosts([address.to_string()]),
     );
-    let app = Router::new()
-        .nest_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(
-            token.clone(),
-            source_authorization,
-        ));
+    let agent_service: StreamableHttpService<S, LocalSessionManager> = StreamableHttpService::new(
+        move || Ok(agent_source.clone()),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default().with_allowed_hosts([address.to_string()]),
+    );
+    let human =
+        Router::new()
+            .nest_service("/mcp", human_service)
+            .layer(middleware::from_fn_with_state(
+                human_token.clone(),
+                source_authorization,
+            ));
+    let agent =
+        Router::new()
+            .nest_service("/mcp", agent_service)
+            .layer(middleware::from_fn_with_state(
+                agent_token.clone(),
+                source_authorization,
+            ));
+    let app = Router::new().nest("/human", human).nest("/agent", agent);
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
     record_event(
@@ -683,8 +781,10 @@ where
     Ok(CapabilityEndpoint {
         id: id.to_owned(),
         revision: revision.to_owned(),
-        url: format!("http://{address}/mcp"),
-        token,
+        human_url: format!("http://{address}/human/mcp"),
+        human_token,
+        agent_url: format!("http://{address}/agent/mcp"),
+        agent_token,
         cancel,
     })
 }
@@ -738,7 +838,8 @@ fn run_driver(
     secret_values.extend(
         capabilities
             .iter()
-            .map(|capability| capability.token.as_bytes().to_vec()),
+            .flat_map(|capability| [&capability.human_token, &capability.agent_token])
+            .map(|token| token.as_bytes().to_vec()),
     );
     let mut driver = DriverProcess::spawn_with(driver_launch)?;
     let result = (|| -> Result<(), RunError> {
@@ -762,8 +863,8 @@ fn run_driver(
                     "revision": capability.revision,
                     "transport": {
                         "type": "http",
-                        "url": capability.url,
-                        "headers": { "Authorization": format!("Bearer {}", capability.token) }
+                        "url": capability.agent_url,
+                        "headers": { "Authorization": format!("Bearer {}", capability.agent_token) }
                     }
                 })
             })
@@ -781,8 +882,21 @@ fn run_driver(
             },
         ))?;
         let opened = driver.receive(DRIVER_RESPONSE_TIMEOUT)?;
-        if !matches!(opened.parsed.body, DriverBody::SessionOpened { .. }) {
-            return Err(RunError::Protocol("expected session.opened".to_owned()));
+        match opened.parsed.body {
+            DriverBody::SessionOpened {
+                session_id: opened_session,
+                ..
+            } if opened_session == session_id => {}
+            DriverBody::Failed { code, message, .. } => {
+                return Err(RunError::Protocol(format!(
+                    "driver failed while opening session: {code}: {message}"
+                )));
+            }
+            _ => {
+                return Err(RunError::Protocol(
+                    "expected session.opened for the requested session".to_owned(),
+                ));
+            }
         }
         record_event(state, "driver.session-opened", JsonValue::Null)?;
 
@@ -799,28 +913,52 @@ fn run_driver(
                 capability_sources: JsonValue::Array(capability_sources),
             },
         ))?;
+        record_event(
+            state,
+            "driver.turn-started",
+            json!({ "sessionId": session_id, "turnId": turn_id }),
+        )?;
+        let turn_start_sequence = lock(&state.events).last().map_or(0, |event| event.sequence);
 
         let mut outcome = None;
         let mut evidence = JsonValue::Null;
         let mut abort_sent = false;
         let mut timed_out = false;
+        let mut limit_error = None;
         let started = Instant::now();
         let mut abort_sent_at = None;
         while outcome.is_none() {
             if started.elapsed() >= Duration::from_millis(scenario.limits.max_duration_ms) {
                 timed_out = true;
             }
-            if (state.cancel.is_cancelled() || timed_out) && !abort_sent {
+            if limit_error.is_none() {
+                limit_error = configured_limit_error(
+                    &lock(&state.events),
+                    turn_start_sequence,
+                    &scenario.limits,
+                );
+            }
+            if (state.cancel.is_cancelled() || timed_out || limit_error.is_some()) && !abort_sent {
+                let reason = limit_error.clone().unwrap_or_else(|| {
+                    if timed_out {
+                        "scenario execution limit exceeded".to_owned()
+                    } else {
+                        "cancelled from Agent Lab".to_owned()
+                    }
+                });
+                if limit_error.is_some() {
+                    record_event(
+                        state,
+                        "controller.limit-exceeded",
+                        json!({ "message": reason }),
+                    )?;
+                }
                 driver.send(&command(
                     "run-abort",
                     CommandBody::AbortTurn {
                         session_id: session_id.clone(),
                         turn_id: turn_id.clone(),
-                        reason: Some(if timed_out {
-                            "scenario execution limit exceeded".to_owned()
-                        } else {
-                            "cancelled from Agent Lab".to_owned()
-                        }),
+                        reason: Some(reason),
                     },
                 ))?;
                 abort_sent = true;
@@ -834,15 +972,38 @@ fn run_driver(
             match driver.receive(DRIVER_POLL) {
                 Ok(message) => match message.parsed.body {
                     DriverBody::TurnEvent {
+                        session_id: event_session,
+                        turn_id: event_turn,
                         event_type,
                         payload,
-                        ..
-                    } => record_event(state, &event_type, redact_value(payload, &secret_values)?)?,
+                    } => {
+                        validate_turn_identity(
+                            &event_session,
+                            &event_turn,
+                            &session_id,
+                            &turn_id,
+                            "turn.event",
+                        )?;
+                        record_event(state, &event_type, redact_value(payload, &secret_values))?;
+                    }
                     DriverBody::TurnFinished {
+                        session_id: finished_session,
+                        turn_id: finished_turn,
                         outcome: result,
                         evidence: result_evidence,
-                        ..
                     } => {
+                        validate_turn_identity(
+                            &finished_session,
+                            &finished_turn,
+                            &session_id,
+                            &turn_id,
+                            "turn.finished",
+                        )?;
+                        record_event(
+                            state,
+                            "driver.turn-finished",
+                            json!({ "sessionId": finished_session, "turnId": finished_turn, "outcome": result }),
+                        )?;
                         outcome = Some(result);
                         evidence = result_evidence;
                     }
@@ -860,13 +1021,30 @@ fn run_driver(
 
         driver.send(&command(
             "run-close",
-            CommandBody::CloseSession { session_id },
+            CommandBody::CloseSession {
+                session_id: session_id.clone(),
+            },
         ))?;
-        let _ = driver.receive(DRIVER_RESPONSE_TIMEOUT)?;
+        let closed = driver.receive(DRIVER_RESPONSE_TIMEOUT)?;
+        match closed.parsed.body {
+            DriverBody::SessionClosed {
+                session_id: closed_session,
+            } if closed_session == session_id => {}
+            DriverBody::Failed { code, message, .. } => {
+                return Err(RunError::Protocol(format!(
+                    "driver failed while closing session: {code}: {message}"
+                )));
+            }
+            _ => {
+                return Err(RunError::Protocol(
+                    "expected session.closed for the active session".to_owned(),
+                ));
+            }
+        }
         let _ = driver.wait_for_exit(DRIVER_RESPONSE_TIMEOUT)?;
         write_json_atomic(
             &state.bundle_dir.join("evidence.json"),
-            &redact_value(evidence, &secret_values)?,
+            &redact_value(evidence, &secret_values),
         )?;
 
         if timed_out {
@@ -875,6 +1053,11 @@ fn run_driver(
                 scenario.limits.max_duration_ms
             );
             let score = json!({ "passed": false, "timedOut": true });
+            finish_run(state, RunStatus::Failed, Some(&message), &score);
+            return Ok(());
+        }
+        if let Some(message) = limit_error {
+            let score = json!({ "passed": false, "limitExceeded": true });
             finish_run(state, RunStatus::Failed, Some(&message), &score);
             return Ok(());
         }
@@ -911,8 +1094,7 @@ fn run_driver(
 }
 
 fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonValue, RunError> {
-    let output_path = confined_child(&state.workspace, &scenario.output)?;
-    let output = read_optional_json(&output_path)?;
+    let output = read_optional_confined_json(&state.workspace, &scenario.output)?;
     let active_names = output
         .as_ref()
         .and_then(|value| value.get("active"))
@@ -975,6 +1157,9 @@ fn finish_run(state: &RunState, status: RunStatus, error: Option<&str>, score: &
     );
     let _ = persist_review(state);
     let _ = persist_manifest(state);
+    for capability in lock(&state.capabilities).drain(..) {
+        capability.cancel.cancel();
+    }
     state.cancel.cancel();
 }
 
@@ -1048,6 +1233,7 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
     let mut current_turn = None;
     let mut pending_capabilities: HashMap<(String, String), u64> = HashMap::new();
     let mut native_actions = HashSet::new();
+    let mut driver_turn_active = false;
 
     for event in events {
         match event.kind.as_str() {
@@ -1067,6 +1253,13 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
                     None,
                     None,
                 );
+            }
+            "driver.turn-started" | "driver.session-opened" => {
+                driver_turn_active = true;
+            }
+            "driver.turn-finished" => {
+                driver_turn_active = false;
+                pending_capabilities.clear();
             }
             "v0.turn-start" => {
                 review.metrics.model_turns += 1;
@@ -1122,12 +1315,16 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
                     );
                 }
             }
-            "mcp.tool.started" => {
+            "mcp.tool.started"
+                if driver_turn_active && capability_event_is_agent(&event.payload) =>
+            {
                 if let Some(key) = capability_key(&event.payload) {
                     pending_capabilities.insert(key, event.sequence);
                 }
             }
-            "mcp.tool.completed" => {
+            "mcp.tool.completed"
+                if driver_turn_active && capability_event_is_agent(&event.payload) =>
+            {
                 if let Some((source, name)) = capability_key(&event.payload) {
                     let mut sequences = Vec::new();
                     if let Some(started) =
@@ -1259,15 +1456,24 @@ fn capability_key(payload: &JsonValue) -> Option<(String, String)> {
     ))
 }
 
+fn capability_event_is_agent(payload: &JsonValue) -> bool {
+    json_string(payload, "actor").is_none_or(|actor| actor == "agent")
+}
+
 fn is_completed_native_action(kind: &str, payload: &JsonValue) -> bool {
+    is_native_action_event(kind, payload)
+        && payload
+            .get("finishedAt")
+            .is_some_and(|value| !value.is_null())
+}
+
+fn is_native_action_event(kind: &str, payload: &JsonValue) -> bool {
     kind.starts_with("v0.task-")
         && !kind.contains("dynamic-tool")
         && !kind.contains("waiting")
         && !kind.contains("programmatic-result")
         && !kind.contains("finished-file-edits")
-        && payload
-            .get("finishedAt")
-            .is_some_and(|value| !value.is_null())
+        && payload.get("id").is_some()
 }
 
 fn native_action_path(payload: &JsonValue) -> Option<String> {
@@ -1294,7 +1500,7 @@ fn add_workspace_steps(review: &mut RunReview, event: &RunEvent) {
         let operation = json_string(change, "kind").unwrap_or("changed");
         let title = match operation {
             "created" => format!("Created {path}"),
-            "removed" => format!("Removed {path}"),
+            "deleted" | "removed" => format!("Deleted {path}"),
             _ => format!("Updated {path}"),
         };
         review.metrics.workspace_changes += 1;
@@ -1349,6 +1555,7 @@ fn initial_assembly(summary: &RunSummary, scenario: &ScenarioManifest) -> Assemb
             title: scenario.title.clone(),
             description: scenario.description.clone(),
             version: scenario.version,
+            output: scenario.output.clone(),
         },
         harness: HarnessAssembly {
             adapter: "external-driver".to_owned(),
@@ -1485,9 +1692,7 @@ fn load_runs(
         if summary.id != entry.file_name().to_string_lossy() {
             continue;
         }
-        let Some(scenario) = scenarios.get(&summary.scenario_id) else {
-            continue;
-        };
+        let scenario = scenarios.get(&summary.scenario_id);
         let workspace = bundle_dir.join("workspace");
         if !workspace.is_dir() {
             continue;
@@ -1513,11 +1718,21 @@ fn load_runs(
                 )
             }
         };
-        let assembly = if bundle_dir.join("assembly.json").is_file() {
+        let mut assembly = if bundle_dir.join("assembly.json").is_file() {
             serde_json::from_slice(&fs::read(bundle_dir.join("assembly.json"))?)?
         } else {
+            let Some(scenario) = scenario else {
+                continue;
+            };
             recover_legacy_assembly(&summary, scenario, &events)
         };
+        if assembly.scenario.output.as_os_str().is_empty() {
+            let Some(scenario) = scenario else {
+                continue;
+            };
+            assembly.scenario.output.clone_from(&scenario.output);
+        }
+        let output = assembly.scenario.output.clone();
         let interrupted = matches!(summary.status, RunStatus::Starting | RunStatus::Running);
         summary.event_count = events.len() as u64;
         let (sender, _) = broadcast::channel(256);
@@ -1529,7 +1744,7 @@ fn load_runs(
             cancel: CancellationToken::new(),
             bundle_dir,
             workspace,
-            output: scenario.output.clone(),
+            output,
             capabilities: Mutex::new(Vec::new()),
             replay_failed,
         });
@@ -1721,30 +1936,52 @@ fn read_optional_json(path: &Path) -> Result<Option<JsonValue>, RunError> {
     }
 }
 
+fn read_optional_confined_json(
+    root: &Path,
+    child: impl AsRef<Path>,
+) -> Result<Option<JsonValue>, RunError> {
+    let path = confined_child(root, child)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(RunError::PathEscape(path));
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    let canonical_path = fs::canonicalize(&path)?;
+    if canonical_path != canonical_root && !canonical_path.starts_with(&canonical_root) {
+        return Err(RunError::PathEscape(path));
+    }
+    read_optional_json(&canonical_path)
+}
+
 fn redact_transcript(mut transcript: DriverTranscript, secrets: &[Vec<u8>]) -> DriverTranscript {
     for record in transcript
         .controller_records
         .iter_mut()
         .chain(transcript.driver_records.iter_mut())
     {
-        replace_secrets(record, secrets);
         if let Ok(mut value) = serde_json::from_slice::<JsonValue>(record) {
             redact_json(&mut value);
+            redact_secret_strings(&mut value, secrets);
             if let Ok(mut redacted) = serde_json::to_vec(&value) {
                 redacted.push(b'\n');
                 *record = redacted;
             }
+        } else {
+            replace_secrets(record, secrets);
         }
     }
     replace_secrets(&mut transcript.driver_stderr, secrets);
     transcript
 }
 
-fn redact_value(mut value: JsonValue, secrets: &[Vec<u8>]) -> Result<JsonValue, RunError> {
+fn redact_value(mut value: JsonValue, secrets: &[Vec<u8>]) -> JsonValue {
     redact_json(&mut value);
-    let mut bytes = serde_json::to_vec(&value)?;
-    replace_secrets(&mut bytes, secrets);
-    Ok(serde_json::from_slice(&bytes)?)
+    redact_secret_strings(&mut value, secrets);
+    value
 }
 
 fn redact_json(value: &mut JsonValue) {
@@ -1759,6 +1996,27 @@ fn redact_json(value: &mut JsonValue) {
             }
         }
         JsonValue::Array(values) => values.iter_mut().for_each(redact_json),
+        _ => {}
+    }
+}
+
+fn redact_secret_strings(value: &mut JsonValue, secrets: &[Vec<u8>]) {
+    match value {
+        JsonValue::Object(object) => object
+            .values_mut()
+            .for_each(|value| redact_secret_strings(value, secrets)),
+        JsonValue::Array(values) => values
+            .iter_mut()
+            .for_each(|value| redact_secret_strings(value, secrets)),
+        JsonValue::String(value) => {
+            for secret in secrets
+                .iter()
+                .filter_map(|secret| std::str::from_utf8(secret).ok())
+                .filter(|secret| secret.len() >= 4)
+            {
+                *value = value.replace(secret, "[REDACTED]");
+            }
+        }
         _ => {}
     }
 }
@@ -1930,6 +2188,7 @@ totalScore = 11
                     title: "Catalog".to_owned(),
                     description: "test".to_owned(),
                     version: 1,
+                    output: "result.json".into(),
                 },
                 harness: HarnessAssembly {
                     adapter: "external-driver".to_owned(),
@@ -1968,6 +2227,75 @@ totalScore = 11
         assert!(confined_child(root, "workspace/result.json").is_ok());
         assert!(confined_child(root, "../outside").is_err());
         assert!(confined_child(root, "/outside").is_err());
+    }
+
+    #[test]
+    fn turn_identity_rejects_stale_driver_messages() {
+        assert!(
+            validate_turn_identity("session", "turn", "session", "turn", "turn.finished").is_ok()
+        );
+        let error = validate_turn_identity(
+            "stale-session",
+            "stale-turn",
+            "session",
+            "turn",
+            "turn.finished",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match active turn"));
+    }
+
+    #[test]
+    fn configured_limits_count_only_activity_after_the_turn_starts() {
+        let limits = ScenarioLimits {
+            max_duration_ms: 1_000,
+            max_command_count: 1,
+            max_orchestrator_invocations: 1,
+            max_tool_invocations: 1,
+        };
+        let events = vec![
+            event(
+                1,
+                "mcp.tool.started",
+                json!({ "source": "catalog", "actor": "human" }),
+            ),
+            event(2, "driver.turn-started", json!({})),
+            event(
+                3,
+                "mcp.tool.started",
+                json!({ "source": "catalog", "actor": "human" }),
+            ),
+            event(
+                4,
+                "mcp.tool.started",
+                json!({ "source": "catalog", "actor": "agent" }),
+            ),
+            event(
+                5,
+                "mcp.tool.started",
+                json!({ "source": "analysis", "actor": "agent" }),
+            ),
+        ];
+        let error = configured_limit_error(&events, 2, &limits).unwrap();
+        assert!(error.contains("tool invocation"));
+        assert!(configured_limit_error(&events, 5, &limits).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_json_reads_refuse_symlinks_outside_the_workspace() {
+        let root = temporary_root("output-symlink");
+        let workspace = root.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(root.join("outside.json"), br#"{"secret":true}"#).unwrap();
+        std::os::unix::fs::symlink(root.join("outside.json"), workspace.join("result.json"))
+            .unwrap();
+
+        assert!(matches!(
+            read_optional_confined_json(&workspace, "result.json"),
+            Err(RunError::PathEscape(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2068,6 +2396,37 @@ totalScore = 11
         );
 
         drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_captures_events_recorded_after_the_prefix_handoff() {
+        let root = temporary_root("subscribe");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-exploration"),
+        })
+        .unwrap();
+        let prepared = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let (history, mut receiver) = controller.subscribe(&prepared.id).unwrap();
+        let state = controller.state(&prepared.id).unwrap();
+        record_event(&state, "test.after-subscribe", JsonValue::Null).unwrap();
+        let live = receiver.try_recv().unwrap();
+        assert_eq!(live.kind, "test.after-subscribe");
+        assert!(live.sequence > history.last().map_or(0, |event| event.sequence));
+
+        drop(controller);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2174,6 +2533,120 @@ totalScore = 11
     }
 
     #[test]
+    fn finalized_bundles_replay_after_their_scenario_is_removed() {
+        let root = temporary_root("scenario-independent-replay");
+        let scenarios_dir = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios_dir).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios_dir);
+        let scenario = load_scenarios(&scenarios_dir).unwrap()["catalog"].clone();
+        let bundle = data.join("run-replay");
+        fs::create_dir_all(bundle.join("workspace")).unwrap();
+        fs::create_dir_all(bundle.join("final")).unwrap();
+        fs::write(bundle.join("final/result.json"), br#"{"totalScore":11}"#).unwrap();
+        let summary = RunSummary {
+            id: "run-replay".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "test/model".to_owned(),
+            status: RunStatus::Passed,
+            started_at_ms: 1,
+            finished_at_ms: Some(2),
+            event_count: 1,
+            error: None,
+        };
+        write_json_atomic(
+            &bundle.join("manifest.json"),
+            &serde_json::to_value(&summary).unwrap(),
+        )
+        .unwrap();
+        write_json_atomic(
+            &bundle.join("assembly.json"),
+            &serde_json::to_value(initial_assembly(&summary, &scenario)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            bundle.join("events.jsonl"),
+            serde_json::to_string(&event(1, "run.finished", json!({ "status": "passed" })))
+                .unwrap()
+                + "\n",
+        )
+        .unwrap();
+        write_json_atomic(&bundle.join("score.json"), &json!({ "passed": true })).unwrap();
+
+        let other = fs::read_to_string(scenarios_dir.join("catalog.toml"))
+            .unwrap()
+            .replacen("id = \"catalog\"", "id = \"other\"", 1);
+        fs::write(scenarios_dir.join("catalog.toml"), other).unwrap();
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-replay"),
+        })
+        .unwrap();
+        let detail = controller.get("run-replay").unwrap();
+        assert_eq!(detail.summary.scenario_id, "catalog");
+        assert_eq!(detail.output.unwrap()["totalScore"], 11);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_output_is_reported_without_breaking_replay() {
+        let root = temporary_root("malformed-output");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let scenario = load_scenarios(&scenarios).unwrap()["catalog"].clone();
+        let bundle = data.join("run-malformed-output");
+        fs::create_dir_all(bundle.join("workspace")).unwrap();
+        fs::create_dir_all(bundle.join("final")).unwrap();
+        fs::write(bundle.join("final/result.json"), b"{not-json").unwrap();
+        let summary = RunSummary {
+            id: "run-malformed-output".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "test/model".to_owned(),
+            status: RunStatus::Failed,
+            started_at_ms: 1,
+            finished_at_ms: Some(2),
+            event_count: 1,
+            error: Some("output was malformed".to_owned()),
+        };
+        write_json_atomic(
+            &bundle.join("manifest.json"),
+            &serde_json::to_value(&summary).unwrap(),
+        )
+        .unwrap();
+        write_json_atomic(
+            &bundle.join("assembly.json"),
+            &serde_json::to_value(initial_assembly(&summary, &scenario)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            bundle.join("events.jsonl"),
+            serde_json::to_string(&event(1, "run.finished", json!({ "status": "failed" })))
+                .unwrap()
+                + "\n",
+        )
+        .unwrap();
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-replay"),
+        })
+        .unwrap();
+        let detail = controller.get("run-malformed-output").unwrap();
+        assert!(detail.output.is_none());
+        assert!(detail.output_error.is_some());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn malformed_event_evidence_fails_only_that_replayed_run() {
         let root = temporary_root("malformed-replay");
         let scenarios = root.join("scenarios");
@@ -2240,6 +2713,7 @@ totalScore = 11
         fs::write(root.join("workspace/unchanged.txt"), "same").unwrap();
         fs::write(root.join("workspace/result.json"), "{}\n").unwrap();
         let (sender, _) = broadcast::channel(1);
+        let capability_cancel = CancellationToken::new();
         let state = RunState {
             summary: Mutex::new(RunSummary {
                 id: "run-diff".to_owned(),
@@ -2259,6 +2733,7 @@ totalScore = 11
                     title: "Catalog".to_owned(),
                     description: "test".to_owned(),
                     version: 1,
+                    output: "result.json".into(),
                 },
                 harness: HarnessAssembly {
                     adapter: "external-driver".to_owned(),
@@ -2286,7 +2761,15 @@ totalScore = 11
             bundle_dir: root.clone(),
             workspace: root.join("workspace"),
             output: "result.json".into(),
-            capabilities: Mutex::new(Vec::new()),
+            capabilities: Mutex::new(vec![CapabilityEndpoint {
+                id: "catalog".to_owned(),
+                revision: "catalog-v2".to_owned(),
+                human_url: "http://127.0.0.1:1/human/mcp".to_owned(),
+                human_token: "human-token".to_owned(),
+                agent_url: "http://127.0.0.1:1/agent/mcp".to_owned(),
+                agent_token: "agent-token".to_owned(),
+                cancel: capability_cancel.clone(),
+            }]),
             replay_failed: false,
         };
         finalize_workspace(&state).unwrap();
@@ -2296,6 +2779,8 @@ totalScore = 11
         assert_eq!(diff["changes"][0]["path"], "result.json");
         assert_eq!(diff["changes"][0]["kind"], "created");
         finish_run(&state, RunStatus::Passed, None, &json!({ "passed": true }));
+        assert!(capability_cancel.is_cancelled());
+        assert!(lock(&state.capabilities).is_empty());
         let review = read_optional_json(&root.join("review.json"))
             .unwrap()
             .unwrap();
@@ -2321,26 +2806,27 @@ totalScore = 11
         };
         let events = vec![
             event(
-                1,
+                3,
                 "driver.ready",
                 json!({ "name": "v0-driver", "version": "1.0.0" }),
             ),
-            event(2, "v0.turn-start", json!({})),
-            event(3, "v0.mdx", json!({ "content": "I will inspect " })),
-            event(4, "v0.mdx", json!({ "content": "the catalog." })),
-            event(5, "v0.turn-finish", json!({})),
+            event(4, "driver.session-opened", JsonValue::Null),
+            event(7, "v0.turn-start", json!({})),
+            event(8, "v0.mdx", json!({ "content": "I will inspect " })),
+            event(9, "v0.mdx", json!({ "content": "the catalog." })),
+            event(10, "v0.turn-finish", json!({})),
             event(
-                6,
+                11,
                 "mcp.tool.started",
-                json!({ "source": "catalog", "name": "list" }),
+                json!({ "source": "catalog", "name": "list", "actor": "agent" }),
             ),
             event(
-                7,
+                12,
                 "mcp.tool.completed",
-                json!({ "source": "catalog", "name": "list", "isError": false }),
+                json!({ "source": "catalog", "name": "list", "actor": "agent", "isError": false }),
             ),
             event(
-                8,
+                13,
                 "v0.task-write-file-v1",
                 json!({
                     "id": "write-1",
@@ -2350,12 +2836,12 @@ totalScore = 11
                 }),
             ),
             event(
-                9,
+                14,
                 "workspace.finalized",
                 json!({ "changes": [{ "path": "result.json", "kind": "created" }] }),
             ),
             event(
-                10,
+                15,
                 "run.finished",
                 json!({
                     "status": "passed",
@@ -2363,7 +2849,7 @@ totalScore = 11
                 }),
             ),
             event(
-                11,
+                16,
                 "mcp.tool.completed",
                 json!({ "source": "catalog", "name": "list", "isError": false }),
             ),
@@ -2390,6 +2876,48 @@ totalScore = 11
             review.steps[5].detail.as_deref(),
             Some("2 active items · total score 11")
         );
+    }
+
+    #[test]
+    fn causal_review_excludes_human_capabilities_during_the_driver_turn() {
+        let summary = RunSummary {
+            id: "run-attribution".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "test/model".to_owned(),
+            status: RunStatus::Running,
+            started_at_ms: 1,
+            finished_at_ms: None,
+            event_count: 5,
+            error: None,
+        };
+        let events = vec![
+            event(1, "driver.session-opened", JsonValue::Null),
+            event(
+                2,
+                "mcp.tool.started",
+                json!({ "source": "catalog", "name": "list", "actor": "human" }),
+            ),
+            event(
+                3,
+                "mcp.tool.completed",
+                json!({ "source": "catalog", "name": "list", "actor": "human", "isError": false }),
+            ),
+            event(
+                4,
+                "mcp.tool.started",
+                json!({ "source": "catalog", "name": "list", "actor": "agent" }),
+            ),
+            event(
+                5,
+                "mcp.tool.completed",
+                json!({ "source": "catalog", "name": "list", "actor": "agent", "isError": false }),
+            ),
+        ];
+        let review = build_review(&summary, &events);
+        assert_eq!(review.metrics.capability_calls, 1);
+        assert_eq!(review.steps.len(), 1);
+        assert_eq!(review.steps[0].title, "catalog · list");
     }
 
     #[test]
@@ -2439,17 +2967,47 @@ totalScore = 11
     }
 
     #[test]
+    fn causal_review_labels_deleted_workspace_files() {
+        let summary = RunSummary {
+            id: "run-delete".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "test/model".to_owned(),
+            status: RunStatus::Passed,
+            started_at_ms: 1,
+            finished_at_ms: Some(2),
+            event_count: 1,
+            error: None,
+        };
+        let review = build_review(
+            &summary,
+            &[event(
+                1,
+                "workspace.finalized",
+                json!({ "changes": [{ "path": "old.txt", "kind": "deleted" }] }),
+            )],
+        );
+        assert_eq!(review.steps[0].title, "Deleted old.txt");
+    }
+
+    #[test]
     fn native_event_redaction_removes_sensitive_fields_and_known_literals() {
         let redacted = redact_value(
             json!({
                 "transport": {
                     "headers": { "Authorization": "Bearer mcp-secret" }
                 },
-                "note": "driver saw environment-secret"
+                "note": "driver saw environment-secret and line\n\"quoted\"\\secret",
+                "boolean": true,
+                "booleanText": "true"
             }),
-            &[b"mcp-secret".to_vec(), b"environment-secret".to_vec()],
-        )
-        .unwrap();
+            &[
+                b"mcp-secret".to_vec(),
+                b"environment-secret".to_vec(),
+                b"line\n\"quoted\"\\secret".to_vec(),
+                b"true".to_vec(),
+            ],
+        );
         let serialized = serde_json::to_string(&redacted).unwrap();
         assert_eq!(
             redacted["transport"]["headers"]["Authorization"],
@@ -2457,6 +3015,9 @@ totalScore = 11
         );
         assert!(!serialized.contains("mcp-secret"));
         assert!(!serialized.contains("environment-secret"));
+        assert!(!serialized.contains("quoted"));
+        assert_eq!(redacted["boolean"], true);
+        assert_eq!(redacted["booleanText"], "[REDACTED]");
         assert!(serialized.contains("[REDACTED]"));
     }
 

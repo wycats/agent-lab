@@ -508,8 +508,13 @@ async fn run_events(
     let Ok((history, receiver)) = runs.subscribe(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let live_after_sequence = history.last().map_or(0, |event| event.sequence);
     let history = futures_util::stream::iter(history);
-    let live = BroadcastStream::new(receiver).filter_map(|event| async move { event.ok() });
+    let live = BroadcastStream::new(receiver).filter_map(move |event| async move {
+        event
+            .ok()
+            .filter(|event| event_is_after_history(event, live_after_sequence))
+    });
     let stream = history
         .chain(live)
         .map(|event| {
@@ -522,6 +527,10 @@ async fn run_events(
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
+}
+
+fn event_is_after_history(event: &RunEvent, live_after_sequence: u64) -> bool {
+    event.sequence > live_after_sequence
 }
 
 fn authorized_runs(state: &AppState, headers: &HeaderMap) -> Option<RunController> {
@@ -981,6 +990,24 @@ mod tests {
             .validated()
             .is_err()
         );
+    }
+
+    #[test]
+    fn live_run_events_skip_sequences_already_present_in_history() {
+        let duplicate = RunEvent {
+            sequence: 7,
+            at_ms: 1,
+            kind: "duplicate".to_owned(),
+            payload: serde_json::Value::Null,
+        };
+        let next = RunEvent {
+            sequence: 8,
+            at_ms: 2,
+            kind: "next".to_owned(),
+            payload: serde_json::Value::Null,
+        };
+        assert!(!event_is_after_history(&duplicate, 7));
+        assert!(event_is_after_history(&next, 7));
     }
 
     #[test]

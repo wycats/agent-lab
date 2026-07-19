@@ -12,7 +12,7 @@ use std::{
 use agent_lab_catalog_source::{AnalysisSource, CatalogSource, SourceObserver};
 use agent_lab_driver_protocol::{
     CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverLaunch, DriverProcess,
-    DriverTranscript, PROTOCOL_VERSION,
+    DriverTranscript, PROTOCOL_VERSION, ProcessError, RawDriverMessage,
 };
 use axum::{
     Router,
@@ -372,12 +372,11 @@ impl RunController {
         } else {
             build_review(&summary, &events)
         };
-        let evidence_root =
-            if summary.status.is_finished() && state.bundle_dir.join("final").is_dir() {
-                state.bundle_dir.join("final")
-            } else {
-                state.workspace.clone()
-            };
+        let evidence_root = if summary.status.is_finished() {
+            state.bundle_dir.join("final")
+        } else {
+            state.workspace.clone()
+        };
         let (output, output_error) =
             match read_optional_confined_json(&evidence_root, &state.output) {
                 Ok(output) => (output, None),
@@ -404,9 +403,11 @@ impl RunController {
         id: &str,
     ) -> Result<(Vec<RunEvent>, broadcast::Receiver<RunEvent>), RunError> {
         let state = self.state(id)?;
+        // `record_event` sends only after releasing this lock. Creating the receiver while the
+        // prefix is locked makes every event belong to exactly one side of the handoff.
+        let events = lock(&state.events);
         let receiver = state.sender.subscribe();
-        let events = lock(&state.events).clone();
-        Ok((events, receiver))
+        Ok((events.clone(), receiver))
     }
 
     /// Request cancellation for an active run.
@@ -822,6 +823,28 @@ fn execute_run(
     }
 }
 
+fn receive_with_cancellation(
+    driver: &mut DriverProcess,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Option<RawDriverMessage>, ProcessError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ProcessError::Timeout);
+        }
+        match driver.receive(remaining.min(DRIVER_POLL)) {
+            Ok(message) => return Ok(Some(message)),
+            Err(ProcessError::Timeout) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_driver(
     state: &Arc<RunState>,
@@ -847,7 +870,17 @@ fn run_driver(
     lock(&state.secret_values).clone_from(&secret_values);
     let mut driver = DriverProcess::spawn_with(driver_launch)?;
     let result = (|| -> Result<(), RunError> {
-        let ready = driver.receive(DRIVER_READY_TIMEOUT)?;
+        let Some(ready) =
+            receive_with_cancellation(&mut driver, DRIVER_READY_TIMEOUT, &state.cancel)?
+        else {
+            finish_run(
+                state,
+                RunStatus::Cancelled,
+                None,
+                &json!({ "passed": false, "cancelled": true }),
+            );
+            return Ok(());
+        };
         let DriverBody::Ready { driver: descriptor } = ready.parsed.body else {
             return Err(RunError::Protocol("expected driver.ready".to_owned()));
         };
@@ -1099,6 +1132,7 @@ fn run_driver(
 
 fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonValue, RunError> {
     let output = read_optional_confined_json(&state.workspace, &scenario.output)?;
+    let schema_valid = output.as_ref().is_some_and(catalog_output_schema_valid);
     let active_names = output
         .as_ref()
         .and_then(|value| value.get("active"))
@@ -1118,8 +1152,9 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
     let names_match = active_names == scenario.assertions.active_names;
     let score_matches = total_score == Some(scenario.assertions.total_score);
     Ok(json!({
-        "passed": output.is_some() && names_match && score_matches,
+        "passed": output.is_some() && schema_valid && names_match && score_matches,
         "outputPresent": output.is_some(),
+        "schemaValid": schema_valid,
         "activeNames": active_names,
         "expectedActiveNames": scenario.assertions.active_names,
         "namesMatch": names_match,
@@ -1127,6 +1162,51 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
         "expectedTotalScore": scenario.assertions.total_score,
         "scoreMatches": score_matches,
     }))
+}
+
+fn catalog_output_schema_valid(output: &JsonValue) -> bool {
+    let Some(object) = output.as_object() else {
+        return false;
+    };
+    if object.len() != 3
+        || !object.contains_key("active")
+        || !object.contains_key("activeCount")
+        || !object.contains_key("totalScore")
+    {
+        return false;
+    }
+    let Some(active) = object.get("active").and_then(JsonValue::as_array) else {
+        return false;
+    };
+    let Some(active_count) = object.get("activeCount").and_then(JsonValue::as_u64) else {
+        return false;
+    };
+    let Some(total_score) = object.get("totalScore").and_then(JsonValue::as_i64) else {
+        return false;
+    };
+    if active_count != active.len() as u64 {
+        return false;
+    }
+    let mut score_sum = 0_i64;
+    for item in active {
+        let Some(item) = item.as_object() else {
+            return false;
+        };
+        if item.len() != 3
+            || item.get("name").and_then(JsonValue::as_str).is_none()
+            || item.get("active").and_then(JsonValue::as_bool) != Some(true)
+        {
+            return false;
+        }
+        let Some(score) = item.get("score").and_then(JsonValue::as_i64) else {
+            return false;
+        };
+        let Some(sum) = score_sum.checked_add(score) else {
+            return false;
+        };
+        score_sum = sum;
+    }
+    score_sum == total_score
 }
 
 fn finish_run(state: &RunState, status: RunStatus, error: Option<&str>, score: &JsonValue) {
@@ -1191,9 +1271,11 @@ fn record_event(state: &RunState, kind: &str, payload: JsonValue) -> Result<(), 
             .open(state.bundle_dir.join("events.jsonl"))?;
         file.write_all(&line)?;
         events.push(event.clone());
-        lock(&state.summary).event_count = event.sequence;
         event
     };
+    let mut summary = lock(&state.summary);
+    summary.event_count = summary.event_count.max(event.sequence);
+    drop(summary);
     let _ = state.sender.send(event);
     Ok(())
 }
@@ -1645,6 +1727,20 @@ fn command(message_id: &str, body: CommandBody) -> ControllerCommand {
     }
 }
 
+fn workspace_relative_path(path: &Path) -> Result<PathBuf, RunError> {
+    let workspace_root = Path::new("/agent-lab-workspace");
+    let normalized = confined_child(workspace_root, path)?;
+    let relative = normalized
+        .strip_prefix(workspace_root)
+        .map_err(|_| RunError::PathEscape(normalized.clone()))?;
+    if relative.as_os_str().is_empty() {
+        return Err(RunError::InvalidScenario(
+            "scenario output must name a file inside the workspace".to_owned(),
+        ));
+    }
+    Ok(relative.to_path_buf())
+}
+
 fn load_scenarios(root: &Path) -> Result<BTreeMap<String, ScenarioManifest>, RunError> {
     let mut scenarios = BTreeMap::new();
     for entry in fs::read_dir(root)? {
@@ -1653,7 +1749,7 @@ fn load_scenarios(root: &Path) -> Result<BTreeMap<String, ScenarioManifest>, Run
             continue;
         }
         let source = fs::read_to_string(entry.path())?;
-        let manifest: ScenarioManifest = toml::from_str(&source)?;
+        let mut manifest: ScenarioManifest = toml::from_str(&source)?;
         if manifest.version != 1 || manifest.id.is_empty() {
             return Err(RunError::InvalidScenario(format!(
                 "{} has an unsupported version or empty id",
@@ -1667,7 +1763,7 @@ fn load_scenarios(root: &Path) -> Result<BTreeMap<String, ScenarioManifest>, Run
                 entry.path().display()
             )));
         }
-        let _ = confined_child(Path::new("/agent-lab-workspace"), &manifest.output)?;
+        manifest.output = workspace_relative_path(&manifest.output)?;
         if scenarios.insert(manifest.id.clone(), manifest).is_some() {
             return Err(RunError::InvalidScenario(
                 "scenario ids must be unique".to_owned(),
@@ -1698,7 +1794,7 @@ fn load_runs(
         }
         let scenario = scenarios.get(&summary.scenario_id);
         let workspace = bundle_dir.join("workspace");
-        if !workspace.is_dir() {
+        if !workspace.is_dir() && !summary.status.is_finished() {
             continue;
         }
         let (events, replay_failed) = match read_events(&bundle_dir.join("events.jsonl")) {
@@ -1736,6 +1832,7 @@ fn load_runs(
             };
             assembly.scenario.output.clone_from(&scenario.output);
         }
+        assembly.scenario.output = workspace_relative_path(&assembly.scenario.output)?;
         let output = assembly.scenario.output.clone();
         let interrupted = matches!(summary.status, RunStatus::Starting | RunStatus::Running);
         summary.event_count = events.len() as u64;
@@ -1754,18 +1851,55 @@ fn load_runs(
             replay_failed,
         });
         if interrupted {
-            let score = json!({ "passed": false, "cancelled": true, "recovered": true });
-            finish_run(
-                &state,
-                RunStatus::Cancelled,
-                Some("controller stopped before the run finalized"),
-                &score,
-            );
+            recover_interrupted_run(&state)?;
         }
         let id = lock(&state.summary).id.clone();
         runs.insert(id, state);
     }
     Ok(runs)
+}
+
+fn recover_interrupted_run(state: &RunState) -> Result<(), RunError> {
+    for directory in [
+        state.workspace.clone(),
+        state.bundle_dir.join("final"),
+        state.bundle_dir.join("final.tmp"),
+    ] {
+        if directory.exists() {
+            fs::remove_dir_all(directory)?;
+        }
+    }
+    let diff = state.bundle_dir.join("diff.json");
+    if diff.exists() {
+        fs::remove_file(diff)?;
+    }
+    let score = json!({
+        "passed": false,
+        "cancelled": true,
+        "recovered": true,
+        "workspaceEvidence": "discarded",
+    });
+    write_json_atomic(&state.bundle_dir.join("score.json"), &score)?;
+    {
+        let mut summary = lock(&state.summary);
+        summary.status = RunStatus::Cancelled;
+        summary.finished_at_ms = Some(now_ms());
+        summary.error = Some("controller stopped before the run finalized".to_owned());
+    }
+    record_event(
+        state,
+        "run.finished",
+        json!({
+            "status": RunStatus::Cancelled,
+            "error": "controller stopped before the run finalized",
+            "score": score,
+            "workspaceEvidence": "discarded because redaction material was unavailable",
+        }),
+    )?;
+    persist_review(state)?;
+    persist_manifest(state)?;
+    state.cancel.cancel();
+    Ok(())
 }
 
 fn read_events(path: &Path) -> Result<Vec<RunEvent>, RunError> {
@@ -1797,39 +1931,45 @@ fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
     if staging_dir.exists() {
         fs::remove_dir_all(&staging_dir)?;
     }
-    copy_tree(&state.workspace, &staging_dir)?;
-    let secret_values = lock(&state.secret_values).clone();
-    redact_tree(&staging_dir, &secret_values)?;
-    let initial = snapshot_tree(&state.bundle_dir.join("initial"))?;
-    let final_files = snapshot_tree(&staging_dir)?;
-    let paths = initial
-        .keys()
-        .chain(final_files.keys())
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let changes = paths
-        .into_iter()
-        .filter_map(|path| {
-            let before = initial.get(&path);
-            let after = final_files.get(&path);
-            (before != after).then(|| {
-                json!({
-                    "path": path,
-                    "kind": match (before, after) {
-                        (None, Some(_)) => "created",
-                        (Some(_), None) => "deleted",
-                        _ => "modified",
-                    },
-                    "before": before.and_then(|bytes| redacted_evidence_text(bytes, &secret_values)),
-                    "after": after.and_then(|bytes| redacted_evidence_text(bytes, &secret_values)),
+    let result = (|| {
+        copy_tree(&state.workspace, &staging_dir)?;
+        let secret_values = lock(&state.secret_values).clone();
+        redact_tree(&staging_dir, &secret_values)?;
+        let initial = snapshot_tree(&state.bundle_dir.join("initial"))?;
+        let final_files = snapshot_tree(&staging_dir)?;
+        let paths = initial
+            .keys()
+            .chain(final_files.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let changes = paths
+            .into_iter()
+            .filter_map(|path| {
+                let before = initial.get(&path);
+                let after = final_files.get(&path);
+                (before != after).then(|| {
+                    json!({
+                        "path": path,
+                        "kind": match (before, after) {
+                            (None, Some(_)) => "created",
+                            (Some(_), None) => "deleted",
+                            _ => "modified",
+                        },
+                        "before": before.and_then(|bytes| redacted_evidence_text(bytes, &secret_values)),
+                        "after": after.and_then(|bytes| redacted_evidence_text(bytes, &secret_values)),
+                    })
                 })
             })
-        })
-        .collect::<Vec<_>>();
-    let diff = json!({ "changes": changes });
-    write_json_atomic(&state.bundle_dir.join("diff.json"), &diff)?;
-    fs::rename(staging_dir, final_dir)?;
-    Ok(diff)
+            .collect::<Vec<_>>();
+        let diff = json!({ "changes": changes });
+        write_json_atomic(&state.bundle_dir.join("diff.json"), &diff)?;
+        fs::rename(&staging_dir, final_dir)?;
+        Ok(diff)
+    })();
+    if result.is_err() && staging_dir.exists() {
+        let _ = fs::remove_dir_all(staging_dir);
+    }
+    result
 }
 
 fn redact_tree(root: &Path, secrets: &[Vec<u8>]) -> Result<(), RunError> {
@@ -1842,6 +1982,7 @@ fn redact_tree(root: &Path, secrets: &[Vec<u8>]) -> Result<(), RunError> {
         if file_type.is_dir() {
             redact_tree(&entry.path(), secrets)?;
         } else if file_type.is_file() {
+            reject_multiply_linked_file(&entry.path(), &entry.metadata()?)?;
             let original = fs::read(entry.path())?;
             let redacted = redact_evidence_bytes(&original, secrets);
             if redacted != original {
@@ -1886,6 +2027,7 @@ fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, RunError> {
             if file_type.is_dir() {
                 visit(root, &entry.path(), files)?;
             } else if file_type.is_file() {
+                reject_multiply_linked_file(&entry.path(), &entry.metadata()?)?;
                 let relative = entry
                     .path()
                     .strip_prefix(root)
@@ -1925,6 +2067,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), RunError> {
         if file_type.is_dir() {
             copy_tree(&entry.path(), &target)?;
         } else if file_type.is_file() {
+            reject_multiply_linked_file(&entry.path(), &entry.metadata()?)?;
             fs::copy(entry.path(), target)?;
         }
     }
@@ -1940,6 +2083,24 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, RunError> {
         )));
     }
     Ok(canonical)
+}
+
+fn reject_multiply_linked_file(path: &Path, metadata: &fs::Metadata) -> Result<(), RunError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() > 1 {
+            return Err(RunError::PathEscape(path.to_path_buf()));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.number_of_links().is_some_and(|links| links > 1) {
+            return Err(RunError::PathEscape(path.to_path_buf()));
+        }
+    }
+    Ok(())
 }
 
 fn confined_child(root: &Path, child: impl AsRef<Path>) -> Result<PathBuf, RunError> {
@@ -1995,6 +2156,7 @@ fn read_optional_confined_json(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(RunError::PathEscape(path));
     }
+    reject_multiply_linked_file(&path, &metadata)?;
     let canonical_root = fs::canonicalize(root)?;
     let canonical_path = fs::canonicalize(&path)?;
     if canonical_path != canonical_root && !canonical_path.starts_with(&canonical_root) {
@@ -2072,6 +2234,11 @@ fn sensitive_name(name: &str) -> bool {
     normalized.contains("authorization")
         || normalized.contains("apikey")
         || normalized.contains("secret")
+        || normalized.contains("password")
+        || normalized.contains("passwd")
+        || normalized.contains("passphrase")
+        || normalized.contains("credential")
+        || normalized.ends_with("pass")
         || normalized.ends_with("token")
 }
 
@@ -2277,6 +2444,54 @@ totalScore = 11
     }
 
     #[test]
+    fn workspace_absolute_outputs_are_normalized_to_relative_paths() {
+        assert_eq!(
+            workspace_relative_path(Path::new("result.json")).unwrap(),
+            Path::new("result.json")
+        );
+        assert_eq!(
+            workspace_relative_path(Path::new("/agent-lab-workspace/nested/result.json")).unwrap(),
+            Path::new("nested/result.json")
+        );
+        assert!(workspace_relative_path(Path::new("/outside/result.json")).is_err());
+        assert!(workspace_relative_path(Path::new("/agent-lab-workspace")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_wait_observes_cancellation_before_the_cold_start_timeout() {
+        let mut driver = DriverProcess::spawn("/bin/sh", ["-c", "sleep 30"]).unwrap();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let message =
+            receive_with_cancellation(&mut driver, Duration::from_secs(30), &cancel).unwrap();
+        canceller.join().unwrap();
+        assert!(message.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn password_and_credential_environment_names_are_sensitive() {
+        for name in [
+            "PASSWORD",
+            "DB_PASSWORD",
+            "DATABASE_PASS",
+            "SSH_PASSPHRASE",
+            "SERVICE_CREDENTIAL",
+            "API_TOKEN",
+        ] {
+            assert!(sensitive_name(name), "{name} should be redacted");
+        }
+        assert!(!sensitive_name("PATH"));
+        assert!(!sensitive_name("MODEL_ID"));
+    }
+
+    #[test]
     fn turn_identity_rejects_stale_driver_messages() {
         assert!(
             validate_turn_identity("session", "turn", "session", "turn", "turn.finished").is_ok()
@@ -2328,6 +2543,51 @@ totalScore = 11
         assert!(configured_limit_error(&events, 5, &limits).is_none());
     }
 
+    #[test]
+    fn catalog_score_requires_the_complete_output_schema() {
+        let root = temporary_root("catalog-schema");
+        let state = test_run_state(&root);
+        let scenario = ScenarioManifest {
+            version: 1,
+            id: "catalog".to_owned(),
+            title: "Catalog".to_owned(),
+            description: "test".to_owned(),
+            question: "test".to_owned(),
+            seed: "catalog/workspace".into(),
+            prompt: "write output".to_owned(),
+            output: "result.json".into(),
+            limits: ScenarioLimits {
+                max_duration_ms: 1_000,
+                max_command_count: 1,
+                max_orchestrator_invocations: 1,
+                max_tool_invocations: 1,
+            },
+            assertions: CatalogAssertions {
+                active_names: vec!["alpha".to_owned(), "gamma".to_owned()],
+                total_score: 11,
+            },
+        };
+        fs::write(
+            state.workspace.join("result.json"),
+            br#"{"active":[{"name":"alpha"},{"name":"gamma"}],"totalScore":11}"#,
+        )
+        .unwrap();
+        let incomplete = score_catalog(&state, &scenario).unwrap();
+        assert_eq!(incomplete["schemaValid"], false);
+        assert_eq!(incomplete["passed"], false);
+
+        fs::write(
+            state.workspace.join("result.json"),
+            br#"{"active":[{"name":"alpha","active":true,"score":3},{"name":"gamma","active":true,"score":8}],"activeCount":2,"totalScore":11}"#,
+        )
+        .unwrap();
+        let complete = score_catalog(&state, &scenario).unwrap();
+        assert_eq!(complete["schemaValid"], true);
+        assert_eq!(complete["passed"], true);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn confined_json_reads_refuse_symlinks_outside_the_workspace() {
@@ -2342,6 +2602,34 @@ totalScore = 11
             read_optional_confined_json(&workspace, "result.json"),
             Err(RunError::PathEscape(_))
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalized_workspace_refuses_hard_links_to_outside_files() {
+        let root = temporary_root("output-hard-link");
+        fs::create_dir(root.join("initial")).unwrap();
+        fs::create_dir(root.join("workspace")).unwrap();
+        fs::write(root.join("outside.json"), br#"{"secret":true}"#).unwrap();
+        fs::hard_link(
+            root.join("outside.json"),
+            root.join("workspace/result.json"),
+        )
+        .unwrap();
+        let state = test_run_state(&root);
+
+        assert!(matches!(
+            read_optional_confined_json(&state.workspace, "result.json"),
+            Err(RunError::PathEscape(_))
+        ));
+        assert!(matches!(
+            finalize_workspace(&state),
+            Err(RunError::PathEscape(_))
+        ));
+        assert!(!root.join("final").exists());
+        assert!(!root.join("final.tmp").exists());
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2477,6 +2765,84 @@ totalScore = 11
         );
 
         drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_runs_discard_workspace_evidence_without_redaction_material() {
+        let root = temporary_root("interrupted-redaction");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let scenario = load_scenarios(&scenarios).unwrap()["catalog"].clone();
+        let bundle = data.join("run-interrupted");
+        fs::create_dir_all(bundle.join("workspace")).unwrap();
+        fs::create_dir_all(bundle.join("initial")).unwrap();
+        fs::create_dir_all(bundle.join("final")).unwrap();
+        fs::create_dir_all(bundle.join("final.tmp")).unwrap();
+        for path in [
+            bundle.join("workspace/result.json"),
+            bundle.join("final/result.json"),
+            bundle.join("final.tmp/result.json"),
+        ] {
+            fs::write(path, br#"{"password":"crash-secret"}"#).unwrap();
+        }
+        fs::write(bundle.join("diff.json"), br#"{"after":"crash-secret"}"#).unwrap();
+        let summary = RunSummary {
+            id: "run-interrupted".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "test/model".to_owned(),
+            status: RunStatus::Running,
+            started_at_ms: 1,
+            finished_at_ms: None,
+            event_count: 1,
+            error: None,
+        };
+        write_json_atomic(
+            &bundle.join("manifest.json"),
+            &serde_json::to_value(&summary).unwrap(),
+        )
+        .unwrap();
+        write_json_atomic(
+            &bundle.join("assembly.json"),
+            &serde_json::to_value(initial_assembly(&summary, &scenario)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            bundle.join("events.jsonl"),
+            serde_json::to_string(&event(1, "run.status", json!({ "status": "running" }))).unwrap()
+                + "\n",
+        )
+        .unwrap();
+
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/driver-is-not-needed-for-replay"),
+        };
+        let controller = RunController::new(config()).unwrap();
+        let detail = controller.get("run-interrupted").unwrap();
+        assert_eq!(detail.summary.status, RunStatus::Cancelled);
+        assert!(detail.output.is_none());
+        assert!(!bundle.join("workspace").exists());
+        assert!(!bundle.join("final").exists());
+        assert!(!bundle.join("final.tmp").exists());
+        assert!(!bundle.join("diff.json").exists());
+        assert_eq!(
+            detail.events.last().unwrap().payload["workspaceEvidence"],
+            "discarded because redaction material was unavailable"
+        );
+        drop(controller);
+
+        let replayed = RunController::new(config()).unwrap();
+        assert_eq!(
+            replayed.get("run-interrupted").unwrap().summary.status,
+            RunStatus::Cancelled
+        );
+        drop(replayed);
         fs::remove_dir_all(root).unwrap();
     }
 

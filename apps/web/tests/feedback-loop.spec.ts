@@ -6,6 +6,19 @@ async function submit(page: Page, source: string): Promise<void> {
   await input.press('Enter');
 }
 
+test('terminal session errors remain visible after the socket closes', async ({ page }) => {
+  await page.routeWebSocket(/\/api\/terminal(?:\?|$)/, (socket) => {
+    setTimeout(() => {
+      socket.send(JSON.stringify({ type: 'error', message: 'run terminal is unavailable' }));
+      socket.close();
+    }, 50);
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'error');
+  await expect(page.getByRole('alert')).toContainText('run terminal is unavailable');
+});
+
 test('a catalog run remains explorable and reopens from durable evidence', async ({ page }) => {
   const socketUrls: string[] = [];
   const terminalFrames: string[] = [];

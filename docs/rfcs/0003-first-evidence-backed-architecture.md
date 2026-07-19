@@ -200,9 +200,10 @@ mechanics without prematurely publishing a universal scalar score.
 ## What remains provisional
 
 - The JSON Lines message names and schemas are experimental.
-- Interactive completion has not yet been implemented in the Nushell surface.
+- Interactive completion covers the current MCP command surface; broader
+  workspace-oriented completion remains provisional.
 - Capability events do not yet have a first-class public envelope.
-- Only one real harness has exercised the driver boundary.
+- Public conformance evidence currently covers one synthetic driver fixture.
 - Cross-harness comparison and model-profile matching remain unproven.
 - Detach/reconnect, durable checkpoints, caching, and multi-agent scheduling
   remain unproven.

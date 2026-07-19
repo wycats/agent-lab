@@ -393,9 +393,13 @@ impl RunController {
         } else {
             state.workspace.clone()
         };
+        let secret_values = lock(&state.secret_values).clone();
         let (output, output_error) =
             match read_optional_confined_json(&evidence_root, &state.output) {
-                Ok(output) => (output, None),
+                Ok(output) => (
+                    output.map(|value| redact_value(value, &secret_values)),
+                    None,
+                ),
                 Err(error) => (None, Some(error.to_string())),
             };
         Ok(RunDetail {
@@ -3242,6 +3246,43 @@ totalScore = 11
         );
 
         drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_workspace_output_is_redacted_before_it_reaches_run_detail() {
+        let root = temporary_root("live-output-redaction");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-exploration"),
+        })
+        .unwrap();
+        let prepared = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = controller.state(&prepared.id).unwrap();
+        lock(&state.secret_values).push(b"provider-secret".to_vec());
+        fs::write(
+            state.workspace.join("result.json"),
+            br#"{"apiKey":"named-secret","note":"contains provider-secret"}"#,
+        )
+        .unwrap();
+
+        let detail = controller.get(&prepared.id).unwrap();
+        let output = detail.output.unwrap();
+        assert_eq!(output["apiKey"], "[REDACTED]");
+        assert_eq!(output["note"], "contains [REDACTED]");
+
+        drop(controller);
         fs::remove_dir_all(root).unwrap();
     }
 

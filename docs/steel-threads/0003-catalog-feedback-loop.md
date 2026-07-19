@@ -33,13 +33,14 @@ controller-mediated projection that can confine and attribute each mutation.
 ## Evidence
 
 The deterministic fixture proves lifecycle, cancellation, malformed-event
-handling, root confinement, scoring, redaction, and offline replay. A local
-real-v0 acceptance run used the same catalog and analysis source revisions as
-the attached Nushell session, created the expected artifact, passed the
-task-specific scorer, and reopened with the same score.
+handling, root confinement, scoring, redaction, and offline replay. It uses the
+same catalog and analysis source revisions as the attached Nushell session,
+creates the expected artifact, passes the task-specific scorer, and reopens
+with the same score.
 
-The live bundle is intentionally not committed. Public tests contain only the
-synthetic scenario, driver fixture, and capability data.
+Public tests and documentation contain only the synthetic scenario, driver
+fixture, and capability data. Private adapter acceptance stays with its owning
+repository.
 
 ## Conclusion
 
@@ -49,6 +50,6 @@ observations must remain separate from driver-native events, and human and
 agent MCP sessions can share authoritative source state without sharing
 protocol-session identity.
 
-The result establishes one real-harness feedback loop. It does not yet prove
+The result establishes one external-harness feedback loop. It does not yet prove
 cross-harness comparison, shared model profiles, or promotion of an exploratory
 discovery into a reusable evaluation.

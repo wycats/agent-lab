@@ -55,6 +55,10 @@
           },
           onEvent(event) {
             sessionEvents = [...sessionEvents, event];
+            if (event.type === 'error') {
+              connectionState = 'error';
+              startupError = event.message;
+            }
           },
           onScreen(text) {
             screenText = text;

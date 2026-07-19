@@ -104,6 +104,7 @@ export async function connectSession(
     flushScreen();
   });
   const scroll = surface.onScroll(flushScreen);
+  let sawError = false;
 
   socket.addEventListener('open', () => {
     if (!disposed) callbacks.onState('connected');
@@ -112,7 +113,13 @@ export async function connectSession(
     if (disposed) return;
     if (typeof message.data === 'string') {
       const event = parseSessionEvent(message.data);
-      if (event) callbacks.onEvent(event);
+      if (event) {
+        if (event.type === 'error') {
+          sawError = true;
+          callbacks.onState('error');
+        }
+        callbacks.onEvent(event);
+      }
     } else if (message.data instanceof ArrayBuffer) {
       surface.write(new Uint8Array(message.data), scheduleScreenRefresh);
     } else if (message.data instanceof Blob) {
@@ -122,7 +129,6 @@ export async function connectSession(
       });
     }
   });
-  let sawError = false;
   socket.addEventListener('error', () => {
     sawError = true;
     if (!disposed) callbacks.onState('error');

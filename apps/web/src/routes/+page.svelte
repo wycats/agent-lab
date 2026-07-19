@@ -128,7 +128,8 @@
   function watchRun(id: string): void {
     eventStream?.abort();
     eventStream = runClient.events(id, (event) => {
-      if (!runEvents.some((known) => known.sequence === event.sequence)) {
+      const lastSequence = runEvents.at(-1)?.sequence ?? -1;
+      if (event.sequence > lastSequence) {
         runEvents = [...runEvents, event];
       }
       if (

@@ -404,22 +404,26 @@ The public steel threads on `main` have demonstrated:
 - an embedded Nushell session with structured MCP discovery and invocation;
 - dynamic command refresh, help, pipelines, and native structured values;
 - browser-visible live activity through the same PTY boundary as the direct
-  interactive session.
+  interactive session;
+- a neutral external-driver lifecycle with streamed native events, explicit
+  cancellation and failure behavior, and reopenable process evidence that
+  preserves raw transcripts separately from named comparison projections.
 
-This evidence supports the structured human surface of the workbench. The
-public repository has not yet demonstrated a neutral external driver, a real
-harness bound to a controlled workspace, durable run replay, two independently
-integrated harnesses, or promotion of an exploratory discovery into an
-evaluation. Those remain validation boundaries rather than evidence for the
-current architecture.
+This evidence supports the structured human surface of the workbench and the
+process-level seam for attaching a harness without absorbing its native loop.
+The public repository has not yet demonstrated a real harness bound to a
+controlled workspace, complete run replay across workspace and capability
+effects, two independently integrated harnesses, or promotion of an
+exploratory discovery into an evaluation. Those remain validation boundaries
+rather than evidence for the current architecture.
 
 ## Next product validation boundary
 
-After the neutral driver and evidence foundation and a first runnable harness
-workbench have landed through the sequence in
-[RFC 0002](0002-steel-thread-method.md), build the smallest "two harnesses, one
-workbench" experience using a public Eve integration and a v0 adapter retained
-in v0's owning repository.
+With the neutral driver and process-evidence foundation in place, bind a first
+real harness to the controlled workspace and capability-source lifecycle in
+[RFC 0002](0002-steel-thread-method.md). Then build the smallest "two harnesses,
+one workbench" experience using a public Eve integration and a v0 adapter
+retained in v0's owning repository.
 
 Each harness should be independently inspectable, attach to the same kind of
 resettable seeded environment, run through its native loop, stream its native

@@ -1314,6 +1314,12 @@ fn redact_driver_descriptor(
 fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonValue, RunError> {
     let output = read_optional_confined_json(&state.workspace, &scenario.output)?;
     let schema_valid = output.as_ref().is_some_and(catalog_output_schema_valid);
+    let active_items = output
+        .as_ref()
+        .and_then(|value| value.get("active"))
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
     let active_names = output
         .as_ref()
         .and_then(|value| value.get("active"))
@@ -1344,14 +1350,19 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
     let capability_evidence_complete = CATALOG_REQUIRED_SOURCES
         .iter()
         .all(|source| capability_sources_used.contains(*source));
-    let catalog_analysis_composed = catalog_analysis_composed(&lock(&state.events));
+    let expected_active_items = catalog_analysis_active_items(&lock(&state.events));
+    let catalog_analysis_composed = expected_active_items.is_some();
+    let items_match = expected_active_items
+        .as_ref()
+        .is_some_and(|expected| active_items == *expected);
     Ok(json!({
         "passed": output.is_some()
             && schema_valid
             && names_match
             && score_matches
             && capability_evidence_complete
-            && catalog_analysis_composed,
+            && catalog_analysis_composed
+            && items_match,
         "outputPresent": output.is_some(),
         "schemaValid": schema_valid,
         "activeNames": active_names,
@@ -1364,10 +1375,11 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
         "expectedCapabilitySources": CATALOG_REQUIRED_SOURCES,
         "capabilityEvidenceComplete": capability_evidence_complete,
         "catalogAnalysisComposed": catalog_analysis_composed,
+        "itemsMatch": items_match,
     }))
 }
 
-fn catalog_analysis_composed(events: &[RunEvent]) -> bool {
+fn catalog_analysis_active_items(events: &[RunEvent]) -> Option<Vec<JsonValue>> {
     let mut catalog_results = Vec::new();
     for event in events {
         let is_agent = event.payload["actor"].as_str() == Some("agent");
@@ -1392,11 +1404,19 @@ fn catalog_analysis_composed(events: &[RunEvent]) -> bool {
                 continue;
             };
             if catalog_results.iter().any(|result| result == items) {
-                return true;
+                return Some(
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item.get("active").and_then(JsonValue::as_bool) == Some(true)
+                        })
+                        .cloned()
+                        .collect(),
+                );
             }
         }
     }
-    false
+    None
 }
 
 fn catalog_output_schema_valid(output: &JsonValue) -> bool {
@@ -2720,6 +2740,11 @@ fn read_optional_confined_file(
     relative: &Path,
     display_path: &Path,
 ) -> Result<Option<Vec<u8>>, RunError> {
+    match fs::symlink_metadata(display_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
     let path = confined_existing_child(root, relative)?;
     let metadata = fs::symlink_metadata(&path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -2968,6 +2993,29 @@ totalScore = 11
         .unwrap();
     }
 
+    fn catalog_scenario() -> ScenarioManifest {
+        ScenarioManifest {
+            version: 1,
+            id: "catalog".to_owned(),
+            title: "Catalog".to_owned(),
+            description: "test".to_owned(),
+            question: "test".to_owned(),
+            seed: "catalog/workspace".into(),
+            prompt: "write output".to_owned(),
+            output: "result.json".into(),
+            limits: ScenarioLimits {
+                max_duration_ms: 1_000,
+                max_command_count: 1,
+                max_orchestrator_invocations: 1,
+                max_tool_invocations: 1,
+            },
+            assertions: CatalogAssertions {
+                active_names: vec!["alpha".to_owned(), "gamma".to_owned()],
+                total_score: 11,
+            },
+        }
+    }
+
     fn test_run_state(root: &Path) -> RunState {
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).unwrap();
@@ -3212,26 +3260,7 @@ totalScore = 11
     fn catalog_score_requires_the_complete_output_schema() {
         let root = temporary_root("catalog-schema");
         let state = test_run_state(&root);
-        let scenario = ScenarioManifest {
-            version: 1,
-            id: "catalog".to_owned(),
-            title: "Catalog".to_owned(),
-            description: "test".to_owned(),
-            question: "test".to_owned(),
-            seed: "catalog/workspace".into(),
-            prompt: "write output".to_owned(),
-            output: "result.json".into(),
-            limits: ScenarioLimits {
-                max_duration_ms: 1_000,
-                max_command_count: 1,
-                max_orchestrator_invocations: 1,
-                max_tool_invocations: 1,
-            },
-            assertions: CatalogAssertions {
-                active_names: vec!["alpha".to_owned(), "gamma".to_owned()],
-                total_score: 11,
-            },
-        };
+        let scenario = catalog_scenario();
         fs::write(
             state.workspace.join("result.json"),
             br#"{"active":[{"name":"alpha"},{"name":"gamma"}],"totalScore":11}"#,
@@ -3299,10 +3328,40 @@ totalScore = 11
                 "arguments": { "items": catalog_items },
             }),
         ));
+
+        fs::write(
+            state.workspace.join("result.json"),
+            br#"{"active":[{"name":"alpha","active":true,"score":10},{"name":"gamma","active":true,"score":1}],"activeCount":2,"totalScore":11}"#,
+        )
+        .unwrap();
+        let fabricated_scores = score_catalog(&state, &scenario).unwrap();
+        assert_eq!(fabricated_scores["catalogAnalysisComposed"], true);
+        assert_eq!(fabricated_scores["itemsMatch"], false);
+        assert_eq!(fabricated_scores["passed"], false);
+
+        fs::write(
+            state.workspace.join("result.json"),
+            br#"{"active":[{"name":"alpha","active":true,"score":3},{"name":"gamma","active":true,"score":8}],"activeCount":2,"totalScore":11}"#,
+        )
+        .unwrap();
         let complete = score_catalog(&state, &scenario).unwrap();
         assert_eq!(complete["catalogAnalysisComposed"], true);
+        assert_eq!(complete["itemsMatch"], true);
         assert_eq!(complete["passed"], true);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confined_json_reads_treat_missing_outputs_as_absent() {
+        let root = temporary_root("output-missing");
+        let workspace = root.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+
+        assert_eq!(
+            read_optional_confined_json(&workspace, "result.json").unwrap(),
+            None
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

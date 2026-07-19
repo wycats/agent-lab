@@ -2,7 +2,7 @@ use std::{
     fs,
     path::PathBuf,
     process::Command as ProcessCommand,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agent_lab_driver_protocol::{
@@ -376,6 +376,68 @@ fn clean_exit_drains_trailing_stderr_before_transcript_capture() {
     ));
     assert_eq!(process.wait_for_exit(TIMEOUT).unwrap(), Some(0));
     assert_eq!(process.stderr(), b"fixture trailing stderr\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn eof_from_a_running_driver_respects_the_receive_timeout() {
+    let mut process = DriverProcess::spawn("sh", ["-c", "exec 1>&-; sleep 30"]).unwrap();
+    let timeout = Duration::from_millis(50);
+    let started = Instant::now();
+
+    assert!(matches!(
+        process.receive(timeout),
+        Err(ProcessError::Timeout)
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "receive blocked for {:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_a_driver_terminates_its_process_group() {
+    let root = temporary_root("process-group");
+    let pid_file = root.join("grandchild.pid");
+    let script = format!(
+        "sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; wait",
+        pid_file.display()
+    );
+    let process = DriverProcess::spawn("sh", ["-c", &script]).unwrap();
+    wait_for_file(&pid_file);
+    let grandchild = fs::read_to_string(&pid_file).unwrap();
+    assert!(process_exists(&grandchild));
+
+    drop(process);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_exists(&grandchild) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !process_exists(&grandchild),
+        "grandchild {grandchild} survived"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+fn wait_for_file(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(path.exists(), "{} was not created", path.display());
+}
+
+#[cfg(unix)]
+fn process_exists(pid: &str) -> bool {
+    ProcessCommand::new("kill")
+        .args(["-0", pid])
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn temporary_root(label: &str) -> PathBuf {

@@ -2,12 +2,17 @@ use std::{
     ffi::{OsStr, OsString},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{ChildStdin, Command, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
+#[cfg(windows)]
+use process_wrap::std::JobObject;
+#[cfg(unix)]
+use process_wrap::std::ProcessGroup;
+use process_wrap::std::{ChildWrapper, CommandWrap};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -83,7 +88,7 @@ impl DriverLaunch {
 }
 
 pub struct DriverProcess {
-    child: Child,
+    child: Box<dyn ChildWrapper>,
     stdin: ChildStdin,
     output: mpsc::Receiver<ReaderItem>,
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -127,22 +132,28 @@ impl DriverProcess {
             command.env_clear();
         }
         command.envs(launch.env);
-        let mut child = command
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut command = CommandWrap::from(command);
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        command.wrap(JobObject);
+        let mut child = command
             .spawn()
             .map_err(|error| ProcessError::Spawn(error.to_string()))?;
         let stdin = child
-            .stdin
+            .stdin()
             .take()
             .ok_or_else(|| ProcessError::Spawn("driver stdin was not piped".to_owned()))?;
         let stdout = child
-            .stdout
+            .stdout()
             .take()
             .ok_or_else(|| ProcessError::Spawn("driver stdout was not piped".to_owned()))?;
         let child_stderr = child
-            .stderr
+            .stderr()
             .take()
             .ok_or_else(|| ProcessError::Spawn("driver stderr was not piped".to_owned()))?;
 
@@ -237,6 +248,7 @@ impl DriverProcess {
     /// Returns distinct errors for timeout, reader failure, malformed output,
     /// protocol mismatch, sequence violation, and unexpected process exit.
     pub fn receive(&mut self, timeout: Duration) -> Result<RawDriverMessage, ProcessError> {
+        let deadline = Instant::now() + timeout;
         match self.output.recv_timeout(timeout) {
             Ok(ReaderItem::Line(raw)) => {
                 self.received.push(raw.clone());
@@ -263,16 +275,7 @@ impl DriverProcess {
                 Ok(RawDriverMessage { raw, parsed })
             }
             Ok(ReaderItem::Error(error)) => Err(ProcessError::Read(error)),
-            Ok(ReaderItem::Eof) => {
-                let status = self
-                    .child
-                    .wait()
-                    .map_err(|error| ProcessError::Read(error.to_string()))?;
-                self.join_readers()?;
-                Err(ProcessError::UnexpectedExit {
-                    code: status.code(),
-                })
-            }
+            Ok(ReaderItem::Eof) => self.unexpected_exit_before(deadline),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ProcessError::Timeout),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProcessError::ReaderStopped),
         }
@@ -305,6 +308,29 @@ impl DriverProcess {
         let stdout = join_reader(self.stdout_reader.take(), "stdout");
         let stderr = join_reader(self.stderr_reader.take(), "stderr");
         stdout.and(stderr)
+    }
+
+    fn unexpected_exit_before(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<RawDriverMessage, ProcessError> {
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| ProcessError::Read(error.to_string()))?
+            {
+                self.join_readers()?;
+                return Err(ProcessError::UnexpectedExit {
+                    code: status.code(),
+                });
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(ProcessError::Timeout);
+            }
+            thread::sleep((deadline - now).min(Duration::from_millis(5)));
+        }
     }
 }
 

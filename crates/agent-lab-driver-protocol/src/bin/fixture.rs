@@ -2,7 +2,7 @@ use std::io::{self, BufRead, BufWriter, Write};
 
 use agent_lab_driver_protocol::{
     CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverFailureScope,
-    DriverMessage, MAX_DRIVER_RECORD_BYTES, PROTOCOL_VERSION,
+    DriverMessage, MAX_DRIVER_RECORD_BYTES, MAX_DRIVER_STDERR_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::{Value as JsonValue, json};
 
@@ -79,7 +79,7 @@ impl Fixture {
                 self.abort_turn(output, session_id, turn_id, reason.as_ref())?;
                 Ok(false)
             }
-            CommandBody::CloseSession { session_id } => self.close_session(output, session_id),
+            CommandBody::CloseSession { session_id } => self.close_session(output, &session_id),
         }
     }
 
@@ -256,8 +256,8 @@ impl Fixture {
         Ok(())
     }
 
-    fn close_session(&mut self, output: &mut impl Write, session_id: String) -> io::Result<bool> {
-        if self.session_id.as_deref() != Some(&session_id) {
+    fn close_session(&mut self, output: &mut impl Write, session_id: &str) -> io::Result<bool> {
+        if self.session_id.as_deref() != Some(session_id) {
             self.fail(
                 output,
                 DriverFailureScope::Session,
@@ -270,19 +270,29 @@ impl Fixture {
         self.emit(
             output,
             DriverBody::SessionClosed {
-                session_id: session_id.clone(),
+                session_id: session_id.to_owned(),
             },
         )?;
-        if std::env::var_os("AGENT_LAB_FIXTURE_TRAILING_STDOUT").is_some() {
+        let trailing_count = std::env::var("AGENT_LAB_FIXTURE_TRAILING_STDOUT_COUNT")
+            .ok()
+            .and_then(|count| count.parse().ok())
+            .unwrap_or_else(|| {
+                usize::from(std::env::var_os("AGENT_LAB_FIXTURE_TRAILING_STDOUT").is_some())
+            });
+        for index in 0..trailing_count {
             self.emit(
                 output,
                 DriverBody::TurnEvent {
-                    session_id,
+                    session_id: session_id.to_owned(),
                     turn_id: "after-close".to_owned(),
                     event_type: "fixture.trailing-stdout".to_owned(),
-                    payload: JsonValue::Null,
+                    payload: json!({ "index": index }),
                 },
             )?;
+        }
+        if std::env::var_os("AGENT_LAB_FIXTURE_TRAILING_MALFORMED_STDOUT").is_some() {
+            output.write_all(b"{not-json}\n")?;
+            output.flush()?;
         }
         if std::env::var_os("AGENT_LAB_FIXTURE_TRAILING_STDERR").is_some() {
             eprintln!("fixture trailing stderr");
@@ -311,6 +321,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut output = io::stdout().lock();
         output.write_all(&vec![b'x'; MAX_DRIVER_RECORD_BYTES + 1])?;
         output.flush()?;
+        return Ok(());
+    }
+    if std::env::var_os("AGENT_LAB_FIXTURE_OVERSIZED_STDERR").is_some() {
+        let mut error = io::stderr().lock();
+        error.write_all(&vec![b'x'; MAX_DRIVER_STDERR_BYTES + 1])?;
+        error.flush()?;
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Ok(());
+    }
+    if std::env::var_os("AGENT_LAB_FIXTURE_LARGE_TRANSCRIPT").is_some() {
+        let mut output = BufWriter::new(io::stdout());
+        for sequence in 1..=10 {
+            write_message(
+                &mut output,
+                &DriverMessage {
+                    protocol_version: PROTOCOL_VERSION,
+                    sequence,
+                    caused_by: None,
+                    body: DriverBody::Ready {
+                        driver: DriverDescriptor {
+                            name: "large-transcript".to_owned(),
+                            version: "1".to_owned(),
+                            revision: None,
+                            features: vec!["x".repeat(MAX_DRIVER_RECORD_BYTES - 1024)],
+                        },
+                    },
+                },
+            )?;
+        }
         return Ok(());
     }
     let stdin = io::stdin();

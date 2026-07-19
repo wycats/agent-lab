@@ -8,7 +8,7 @@ use std::{
 use agent_lab_driver_protocol::{
     CanonicalizationPolicy, CommandBody, ControllerCommand, DriverBody, DriverEvidenceBundle,
     DriverFailureScope, DriverLaunch, DriverMessage, DriverProcess, MAX_DRIVER_RECORD_BYTES,
-    PROTOCOL_VERSION, ProcessError,
+    MAX_DRIVER_STDERR_BYTES, MAX_DRIVER_TRANSCRIPT_BYTES, PROTOCOL_VERSION, ProcessError,
 };
 use serde_json::json;
 
@@ -296,6 +296,48 @@ fn oversized_driver_records_are_bounded_before_buffering() {
 }
 
 #[test]
+fn oversized_driver_stderr_is_bounded_before_buffering() {
+    let mut launch = DriverLaunch::new(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"));
+    launch
+        .env
+        .push(("AGENT_LAB_FIXTURE_OVERSIZED_STDERR".into(), "1".into()));
+    let mut process = DriverProcess::spawn_with(launch).unwrap();
+
+    assert!(matches!(
+        process.receive(TIMEOUT),
+        Err(ProcessError::StderrLimitExceeded { limit }) if limit == MAX_DRIVER_STDERR_BYTES
+    ));
+    assert_eq!(process.stderr().len(), MAX_DRIVER_STDERR_BYTES);
+}
+
+#[test]
+fn total_driver_transcript_retention_is_bounded() {
+    let mut launch = DriverLaunch::new(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"));
+    launch
+        .env
+        .push(("AGENT_LAB_FIXTURE_LARGE_TRANSCRIPT".into(), "1".into()));
+    let mut process = DriverProcess::spawn_with(launch).unwrap();
+
+    loop {
+        match process.receive(TIMEOUT) {
+            Ok(_) => {}
+            Err(ProcessError::TranscriptLimitExceeded { limit }) => {
+                assert_eq!(limit, MAX_DRIVER_TRANSCRIPT_BYTES);
+                break;
+            }
+            Err(error) => panic!("unexpected process error: {error}"),
+        }
+    }
+    let retained = process
+        .transcript()
+        .driver_records
+        .iter()
+        .map(Vec::len)
+        .sum::<usize>();
+    assert!(retained <= MAX_DRIVER_TRANSCRIPT_BYTES);
+}
+
+#[test]
 fn raw_runs_remain_distinct_while_named_canonical_evidence_matches() {
     let first = completed_fixture_bundle();
     let second = completed_fixture_bundle();
@@ -429,9 +471,42 @@ fn evidence_rejects_protocol_and_manifest_identity_mismatches() {
         )
         .is_err()
     );
+}
 
+#[test]
+fn evidence_rejects_a_session_closed_with_an_unfinished_turn() {
+    let bundle = completed_fixture_bundle();
     let mut unfinished = bundle.transcript.clone();
-    unfinished.driver_records.pop();
+    unfinished.controller_records.insert(
+        1,
+        controller_record(&command(
+            "unfinished-turn",
+            CommandBody::StartTurn {
+                session_id: "evidence-session".to_owned(),
+                turn_id: "unfinished-turn".to_owned(),
+                task: json!({}),
+                capability_sources: json!([]),
+            },
+        )),
+    );
+    let mut closed: DriverMessage =
+        serde_json::from_slice(unfinished.driver_records.last().unwrap()).unwrap();
+    closed.sequence = 4;
+    unfinished.driver_records[2] = driver_record(&closed);
+    unfinished.driver_records.insert(
+        2,
+        driver_record(&DriverMessage {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: 3,
+            caused_by: Some("unfinished-turn".to_owned()),
+            body: DriverBody::TurnEvent {
+                session_id: "evidence-session".to_owned(),
+                turn_id: "unfinished-turn".to_owned(),
+                event_type: "fixture.waiting".to_owned(),
+                payload: json!({}),
+            },
+        }),
+    );
     assert!(
         DriverEvidenceBundle::new(
             bundle.controller_revision.clone(),
@@ -541,9 +616,10 @@ fn clean_exit_drains_trailing_stderr_before_transcript_capture() {
 #[test]
 fn clean_exit_drains_queued_stdout_before_transcript_capture() {
     let mut launch = DriverLaunch::new(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"));
-    launch
-        .env
-        .push(("AGENT_LAB_FIXTURE_TRAILING_STDOUT".into(), "1".into()));
+    launch.env.push((
+        "AGENT_LAB_FIXTURE_TRAILING_STDOUT_COUNT".into(),
+        "64".into(),
+    ));
     let mut process = DriverProcess::spawn_with(launch).unwrap();
     open_session(&mut process);
     process
@@ -558,15 +634,50 @@ fn clean_exit_drains_queued_stdout_before_transcript_capture() {
         process.receive(TIMEOUT).unwrap().parsed.body,
         DriverBody::SessionClosed { .. }
     ));
-    assert_eq!(process.wait_for_exit(TIMEOUT).unwrap(), Some(0));
+    assert!(matches!(
+        process.wait_for_exit(TIMEOUT),
+        Err(ProcessError::UnexpectedOutputAfterClose { .. })
+    ));
 
     let transcript = process.transcript();
+    assert_eq!(transcript.driver_records.len(), 67);
     let trailing: DriverMessage =
         serde_json::from_slice(transcript.driver_records.last().unwrap()).unwrap();
     assert!(matches!(
         trailing.body,
         DriverBody::TurnEvent { ref event_type, .. } if event_type == "fixture.trailing-stdout"
     ));
+}
+
+#[test]
+fn clean_exit_validates_malformed_queued_stdout() {
+    let mut launch = DriverLaunch::new(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"));
+    launch.env.push((
+        "AGENT_LAB_FIXTURE_TRAILING_MALFORMED_STDOUT".into(),
+        "1".into(),
+    ));
+    let mut process = DriverProcess::spawn_with(launch).unwrap();
+    open_session(&mut process);
+    process
+        .send(&command(
+            "close-malformed",
+            CommandBody::CloseSession {
+                session_id: "session-1".to_owned(),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        process.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::SessionClosed { .. }
+    ));
+    assert!(matches!(
+        process.wait_for_exit(TIMEOUT),
+        Err(ProcessError::MalformedOutput { ref raw, .. }) if raw == b"{not-json}\n"
+    ));
+    assert_eq!(
+        process.transcript().driver_records.last().unwrap(),
+        b"{not-json}\n"
+    );
 }
 
 #[cfg(unix)]
@@ -580,6 +691,24 @@ fn clean_exit_terminates_descendants_that_hold_reader_pipes() {
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "reader cleanup blocked for {:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn receive_reports_a_crashed_driver_even_when_a_descendant_holds_stdout() {
+    let mut process = DriverProcess::spawn("sh", ["-c", "sleep 30 & exit 17"]).unwrap();
+    let timeout = Duration::from_millis(250);
+    let started = Instant::now();
+
+    assert!(matches!(
+        process.receive(timeout),
+        Err(ProcessError::UnexpectedExit { code: Some(17) })
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "crash detection blocked for {:?}",
         started.elapsed()
     );
 }

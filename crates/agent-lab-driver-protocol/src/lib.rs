@@ -12,8 +12,8 @@ pub use evidence::{
     EvidenceError, EvidenceManifest,
 };
 pub use process::{
-    DriverLaunch, DriverProcess, DriverTranscript, MAX_DRIVER_RECORD_BYTES, ProcessError,
-    RawDriverMessage,
+    DriverLaunch, DriverProcess, DriverTranscript, MAX_DRIVER_RECORD_BYTES,
+    MAX_DRIVER_STDERR_BYTES, MAX_DRIVER_TRANSCRIPT_BYTES, ProcessError, RawDriverMessage,
 };
 pub use protocol::{
     CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverFailureScope,

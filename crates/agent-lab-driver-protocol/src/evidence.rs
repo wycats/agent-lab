@@ -10,7 +10,7 @@ use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 use crate::{
-    ControllerCommand, DriverBody, DriverDescriptor, DriverMessage, DriverTranscript,
+    CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverMessage, DriverTranscript,
     PROTOCOL_VERSION,
 };
 
@@ -219,10 +219,10 @@ pub enum EvidenceError {
 fn validate_bundle(bundle: &DriverEvidenceBundle) -> Result<(), EvidenceError> {
     let controller_records =
         validate_records::<ControllerCommand>("controller", &bundle.transcript.controller_records)?;
-    validate_controller_records(&controller_records)?;
+    let lifecycle = validate_controller_records(&controller_records)?;
     let driver_records =
         validate_records::<DriverMessage>("driver", &bundle.transcript.driver_records)?;
-    validate_driver_records(bundle, &driver_records)?;
+    validate_driver_records(bundle, &driver_records, &lifecycle)?;
     let expected =
         canonicalize_driver_records(&bundle.transcript, bundle.canonical.policy.clone())?;
     if expected != bundle.canonical {
@@ -233,7 +233,19 @@ fn validate_bundle(bundle: &DriverEvidenceBundle) -> Result<(), EvidenceError> {
     Ok(())
 }
 
-fn validate_controller_records(records: &[ControllerCommand]) -> Result<(), EvidenceError> {
+struct ControllerLifecycle {
+    sessions: BTreeSet<String>,
+    turns: BTreeSet<(String, String)>,
+}
+
+fn validate_controller_records(
+    records: &[ControllerCommand],
+) -> Result<ControllerLifecycle, EvidenceError> {
+    let mut lifecycle = ControllerLifecycle {
+        sessions: BTreeSet::new(),
+        turns: BTreeSet::new(),
+    };
+    let mut closed_sessions = BTreeSet::new();
     for (index, record) in records.iter().enumerate() {
         if record.protocol_version != PROTOCOL_VERSION {
             return Err(EvidenceError::InvalidBundle(format!(
@@ -242,8 +254,79 @@ fn validate_controller_records(records: &[ControllerCommand]) -> Result<(), Evid
                 record.protocol_version
             )));
         }
+        match &record.body {
+            CommandBody::OpenSession { session_id, .. } => {
+                if !lifecycle.sessions.insert(session_id.clone()) {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "controller record {} opens duplicate session {session_id}",
+                        index + 1
+                    )));
+                }
+            }
+            CommandBody::StartTurn {
+                session_id,
+                turn_id,
+                ..
+            } => {
+                if !lifecycle.sessions.contains(session_id) {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "controller record {} starts a turn for unopened session {session_id}",
+                        index + 1
+                    )));
+                }
+                if closed_sessions.contains(session_id) {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "controller record {} starts a turn after session {session_id} closed",
+                        index + 1
+                    )));
+                }
+                if !lifecycle
+                    .turns
+                    .insert((session_id.clone(), turn_id.clone()))
+                {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "controller record {} starts duplicate turn {session_id}/{turn_id}",
+                        index + 1
+                    )));
+                }
+            }
+            CommandBody::AbortTurn {
+                session_id,
+                turn_id,
+                ..
+            } => {
+                if !lifecycle
+                    .turns
+                    .contains(&(session_id.clone(), turn_id.clone()))
+                {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "controller record {} aborts unknown turn {session_id}/{turn_id}",
+                        index + 1
+                    )));
+                }
+            }
+            CommandBody::CloseSession { session_id } => {
+                if !lifecycle.sessions.contains(session_id) {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "controller record {} references unopened session {session_id}",
+                        index + 1
+                    )));
+                }
+                if !closed_sessions.insert(session_id.clone()) {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "controller record {} closes duplicate session {session_id}",
+                        index + 1
+                    )));
+                }
+            }
+        }
     }
-    Ok(())
+    if lifecycle.sessions != closed_sessions {
+        return Err(EvidenceError::InvalidBundle(
+            "controller transcript does not close every opened session".to_owned(),
+        ));
+    }
+    Ok(lifecycle)
 }
 
 fn validate_records<T>(kind: &str, records: &[Vec<u8>]) -> Result<Vec<T>, EvidenceError>
@@ -268,8 +351,9 @@ where
 fn validate_driver_records(
     bundle: &DriverEvidenceBundle,
     records: &[DriverMessage],
+    lifecycle: &ControllerLifecycle,
 ) -> Result<(), EvidenceError> {
-    let mut saw_ready = false;
+    let mut state = DriverLifecycleState::default();
     for (index, record) in records.iter().enumerate() {
         let record_number = index + 1;
         if record.protocol_version != PROTOCOL_VERSION {
@@ -287,38 +371,177 @@ fn validate_driver_records(
                 record.sequence
             )));
         }
-        match &record.body {
+        state.validate_body(bundle, lifecycle, record_number, &record.body)?;
+    }
+    state.finish(lifecycle, records)
+}
+
+#[derive(Default)]
+struct DriverLifecycleState {
+    saw_ready: bool,
+    finished_turns: BTreeSet<(String, String)>,
+    opened_sessions: BTreeSet<String>,
+    closed_sessions: BTreeSet<String>,
+}
+
+impl DriverLifecycleState {
+    fn validate_body(
+        &mut self,
+        bundle: &DriverEvidenceBundle,
+        lifecycle: &ControllerLifecycle,
+        record_number: usize,
+        body: &DriverBody,
+    ) -> Result<(), EvidenceError> {
+        if record_number == 1 && !matches!(body, DriverBody::Ready { .. }) {
+            return Err(EvidenceError::InvalidBundle(
+                "first driver record is not driver.ready".to_owned(),
+            ));
+        }
+        match body {
             DriverBody::Ready { driver } => {
-                saw_ready = true;
+                if self.saw_ready {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "driver record {record_number} repeats driver.ready"
+                    )));
+                }
+                self.saw_ready = true;
                 if driver != &bundle.driver {
                     return Err(EvidenceError::InvalidBundle(format!(
                         "driver record {record_number} descriptor does not match the manifest"
                     )));
                 }
             }
-            DriverBody::SessionOpened { process_id, .. } if *process_id != bundle.process_id => {
-                return Err(EvidenceError::InvalidBundle(format!(
-                    "driver record {record_number} process ID {process_id} does not match manifest process ID {}",
-                    bundle.process_id
-                )));
+            DriverBody::SessionOpened {
+                session_id,
+                process_id,
+            } => {
+                if !lifecycle.sessions.contains(session_id) {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "driver record {record_number} opened unexpected session {session_id}"
+                    )));
+                }
+                if *process_id != bundle.process_id {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "driver record {record_number} process ID {process_id} does not match manifest process ID {}",
+                        bundle.process_id
+                    )));
+                }
+                if !self.opened_sessions.insert(session_id.clone()) {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "driver record {record_number} opened duplicate session {session_id}"
+                    )));
+                }
             }
-            _ => {}
+            DriverBody::TurnEvent {
+                session_id,
+                turn_id,
+                ..
+            } => {
+                validate_open_turn_reference(
+                    lifecycle,
+                    &self.opened_sessions,
+                    record_number,
+                    session_id,
+                    turn_id,
+                )?;
+            }
+            DriverBody::TurnFinished {
+                session_id,
+                turn_id,
+                ..
+            } => {
+                validate_open_turn_reference(
+                    lifecycle,
+                    &self.opened_sessions,
+                    record_number,
+                    session_id,
+                    turn_id,
+                )?;
+                if !self
+                    .finished_turns
+                    .insert((session_id.clone(), turn_id.clone()))
+                {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "driver record {record_number} finishes duplicate turn {session_id}/{turn_id}"
+                    )));
+                }
+            }
+            DriverBody::SessionClosed { session_id } => {
+                if !self.opened_sessions.contains(session_id) {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "driver record {record_number} closed unopened session {session_id}"
+                    )));
+                }
+                if lifecycle.turns.iter().any(|turn| {
+                    turn.0.as_str() == session_id.as_str() && !self.finished_turns.contains(turn)
+                }) {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "driver record {record_number} closed session {session_id} with an unfinished turn"
+                    )));
+                }
+                if !self.closed_sessions.insert(session_id.clone()) {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "driver record {record_number} closed duplicate session {session_id}"
+                    )));
+                }
+            }
+            DriverBody::Failed { .. } => {}
         }
+        Ok(())
     }
-    if !saw_ready {
-        return Err(EvidenceError::InvalidBundle(
-            "driver transcript does not contain driver.ready".to_owned(),
-        ));
+
+    fn finish(
+        &self,
+        lifecycle: &ControllerLifecycle,
+        records: &[DriverMessage],
+    ) -> Result<(), EvidenceError> {
+        if !self.saw_ready {
+            return Err(EvidenceError::InvalidBundle(
+                "driver transcript does not contain driver.ready".to_owned(),
+            ));
+        }
+        if !matches!(
+            records.last().map(|record| &record.body),
+            Some(DriverBody::SessionClosed { .. })
+        ) {
+            return Err(EvidenceError::InvalidBundle(
+                "driver transcript does not end with session.closed".to_owned(),
+            ));
+        }
+        if let Some((session_id, turn_id)) = lifecycle.turns.difference(&self.finished_turns).next()
+        {
+            return Err(EvidenceError::InvalidBundle(format!(
+                "turn {session_id}/{turn_id} did not reach turn.finished"
+            )));
+        }
+        if lifecycle.sessions != self.opened_sessions || lifecycle.sessions != self.closed_sessions
+        {
+            return Err(EvidenceError::InvalidBundle(
+                "driver transcript does not open and close every requested session".to_owned(),
+            ));
+        }
+        Ok(())
     }
-    if !matches!(
-        records.last().map(|record| &record.body),
-        Some(DriverBody::SessionClosed { .. })
-    ) {
-        return Err(EvidenceError::InvalidBundle(
-            "driver transcript does not end with session.closed".to_owned(),
-        ));
+}
+
+fn validate_open_turn_reference(
+    lifecycle: &ControllerLifecycle,
+    opened_sessions: &BTreeSet<String>,
+    record_number: usize,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<(), EvidenceError> {
+    if opened_sessions.contains(session_id)
+        && lifecycle
+            .turns
+            .contains(&(session_id.to_owned(), turn_id.to_owned()))
+    {
+        Ok(())
+    } else {
+        Err(EvidenceError::InvalidBundle(format!(
+            "driver record {record_number} references unexpected turn {session_id}/{turn_id}"
+        )))
     }
-    Ok(())
 }
 
 fn canonicalize_driver_records(

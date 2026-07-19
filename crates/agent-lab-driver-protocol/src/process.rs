@@ -19,6 +19,8 @@ use thiserror::Error;
 use crate::{ControllerCommand, DriverMessage, PROTOCOL_VERSION};
 
 pub const MAX_DRIVER_RECORD_BYTES: usize = 1024 * 1024;
+pub const MAX_DRIVER_STDERR_BYTES: usize = 1024 * 1024;
+pub const MAX_DRIVER_TRANSCRIPT_BYTES: usize = 8 * 1024 * 1024;
 const OUTPUT_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +53,12 @@ pub enum ProcessError {
     UnterminatedOutput { raw: Vec<u8> },
     #[error("driver output record exceeded the {limit}-byte limit")]
     OutputLimitExceeded { limit: usize },
+    #[error("driver stderr exceeded the {limit}-byte retention limit")]
+    StderrLimitExceeded { limit: usize },
+    #[error("driver transcript exceeded the {limit}-byte retention limit")]
+    TranscriptLimitExceeded { limit: usize },
+    #[error("driver emitted output after session.closed: raw={raw:?}")]
+    UnexpectedOutputAfterClose { raw: Vec<u8> },
     #[error("driver emitted protocol version {actual}; expected {expected}")]
     UnsupportedVersion { expected: u32, actual: u32 },
     #[error("driver sequence was not contiguous: expected={expected}, actual={actual}")]
@@ -69,6 +77,7 @@ enum ReaderItem {
     Line(Vec<u8>),
     Error(String),
     OutputLimitExceeded,
+    StderrLimitExceeded,
     Eof,
 }
 
@@ -110,6 +119,7 @@ pub struct DriverProcess {
     stderr_reader: Option<thread::JoinHandle<Result<(), String>>>,
     sent: Vec<Vec<u8>>,
     received: Vec<Vec<u8>>,
+    received_bytes: usize,
     last_sequence: u64,
     stdout_eof: bool,
     stdout_complete: bool,
@@ -177,10 +187,11 @@ impl DriverProcess {
         let (sender, output) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
         let (completion_sender, reader_completion) = mpsc::channel();
         let stdout_completion = completion_sender.clone();
+        let stdout_sender = sender.clone();
         let stdout_reader = match thread::Builder::new()
             .name("agent-lab-driver-stdout".to_owned())
             .spawn(move || {
-                let result = read_stdout(stdout, &sender);
+                let result = read_stdout(stdout, &stdout_sender);
                 let _ = stdout_completion.send(ReaderCompletion::Stdout);
                 result
             }) {
@@ -197,7 +208,7 @@ impl DriverProcess {
         let stderr_reader = match thread::Builder::new()
             .name("agent-lab-driver-stderr".to_owned())
             .spawn(move || {
-                let result = read_stderr(child_stderr, &stderr_writer);
+                let result = read_stderr(child_stderr, &stderr_writer, &sender);
                 let _ = completion_sender.send(ReaderCompletion::Stderr);
                 result
             }) {
@@ -220,6 +231,7 @@ impl DriverProcess {
             stderr_reader: Some(stderr_reader),
             sent: Vec::new(),
             received: Vec::new(),
+            received_bytes: 0,
             last_sequence: 0,
             stdout_eof: false,
             stdout_complete: false,
@@ -278,44 +290,43 @@ impl DriverProcess {
     /// protocol mismatch, sequence violation, and unexpected process exit.
     pub fn receive(&mut self, timeout: Duration) -> Result<RawDriverMessage, ProcessError> {
         let deadline = Instant::now() + timeout;
-        match self.output.recv_timeout(timeout) {
-            Ok(ReaderItem::Line(raw)) => {
-                self.received.push(raw.clone());
-                if !raw.ends_with(b"\n") {
-                    return Err(ProcessError::UnterminatedOutput { raw });
+        loop {
+            let remaining = remaining_before(deadline, false)?;
+            match self
+                .output
+                .recv_timeout(remaining.min(Duration::from_millis(5)))
+            {
+                Ok(ReaderItem::Line(raw)) => return self.accept_line(raw),
+                Ok(ReaderItem::Error(error)) => return Err(ProcessError::Read(error)),
+                Ok(ReaderItem::OutputLimitExceeded) => {
+                    return Err(ProcessError::OutputLimitExceeded {
+                        limit: MAX_DRIVER_RECORD_BYTES,
+                    });
                 }
-                let parsed = serde_json::from_slice::<DriverMessage>(&raw).map_err(|error| {
-                    ProcessError::MalformedOutput {
-                        raw: raw.clone(),
-                        message: error.to_string(),
+                Ok(ReaderItem::StderrLimitExceeded) => {
+                    return Err(ProcessError::StderrLimitExceeded {
+                        limit: MAX_DRIVER_STDERR_BYTES,
+                    });
+                }
+                Ok(ReaderItem::Eof) => self.stdout_eof = true,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if !self.stdout_eof {
+                        return Err(ProcessError::ReaderStopped);
                     }
-                })?;
-                if parsed.protocol_version != PROTOCOL_VERSION {
-                    return Err(ProcessError::UnsupportedVersion {
-                        expected: PROTOCOL_VERSION,
-                        actual: parsed.protocol_version,
-                    });
+                    thread::sleep(remaining.min(Duration::from_millis(5)));
                 }
-                let expected_sequence = self.last_sequence + 1;
-                if parsed.sequence != expected_sequence {
-                    return Err(ProcessError::UnexpectedSequence {
-                        expected: expected_sequence,
-                        actual: parsed.sequence,
-                    });
-                }
-                self.last_sequence = parsed.sequence;
-                Ok(RawDriverMessage { raw, parsed })
             }
-            Ok(ReaderItem::Error(error)) => Err(ProcessError::Read(error)),
-            Ok(ReaderItem::OutputLimitExceeded) => Err(ProcessError::OutputLimitExceeded {
-                limit: MAX_DRIVER_RECORD_BYTES,
-            }),
-            Ok(ReaderItem::Eof) => {
-                self.stdout_eof = true;
-                self.unexpected_exit_before(deadline)
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| ProcessError::Read(error.to_string()))?
+            {
+                self.finish_after_exit(deadline, false)?;
+                return Err(ProcessError::UnexpectedExit {
+                    code: status.code(),
+                });
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(ProcessError::Timeout),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProcessError::ReaderStopped),
         }
     }
 
@@ -326,19 +337,103 @@ impl DriverProcess {
     /// Returns an error when polling the child fails or the deadline expires.
     pub fn wait_for_exit(&mut self, timeout: Duration) -> Result<Option<i32>, ProcessError> {
         let deadline = Instant::now() + timeout;
+        let mut pending = None;
         loop {
+            self.consume_wait_output(&mut pending);
             if let Some(status) = self
                 .child
                 .try_wait()
                 .map_err(|error| ProcessError::Read(error.to_string()))?
             {
-                self.finish_after_exit(deadline, true)?;
-                return Ok(status.code());
+                let finished = self.finish_after_exit(deadline, true);
+                return match pending {
+                    Some(error) => Err(error),
+                    None => finished.map(|()| status.code()),
+                };
             }
-            if Instant::now() >= deadline {
-                return Err(ProcessError::ExitTimeout);
+            let remaining = match remaining_before(deadline, true) {
+                Ok(remaining) => remaining,
+                Err(timeout) => return Err(pending.unwrap_or(timeout)),
+            };
+            match self
+                .output
+                .recv_timeout(remaining.min(Duration::from_millis(5)))
+            {
+                Ok(item) => self.record_wait_item(item, &mut pending),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if !self.stdout_eof {
+                        pending.get_or_insert(ProcessError::ReaderStopped);
+                    }
+                    thread::sleep(remaining.min(Duration::from_millis(5)));
+                }
             }
-            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn accept_line(&mut self, raw: Vec<u8>) -> Result<RawDriverMessage, ProcessError> {
+        if self.received_bytes.saturating_add(raw.len()) > MAX_DRIVER_TRANSCRIPT_BYTES {
+            return Err(ProcessError::TranscriptLimitExceeded {
+                limit: MAX_DRIVER_TRANSCRIPT_BYTES,
+            });
+        }
+        self.received_bytes += raw.len();
+        self.received.push(raw.clone());
+        if !raw.ends_with(b"\n") {
+            return Err(ProcessError::UnterminatedOutput { raw });
+        }
+        let parsed = serde_json::from_slice::<DriverMessage>(&raw).map_err(|error| {
+            ProcessError::MalformedOutput {
+                raw: raw.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        if parsed.protocol_version != PROTOCOL_VERSION {
+            return Err(ProcessError::UnsupportedVersion {
+                expected: PROTOCOL_VERSION,
+                actual: parsed.protocol_version,
+            });
+        }
+        let expected_sequence = self.last_sequence + 1;
+        if parsed.sequence != expected_sequence {
+            return Err(ProcessError::UnexpectedSequence {
+                expected: expected_sequence,
+                actual: parsed.sequence,
+            });
+        }
+        self.last_sequence = parsed.sequence;
+        Ok(RawDriverMessage { raw, parsed })
+    }
+
+    fn consume_wait_output(&mut self, pending: &mut Option<ProcessError>) {
+        for _ in 0..OUTPUT_QUEUE_CAPACITY {
+            match self.output.try_recv() {
+                Ok(item) => self.record_wait_item(item, pending),
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn record_wait_item(&mut self, item: ReaderItem, pending: &mut Option<ProcessError>) {
+        let error = match item {
+            ReaderItem::Line(raw) => match self.accept_line(raw) {
+                Ok(message) => Some(ProcessError::UnexpectedOutputAfterClose { raw: message.raw }),
+                Err(error) => Some(error),
+            },
+            ReaderItem::Error(error) => Some(ProcessError::Read(error)),
+            ReaderItem::OutputLimitExceeded => Some(ProcessError::OutputLimitExceeded {
+                limit: MAX_DRIVER_RECORD_BYTES,
+            }),
+            ReaderItem::StderrLimitExceeded => Some(ProcessError::StderrLimitExceeded {
+                limit: MAX_DRIVER_STDERR_BYTES,
+            }),
+            ReaderItem::Eof => {
+                self.stdout_eof = true;
+                None
+            }
+        };
+        if pending.is_none() {
+            *pending = error;
         }
     }
 
@@ -376,9 +471,14 @@ impl DriverProcess {
             let remaining = remaining_before(deadline, exit_timeout)?;
             match self.output.recv_timeout(remaining) {
                 Ok(ReaderItem::Line(raw)) => {
-                    self.received.push(raw.clone());
-                    if !raw.ends_with(b"\n") && pending.is_none() {
-                        pending = Some(ProcessError::UnterminatedOutput { raw });
+                    let error = match self.accept_line(raw) {
+                        Ok(message) => {
+                            ProcessError::UnexpectedOutputAfterClose { raw: message.raw }
+                        }
+                        Err(error) => error,
+                    };
+                    if pending.is_none() {
+                        pending = Some(error);
                     }
                 }
                 Ok(ReaderItem::Error(error)) => {
@@ -387,6 +487,11 @@ impl DriverProcess {
                 Ok(ReaderItem::OutputLimitExceeded) => {
                     pending.get_or_insert(ProcessError::OutputLimitExceeded {
                         limit: MAX_DRIVER_RECORD_BYTES,
+                    });
+                }
+                Ok(ReaderItem::StderrLimitExceeded) => {
+                    pending.get_or_insert(ProcessError::StderrLimitExceeded {
+                        limit: MAX_DRIVER_STDERR_BYTES,
                     });
                 }
                 Ok(ReaderItem::Eof) => self.stdout_eof = true,
@@ -423,29 +528,6 @@ impl DriverProcess {
             }
         }
         Ok(())
-    }
-
-    fn unexpected_exit_before(
-        &mut self,
-        deadline: Instant,
-    ) -> Result<RawDriverMessage, ProcessError> {
-        loop {
-            if let Some(status) = self
-                .child
-                .try_wait()
-                .map_err(|error| ProcessError::Read(error.to_string()))?
-            {
-                self.finish_after_exit(deadline, false)?;
-                return Err(ProcessError::UnexpectedExit {
-                    code: status.code(),
-                });
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(ProcessError::Timeout);
-            }
-            thread::sleep((deadline - now).min(Duration::from_millis(5)));
-        }
     }
 }
 
@@ -526,7 +608,11 @@ fn read_stdout(stdout: impl Read, sender: &mpsc::SyncSender<ReaderItem>) -> Resu
     }
 }
 
-fn read_stderr(stderr: impl Read, destination: &Mutex<Vec<u8>>) -> Result<(), String> {
+fn read_stderr(
+    stderr: impl Read,
+    destination: &Mutex<Vec<u8>>,
+    sender: &mpsc::SyncSender<ReaderItem>,
+) -> Result<(), String> {
     let mut reader = BufReader::new(stderr);
     let mut chunk = [0_u8; 4096];
     loop {
@@ -534,9 +620,17 @@ fn read_stderr(stderr: impl Read, destination: &Mutex<Vec<u8>>) -> Result<(), St
         if count == 0 {
             return Ok(());
         }
-        destination
+        let mut retained = destination
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend_from_slice(&chunk[..count]);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remaining = MAX_DRIVER_STDERR_BYTES.saturating_sub(retained.len());
+        retained.extend_from_slice(&chunk[..count.min(remaining)]);
+        if count > remaining {
+            drop(retained);
+            let _ = sender.send(ReaderItem::StderrLimitExceeded);
+            return Err(format!(
+                "driver stderr exceeded the {MAX_DRIVER_STDERR_BYTES}-byte retention limit"
+            ));
+        }
     }
 }

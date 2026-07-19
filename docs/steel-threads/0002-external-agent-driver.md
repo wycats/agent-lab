@@ -194,25 +194,30 @@ public-foundation boundary:
 
 ```console
 $ cargo test -p agent-lab-driver-protocol --all-features
-running 16 tests
+running 21 tests
 test clean_exit_drains_queued_stdout_before_transcript_capture ... ok
 test clean_exit_drains_trailing_stderr_before_transcript_capture ... ok
 test clean_exit_terminates_descendants_that_hold_reader_pipes ... ok
+test clean_exit_validates_malformed_queued_stdout ... ok
 test dropping_a_driver_terminates_its_process_group ... ok
 test durable_evidence_reopens_and_rejects_tampering ... ok
 test eof_from_a_running_driver_respects_the_receive_timeout ... ok
+test evidence_rejects_a_session_closed_with_an_unfinished_turn ... ok
 test evidence_rejects_protocol_and_manifest_identity_mismatches ... ok
 test malformed_output_reported_failure_and_process_exit_are_distinct ... ok
 test one_process_streams_two_turns_and_cancels_the_second ... ok
 test oversized_driver_records_are_bounded_before_buffering ... ok
+test oversized_driver_stderr_is_bounded_before_buffering ... ok
 test probe_can_finalize_fixture_evidence_for_direct_inspection ... ok
 test probe_rejects_a_nonzero_driver_exit_before_finalizing_evidence ... ok
 test probe_rejects_completion_for_an_unexpected_turn ... ok
 test protocol_version_and_sequence_violations_are_distinct ... ok
 test raw_runs_remain_distinct_while_named_canonical_evidence_matches ... ok
+test receive_reports_a_crashed_driver_even_when_a_descendant_holds_stdout ... ok
+test total_driver_transcript_retention_is_bounded ... ok
 test unterminated_driver_records_are_rejected_before_parsing ... ok
 
-test result: ok. 16 passed; 0 failed
+test result: ok. 21 passed; 0 failed
 ```
 
 The focused strict-Clippy gate also passes:
@@ -228,7 +233,10 @@ process and session, protocol failures remain distinct, and raw records retain
 their JSON Lines delimiters. A clean process exit joins both reader threads so
 trailing stderr and queued stdout are present before transcript capture;
 descendants that inherit those pipes are terminated within the same bounded
-lifecycle. Oversized and unterminated frames fail before unbounded retention.
+lifecycle. Backpressure is drained while the driver exits, crashes remain
+distinct from output timeouts, and post-close records receive normal protocol
+validation. Oversized stdout frames, total driver transcript retention, and
+stderr fail at explicit bounds.
 Two fixture processes produce different raw records because their PIDs differ, while the
 `fixture-v1` projection matches after removing the explicitly named
 `processId` field. The finalized directory

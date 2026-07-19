@@ -273,6 +273,7 @@ struct RunState {
     bundle_dir: PathBuf,
     workspace: PathBuf,
     output: PathBuf,
+    initial_snapshot: Option<BTreeMap<String, Vec<u8>>>,
     capabilities: Mutex<Vec<CapabilityEndpoint>>,
     secret_values: Mutex<Vec<Vec<u8>>>,
     replay_failed: bool,
@@ -532,8 +533,12 @@ impl RunController {
             })
             .cloned();
         if let Some(state) = existing {
-            if lock(&state.capabilities).is_empty() {
+            lock(&state.secret_values).clone_from(&driver_secret_values(&self.inner.driver));
+            let attached_capabilities = lock(&state.capabilities).clone();
+            extend_capability_secrets(&state, &attached_capabilities);
+            if attached_capabilities.is_empty() {
                 let capabilities = start_capability_sources(state.clone()).await?;
+                extend_capability_secrets(&state, &capabilities);
                 lock(&state.capabilities).clone_from(&capabilities);
                 update_assembly_capabilities(&state, &capabilities)?;
             }
@@ -545,6 +550,7 @@ impl RunController {
         fs::create_dir(&bundle_dir)?;
         let workspace = bundle_dir.join("workspace");
         let seed = confined_existing_child(&self.inner.scenarios_dir, &scenario.seed)?;
+        let initial_snapshot = snapshot_tree(&seed)?;
         copy_tree(&seed, &workspace)?;
         copy_tree(&seed, &bundle_dir.join("initial"))?;
 
@@ -570,8 +576,9 @@ impl RunController {
             bundle_dir,
             workspace,
             output: scenario.output.clone(),
+            initial_snapshot: Some(initial_snapshot),
             capabilities: Mutex::new(Vec::new()),
-            secret_values: Mutex::new(Vec::new()),
+            secret_values: Mutex::new(driver_secret_values(&self.inner.driver)),
             replay_failed: false,
         });
         lock(&self.inner.runs).insert(id, state.clone());
@@ -579,6 +586,7 @@ impl RunController {
         persist_assembly(&state)?;
         record_event(&state, "run.prepared", json!({ "scenario": scenario.id }))?;
         let capabilities = start_capability_sources(state.clone()).await?;
+        extend_capability_secrets(&state, &capabilities);
         lock(&state.capabilities).clone_from(&capabilities);
         update_assembly_capabilities(&state, &capabilities)?;
         Ok(lock(&state.summary).clone())
@@ -907,6 +915,24 @@ fn redacted_run_error(state: &RunState, error: &RunError) -> String {
     redact_string(&error.to_string(), &lock(&state.secret_values).clone())
 }
 
+fn driver_secret_values(driver_launch: &DriverLaunch) -> Vec<Vec<u8>> {
+    driver_launch
+        .env
+        .iter()
+        .map(|(_, value)| value.to_string_lossy().as_bytes().to_vec())
+        .filter(|value| value.len() >= 4)
+        .collect()
+}
+
+fn extend_capability_secrets(state: &RunState, capabilities: &[CapabilityEndpoint]) {
+    lock(&state.secret_values).extend(
+        capabilities
+            .iter()
+            .flat_map(|capability| [&capability.human_token, &capability.agent_token])
+            .map(|token| token.as_bytes().to_vec()),
+    );
+}
+
 fn receive_with_cancellation(
     driver: &mut DriverProcess,
     timeout: Duration,
@@ -968,12 +994,7 @@ fn run_driver(
 ) -> Result<(), RunError> {
     update_status(state, RunStatus::Running)?;
     record_event(state, "driver.starting", JsonValue::Null)?;
-    let mut secret_values = driver_launch
-        .env
-        .iter()
-        .map(|(_, value)| value.to_string_lossy().as_bytes().to_vec())
-        .filter(|value| value.len() >= 4)
-        .collect::<Vec<_>>();
+    let mut secret_values = driver_secret_values(&driver_launch);
     secret_values.extend(
         capabilities
             .iter()
@@ -1314,12 +1335,6 @@ fn redact_driver_descriptor(
 fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonValue, RunError> {
     let output = read_optional_confined_json(&state.workspace, &scenario.output)?;
     let schema_valid = output.as_ref().is_some_and(catalog_output_schema_valid);
-    let active_items = output
-        .as_ref()
-        .and_then(|value| value.get("active"))
-        .and_then(JsonValue::as_array)
-        .cloned()
-        .unwrap_or_default();
     let active_names = output
         .as_ref()
         .and_then(|value| value.get("active"))
@@ -1350,11 +1365,11 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
     let capability_evidence_complete = CATALOG_REQUIRED_SOURCES
         .iter()
         .all(|source| capability_sources_used.contains(*source));
-    let expected_active_items = catalog_analysis_active_items(&lock(&state.events));
-    let catalog_analysis_composed = expected_active_items.is_some();
-    let items_match = expected_active_items
+    let analysis_result = catalog_analysis_result(&lock(&state.events));
+    let catalog_analysis_composed = analysis_result.is_some();
+    let analysis_result_matches = analysis_result
         .as_ref()
-        .is_some_and(|expected| active_items == *expected);
+        .is_some_and(|expected| output.as_ref() == Some(expected));
     Ok(json!({
         "passed": output.is_some()
             && schema_valid
@@ -1362,7 +1377,7 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
             && score_matches
             && capability_evidence_complete
             && catalog_analysis_composed
-            && items_match,
+            && analysis_result_matches,
         "outputPresent": output.is_some(),
         "schemaValid": schema_valid,
         "activeNames": active_names,
@@ -1375,11 +1390,11 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
         "expectedCapabilitySources": CATALOG_REQUIRED_SOURCES,
         "capabilityEvidenceComplete": capability_evidence_complete,
         "catalogAnalysisComposed": catalog_analysis_composed,
-        "itemsMatch": items_match,
+        "analysisResultMatches": analysis_result_matches,
     }))
 }
 
-fn catalog_analysis_active_items(events: &[RunEvent]) -> Option<Vec<JsonValue>> {
+fn catalog_analysis_result(events: &[RunEvent]) -> Option<JsonValue> {
     let mut catalog_results = Vec::new();
     for event in events {
         let is_agent = event.payload["actor"].as_str() == Some("agent");
@@ -1404,15 +1419,11 @@ fn catalog_analysis_active_items(events: &[RunEvent]) -> Option<Vec<JsonValue>> 
                 continue;
             };
             if catalog_results.iter().any(|result| result == items) {
-                return Some(
-                    items
-                        .iter()
-                        .filter(|item| {
-                            item.get("active").and_then(JsonValue::as_bool) == Some(true)
-                        })
-                        .cloned()
-                        .collect(),
-                );
+                return event
+                    .payload
+                    .get("result")
+                    .filter(|result| result.is_object())
+                    .cloned();
             }
         }
     }
@@ -2184,6 +2195,9 @@ fn load_runs(
         }
         assembly.scenario.output = workspace_relative_path(&assembly.scenario.output)?;
         let output = assembly.scenario.output.clone();
+        let initial_snapshot = (summary.status == RunStatus::Exploring)
+            .then(|| snapshot_tree(&bundle_dir.join("initial")).ok())
+            .flatten();
         summary.event_count = events.len() as u64;
         let (sender, _) = broadcast::channel(256);
         let state = Arc::new(RunState {
@@ -2195,6 +2209,7 @@ fn load_runs(
             bundle_dir,
             workspace,
             output,
+            initial_snapshot,
             capabilities: Mutex::new(Vec::new()),
             secret_values: Mutex::new(Vec::new()),
             replay_failed,
@@ -2340,7 +2355,12 @@ fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
         copy_tree(&state.workspace, &staging_dir)?;
         let secret_values = lock(&state.secret_values).clone();
         redact_tree(&staging_dir, &secret_values)?;
-        let initial = snapshot_tree(&state.bundle_dir.join("initial"))?;
+        let initial = state.initial_snapshot.as_ref().ok_or_else(|| {
+            RunError::EvidencePersistence(
+                "protected initial workspace snapshot is unavailable".to_owned(),
+            )
+        })?;
+        persist_initial_snapshot(state, initial)?;
         let final_files = snapshot_tree(&staging_dir)?;
         let paths = initial
             .keys()
@@ -2380,6 +2400,26 @@ fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
     result
 }
 
+fn persist_initial_snapshot(
+    state: &RunState,
+    snapshot: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), RunError> {
+    let initial_dir = state.bundle_dir.join("initial");
+    let staging_dir = state.bundle_dir.join("initial.tmp");
+    remove_evidence_entry(&staging_dir)?;
+    fs::create_dir(&staging_dir)?;
+    for (relative, contents) in snapshot {
+        let path = confined_child(&staging_dir, relative)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, contents)?;
+    }
+    remove_evidence_entry(&initial_dir)?;
+    fs::rename(staging_dir, initial_dir)?;
+    Ok(())
+}
+
 fn remove_evidence_entry(path: &Path) -> Result<(), RunError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -2414,6 +2454,8 @@ fn redact_tree(root: &Path, secrets: &[Vec<u8>]) -> Result<(), RunError> {
                 if redacted != original {
                     fs::write(entry.path(), redacted)?;
                 }
+            } else {
+                return Err(RunError::UnsupportedWorkspaceEntry(entry.path()));
             }
         }
         Ok(())
@@ -2464,6 +2506,8 @@ fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, RunError> {
                     .to_string_lossy()
                     .into_owned();
                 files.insert(relative, read_evidence_file(&entry.path(), retained_bytes)?);
+            } else {
+                return Err(RunError::UnsupportedWorkspaceEntry(entry.path()));
             }
         }
         Ok(())
@@ -2486,6 +2530,8 @@ fn validate_evidence_tree(root: &Path) -> Result<(), RunError> {
                 visit(&entry.path(), retained_bytes)?;
             } else if file_type.is_file() {
                 validate_evidence_file(&entry.path(), &entry.metadata()?, retained_bytes)?;
+            } else {
+                return Err(RunError::UnsupportedWorkspaceEntry(entry.path()));
             }
         }
         Ok(())
@@ -2564,6 +2610,8 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), RunError> {
         } else if file_type.is_file() {
             reject_multiply_linked_file(&entry.path(), &entry.metadata()?)?;
             fs::copy(entry.path(), target)?;
+        } else {
+            return Err(RunError::UnsupportedWorkspaceEntry(entry.path()));
         }
     }
     Ok(())
@@ -2907,6 +2955,8 @@ pub enum RunError {
     EvidencePersistence(String),
     #[error("workspace evidence exceeds its retention limit: {0}")]
     EvidenceLimit(String),
+    #[error("workspace contains an unsupported filesystem entry: {0}")]
+    UnsupportedWorkspaceEntry(PathBuf),
     #[error(transparent)]
     Process(#[from] agent_lab_driver_protocol::ProcessError),
     #[error(transparent)]
@@ -3019,6 +3069,7 @@ totalScore = 11
     fn test_run_state(root: &Path) -> RunState {
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).unwrap();
+        let initial_snapshot = snapshot_tree(&root.join("initial")).ok();
         let (sender, _) = broadcast::channel(1);
         RunState {
             summary: Mutex::new(RunSummary {
@@ -3067,6 +3118,7 @@ totalScore = 11
             bundle_dir: root.to_path_buf(),
             workspace,
             output: "result.json".into(),
+            initial_snapshot,
             capabilities: Mutex::new(Vec::new()),
             secret_values: Mutex::new(Vec::new()),
             replay_failed: false,
@@ -3309,6 +3361,11 @@ totalScore = 11
                     "actor": "agent",
                     "isError": false,
                     "arguments": { "items": [{ "name": "fabricated", "active": true, "score": 11 }] },
+                    "result": {
+                        "active": [{ "name": "fabricated", "active": true, "score": 11 }],
+                        "activeCount": 1,
+                        "totalScore": 11,
+                    },
                 }),
             ),
         ]);
@@ -3326,6 +3383,14 @@ totalScore = 11
                 "actor": "agent",
                 "isError": false,
                 "arguments": { "items": catalog_items },
+                "result": {
+                    "active": [
+                        { "name": "alpha", "active": true, "score": 3 },
+                        { "name": "gamma", "active": true, "score": 8 },
+                    ],
+                    "activeCount": 2,
+                    "totalScore": 11,
+                },
             }),
         ));
 
@@ -3336,7 +3401,7 @@ totalScore = 11
         .unwrap();
         let fabricated_scores = score_catalog(&state, &scenario).unwrap();
         assert_eq!(fabricated_scores["catalogAnalysisComposed"], true);
-        assert_eq!(fabricated_scores["itemsMatch"], false);
+        assert_eq!(fabricated_scores["analysisResultMatches"], false);
         assert_eq!(fabricated_scores["passed"], false);
 
         fs::write(
@@ -3346,7 +3411,7 @@ totalScore = 11
         .unwrap();
         let complete = score_catalog(&state, &scenario).unwrap();
         assert_eq!(complete["catalogAnalysisComposed"], true);
-        assert_eq!(complete["itemsMatch"], true);
+        assert_eq!(complete["analysisResultMatches"], true);
         assert_eq!(complete["passed"], true);
 
         fs::remove_dir_all(root).unwrap();
@@ -3499,6 +3564,51 @@ totalScore = 11
         );
         drop(events);
         drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_exploration_redacts_driver_environment_secrets() {
+        let root = temporary_root("prepared-secret-redaction");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let mut driver = DriverLaunch::new("/driver-is-not-needed-for-exploration");
+        driver
+            .env
+            .push(("PROVIDER_TOKEN".into(), "provider-secret".into()));
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver,
+        })
+        .unwrap();
+        let summary = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = controller.state(&summary.id).unwrap();
+
+        source_observer(state.clone(), "catalog", "human")(
+            "mcp.tool.started",
+            json!({ "arguments": { "note": "provider-secret" } }),
+        );
+
+        assert_eq!(
+            lock(&state.events).last().unwrap().payload["arguments"]["note"],
+            "[REDACTED]"
+        );
+        assert!(
+            !fs::read_to_string(state.bundle_dir.join("events.jsonl"))
+                .unwrap()
+                .contains("provider-secret")
+        );
+        drop(state);
+        drop(controller);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4300,6 +4410,7 @@ totalScore = 11
             bundle_dir: root.clone(),
             workspace: root.join("workspace"),
             output: "result.json".into(),
+            initial_snapshot: Some(snapshot_tree(&root.join("initial")).unwrap()),
             capabilities: Mutex::new(vec![CapabilityEndpoint {
                 id: "catalog".to_owned(),
                 revision: "catalog-v2".to_owned(),
@@ -4462,6 +4573,51 @@ totalScore = 11
         assert!(!root.join("final.tmp").exists());
         assert!(!root.join("final").exists());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_workspace_entries_are_rejected_before_snapshotting() {
+        let root = PathBuf::from("/tmp").join(format!(
+            "agent-lab-special-{}-{}",
+            std::process::id(),
+            random_suffix()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("initial")).unwrap();
+        let state = test_run_state(&root);
+        let socket =
+            std::os::unix::net::UnixListener::bind(state.workspace.join("agent.sock")).unwrap();
+
+        assert!(matches!(
+            finalize_workspace(&state),
+            Err(RunError::UnsupportedWorkspaceEntry(_))
+        ));
+        assert!(!root.join("final").exists());
+
+        drop(socket);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finalization_restores_the_protected_initial_snapshot() {
+        let root = temporary_root("protected-initial");
+        fs::create_dir(root.join("initial")).unwrap();
+        fs::write(root.join("initial/seed.txt"), "original").unwrap();
+        let state = test_run_state(&root);
+        fs::write(state.workspace.join("seed.txt"), "original").unwrap();
+        fs::write(state.workspace.join("result.json"), "{}\n").unwrap();
+        fs::write(root.join("initial/seed.txt"), "driver-controlled").unwrap();
+
+        let diff = finalize_workspace(&state).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("initial/seed.txt")).unwrap(),
+            "original"
+        );
+        assert_eq!(diff["changes"].as_array().unwrap().len(), 1);
+        assert_eq!(diff["changes"][0]["path"], "result.json");
         fs::remove_dir_all(root).unwrap();
     }
 

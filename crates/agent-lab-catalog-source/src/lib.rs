@@ -157,6 +157,7 @@ impl ServerHandler for AnalysisSource {
             "mcp.tool.started",
             json!({ "name": name, "arguments": arguments }),
         );
+        let mut structured_result = None;
         let result = match name.as_str() {
             "summarize" => arguments
                 .get("items")
@@ -175,11 +176,13 @@ impl ServerHandler for AnalysisSource {
                             .iter()
                             .filter_map(|item| item.get("score").and_then(JsonValue::as_i64))
                             .sum::<i64>();
-                        Ok(CallToolResult::structured(json!({
+                        let value = json!({
                             "active": active,
                             "activeCount": active.len(),
                             "totalScore": total_score
-                        })))
+                        });
+                        structured_result = Some(value.clone());
+                        Ok(CallToolResult::structured(value))
                     },
                 ),
             name => Err(McpError::invalid_params(
@@ -189,7 +192,12 @@ impl ServerHandler for AnalysisSource {
         };
         self.record(
             "mcp.tool.completed",
-            json!({ "name": name, "arguments": arguments, "isError": result.is_err() }),
+            json!({
+                "name": name,
+                "arguments": arguments,
+                "isError": result.is_err(),
+                "result": structured_result,
+            }),
         );
         result
     }

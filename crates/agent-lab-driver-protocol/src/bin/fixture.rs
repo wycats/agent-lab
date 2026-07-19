@@ -89,7 +89,7 @@ impl Fixture {
             return self.fail(
                 output,
                 DriverFailureScope::Session,
-                self.session_id.clone(),
+                Some(session_id),
                 None,
                 "session-already-open",
                 "fixture supports one session",
@@ -157,6 +157,17 @@ impl Fixture {
                     turn_id: "stale-turn".to_owned(),
                     outcome: "completed".to_owned(),
                     evidence: json!({ "fixture": true }),
+                },
+            ),
+            Some("unexpected-ready") => self.emit(
+                output,
+                DriverBody::Ready {
+                    driver: DriverDescriptor {
+                        name: "unexpected-ready".to_owned(),
+                        version: "1".to_owned(),
+                        revision: None,
+                        features: vec![],
+                    },
                 },
             ),
             Some("fail") => self.fail(
@@ -273,6 +284,17 @@ impl Fixture {
             )?;
             return Ok(false);
         }
+        if self.active_turn.is_some() {
+            self.fail(
+                output,
+                DriverFailureScope::Session,
+                Some(session_id.to_owned()),
+                None,
+                "turn-active",
+                "cannot close a session while a turn is active",
+            )?;
+            return Ok(false);
+        }
         self.emit(
             output,
             DriverBody::SessionClosed {
@@ -322,6 +344,33 @@ fn write_message(output: &mut impl Write, message: &DriverMessage) -> io::Result
     output.flush()
 }
 
+fn start_fixture(output: &mut impl Write, fixture: &mut Fixture) -> io::Result<bool> {
+    fixture.emit(
+        output,
+        DriverBody::Ready {
+            driver: DriverDescriptor {
+                name: "agent-lab-fixture".to_owned(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                revision: None,
+                features: vec![
+                    "streaming".to_owned(),
+                    "cancellation".to_owned(),
+                    "raw-evidence".to_owned(),
+                ],
+            },
+        },
+    )?;
+    if std::env::var_os("AGENT_LAB_FIXTURE_EXIT_AFTER_READY").is_some() {
+        return Ok(true);
+    }
+    if std::env::var_os("AGENT_LAB_FIXTURE_MALFORMED_AFTER_READY").is_some() {
+        output.write_all(b"{not-json}\n")?;
+        output.flush()?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("AGENT_LAB_FIXTURE_OVERSIZED_STDOUT").is_some() {
         let mut output = io::stdout().lock();
@@ -361,22 +410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let mut output = BufWriter::new(io::stdout());
     let mut fixture = Fixture::new();
-    fixture.emit(
-        &mut output,
-        DriverBody::Ready {
-            driver: DriverDescriptor {
-                name: "agent-lab-fixture".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                revision: None,
-                features: vec![
-                    "streaming".to_owned(),
-                    "cancellation".to_owned(),
-                    "raw-evidence".to_owned(),
-                ],
-            },
-        },
-    )?;
-    if std::env::var_os("AGENT_LAB_FIXTURE_EXIT_AFTER_READY").is_some() {
+    if start_fixture(&mut output, &mut fixture)? {
         return Ok(());
     }
 

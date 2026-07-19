@@ -164,7 +164,13 @@ fn run_probe_turn(
             DriverBody::Failed { code, message, .. } => {
                 return Err(io::Error::other(format!("driver failed: {code}: {message}")).into());
             }
-            _ => {}
+            body => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected driver message during turn: {body:?}"),
+                )
+                .into());
+            }
         }
     };
     Ok((event_types, outcome, evidence))

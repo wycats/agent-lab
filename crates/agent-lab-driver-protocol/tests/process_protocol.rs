@@ -57,6 +57,27 @@ fn open_session(driver: &mut DriverProcess) -> u32 {
     process_id
 }
 
+fn assert_active_turn_blocks_close(driver: &mut DriverProcess) {
+    driver
+        .send(&command(
+            "close-active",
+            CommandBody::CloseSession {
+                session_id: "session-1".to_owned(),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::Failed {
+            scope: DriverFailureScope::Session,
+            session_id: Some(ref session_id),
+            turn_id: None,
+            ref code,
+            ..
+        } if session_id == "session-1" && code == "turn-active"
+    ));
+}
+
 #[test]
 fn one_process_streams_two_turns_and_cancels_the_second() {
     let mut driver = fixture();
@@ -153,6 +174,59 @@ fn one_process_streams_two_turns_and_cancels_the_second() {
 }
 
 #[test]
+fn fixture_refuses_to_close_while_a_turn_is_active() {
+    let mut driver = fixture();
+    open_session(&mut driver);
+    driver
+        .send(&command(
+            "active-turn",
+            CommandBody::StartTurn {
+                session_id: "session-1".to_owned(),
+                turn_id: "active-turn".to_owned(),
+                task: json!({ "mode": "wait-for-abort" }),
+                capability_sources: json!([]),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::TurnEvent { .. }
+    ));
+    assert_active_turn_blocks_close(&mut driver);
+    driver
+        .send(&command(
+            "abort-active",
+            CommandBody::AbortTurn {
+                session_id: "session-1".to_owned(),
+                turn_id: "active-turn".to_owned(),
+                reason: None,
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::TurnEvent { .. }
+    ));
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::TurnFinished { .. }
+    ));
+    driver
+        .send(&command(
+            "close-after-abort",
+            CommandBody::CloseSession {
+                session_id: "session-1".to_owned(),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::SessionClosed { .. }
+    ));
+    assert_eq!(driver.wait_for_exit(TIMEOUT).unwrap(), Some(0));
+}
+
+#[test]
 fn clean_exit_closes_stdin_for_eof_driven_drivers() {
     let mut launch = DriverLaunch::new(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"));
     launch.env.push((
@@ -205,6 +279,29 @@ fn fast_driver_exit_preserves_its_final_valid_message() {
 }
 
 #[test]
+fn fast_driver_exit_preserves_output_order_before_a_later_error() {
+    for _ in 0..4 {
+        let mut launch = DriverLaunch::new(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"));
+        launch
+            .env
+            .push(("AGENT_LAB_FIXTURE_MALFORMED_AFTER_READY".into(), "1".into()));
+        let mut driver = DriverProcess::spawn_with(launch).unwrap();
+        assert!(matches!(
+            driver.receive(TIMEOUT).unwrap().parsed.body,
+            DriverBody::Ready { .. }
+        ));
+        assert!(matches!(
+            driver.receive(TIMEOUT),
+            Err(ProcessError::MalformedOutput { .. })
+        ));
+        assert!(matches!(
+            driver.receive(TIMEOUT),
+            Err(ProcessError::UnexpectedExit { code: Some(0) })
+        ));
+    }
+}
+
+#[test]
 fn fixture_failures_use_scope_appropriate_identities() {
     let mut driver = fixture();
     open_session(&mut driver);
@@ -225,6 +322,32 @@ fn fixture_failures_use_scope_appropriate_identities() {
             turn_id: None,
             ..
         }
+    ));
+
+    driver
+        .send(&command(
+            "duplicate-open",
+            CommandBody::OpenSession {
+                session_id: "session-2".to_owned(),
+                config: json!({}),
+                limits: json!({}),
+            },
+        ))
+        .unwrap();
+    let duplicate = driver.receive(TIMEOUT).unwrap();
+    assert_eq!(
+        duplicate.parsed.caused_by.as_deref(),
+        Some("duplicate-open")
+    );
+    assert!(matches!(
+        duplicate.parsed.body,
+        DriverBody::Failed {
+            scope: DriverFailureScope::Session,
+            session_id: Some(ref session_id),
+            turn_id: None,
+            ref code,
+            ..
+        } if session_id == "session-2" && code == "session-already-open"
     ));
 
     driver
@@ -758,6 +881,63 @@ fn evidence_rejects_invalid_failure_and_causal_identities() {
 }
 
 #[test]
+fn turn_failure_is_terminal_in_evidence() {
+    let bundle = completed_fixture_bundle_with_turn();
+    let mut failed = bundle.transcript.clone();
+    failed.driver_records[3] = driver_record(&DriverMessage {
+        protocol_version: PROTOCOL_VERSION,
+        sequence: 4,
+        caused_by: Some("turn-evidence".to_owned()),
+        body: DriverBody::Failed {
+            scope: DriverFailureScope::Turn,
+            session_id: Some("evidence-session".to_owned()),
+            turn_id: Some("turn-evidence".to_owned()),
+            code: "fixture-failure".to_owned(),
+            message: "turn failed".to_owned(),
+        },
+    });
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id,
+            failed.clone(),
+            bundle.canonical.policy.clone(),
+        )
+        .is_ok()
+    );
+
+    let mut closed: DriverMessage =
+        serde_json::from_slice(failed.driver_records.last().unwrap()).unwrap();
+    closed.sequence = 6;
+    *failed.driver_records.last_mut().unwrap() = driver_record(&closed);
+    failed.driver_records.insert(
+        4,
+        driver_record(&DriverMessage {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: 5,
+            caused_by: Some("turn-evidence".to_owned()),
+            body: DriverBody::TurnFinished {
+                session_id: "evidence-session".to_owned(),
+                turn_id: "turn-evidence".to_owned(),
+                outcome: "completed".to_owned(),
+                evidence: json!({}),
+            },
+        }),
+    );
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id,
+            failed,
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn probe_can_finalize_fixture_evidence_for_direct_inspection() {
     let root = temporary_root("probe-evidence");
     let evidence = root.join("run-1");
@@ -825,6 +1005,23 @@ fn probe_rejects_completion_for_an_unexpected_turn() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected session/turn"));
     assert!(!evidence.exists());
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn probe_rejects_unexpected_turn_loop_messages_without_evidence_output() {
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-lab-driver-probe"))
+        .arg(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"))
+        .env(
+            "AGENT_LAB_DRIVER_TASK_JSON",
+            r#"{"mode":"unexpected-ready"}"#,
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unexpected driver message during turn")
+    );
 }
 
 #[test]

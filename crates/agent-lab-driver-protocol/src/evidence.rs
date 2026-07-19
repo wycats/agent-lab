@@ -524,7 +524,7 @@ fn validate_driver_records(
 #[derive(Default)]
 struct DriverLifecycleState {
     saw_ready: bool,
-    finished_turns: BTreeSet<(String, String)>,
+    terminal_turns: BTreeSet<(String, String)>,
     opened_sessions: BTreeSet<String>,
     closed_sessions: BTreeSet<String>,
 }
@@ -594,7 +594,7 @@ impl DriverLifecycleState {
                     )));
                 }
                 if lifecycle.turns.iter().any(|turn| {
-                    turn.0.as_str() == session_id.as_str() && !self.finished_turns.contains(turn)
+                    turn.0.as_str() == session_id.as_str() && !self.terminal_turns.contains(turn)
                 }) {
                     return Err(EvidenceError::InvalidBundle(format!(
                         "driver record {record_number} closed session {session_id} with an unfinished turn"
@@ -631,11 +631,11 @@ impl DriverLifecycleState {
     ) -> Result<(), EvidenceError> {
         self.validate_turn_reference(lifecycle, record_number, session_id, turn_id)?;
         if self
-            .finished_turns
+            .terminal_turns
             .contains(&(session_id.to_owned(), turn_id.to_owned()))
         {
             Err(EvidenceError::InvalidBundle(format!(
-                "driver record {record_number} emits an event after turn {session_id}/{turn_id} finished"
+                "driver record {record_number} emits an event after turn {session_id}/{turn_id} became terminal"
             )))
         } else {
             Ok(())
@@ -651,13 +651,13 @@ impl DriverLifecycleState {
     ) -> Result<(), EvidenceError> {
         self.validate_turn_reference(lifecycle, record_number, session_id, turn_id)?;
         if self
-            .finished_turns
+            .terminal_turns
             .insert((session_id.to_owned(), turn_id.to_owned()))
         {
             Ok(())
         } else {
             Err(EvidenceError::InvalidBundle(format!(
-                "driver record {record_number} finishes duplicate turn {session_id}/{turn_id}"
+                "driver record {record_number} finishes already-terminal turn {session_id}/{turn_id}"
             )))
         }
     }
@@ -680,7 +680,7 @@ impl DriverLifecycleState {
     }
 
     fn validate_failure_identity(
-        &self,
+        &mut self,
         lifecycle: &ControllerLifecycle,
         record_number: usize,
         scope: DriverFailureScope,
@@ -695,14 +695,15 @@ impl DriverLifecycleState {
                     && lifecycle.sessions.contains(session_id)
             }
             (DriverFailureScope::Turn, Some(session_id), Some(turn_id)) => {
-                self.opened_sessions.contains(session_id)
+                let turn = (session_id.to_owned(), turn_id.to_owned());
+                let valid = self.opened_sessions.contains(session_id)
                     && !self.closed_sessions.contains(session_id)
-                    && lifecycle
-                        .turns
-                        .contains(&(session_id.to_owned(), turn_id.to_owned()))
-                    && !self
-                        .finished_turns
-                        .contains(&(session_id.to_owned(), turn_id.to_owned()))
+                    && lifecycle.turns.contains(&turn)
+                    && !self.terminal_turns.contains(&turn);
+                if valid {
+                    self.terminal_turns.insert(turn);
+                }
+                valid
             }
             _ => false,
         };
@@ -733,10 +734,10 @@ impl DriverLifecycleState {
                 "driver transcript does not end with session.closed".to_owned(),
             ));
         }
-        if let Some((session_id, turn_id)) = lifecycle.turns.difference(&self.finished_turns).next()
+        if let Some((session_id, turn_id)) = lifecycle.turns.difference(&self.terminal_turns).next()
         {
             return Err(EvidenceError::InvalidBundle(format!(
-                "turn {session_id}/{turn_id} did not reach turn.finished"
+                "turn {session_id}/{turn_id} did not reach a terminal driver record"
             )));
         }
         if lifecycle.sessions != self.opened_sessions || lifecycle.sessions != self.closed_sessions

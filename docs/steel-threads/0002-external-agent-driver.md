@@ -199,7 +199,7 @@ test evidence::tests::finalization_does_not_replace_an_existing_empty_directory 
 
 test result: ok. 1 passed; 0 failed
 
-running 26 tests
+running 30 tests
 test clean_exit_closes_stdin_for_eof_driven_drivers ... ok
 test clean_exit_drains_queued_stdout_before_transcript_capture ... ok
 test clean_exit_drains_trailing_stderr_before_transcript_capture ... ok
@@ -212,8 +212,10 @@ test evidence_rejects_a_session_closed_with_an_unfinished_turn ... ok
 test evidence_rejects_invalid_failure_and_causal_identities ... ok
 test evidence_rejects_post_terminal_turn_and_session_activity ... ok
 test evidence_rejects_protocol_and_manifest_identity_mismatches ... ok
+test fast_driver_exit_preserves_output_order_before_a_later_error ... ok
 test fast_driver_exit_preserves_its_final_valid_message ... ok
 test fixture_failures_use_scope_appropriate_identities ... ok
+test fixture_refuses_to_close_while_a_turn_is_active ... ok
 test malformed_output_reported_failure_and_process_exit_are_distinct ... ok
 test one_process_streams_two_turns_and_cancels_the_second ... ok
 test oversized_driver_records_are_bounded_before_buffering ... ok
@@ -221,13 +223,15 @@ test oversized_driver_stderr_is_bounded_before_buffering ... ok
 test probe_can_finalize_fixture_evidence_for_direct_inspection ... ok
 test probe_rejects_a_nonzero_driver_exit_before_finalizing_evidence ... ok
 test probe_rejects_completion_for_an_unexpected_turn ... ok
+test probe_rejects_unexpected_turn_loop_messages_without_evidence_output ... ok
 test protocol_version_and_sequence_violations_are_distinct ... ok
 test raw_runs_remain_distinct_while_named_canonical_evidence_matches ... ok
 test receive_reports_a_crashed_driver_even_when_a_descendant_holds_stdout ... ok
 test total_driver_transcript_retention_is_bounded ... ok
+test turn_failure_is_terminal_in_evidence ... ok
 test unterminated_driver_records_are_rejected_before_parsing ... ok
 
-test result: ok. 26 passed; 0 failed
+test result: ok. 30 passed; 0 failed
 ```
 
 The focused strict-Clippy gate also passes:
@@ -249,9 +253,11 @@ validation. Oversized stdout frames, total driver transcript retention, and
 stderr fail at explicit bounds. Waiting closes the command pipe so EOF-driven
 drivers can exit, durable validation rejects activity after terminal lifecycle
 records and verifies causal links against the matching command identity,
-scope-specific fixture failures remain protocol-valid, and final publication
-uses an atomic no-replace rename. Valid output remains receivable when process
-exit races with the stdout reader.
+scope-specific fixture failures remain protocol-valid, turn failures are
+terminal evidence, and final publication uses an atomic no-replace rename.
+Valid output remains receivable before a later output error when process exit
+races with the stdout reader. The probe rejects lifecycle messages that do not
+belong in its active turn even when no evidence directory was requested.
 Two fixture processes produce different raw records because their PIDs differ, while the
 `fixture-v1` projection matches after removing the explicitly named
 `processId` field. The finalized directory

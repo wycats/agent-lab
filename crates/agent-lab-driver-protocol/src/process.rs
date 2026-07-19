@@ -120,7 +120,7 @@ pub struct DriverProcess {
     stderr_reader: Option<thread::JoinHandle<Result<(), String>>>,
     sent: Vec<Vec<u8>>,
     received: Vec<Vec<u8>>,
-    pending_received: VecDeque<RawDriverMessage>,
+    pending_received: VecDeque<Result<RawDriverMessage, ProcessError>>,
     received_bytes: usize,
     last_sequence: u64,
     stdout_eof: bool,
@@ -297,7 +297,7 @@ impl DriverProcess {
     /// protocol mismatch, sequence violation, and unexpected process exit.
     pub fn receive(&mut self, timeout: Duration) -> Result<RawDriverMessage, ProcessError> {
         if let Some(message) = self.pending_received.pop_front() {
-            return Ok(message);
+            return message;
         }
         let deadline = Instant::now() + timeout;
         loop {
@@ -332,11 +332,13 @@ impl DriverProcess {
                 .try_wait()
                 .map_err(|error| ProcessError::Read(error.to_string()))?
             {
-                self.finish_after_exit_for_receive(deadline)?;
-                return self.pending_received.pop_front().ok_or_else(|| {
-                    ProcessError::UnexpectedExit {
+                if let Err(error) = self.finish_after_exit_for_receive(deadline) {
+                    self.pending_received.push_back(Err(error));
+                }
+                return self.pending_received.pop_front().unwrap_or_else(|| {
+                    Err(ProcessError::UnexpectedExit {
                         code: status.code(),
-                    }
+                    })
                 });
             }
         }
@@ -491,38 +493,39 @@ impl DriverProcess {
     }
 
     fn drain_stdout_for_receive_before(&mut self, deadline: Instant) -> Result<(), ProcessError> {
-        let mut pending = None;
         while !self.stdout_eof {
             let remaining = remaining_before(deadline, false)?;
             match self.output.recv_timeout(remaining) {
-                Ok(ReaderItem::Line(raw)) => match self.accept_line(raw) {
-                    Ok(message) => self.pending_received.push_back(message),
-                    Err(error) => {
-                        pending.get_or_insert(error);
-                    }
-                },
+                Ok(ReaderItem::Line(raw)) => {
+                    let message = self.accept_line(raw);
+                    self.pending_received.push_back(message);
+                }
                 Ok(ReaderItem::Error(error)) => {
-                    pending.get_or_insert(ProcessError::Read(error));
+                    self.pending_received
+                        .push_back(Err(ProcessError::Read(error)));
                 }
                 Ok(ReaderItem::OutputLimitExceeded) => {
-                    pending.get_or_insert(ProcessError::OutputLimitExceeded {
-                        limit: MAX_DRIVER_RECORD_BYTES,
-                    });
+                    self.pending_received
+                        .push_back(Err(ProcessError::OutputLimitExceeded {
+                            limit: MAX_DRIVER_RECORD_BYTES,
+                        }));
                 }
                 Ok(ReaderItem::StderrLimitExceeded) => {
-                    pending.get_or_insert(ProcessError::StderrLimitExceeded {
-                        limit: MAX_DRIVER_STDERR_BYTES,
-                    });
+                    self.pending_received
+                        .push_back(Err(ProcessError::StderrLimitExceeded {
+                            limit: MAX_DRIVER_STDERR_BYTES,
+                        }));
                 }
                 Ok(ReaderItem::Eof) => self.stdout_eof = true,
                 Err(mpsc::RecvTimeoutError::Timeout) => return Err(ProcessError::Timeout),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    pending.get_or_insert(ProcessError::ReaderStopped);
+                    self.pending_received
+                        .push_back(Err(ProcessError::ReaderStopped));
                     break;
                 }
             }
         }
-        pending.map_or(Ok(()), Err)
+        Ok(())
     }
 
     fn drain_stdout_before(

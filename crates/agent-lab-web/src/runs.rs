@@ -971,7 +971,6 @@ fn run_driver(
     let mut secret_values = driver_launch
         .env
         .iter()
-        .filter(|(name, _)| sensitive_name(&name.to_string_lossy()))
         .map(|(_, value)| value.to_string_lossy().as_bytes().to_vec())
         .filter(|value| value.len() >= 4)
         .collect::<Vec<_>>();
@@ -992,6 +991,7 @@ fn run_driver(
         let DriverBody::Ready { driver: descriptor } = ready.parsed.body else {
             return Err(RunError::Protocol("expected driver.ready".to_owned()));
         };
+        let descriptor = redact_driver_descriptor(descriptor, &secret_values);
         lock(&state.assembly).harness.driver = Some(descriptor.clone());
         persist_assembly(state)?;
         record_event(state, "driver.ready", serde_json::to_value(&descriptor)?)?;
@@ -1294,6 +1294,23 @@ fn driver_event_kind(event_type: &str) -> String {
     }
 }
 
+fn redact_driver_descriptor(
+    mut descriptor: DriverDescriptor,
+    secrets: &[Vec<u8>],
+) -> DriverDescriptor {
+    descriptor.name = redact_string(&descriptor.name, secrets);
+    descriptor.version = redact_string(&descriptor.version, secrets);
+    descriptor.revision = descriptor
+        .revision
+        .map(|revision| redact_string(&revision, secrets));
+    descriptor.features = descriptor
+        .features
+        .into_iter()
+        .map(|feature| redact_string(&feature, secrets))
+        .collect();
+    descriptor
+}
+
 fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonValue, RunError> {
     let output = read_optional_confined_json(&state.workspace, &scenario.output)?;
     let schema_valid = output.as_ref().is_some_and(catalog_output_schema_valid);
@@ -1455,6 +1472,9 @@ fn finish_run(
             }
         }
     }
+    let secrets = lock(&state.secret_values).clone();
+    score = redact_value(score, &secrets);
+    error = error.map(|message| redact_string(&message, &secrets));
     if let Err(score_error) = write_json_atomic(&state.bundle_dir.join("score.json"), &score) {
         persistence_errors.push(format!("score.json could not be written: {score_error}"));
     }
@@ -2613,22 +2633,99 @@ fn read_optional_confined_json(
     child: impl AsRef<Path>,
 ) -> Result<Option<JsonValue>, RunError> {
     let path = confined_child(root, child)?;
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| RunError::PathEscape(path.clone()))?;
+    let Some(bytes) = read_optional_confined_file(root, relative, &path)? else {
+        return Ok(None);
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(RunError::PathEscape(path));
-    }
-    reject_multiply_linked_file(&path, &metadata)?;
-    let canonical_root = fs::canonicalize(root)?;
-    let canonical_path = fs::canonicalize(&path)?;
-    if canonical_path != canonical_root && !canonical_path.starts_with(&canonical_root) {
-        return Err(RunError::PathEscape(path));
-    }
-    let bytes = read_evidence_file(&canonical_path, &mut 0)?;
     Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+#[cfg(unix)]
+fn read_optional_confined_file(
+    root: &Path,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<Option<Vec<u8>>, RunError> {
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(component) => Ok(component.to_owned()),
+            _ => Err(RunError::PathEscape(display_path.to_path_buf())),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if components.is_empty() {
+        return Err(RunError::PathEscape(display_path.to_path_buf()));
+    }
+    let mut directory = rustix::fs::open(
+        root,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    for (index, component) in components.iter().enumerate() {
+        let is_file = index + 1 == components.len();
+        let mut flags =
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW;
+        if !is_file {
+            flags |= rustix::fs::OFlags::DIRECTORY;
+        }
+        let opened =
+            match rustix::fs::openat(&directory, component, flags, rustix::fs::Mode::empty()) {
+                Ok(opened) => opened,
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+                    return Err(RunError::PathEscape(display_path.to_path_buf()));
+                }
+                Err(error) => {
+                    return Err(io::Error::from(error).into());
+                }
+            };
+        if !is_file {
+            directory = opened;
+            continue;
+        }
+        let opened = fs::File::from(opened);
+        let metadata = opened.metadata()?;
+        if !metadata.is_file() {
+            return Err(RunError::PathEscape(display_path.to_path_buf()));
+        }
+        let mut retained_bytes = 0;
+        validate_evidence_file(display_path, &metadata, &mut retained_bytes)?;
+        let capacity = usize::try_from(metadata.len()).map_err(|_| {
+            RunError::EvidenceLimit("file size does not fit this platform".to_owned())
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        opened
+            .take(MAX_EVIDENCE_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_EVIDENCE_FILE_BYTES {
+            return Err(RunError::EvidenceLimit(format!(
+                "{} grew beyond the per-file limit while being read",
+                display_path.display()
+            )));
+        }
+        return Ok(Some(bytes));
+    }
+    unreachable!("a non-empty component list must open or reject its final file")
+}
+
+#[cfg(not(unix))]
+fn read_optional_confined_file(
+    root: &Path,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<Option<Vec<u8>>, RunError> {
+    let path = confined_existing_child(root, relative)?;
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(RunError::PathEscape(display_path.to_path_buf()));
+    }
+    read_evidence_file(&path, &mut 0).map(Some)
 }
 
 fn redact_transcript(mut transcript: DriverTranscript, secrets: &[Vec<u8>]) -> DriverTranscript {
@@ -2726,6 +2823,7 @@ fn sensitive_name(name: &str) -> bool {
         || normalized.contains("passwd")
         || normalized.contains("passphrase")
         || normalized.contains("credential")
+        || normalized.contains("privatekey")
         || normalized.ends_with("pass")
         || normalized.ends_with("token")
 }
@@ -3011,6 +3109,8 @@ totalScore = 11
             "SSH_PASSPHRASE",
             "SERVICE_CREDENTIAL",
             "API_TOKEN",
+            "PRIVATE_KEY",
+            "SSH_PRIVATE_KEY",
         ] {
             assert!(sensitive_name(name), "{name} should be redacted");
         }
@@ -3049,6 +3149,20 @@ totalScore = 11
                 format!("driver.event.{reserved}")
             );
         }
+    }
+
+    #[test]
+    fn driver_descriptors_are_redacted_before_persistence() {
+        let descriptor = DriverDescriptor {
+            name: "driver-provider-secret".to_owned(),
+            version: "provider-secret".to_owned(),
+            revision: Some("revision-provider-secret".to_owned()),
+            features: vec!["feature-provider-secret".to_owned()],
+        };
+        let redacted = redact_driver_descriptor(descriptor, &[b"provider-secret".to_vec()]);
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(!serialized.contains("provider-secret"));
+        assert!(serialized.contains("[REDACTED]"));
     }
 
     #[test]
@@ -3204,6 +3318,24 @@ totalScore = 11
 
         assert!(matches!(
             read_optional_confined_json(&workspace, "result.json"),
+            Err(RunError::PathEscape(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_json_reads_refuse_symlinked_intermediate_directories() {
+        let root = temporary_root("output-intermediate-symlink");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("result.json"), br#"{"secret":true}"#).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("nested")).unwrap();
+
+        assert!(matches!(
+            read_optional_confined_json(&workspace, "nested/result.json"),
             Err(RunError::PathEscape(_))
         ));
         fs::remove_dir_all(root).unwrap();
@@ -4180,6 +4312,38 @@ totalScore = 11
                 "{path} retained the driver failure secret"
             );
         }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scores_are_redacted_before_final_evidence() {
+        let root = temporary_root("score-redaction");
+        fs::create_dir(root.join("initial")).unwrap();
+        let state = test_run_state(&root);
+        lock(&state.secret_values).push(b"provider-secret".to_vec());
+
+        finish_run(
+            &state,
+            RunStatus::Failed,
+            Some("score contained provider-secret"),
+            &json!({ "passed": false, "activeNames": ["provider-secret"] }),
+        )
+        .unwrap();
+
+        for path in ["score.json", "manifest.json", "events.jsonl", "review.json"] {
+            let evidence = fs::read_to_string(root.join(path)).unwrap();
+            assert!(
+                !evidence.contains("provider-secret"),
+                "{path} retained the score secret"
+            );
+        }
+        assert_eq!(
+            read_optional_json(&root.join("score.json"))
+                .unwrap()
+                .unwrap()["activeNames"][0],
+            "[REDACTED]"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

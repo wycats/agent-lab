@@ -72,6 +72,7 @@ dependencies = [
  "portable-pty",
  "rand 0.9.5",
  "rmcp",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

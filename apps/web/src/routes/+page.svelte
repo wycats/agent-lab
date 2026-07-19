@@ -203,10 +203,11 @@
 
   async function refreshRun(id: string): Promise<void> {
     try {
-      const detail = await runClient.detail(id);
+      const [detail, latestRuns] = await Promise.all([runClient.detail(id), runClient.runs()]);
+      if (selectedRun?.summary.id !== id) return;
       selectedRun = detail;
       runEvents = detail.events;
-      runs = await runClient.runs();
+      runs = latestRuns;
     } catch (error) {
       actionError = message(error);
     }

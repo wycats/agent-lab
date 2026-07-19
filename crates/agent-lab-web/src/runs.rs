@@ -270,6 +270,7 @@ struct RunState {
     workspace: PathBuf,
     output: PathBuf,
     capabilities: Mutex<Vec<CapabilityEndpoint>>,
+    secret_values: Mutex<Vec<Vec<u8>>>,
     replay_failed: bool,
 }
 
@@ -515,6 +516,7 @@ impl RunController {
             workspace,
             output: scenario.output.clone(),
             capabilities: Mutex::new(Vec::new()),
+            secret_values: Mutex::new(Vec::new()),
             replay_failed: false,
         });
         lock(&self.inner.runs).insert(id, state.clone());
@@ -539,6 +541,10 @@ impl RunController {
     ) -> Result<RunSummary, RunError> {
         validate_model_id(&request.model_id)?;
         let state = self.state(id)?;
+        let capabilities = lock(&state.capabilities).clone();
+        if capabilities.is_empty() {
+            return Err(RunError::RunUnavailable(id.to_owned()));
+        }
         let scenario = {
             let mut summary = lock(&state.summary);
             if summary.status != RunStatus::Exploring {
@@ -562,10 +568,6 @@ impl RunController {
             "run.status",
             json!({ "status": RunStatus::Starting }),
         )?;
-        let capabilities = lock(&state.capabilities).clone();
-        if capabilities.is_empty() {
-            return Err(RunError::RunUnavailable(id.to_owned()));
-        }
         let summary = lock(&state.summary).clone();
         let driver = self.inner.driver.clone();
         tokio::task::spawn_blocking(move || {
@@ -715,6 +717,7 @@ fn source_observer(
             payload.insert("source".to_owned(), JsonValue::String(source.to_owned()));
             payload.insert("actor".to_owned(), JsonValue::String(actor.to_owned()));
         }
+        redact_json(&mut payload);
         let _ = record_event(&state, kind, payload);
     })
 }
@@ -841,6 +844,7 @@ fn run_driver(
             .flat_map(|capability| [&capability.human_token, &capability.agent_token])
             .map(|token| token.as_bytes().to_vec()),
     );
+    lock(&state.secret_values).clone_from(&secret_values);
     let mut driver = DriverProcess::spawn_with(driver_launch)?;
     let result = (|| -> Result<(), RunError> {
         let ready = driver.receive(DRIVER_READY_TIMEOUT)?;
@@ -1187,9 +1191,9 @@ fn record_event(state: &RunState, kind: &str, payload: JsonValue) -> Result<(), 
             .open(state.bundle_dir.join("events.jsonl"))?;
         file.write_all(&line)?;
         events.push(event.clone());
+        lock(&state.summary).event_count = event.sequence;
         event
     };
-    lock(&state.summary).event_count = event.sequence;
     let _ = state.sender.send(event);
     Ok(())
 }
@@ -1746,6 +1750,7 @@ fn load_runs(
             workspace,
             output,
             capabilities: Mutex::new(Vec::new()),
+            secret_values: Mutex::new(Vec::new()),
             replay_failed,
         });
         if interrupted {
@@ -1793,6 +1798,8 @@ fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
         fs::remove_dir_all(&staging_dir)?;
     }
     copy_tree(&state.workspace, &staging_dir)?;
+    let secret_values = lock(&state.secret_values).clone();
+    redact_tree(&staging_dir, &secret_values)?;
     let initial = snapshot_tree(&state.bundle_dir.join("initial"))?;
     let final_files = snapshot_tree(&staging_dir)?;
     let paths = initial
@@ -1813,8 +1820,8 @@ fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
                         (Some(_), None) => "deleted",
                         _ => "modified",
                     },
-                    "before": before.and_then(|bytes| std::str::from_utf8(bytes).ok()),
-                    "after": after.and_then(|bytes| std::str::from_utf8(bytes).ok()),
+                    "before": before.and_then(|bytes| redacted_evidence_text(bytes, &secret_values)),
+                    "after": after.and_then(|bytes| redacted_evidence_text(bytes, &secret_values)),
                 })
             })
         })
@@ -1823,6 +1830,45 @@ fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
     write_json_atomic(&state.bundle_dir.join("diff.json"), &diff)?;
     fs::rename(staging_dir, final_dir)?;
     Ok(diff)
+}
+
+fn redact_tree(root: &Path, secrets: &[Vec<u8>]) -> Result<(), RunError> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(RunError::PathEscape(entry.path()));
+        }
+        if file_type.is_dir() {
+            redact_tree(&entry.path(), secrets)?;
+        } else if file_type.is_file() {
+            let original = fs::read(entry.path())?;
+            let redacted = redact_evidence_bytes(&original, secrets);
+            if redacted != original {
+                fs::write(entry.path(), redacted)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn redacted_evidence_text(bytes: &[u8], secrets: &[Vec<u8>]) -> Option<String> {
+    String::from_utf8(redact_evidence_bytes(bytes, secrets)).ok()
+}
+
+fn redact_evidence_bytes(bytes: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
+    if let Ok(mut value) = serde_json::from_slice::<JsonValue>(bytes) {
+        let original = value.clone();
+        redact_json(&mut value);
+        redact_secret_strings(&mut value, secrets);
+        if value != original {
+            return serde_json::to_vec_pretty(&value).unwrap_or_else(|_| bytes.to_vec());
+        }
+        return bytes.to_vec();
+    }
+    let mut redacted = bytes.to_vec();
+    replace_secrets(&mut redacted, secrets);
+    redacted
 }
 
 fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, RunError> {
@@ -2217,6 +2263,7 @@ totalScore = 11
             workspace,
             output: "result.json".into(),
             capabilities: Mutex::new(Vec::new()),
+            secret_values: Mutex::new(Vec::new()),
             replay_failed: false,
         }
     }
@@ -2341,6 +2388,27 @@ totalScore = 11
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn capability_observations_are_redacted_before_persistence() {
+        let root = temporary_root("capability-redaction");
+        let state = Arc::new(test_run_state(&root));
+        let observe = source_observer(state.clone(), "catalog", "human");
+        observe(
+            "mcp.tool.started",
+            json!({ "arguments": { "apiKey": "capability-secret" } }),
+        );
+        let events = lock(&state.events);
+        assert_eq!(events[0].payload["arguments"]["apiKey"], "[REDACTED]");
+        assert!(
+            !fs::read_to_string(root.join("events.jsonl"))
+                .unwrap()
+                .contains("capability-secret")
+        );
+        drop(events);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn prepared_scenario_reuses_its_workspace_and_sources_after_controller_restart() {
         let root = temporary_root("prepare");
@@ -2378,6 +2446,19 @@ totalScore = 11
         drop(controller);
 
         let restarted = RunController::new(config()).unwrap();
+        let unavailable = restarted
+            .start_prepared(
+                &prepared.id,
+                StartPreparedRunRequest {
+                    model_id: "test/model".to_owned(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(unavailable, RunError::RunUnavailable(_)));
+        assert_eq!(
+            restarted.get(&prepared.id).unwrap().summary.status,
+            RunStatus::Exploring
+        );
         let resumed = restarted
             .prepare(PrepareRunRequest {
                 scenario_id: "catalog".to_owned(),
@@ -2711,7 +2792,11 @@ totalScore = 11
         fs::create_dir(root.join("workspace")).unwrap();
         fs::write(root.join("initial/unchanged.txt"), "same").unwrap();
         fs::write(root.join("workspace/unchanged.txt"), "same").unwrap();
-        fs::write(root.join("workspace/result.json"), "{}\n").unwrap();
+        fs::write(
+            root.join("workspace/result.json"),
+            r#"{"apiKey":"workspace-secret","note":"environment-secret"}"#,
+        )
+        .unwrap();
         let (sender, _) = broadcast::channel(1);
         let capability_cancel = CancellationToken::new();
         let state = RunState {
@@ -2770,6 +2855,7 @@ totalScore = 11
                 agent_token: "agent-token".to_owned(),
                 cancel: capability_cancel.clone(),
             }]),
+            secret_values: Mutex::new(vec![b"environment-secret".to_vec()]),
             replay_failed: false,
         };
         finalize_workspace(&state).unwrap();
@@ -2778,6 +2864,14 @@ totalScore = 11
             .unwrap();
         assert_eq!(diff["changes"][0]["path"], "result.json");
         assert_eq!(diff["changes"][0]["kind"], "created");
+        let finalized = fs::read_to_string(root.join("final/result.json")).unwrap();
+        assert!(!finalized.contains("workspace-secret"));
+        assert!(!finalized.contains("environment-secret"));
+        assert!(
+            !serde_json::to_string(&diff)
+                .unwrap()
+                .contains("environment-secret")
+        );
         finish_run(&state, RunStatus::Passed, None, &json!({ "passed": true }));
         assert!(capability_cancel.is_cancelled());
         assert!(lock(&state.capabilities).is_empty());

@@ -11,7 +11,10 @@ pub use evidence::{
     CanonicalProjection, CanonicalizationPolicy, DriverEvidenceBundle, EVIDENCE_SCHEMA_VERSION,
     EvidenceError, EvidenceManifest,
 };
-pub use process::{DriverLaunch, DriverProcess, DriverTranscript, ProcessError, RawDriverMessage};
+pub use process::{
+    DriverLaunch, DriverProcess, DriverTranscript, MAX_DRIVER_RECORD_BYTES, ProcessError,
+    RawDriverMessage,
+};
 pub use protocol::{
     CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverFailureScope,
     DriverMessage, PROTOCOL_VERSION,

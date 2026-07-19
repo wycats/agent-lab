@@ -217,7 +217,9 @@ pub enum EvidenceError {
 }
 
 fn validate_bundle(bundle: &DriverEvidenceBundle) -> Result<(), EvidenceError> {
-    validate_records::<ControllerCommand>("controller", &bundle.transcript.controller_records)?;
+    let controller_records =
+        validate_records::<ControllerCommand>("controller", &bundle.transcript.controller_records)?;
+    validate_controller_records(&controller_records)?;
     let driver_records =
         validate_records::<DriverMessage>("driver", &bundle.transcript.driver_records)?;
     validate_driver_records(bundle, &driver_records)?;
@@ -227,6 +229,19 @@ fn validate_bundle(bundle: &DriverEvidenceBundle) -> Result<(), EvidenceError> {
         return Err(EvidenceError::InvalidBundle(
             "canonical projection does not match the retained driver records".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_controller_records(records: &[ControllerCommand]) -> Result<(), EvidenceError> {
+    for (index, record) in records.iter().enumerate() {
+        if record.protocol_version != PROTOCOL_VERSION {
+            return Err(EvidenceError::InvalidBundle(format!(
+                "controller record {} has protocol version {}; expected {PROTOCOL_VERSION}",
+                index + 1,
+                record.protocol_version
+            )));
+        }
     }
     Ok(())
 }
@@ -293,6 +308,14 @@ fn validate_driver_records(
     if !saw_ready {
         return Err(EvidenceError::InvalidBundle(
             "driver transcript does not contain driver.ready".to_owned(),
+        ));
+    }
+    if !matches!(
+        records.last().map(|record| &record.body),
+        Some(DriverBody::SessionClosed { .. })
+    ) {
+        return Err(EvidenceError::InvalidBundle(
+            "driver transcript does not end with session.closed".to_owned(),
         ));
     }
     Ok(())

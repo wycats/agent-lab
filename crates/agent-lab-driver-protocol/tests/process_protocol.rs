@@ -7,7 +7,8 @@ use std::{
 
 use agent_lab_driver_protocol::{
     CanonicalizationPolicy, CommandBody, ControllerCommand, DriverBody, DriverEvidenceBundle,
-    DriverFailureScope, DriverLaunch, DriverMessage, DriverProcess, PROTOCOL_VERSION, ProcessError,
+    DriverFailureScope, DriverLaunch, DriverMessage, DriverProcess, MAX_DRIVER_RECORD_BYTES,
+    PROTOCOL_VERSION, ProcessError,
 };
 use serde_json::json;
 
@@ -281,6 +282,20 @@ fn unterminated_driver_records_are_rejected_before_parsing() {
 }
 
 #[test]
+fn oversized_driver_records_are_bounded_before_buffering() {
+    let mut launch = DriverLaunch::new(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"));
+    launch
+        .env
+        .push(("AGENT_LAB_FIXTURE_OVERSIZED_STDOUT".into(), "1".into()));
+    let mut process = DriverProcess::spawn_with(launch).unwrap();
+
+    assert!(matches!(
+        process.receive(TIMEOUT),
+        Err(ProcessError::OutputLimitExceeded { limit }) if limit == MAX_DRIVER_RECORD_BYTES
+    ));
+}
+
+#[test]
 fn raw_runs_remain_distinct_while_named_canonical_evidence_matches() {
     let first = completed_fixture_bundle();
     let second = completed_fixture_bundle();
@@ -398,6 +413,35 @@ fn evidence_rejects_protocol_and_manifest_identity_mismatches() {
         )
         .is_err()
     );
+
+    let mut wrong_controller_version = bundle.transcript.clone();
+    let mut controller: ControllerCommand =
+        serde_json::from_slice(&wrong_controller_version.controller_records[0]).unwrap();
+    controller.protocol_version += 1;
+    wrong_controller_version.controller_records[0] = controller_record(&controller);
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id,
+            wrong_controller_version,
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
+
+    let mut unfinished = bundle.transcript.clone();
+    unfinished.driver_records.pop();
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id,
+            unfinished,
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -451,6 +495,26 @@ fn probe_rejects_a_nonzero_driver_exit_before_finalizing_evidence() {
 }
 
 #[test]
+fn probe_rejects_completion_for_an_unexpected_turn() {
+    let root = temporary_root("probe-wrong-turn");
+    let evidence = root.join("run-1");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-lab-driver-probe"))
+        .arg(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"))
+        .env("AGENT_LAB_EVIDENCE_DIR", &evidence)
+        .env(
+            "AGENT_LAB_DRIVER_TASK_JSON",
+            r#"{"mode":"wrong-turn-finished"}"#,
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected session/turn"));
+    assert!(!evidence.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn clean_exit_drains_trailing_stderr_before_transcript_capture() {
     let mut launch = DriverLaunch::new(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"));
     launch
@@ -472,6 +536,52 @@ fn clean_exit_drains_trailing_stderr_before_transcript_capture() {
     ));
     assert_eq!(process.wait_for_exit(TIMEOUT).unwrap(), Some(0));
     assert_eq!(process.stderr(), b"fixture trailing stderr\n");
+}
+
+#[test]
+fn clean_exit_drains_queued_stdout_before_transcript_capture() {
+    let mut launch = DriverLaunch::new(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"));
+    launch
+        .env
+        .push(("AGENT_LAB_FIXTURE_TRAILING_STDOUT".into(), "1".into()));
+    let mut process = DriverProcess::spawn_with(launch).unwrap();
+    open_session(&mut process);
+    process
+        .send(&command(
+            "close-stdout",
+            CommandBody::CloseSession {
+                session_id: "session-1".to_owned(),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        process.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::SessionClosed { .. }
+    ));
+    assert_eq!(process.wait_for_exit(TIMEOUT).unwrap(), Some(0));
+
+    let transcript = process.transcript();
+    let trailing: DriverMessage =
+        serde_json::from_slice(transcript.driver_records.last().unwrap()).unwrap();
+    assert!(matches!(
+        trailing.body,
+        DriverBody::TurnEvent { ref event_type, .. } if event_type == "fixture.trailing-stdout"
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn clean_exit_terminates_descendants_that_hold_reader_pipes() {
+    let mut process = DriverProcess::spawn("sh", ["-c", "sleep 30 & exit 0"]).unwrap();
+    let timeout = Duration::from_millis(250);
+    let started = Instant::now();
+
+    assert_eq!(process.wait_for_exit(timeout).unwrap(), Some(0));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "reader cleanup blocked for {:?}",
+        started.elapsed()
+    );
 }
 
 #[cfg(unix)]
@@ -596,6 +706,12 @@ fn completed_fixture_bundle() -> DriverEvidenceBundle {
 
 fn driver_record(message: &DriverMessage) -> Vec<u8> {
     let mut raw = serde_json::to_vec(message).unwrap();
+    raw.push(b'\n');
+    raw
+}
+
+fn controller_record(command: &ControllerCommand) -> Vec<u8> {
+    let mut raw = serde_json::to_vec(command).unwrap();
     raw.push(b'\n');
     raw
 }

@@ -2,7 +2,7 @@ use std::io::{self, BufRead, BufWriter, Write};
 
 use agent_lab_driver_protocol::{
     CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverFailureScope,
-    DriverMessage, PROTOCOL_VERSION,
+    DriverMessage, MAX_DRIVER_RECORD_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::{Value as JsonValue, json};
 
@@ -147,6 +147,15 @@ impl Fixture {
                 },
             ),
             Some("exit") => std::process::exit(17),
+            Some("wrong-turn-finished") => self.emit(
+                output,
+                DriverBody::TurnFinished {
+                    session_id,
+                    turn_id: "stale-turn".to_owned(),
+                    outcome: "completed".to_owned(),
+                    evidence: json!({ "fixture": true }),
+                },
+            ),
             Some("fail") => self.fail(
                 output,
                 DriverFailureScope::Turn,
@@ -258,7 +267,23 @@ impl Fixture {
             )?;
             return Ok(false);
         }
-        self.emit(output, DriverBody::SessionClosed { session_id })?;
+        self.emit(
+            output,
+            DriverBody::SessionClosed {
+                session_id: session_id.clone(),
+            },
+        )?;
+        if std::env::var_os("AGENT_LAB_FIXTURE_TRAILING_STDOUT").is_some() {
+            self.emit(
+                output,
+                DriverBody::TurnEvent {
+                    session_id,
+                    turn_id: "after-close".to_owned(),
+                    event_type: "fixture.trailing-stdout".to_owned(),
+                    payload: JsonValue::Null,
+                },
+            )?;
+        }
         if std::env::var_os("AGENT_LAB_FIXTURE_TRAILING_STDERR").is_some() {
             eprintln!("fixture trailing stderr");
         }
@@ -282,6 +307,12 @@ fn write_message(output: &mut impl Write, message: &DriverMessage) -> io::Result
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os("AGENT_LAB_FIXTURE_OVERSIZED_STDOUT").is_some() {
+        let mut output = io::stdout().lock();
+        output.write_all(&vec![b'x'; MAX_DRIVER_RECORD_BYTES + 1])?;
+        output.flush()?;
+        return Ok(());
+    }
     let stdin = io::stdin();
     let mut output = BufWriter::new(io::stdout());
     let mut fixture = Fixture::new();

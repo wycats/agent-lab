@@ -1,7 +1,7 @@
 # RFC 0003: First evidence-backed architecture
 
 - Status: Candidate
-- Evidence: [steel thread 0001](../steel-threads/0001-nushell-mcp-session.md), [steel thread 0002](../steel-threads/0002-external-agent-driver.md), [steel thread 0003](../steel-threads/0003-editor-diagnostics.md)
+- Evidence: [steel thread 0001](../steel-threads/0001-nushell-mcp-session.md), [steel thread 0002](../steel-threads/0002-external-agent-driver.md), [steel thread 0003](../steel-threads/0003-catalog-feedback-loop.md)
 
 ## Summary
 
@@ -14,8 +14,9 @@ The first three steel threads support a hybrid product shape. Embedded Nushell
 is the first rich human surface because it preserves structured exploration,
 state, pipelines, and dynamically discovered commands. A just-bash-backed v0
 host is the first bounded agent execution host because it is small, in-process,
-and easy to instrument. Both consume the same capability facts, but neither is
-the core contract.
+and easy to instrument. The catalog slice demonstrates that a person and an
+external agent can operate against the same workspace and capability-source
+revisions while retaining distinct sessions and native interfaces.
 
 The public Rust controller runs agents as external drivers, observes capability
 sources separately, and retains exact evidence plus named canonical
@@ -55,7 +56,7 @@ surface.
    native tools, permission UX, context policy, checkpoints, and native event
    taxonomy. The public process protocol owns lifecycle, not those internals.
 5. **Surface.** Presents capabilities to a human or agent. Nushell commands,
-   MCP dynamic tools, v0's native LSP tool, and a future eval runner are
+   agent MCP tools, browser reviews, and future harness-native tools are
    projections, not capability sources.
 
 An evidence plane crosses these boundaries without merging their native event
@@ -127,33 +128,20 @@ source id, source-local sequence, trial correlation, event kind, and structured
 payload. Prefixing an agent-driver event name is sufficient for a spike but not
 a durable source contract.
 
-### Multiple projections of one capability
+### Shared capability identity across surfaces
 
-One capability may have different agent-native projections. Steel thread 0003
-presented one diagnostic source as an MCP dynamic tool and as v0's built-in LSP
-tool. The source snapshot was identical; v0's retained context was not. The
-dynamic projection kept the full structured snapshot, while the native path
-compressed it to a count after the immediate turn.
+The catalog source is projected into Nushell for direct human exploration and
+into each external agent session over authenticated MCP. Both projections
+retain the source identity and revision while using separate protocol sessions.
+The run controller records capability-owned observations independently from
+the driver's native events, so agent activity cannot stand in for proof that a
+source operation occurred.
 
-That difference is evaluation input, not abstraction failure. Agent Lab should
-measure selection, task success, recovery, retained bytes, and token/cache use
-across projections. It must preserve capability-owned observations so a native
-tool does not disappear from attribution merely because it bypassed the
-driver's third-party-tool set.
-
-A current multi-client capability ([v0 PR 26616](https://github.com/vercel/v0/pull/26616))
-provides a second portability shape: web and CLI surfaces can execute the full
-local handler while a native surface intentionally renders a structured
-continuation to the web surface. Agent Lab should not classify that as a
-missing capability or force every client to implement identical behavior.
-Capability identity and intent remain shared; renderer choice, local support,
-and cross-surface continuation belong to the surface or driver projection.
-
-The evidence model therefore needs an explicit handoff outcome with the target
-surface, reason, resumable state, and source capability identity. A handoff is
-neither tool success with hidden follow-up nor tool failure. This gives the
-driver harness a concrete portability scenario: compare full execution and
-intentional continuation without changing the capability-source contract.
+Future harness-native projections may present the same source facts with
+different selection, compression, or recovery behavior. Those differences are
+evaluation input rather than abstraction failure. Agent Lab should add such a
+projection only with evidence that the source identity and observations remain
+attributable across the boundary.
 
 ## State, permissions, and lifecycle
 
@@ -187,17 +175,10 @@ evidence than a description saying background work is unsupported.
 
 v0 plugs in as an external driver and remains free to test its own assumptions.
 The first adapter proves that a small optional root-agent variant seam is
-enough to run the real loop without impersonating a subagent. It also proves
-that semantic services can be injected into the existing filesystem boundary
-without moving the full `IVirtualMachine` surface into Agent Lab.
-
-The editor spike found a real internal gap: v0 defines semantic LSP requests,
-the remote filesystem implements them, and the Git VM/code-server filesystem
-currently returns unsupported. A narrow v0 cleanup can improve that boundary,
-but Agent Lab should not choose whether semantic services permanently belong
-under `AgentFileSystem`. The paired harness is specifically where an extracted
-`AgentSemanticServices` interface can be compared against the current design
-without blocking on local-sandbox or ongoing VM simplification work.
+enough to run the real loop without impersonating a subagent. A root-confined
+physical workspace adapter lets the real v0 file and just-bash tools operate on
+the controller-owned run workspace without moving the full `IVirtualMachine`
+surface into Agent Lab.
 
 No v0 prompt model, checkpoint contract, tool definition, or VM abstraction is
 part of this RFC. No public Agent Lab package depends on v0.
@@ -211,62 +192,38 @@ plumbing and determinism. Claims about agent quality require repeated real-model
 trials.
 
 Useful scores are task-specific. The browser precedent measures task success,
-first useful selection, semantic-fallback violations, and forbidden backend
-effects. The editor slice adds post-edit diagnostic absence, unnecessary
-file/shell operations, retained diagnostic bytes, turns, and token/cache use.
-Multi-client scenarios add correct renderer selection, preservation of
-resumable state, and successful continuation on the target surface. Agent Lab
-should provide evaluation mechanics without prematurely publishing a universal
-scalar score.
+first useful selection, capability calls, native actions, workspace effects,
+duration, and any usage or cache data the harness reports. Later scenarios may
+add domain-specific measurements, but Agent Lab should provide evaluation
+mechanics without prematurely publishing a universal scalar score.
 
 ## What remains provisional
 
 - The JSON Lines message names and schemas are experimental.
 - Interactive completion has not yet been implemented in the Nushell surface.
 - Capability events do not yet have a first-class public envelope.
-- The deterministic editor source is not a real VS Code Problems adapter.
-- The paired diagnostic run proves plumbing, not a model-quality improvement.
-- Workspace/execution-host extraction has not been attempted.
+- Only one real harness has exercised the driver boundary.
+- Cross-harness comparison and model-profile matching remain unproven.
 - Detach/reconnect, durable checkpoints, caching, and multi-agent scheduling
   remain unproven.
 
 These gaps are boundaries for later steel threads, not reasons to generalize
 the current adapters into a framework now.
 
-## Product sequencing update
+## Next validation boundary
 
-RFC 0001 now identifies a two-harness workbench using v0 and Eve as the next
-product-validation boundary. That slice should establish the interactive
-learning loop and demonstrate that the harness boundary works for two real
-implementations before Agent Lab deepens one semantic-capability comparison.
+Run the same catalog scenario through v0 and Eve from one immutable Explore
+workspace snapshot. Each harness must use its native loop and execution host,
+stream its native events, operate against the same capability revisions, and
+produce independently replayable evidence. The workbench should compare task
+correctness and observable behavior without forcing the harnesses to share a
+tool loop or claiming a universal winner.
 
-The diagnostic adapter below remains the next architecture-validation boundary
-for semantic editor capabilities. This sequencing update does not change the
-architecture or evidence requirements described by this RFC; it places them
-inside the product loop established by RFC 0001.
-
-## Exact next implementation boundary
-
-Build one real VS Code/code-server diagnostic adapter behind the public
-diagnostic snapshot contract. The extension uses
-`vscode.languages.getDiagnostics()` and a bounded local transport. It must
-prove workspace binding, pending and settled revisions, cancellation, timeout,
-extension restart, no-listener behavior, and a repair followed by a settled
-empty snapshot.
-
-Run the same seeded TypeScript task through both v0 projections with identical
-source observations. First use the scripted model to pin the evidence, then run
-repeated real-model trials. Do not add rename-symbol, generic VS Code command
-execution, a universal workspace host, or a stable public driver SDK in that
-change.
-
-After that evidence, decide two questions before proposing the v0 work or
-promoting public contracts:
-
-1. Should semantic services remain a facet of `AgentFileSystem`, or become a
-   separate injected interface?
-2. What diagnostic facts must v0 retain after its native LSP compression step
-   to preserve recovery without keeping the full snapshot in agent context?
+This boundary must also make Nushell and the browser two controls for the same
+workbench state: shared harness and model selection, shell- or browser-initiated
+evaluation, origin-labelled events, aligned visual review, and durable paired
+replay. Editor diagnostics, a universal operation registry, and publication of
+product-specific adapters remain outside that change.
 
 Repository pushes, pull requests, and public design communication remain
 separate approval boundaries.

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs,
     io::Write,
@@ -279,6 +279,11 @@ struct RunCompletion {
     status: RunStatus,
     error: Option<String>,
     score: JsonValue,
+}
+
+enum ExitWait {
+    Exited(Option<i32>),
+    Cancelled,
 }
 
 impl Drop for RunState {
@@ -741,7 +746,8 @@ fn source_observer(
             payload.insert("source".to_owned(), JsonValue::String(source.to_owned()));
             payload.insert("actor".to_owned(), JsonValue::String(actor.to_owned()));
         }
-        redact_json(&mut payload);
+        let secrets = lock(&state.secret_values).clone();
+        payload = redact_value(payload, &secrets);
         let _ = record_event(&state, kind, payload);
     })
 }
@@ -868,6 +874,36 @@ fn receive_with_cancellation(
     }
 }
 
+fn wait_for_exit_with_cancellation(
+    driver: &mut DriverProcess,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<ExitWait, ProcessError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(ExitWait::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ProcessError::ExitTimeout);
+        }
+        match driver.wait_for_exit(remaining.min(DRIVER_POLL)) {
+            Ok(exit_code) => return Ok(ExitWait::Exited(exit_code)),
+            Err(ProcessError::ExitTimeout) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn cancelled_completion() -> RunCompletion {
+    RunCompletion {
+        status: RunStatus::Cancelled,
+        error: None,
+        score: json!({ "passed": false, "cancelled": true }),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_driver(
     state: &Arc<RunState>,
@@ -896,11 +932,7 @@ fn run_driver(
         let Some(ready) =
             receive_with_cancellation(&mut driver, DRIVER_READY_TIMEOUT, &state.cancel)?
         else {
-            return Ok(RunCompletion {
-                status: RunStatus::Cancelled,
-                error: None,
-                score: json!({ "passed": false, "cancelled": true }),
-            });
+            return Ok(cancelled_completion());
         };
         let DriverBody::Ready { driver: descriptor } = ready.parsed.body else {
             return Err(RunError::Protocol("expected driver.ready".to_owned()));
@@ -939,7 +971,11 @@ fn run_driver(
                 limits: serde_json::to_value(&scenario.limits)?,
             },
         ))?;
-        let opened = driver.receive(DRIVER_RESPONSE_TIMEOUT)?;
+        let Some(opened) =
+            receive_with_cancellation(&mut driver, DRIVER_RESPONSE_TIMEOUT, &state.cancel)?
+        else {
+            return Ok(cancelled_completion());
+        };
         match opened.parsed.body {
             DriverBody::SessionOpened {
                 session_id: opened_session,
@@ -1083,7 +1119,11 @@ fn run_driver(
                 session_id: session_id.clone(),
             },
         ))?;
-        let closed = driver.receive(DRIVER_RESPONSE_TIMEOUT)?;
+        let Some(closed) =
+            receive_with_cancellation(&mut driver, DRIVER_RESPONSE_TIMEOUT, &state.cancel)?
+        else {
+            return Ok(cancelled_completion());
+        };
         match closed.parsed.body {
             DriverBody::SessionClosed {
                 session_id: closed_session,
@@ -1099,7 +1139,15 @@ fn run_driver(
                 ));
             }
         }
-        require_successful_driver_exit(driver.wait_for_exit(DRIVER_RESPONSE_TIMEOUT)?)?;
+        let exit_code = match wait_for_exit_with_cancellation(
+            &mut driver,
+            DRIVER_RESPONSE_TIMEOUT,
+            &state.cancel,
+        )? {
+            ExitWait::Exited(exit_code) => exit_code,
+            ExitWait::Cancelled => return Ok(cancelled_completion()),
+        };
+        require_successful_driver_exit(exit_code)?;
         write_json_atomic(
             &state.bundle_dir.join("evidence.json"),
             &redact_value(evidence, &secret_values),
@@ -1363,7 +1411,7 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
         steps: Vec::new(),
     };
     let mut current_turn = None;
-    let mut pending_capabilities: HashMap<(String, String), u64> = HashMap::new();
+    let mut pending_capabilities: HashMap<(String, String), VecDeque<u64>> = HashMap::new();
     let mut native_actions = HashSet::new();
     let mut driver_turn_active = false;
 
@@ -1451,7 +1499,10 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
                 if driver_turn_active && capability_event_is_agent(&event.payload) =>
             {
                 if let Some(key) = capability_key(&event.payload) {
-                    pending_capabilities.insert(key, event.sequence);
+                    pending_capabilities
+                        .entry(key)
+                        .or_default()
+                        .push_back(event.sequence);
                 }
             }
             "mcp.tool.completed"
@@ -1459,10 +1510,18 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
             {
                 if let Some((source, name)) = capability_key(&event.payload) {
                     let mut sequences = Vec::new();
-                    if let Some(started) =
-                        pending_capabilities.remove(&(source.clone(), name.clone()))
+                    let key = (source.clone(), name.clone());
+                    if let Some(started) = pending_capabilities
+                        .get_mut(&key)
+                        .and_then(VecDeque::pop_front)
                     {
                         sequences.push(started);
+                    }
+                    if pending_capabilities
+                        .get(&key)
+                        .is_some_and(VecDeque::is_empty)
+                    {
+                        pending_capabilities.remove(&key);
                     }
                     sequences.push(event.sequence);
                     let failed = event.payload["isError"].as_bool() == Some(true);
@@ -2276,23 +2335,45 @@ fn redact_json(value: &mut JsonValue) {
 
 fn redact_secret_strings(value: &mut JsonValue, secrets: &[Vec<u8>]) {
     match value {
-        JsonValue::Object(object) => object
-            .values_mut()
-            .for_each(|value| redact_secret_strings(value, secrets)),
+        JsonValue::Object(object) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, mut value) in std::mem::take(object) {
+                redact_secret_strings(&mut value, secrets);
+                let key = redact_string(&key, secrets);
+                let unique_key = unique_redacted_key(&redacted, key);
+                redacted.insert(unique_key, value);
+            }
+            *object = redacted;
+        }
         JsonValue::Array(values) => values
             .iter_mut()
             .for_each(|value| redact_secret_strings(value, secrets)),
-        JsonValue::String(value) => {
-            for secret in secrets
-                .iter()
-                .filter_map(|secret| std::str::from_utf8(secret).ok())
-                .filter(|secret| secret.len() >= 4)
-            {
-                *value = value.replace(secret, "[REDACTED]");
-            }
-        }
+        JsonValue::String(value) => *value = redact_string(value, secrets),
         _ => {}
     }
+}
+
+fn redact_string(value: &str, secrets: &[Vec<u8>]) -> String {
+    secrets
+        .iter()
+        .filter_map(|secret| std::str::from_utf8(secret).ok())
+        .filter(|secret| secret.len() >= 4)
+        .fold(value.to_owned(), |value, secret| {
+            value.replace(secret, "[REDACTED]")
+        })
+}
+
+fn unique_redacted_key(object: &serde_json::Map<String, JsonValue>, key: String) -> String {
+    if !object.contains_key(&key) {
+        return key;
+    }
+    for suffix in 2_u64..=u64::MAX {
+        let candidate = format!("{key}#{suffix}");
+        if !object.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("a finite JSON object must have an unused redacted key")
 }
 
 fn sensitive_name(name: &str) -> bool {
@@ -2542,7 +2623,7 @@ totalScore = 11
 
     #[cfg(unix)]
     #[test]
-    fn readiness_wait_observes_cancellation_before_the_cold_start_timeout() {
+    fn response_wait_observes_cancellation_before_its_timeout() {
         let mut driver = DriverProcess::spawn("/bin/sh", ["-c", "sleep 30"]).unwrap();
         let cancel = CancellationToken::new();
         let trigger = cancel.clone();
@@ -2555,6 +2636,24 @@ totalScore = 11
             receive_with_cancellation(&mut driver, Duration::from_secs(30), &cancel).unwrap();
         canceller.join().unwrap();
         assert!(message.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_wait_observes_cancellation_before_its_timeout() {
+        let mut driver = DriverProcess::spawn("/bin/sh", ["-c", "sleep 30"]).unwrap();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let exit =
+            wait_for_exit_with_cancellation(&mut driver, Duration::from_secs(30), &cancel).unwrap();
+        canceller.join().unwrap();
+        assert!(matches!(exit, ExitWait::Cancelled));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -2770,13 +2869,23 @@ totalScore = 11
     fn capability_observations_are_redacted_before_persistence() {
         let root = temporary_root("capability-redaction");
         let state = Arc::new(test_run_state(&root));
+        lock(&state.secret_values).push(b"capability-secret".to_vec());
         let observe = source_observer(state.clone(), "catalog", "human");
         observe(
             "mcp.tool.started",
-            json!({ "arguments": { "apiKey": "capability-secret" } }),
+            json!({
+                "arguments": {
+                    "apiKey": "key-name-redaction",
+                    "note": "the agent sent capability-secret"
+                }
+            }),
         );
         let events = lock(&state.events);
         assert_eq!(events[0].payload["arguments"]["apiKey"], "[REDACTED]");
+        assert_eq!(
+            events[0].payload["arguments"]["note"],
+            "the agent sent [REDACTED]"
+        );
         assert!(
             !fs::read_to_string(root.join("events.jsonl"))
                 .unwrap()
@@ -3538,6 +3647,48 @@ totalScore = 11
     }
 
     #[test]
+    fn causal_review_pairs_overlapping_capability_calls_in_fifo_order() {
+        let summary = RunSummary {
+            id: "run-overlap".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "test/model".to_owned(),
+            status: RunStatus::Running,
+            started_at_ms: 1,
+            finished_at_ms: None,
+            event_count: 5,
+            error: None,
+        };
+        let events = vec![
+            event(1, "driver.session-opened", JsonValue::Null),
+            event(
+                2,
+                "mcp.tool.started",
+                json!({ "source": "catalog", "name": "list", "actor": "agent" }),
+            ),
+            event(
+                3,
+                "mcp.tool.started",
+                json!({ "source": "catalog", "name": "list", "actor": "agent" }),
+            ),
+            event(
+                4,
+                "mcp.tool.completed",
+                json!({ "source": "catalog", "name": "list", "actor": "agent", "isError": false }),
+            ),
+            event(
+                5,
+                "mcp.tool.completed",
+                json!({ "source": "catalog", "name": "list", "actor": "agent", "isError": false }),
+            ),
+        ];
+        let review = build_review(&summary, &events);
+        assert_eq!(review.metrics.capability_calls, 2);
+        assert_eq!(review.steps[0].event_sequences, vec![2, 4]);
+        assert_eq!(review.steps[1].event_sequences, vec![3, 5]);
+    }
+
+    #[test]
     fn causal_review_explains_model_provider_failures() {
         let summary = RunSummary {
             id: "run-provider-failure".to_owned(),
@@ -3609,15 +3760,20 @@ totalScore = 11
 
     #[test]
     fn native_event_redaction_removes_sensitive_fields_and_known_literals() {
+        let mut value = json!({
+            "transport": {
+                "headers": { "Authorization": "Bearer mcp-secret" }
+            },
+            "note": "driver saw environment-secret and line\n\"quoted\"\\secret",
+            "boolean": true,
+            "booleanText": "true"
+        });
+        value.as_object_mut().unwrap().insert(
+            "dynamic-environment-secret-key".to_owned(),
+            JsonValue::String("safe".to_owned()),
+        );
         let redacted = redact_value(
-            json!({
-                "transport": {
-                    "headers": { "Authorization": "Bearer mcp-secret" }
-                },
-                "note": "driver saw environment-secret and line\n\"quoted\"\\secret",
-                "boolean": true,
-                "booleanText": "true"
-            }),
+            value,
             &[
                 b"mcp-secret".to_vec(),
                 b"environment-secret".to_vec(),
@@ -3636,6 +3792,22 @@ totalScore = 11
         assert_eq!(redacted["boolean"], true);
         assert_eq!(redacted["booleanText"], "[REDACTED]");
         assert!(serialized.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn secret_key_redaction_preserves_distinct_json_entries() {
+        let redacted = redact_value(
+            json!({
+                "first-literal": "first",
+                "second-literal": "second"
+            }),
+            &[b"first-literal".to_vec(), b"second-literal".to_vec()],
+        );
+        let object = redacted.as_object().unwrap();
+        assert_eq!(object.len(), 2);
+        assert!(object.keys().all(|key| !key.contains("literal")));
+        assert!(object.values().any(|value| value == "first"));
+        assert!(object.values().any(|value| value == "second"));
     }
 
     #[test]

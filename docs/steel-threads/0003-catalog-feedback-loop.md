@@ -23,6 +23,13 @@ The browser keeps Explore available while the run streams model, capability,
 native-action, workspace, usage, and scoring events. Completed runs reopen from
 immutable evidence after the live driver and sources are gone.
 
+In this slice, Explore is capability-oriented rather than an ambient local
+shell. Its Nushell context keeps structured pipelines, help, and formatting but
+does not expose filesystem commands, script loading, file redirection, or
+external commands. The browser session therefore cannot mutate the physical
+workspace used for agent scoring. Adding human filesystem access requires a
+controller-mediated projection that can confine and attribute each mutation.
+
 ## Evidence
 
 The deterministic fixture proves lifecycle, cancellation, malformed-event

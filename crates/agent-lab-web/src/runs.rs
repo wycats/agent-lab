@@ -513,7 +513,7 @@ impl RunController {
         let bundle_dir = confined_child(&self.inner.data_dir, &id)?;
         fs::create_dir(&bundle_dir)?;
         let workspace = bundle_dir.join("workspace");
-        let seed = confined_child(&self.inner.scenarios_dir, &scenario.seed)?;
+        let seed = confined_existing_child(&self.inner.scenarios_dir, &scenario.seed)?;
         copy_tree(&seed, &workspace)?;
         copy_tree(&seed, &bundle_dir.join("initial"))?;
 
@@ -1802,7 +1802,7 @@ fn load_scenarios(root: &Path) -> Result<BTreeMap<String, ScenarioManifest>, Run
                 entry.path().display()
             )));
         }
-        let seed = confined_child(root, &manifest.seed)?;
+        let seed = confined_existing_child(root, &manifest.seed)?;
         if !seed.is_dir() {
             return Err(RunError::InvalidScenario(format!(
                 "{} refers to a missing seed directory",
@@ -1843,27 +1843,34 @@ fn load_runs(
         if !workspace.is_dir() && !summary.status.is_finished() {
             continue;
         }
-        let (events, replay_failed) = match read_events(&bundle_dir.join("events.jsonl")) {
-            Ok(events) => (events, false),
-            Err(error) => {
-                let message = format!("stored event replay failed: {error}");
-                summary.status = RunStatus::Failed;
-                summary.error = Some(message.clone());
-                (
-                    vec![RunEvent {
-                        sequence: 1,
-                        at_ms: now_ms(),
-                        kind: "run.finished".to_owned(),
-                        payload: json!({
-                            "status": RunStatus::Failed,
-                            "error": message,
-                            "recovered": true,
-                        }),
-                    }],
-                    true,
-                )
-            }
-        };
+        let interrupted = matches!(summary.status, RunStatus::Starting | RunStatus::Running);
+        let (events, replay_failed, malformed_event_log) =
+            match read_events(&bundle_dir.join("events.jsonl")) {
+                Ok(events) => (events, false, false),
+                Err(error) => {
+                    let message = format!("stored event replay failed: {error}");
+                    if interrupted {
+                        (Vec::new(), false, true)
+                    } else {
+                        summary.status = RunStatus::Failed;
+                        summary.error = Some(message.clone());
+                        (
+                            vec![RunEvent {
+                                sequence: 1,
+                                at_ms: now_ms(),
+                                kind: "run.finished".to_owned(),
+                                payload: json!({
+                                    "status": RunStatus::Failed,
+                                    "error": message,
+                                    "recovered": true,
+                                }),
+                            }],
+                            true,
+                            true,
+                        )
+                    }
+                }
+            };
         let mut assembly = if bundle_dir.join("assembly.json").is_file() {
             serde_json::from_slice(&fs::read(bundle_dir.join("assembly.json"))?)?
         } else {
@@ -1880,7 +1887,6 @@ fn load_runs(
         }
         assembly.scenario.output = workspace_relative_path(&assembly.scenario.output)?;
         let output = assembly.scenario.output.clone();
-        let interrupted = matches!(summary.status, RunStatus::Starting | RunStatus::Running);
         summary.event_count = events.len() as u64;
         let (sender, _) = broadcast::channel(256);
         let state = Arc::new(RunState {
@@ -1897,7 +1903,7 @@ fn load_runs(
             replay_failed,
         });
         if interrupted {
-            recover_interrupted_run(&state)?;
+            recover_interrupted_run(&state, malformed_event_log)?;
         }
         let id = lock(&state.summary).id.clone();
         runs.insert(id, state);
@@ -1905,7 +1911,7 @@ fn load_runs(
     Ok(runs)
 }
 
-fn recover_interrupted_run(state: &RunState) -> Result<(), RunError> {
+fn recover_interrupted_run(state: &RunState, reset_event_log: bool) -> Result<(), RunError> {
     for directory in [
         state.workspace.clone(),
         state.bundle_dir.join("final"),
@@ -1931,6 +1937,10 @@ fn recover_interrupted_run(state: &RunState) -> Result<(), RunError> {
         summary.status = RunStatus::Cancelled;
         summary.finished_at_ms = Some(now_ms());
         summary.error = Some("controller stopped before the run finalized".to_owned());
+    }
+    if reset_event_log {
+        lock(&state.events).clear();
+        fs::write(state.bundle_dir.join("events.jsonl"), [])?;
     }
     record_event(
         state,
@@ -2156,6 +2166,16 @@ fn confined_child(root: &Path, child: impl AsRef<Path>) -> Result<PathBuf, RunEr
         return Err(RunError::PathEscape(candidate));
     }
     Ok(normalized)
+}
+
+fn confined_existing_child(root: &Path, child: impl AsRef<Path>) -> Result<PathBuf, RunError> {
+    let candidate = confined_child(root, child)?;
+    let canonical_root = fs::canonicalize(root)?;
+    let canonical_candidate = fs::canonicalize(&candidate)?;
+    if canonical_candidate != canonical_root && !canonical_candidate.starts_with(&canonical_root) {
+        return Err(RunError::PathEscape(candidate));
+    }
+    Ok(canonical_candidate)
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -2487,6 +2507,23 @@ totalScore = 11
         assert!(confined_child(root, "workspace/result.json").is_ok());
         assert!(confined_child(root, "../outside").is_err());
         assert!(confined_child(root, "/outside").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_children_reject_intermediate_symlink_escapes() {
+        let root = temporary_root("intermediate-symlink");
+        let scenarios = root.join("scenarios");
+        let outside = root.join("outside");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, scenarios.join("link")).unwrap();
+
+        assert!(matches!(
+            confined_existing_child(&scenarios, "link"),
+            Err(RunError::PathEscape(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2848,7 +2885,7 @@ totalScore = 11
     }
 
     #[test]
-    fn interrupted_runs_discard_workspace_evidence_without_redaction_material() {
+    fn interrupted_runs_recover_and_discard_workspace_when_event_replay_is_malformed() {
         let root = temporary_root("interrupted-redaction");
         let scenarios = root.join("scenarios");
         let data = root.join("runs");
@@ -2890,12 +2927,7 @@ totalScore = 11
             &serde_json::to_value(initial_assembly(&summary, &scenario)).unwrap(),
         )
         .unwrap();
-        fs::write(
-            bundle.join("events.jsonl"),
-            serde_json::to_string(&event(1, "run.status", json!({ "status": "running" }))).unwrap()
-                + "\n",
-        )
-        .unwrap();
+        fs::write(bundle.join("events.jsonl"), b"{malformed event evidence\n").unwrap();
 
         let config = || RunControllerConfig {
             scenarios_dir: scenarios.clone(),
@@ -2914,6 +2946,7 @@ totalScore = 11
             detail.events.last().unwrap().payload["workspaceEvidence"],
             "discarded because redaction material was unavailable"
         );
+        assert_eq!(read_events(&bundle.join("events.jsonl")).unwrap().len(), 1);
         drop(controller);
 
         let replayed = RunController::new(config()).unwrap();

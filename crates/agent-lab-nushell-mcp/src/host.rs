@@ -9,6 +9,7 @@ use nu_engine::CallExt;
 use nu_parser::FlatShape;
 use nu_protocol::{
     IntoPipelineData, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
+    ast::{Block, Expr, PipelineRedirection, RedirectionTarget, Traverse},
     debugger::WithoutDebug,
     engine::{Command, EngineState, Stack, StateWorkingSet},
     report_error::report_compile_error,
@@ -50,7 +51,34 @@ pub enum HostError {
     InteractiveIo(#[from] io::Error),
     #[error("interactive line editor failed: {0}")]
     LineEditor(#[from] reedline::ReedlineError),
+    #[error("filesystem redirection is not available in the Agent Lab Explore shell")]
+    FilesystemRedirection,
 }
+
+const WORKSPACE_UNSAFE_COMMANDS: &[&str] = &[
+    "cd",
+    "config env",
+    "config meta",
+    "config nu",
+    "cp",
+    "glob",
+    "ls",
+    "mkdir",
+    "mv",
+    "open",
+    "overlay use",
+    "path exists",
+    "path expand",
+    "path type",
+    "rm",
+    "run",
+    "save",
+    "source",
+    "source-env",
+    "touch",
+    "use",
+    "view files",
+];
 
 pub struct NushellHost {
     engine_state: EngineState,
@@ -72,6 +100,9 @@ impl NushellHost {
         let mut engine_state =
             nu_command::add_shell_command_context(nu_cmd_lang::create_default_context());
         let mut working_set = StateWorkingSet::new(&engine_state);
+        for command in WORKSPACE_UNSAFE_COMMANDS {
+            working_set.hide_decl(command.as_bytes());
+        }
         working_set.add_decl(Box::new(AgentLabExternalGuard));
         engine_state
             .merge_delta(working_set.render())
@@ -202,6 +233,9 @@ impl NushellHost {
         }
         if let Some(error) = working_set.compile_errors.first() {
             return Err(HostError::Compile(format!("{error:?}")));
+        }
+        if block_has_file_redirection(&working_set, &block) {
+            return Err(HostError::FilesystemRedirection);
         }
         self.engine_state.merge_delta(working_set.render())?;
         nu_engine::eval_block::<WithoutDebug>(
@@ -369,6 +403,10 @@ impl NushellHost {
             report_compile_error(Some(&self.stack), &working_set, error);
             return;
         }
+        if block_has_file_redirection(&working_set, &block) {
+            eprintln!("{}", HostError::FilesystemRedirection);
+            return;
+        }
         let delta = working_set.render();
         if let Err(error) = self.engine_state.merge_delta(delta) {
             report_shell_error(Some(&self.stack), &self.engine_state, &error);
@@ -393,6 +431,47 @@ impl NushellHost {
             }
             Err(error) => report_shell_error(Some(&self.stack), &self.engine_state, &error),
         }
+    }
+}
+
+fn block_has_file_redirection(working_set: &StateWorkingSet<'_>, block: &Block) -> bool {
+    fn directly_redirects_to_file(block: &Block) -> bool {
+        block.pipelines.iter().any(|pipeline| {
+            pipeline.elements.iter().any(|element| {
+                element
+                    .redirection
+                    .as_ref()
+                    .is_some_and(redirection_targets_file)
+            })
+        })
+    }
+
+    if directly_redirects_to_file(block) {
+        return true;
+    }
+
+    let mut nested_blocks = Vec::new();
+    block.flat_map(
+        working_set,
+        &|expression| match expression.expr {
+            Expr::Block(id)
+            | Expr::Closure(id)
+            | Expr::RowCondition(id)
+            | Expr::Subexpression(id) => vec![id],
+            _ => Vec::new(),
+        },
+        &mut nested_blocks,
+    );
+    nested_blocks
+        .into_iter()
+        .any(|id| directly_redirects_to_file(working_set.get_block(id)))
+}
+
+fn redirection_targets_file(redirection: &PipelineRedirection) -> bool {
+    let is_file = |target: &RedirectionTarget| matches!(target, RedirectionTarget::File { .. });
+    match redirection {
+        PipelineRedirection::Single { target, .. } => is_file(target),
+        PipelineRedirection::Separate { out, err } => is_file(out) || is_file(err),
     }
 }
 
@@ -538,6 +617,58 @@ impl AgentLabCompleter {
             !is_mcp_namespace_root || !canonical_commands.contains(&format!("{command} tools"))
         });
         Self { commands }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{HostError, NushellHost, WORKSPACE_UNSAFE_COMMANDS};
+
+    #[test]
+    fn explore_shell_hides_ambient_file_commands() {
+        let host = NushellHost::new();
+        for command in WORKSPACE_UNSAFE_COMMANDS {
+            assert!(
+                host.engine_state
+                    .find_decl(command.as_bytes(), &[])
+                    .is_none(),
+                "{command} should not be visible in Explore"
+            );
+        }
+    }
+
+    #[test]
+    fn explore_shell_rejects_file_redirection_before_evaluation() {
+        let mut host = NushellHost::new();
+        let path = std::env::temp_dir().join(format!(
+            "agent-lab-explore-redirection-{}",
+            std::process::id()
+        ));
+        let source = format!("'outside' o> '{}'", path.display());
+        assert!(matches!(
+            host.eval(&source),
+            Err(HostError::FilesystemRedirection)
+        ));
+        assert!(!path.exists());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn explore_shell_rejects_nested_file_redirection() {
+        let mut host = NushellHost::new();
+        let path = std::env::temp_dir().join(format!(
+            "agent-lab-explore-nested-redirection-{}",
+            std::process::id()
+        ));
+        let source = format!("do {{ 'outside' o> '{}' }}", path.display());
+        assert!(matches!(
+            host.eval(&source),
+            Err(HostError::FilesystemRedirection)
+        ));
+        assert!(!path.exists());
+        let _ = fs::remove_file(path);
     }
 }
 

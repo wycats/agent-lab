@@ -7,7 +7,7 @@ use std::{
 
 use agent_lab_driver_protocol::{
     CanonicalizationPolicy, CommandBody, ControllerCommand, DriverBody, DriverEvidenceBundle,
-    DriverFailureScope, DriverLaunch, DriverProcess, PROTOCOL_VERSION, ProcessError,
+    DriverFailureScope, DriverLaunch, DriverMessage, DriverProcess, PROTOCOL_VERSION, ProcessError,
 };
 use serde_json::json;
 
@@ -262,6 +262,24 @@ fn protocol_version_and_sequence_violations_are_distinct() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn unterminated_driver_records_are_rejected_before_parsing() {
+    let mut process = DriverProcess::spawn(
+        "sh",
+        [
+            "-c",
+            "printf '%s' '{\"protocolVersion\":1,\"sequence\":1,\"causedBy\":null,\"type\":\"driver.ready\",\"driver\":{\"name\":\"partial\",\"version\":\"1\",\"revision\":null,\"features\":[]}}'",
+        ],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        process.receive(TIMEOUT),
+        Err(ProcessError::UnterminatedOutput { ref raw }) if !raw.ends_with(b"\n")
+    ));
+}
+
 #[test]
 fn raw_runs_remain_distinct_while_named_canonical_evidence_matches() {
     let first = completed_fixture_bundle();
@@ -322,6 +340,67 @@ fn durable_evidence_reopens_and_rejects_tampering() {
 }
 
 #[test]
+fn evidence_rejects_protocol_and_manifest_identity_mismatches() {
+    let bundle = completed_fixture_bundle();
+
+    let mut wrong_version = bundle.transcript.clone();
+    let mut message: DriverMessage =
+        serde_json::from_slice(&wrong_version.driver_records[1]).unwrap();
+    message.protocol_version += 1;
+    wrong_version.driver_records[1] = driver_record(&message);
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id,
+            wrong_version,
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
+
+    let mut wrong_sequence = bundle.transcript.clone();
+    let mut message: DriverMessage =
+        serde_json::from_slice(&wrong_sequence.driver_records[1]).unwrap();
+    message.sequence += 1;
+    wrong_sequence.driver_records[1] = driver_record(&message);
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id,
+            wrong_sequence,
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
+
+    let mut stale_driver = bundle.driver.clone();
+    stale_driver.revision = Some("stale".to_owned());
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            stale_driver,
+            bundle.process_id,
+            bundle.transcript.clone(),
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
+
+    assert!(
+        DriverEvidenceBundle::new(
+            bundle.controller_revision.clone(),
+            bundle.driver.clone(),
+            bundle.process_id + 1,
+            bundle.transcript.clone(),
+            bundle.canonical.policy.clone(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn probe_can_finalize_fixture_evidence_for_direct_inspection() {
     let root = temporary_root("probe-evidence");
     let evidence = root.join("run-1");
@@ -351,6 +430,23 @@ fn probe_can_finalize_fixture_evidence_for_direct_inspection() {
     );
     assert_eq!(bundle.canonical.policy.name, "fixture-v1");
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn probe_rejects_a_nonzero_driver_exit_before_finalizing_evidence() {
+    let root = temporary_root("probe-nonzero-exit");
+    let evidence = root.join("run-1");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-lab-driver-probe"))
+        .arg(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"))
+        .env("AGENT_LAB_EVIDENCE_DIR", &evidence)
+        .env("AGENT_LAB_FIXTURE_EXIT_CODE_AFTER_CLOSE", "23")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("driver exited unsuccessfully"));
+    assert!(!evidence.exists());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -496,4 +592,10 @@ fn completed_fixture_bundle() -> DriverEvidenceBundle {
         CanonicalizationPolicy::new("fixture-v1", ["processId"]),
     )
     .unwrap()
+}
+
+fn driver_record(message: &DriverMessage) -> Vec<u8> {
+    let mut raw = serde_json::to_vec(message).unwrap();
+    raw.push(b'\n');
+    raw
 }

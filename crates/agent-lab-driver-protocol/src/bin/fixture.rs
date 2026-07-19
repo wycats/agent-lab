@@ -334,5 +334,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some(code) = std::env::var("AGENT_LAB_FIXTURE_EXIT_CODE_AFTER_CLOSE")
+        .ok()
+        .and_then(|code| code.parse().ok())
+    {
+        std::process::exit(code);
+    }
+
     Ok(())
 }

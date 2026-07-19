@@ -44,6 +44,8 @@ pub enum ProcessError {
     Read(String),
     #[error("driver emitted malformed JSON: {message}; raw={raw:?}")]
     MalformedOutput { raw: Vec<u8>, message: String },
+    #[error("driver emitted a JSON Lines record without a trailing newline: raw={raw:?}")]
+    UnterminatedOutput { raw: Vec<u8> },
     #[error("driver emitted protocol version {actual}; expected {expected}")]
     UnsupportedVersion { expected: u32, actual: u32 },
     #[error("driver sequence was not contiguous: expected={expected}, actual={actual}")]
@@ -252,6 +254,9 @@ impl DriverProcess {
         match self.output.recv_timeout(timeout) {
             Ok(ReaderItem::Line(raw)) => {
                 self.received.push(raw.clone());
+                if !raw.ends_with(b"\n") {
+                    return Err(ProcessError::UnterminatedOutput { raw });
+                }
                 let parsed = serde_json::from_slice::<DriverMessage>(&raw).map_err(|error| {
                     ProcessError::MalformedOutput {
                         raw: raw.clone(),

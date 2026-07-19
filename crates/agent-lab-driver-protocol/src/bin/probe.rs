@@ -24,6 +24,16 @@ fn json_env(name: &str, default: JsonValue) -> Result<JsonValue, Box<dyn Error>>
     }
 }
 
+fn ensure_clean_exit(exit_code: Option<i32>) -> Result<(), io::Error> {
+    if exit_code == Some(0) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "driver exited unsuccessfully with code {exit_code:?}"
+        )))
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
     let executable = args.next().ok_or_else(|| {
@@ -95,6 +105,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "expected session.closed").into());
     }
     let exit_code = driver.wait_for_exit(TIMEOUT)?;
+    ensure_clean_exit(exit_code)?;
     let transcript = driver.transcript();
     let evidence_dir = env::var_os("AGENT_LAB_EVIDENCE_DIR").map(PathBuf::from);
     if let Some(directory) = &evidence_dir {

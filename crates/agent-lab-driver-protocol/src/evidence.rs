@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use thiserror::Error;
 
-use crate::{ControllerCommand, DriverDescriptor, DriverMessage, DriverTranscript};
+use crate::{
+    ControllerCommand, DriverBody, DriverDescriptor, DriverMessage, DriverTranscript,
+    PROTOCOL_VERSION,
+};
 
 pub const EVIDENCE_SCHEMA_VERSION: u32 = 1;
 
@@ -72,22 +75,25 @@ impl DriverEvidenceBundle {
     ///
     /// # Errors
     ///
-    /// Returns an error if a retained driver record is not valid JSON.
+    /// Returns an error if retained records or their declared identities are
+    /// invalid or inconsistent.
     pub fn new(
         controller_revision: Option<String>,
         driver: DriverDescriptor,
         process_id: u32,
         transcript: DriverTranscript,
         policy: CanonicalizationPolicy,
-    ) -> Result<Self, serde_json::Error> {
+    ) -> Result<Self, EvidenceError> {
         let canonical = canonicalize_driver_records(&transcript, policy)?;
-        Ok(Self {
+        let bundle = Self {
             controller_revision,
             driver,
             process_id,
             transcript,
             canonical,
-        })
+        };
+        validate_bundle(&bundle)?;
+        Ok(bundle)
     }
 
     #[must_use]
@@ -212,7 +218,9 @@ pub enum EvidenceError {
 
 fn validate_bundle(bundle: &DriverEvidenceBundle) -> Result<(), EvidenceError> {
     validate_records::<ControllerCommand>("controller", &bundle.transcript.controller_records)?;
-    validate_records::<DriverMessage>("driver", &bundle.transcript.driver_records)?;
+    let driver_records =
+        validate_records::<DriverMessage>("driver", &bundle.transcript.driver_records)?;
+    validate_driver_records(bundle, &driver_records)?;
     let expected =
         canonicalize_driver_records(&bundle.transcript, bundle.canonical.policy.clone())?;
     if expected != bundle.canonical {
@@ -223,10 +231,11 @@ fn validate_bundle(bundle: &DriverEvidenceBundle) -> Result<(), EvidenceError> {
     Ok(())
 }
 
-fn validate_records<T>(kind: &str, records: &[Vec<u8>]) -> Result<(), EvidenceError>
+fn validate_records<T>(kind: &str, records: &[Vec<u8>]) -> Result<Vec<T>, EvidenceError>
 where
     T: for<'de> Deserialize<'de>,
 {
+    let mut parsed = Vec::with_capacity(records.len());
     for (index, record) in records.iter().enumerate() {
         if !record.ends_with(b"\n") {
             return Err(EvidenceError::InvalidBundle(format!(
@@ -234,9 +243,57 @@ where
                 index + 1
             )));
         }
-        serde_json::from_slice::<T>(record).map_err(|error| {
+        parsed.push(serde_json::from_slice::<T>(record).map_err(|error| {
             EvidenceError::InvalidBundle(format!("{kind} record {} is invalid: {error}", index + 1))
+        })?);
+    }
+    Ok(parsed)
+}
+
+fn validate_driver_records(
+    bundle: &DriverEvidenceBundle,
+    records: &[DriverMessage],
+) -> Result<(), EvidenceError> {
+    let mut saw_ready = false;
+    for (index, record) in records.iter().enumerate() {
+        let record_number = index + 1;
+        if record.protocol_version != PROTOCOL_VERSION {
+            return Err(EvidenceError::InvalidBundle(format!(
+                "driver record {record_number} has protocol version {}; expected {PROTOCOL_VERSION}",
+                record.protocol_version
+            )));
+        }
+        let expected_sequence = u64::try_from(record_number).map_err(|error| {
+            EvidenceError::InvalidBundle(format!("driver record count exceeds u64: {error}"))
         })?;
+        if record.sequence != expected_sequence {
+            return Err(EvidenceError::InvalidBundle(format!(
+                "driver record {record_number} has sequence {}; expected {expected_sequence}",
+                record.sequence
+            )));
+        }
+        match &record.body {
+            DriverBody::Ready { driver } => {
+                saw_ready = true;
+                if driver != &bundle.driver {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "driver record {record_number} descriptor does not match the manifest"
+                    )));
+                }
+            }
+            DriverBody::SessionOpened { process_id, .. } if *process_id != bundle.process_id => {
+                return Err(EvidenceError::InvalidBundle(format!(
+                    "driver record {record_number} process ID {process_id} does not match manifest process ID {}",
+                    bundle.process_id
+                )));
+            }
+            _ => {}
+        }
+    }
+    if !saw_ready {
+        return Err(EvidenceError::InvalidBundle(
+            "driver transcript does not contain driver.ready".to_owned(),
+        ));
     }
     Ok(())
 }

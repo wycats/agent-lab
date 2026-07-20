@@ -41,6 +41,17 @@ impl Fixture {
         }
     }
 
+    fn startup(&mut self, output: &mut impl Write) -> io::Result<()> {
+        self.emit(
+            output,
+            DriverBody::StartupEvent {
+                phase: "adapter-load".to_owned(),
+                status: "completed".to_owned(),
+                detail: Some("Fixture adapter loaded".to_owned()),
+            },
+        )
+    }
+
     fn emit(&mut self, output: &mut impl Write, body: DriverBody) -> io::Result<()> {
         self.sequence += 1;
         write_message(
@@ -477,6 +488,7 @@ fn write_message(output: &mut impl Write, message: &DriverMessage) -> io::Result
 }
 
 fn start_fixture(output: &mut impl Write, fixture: &mut Fixture) -> io::Result<bool> {
+    fixture.startup(output)?;
     fixture.emit(
         output,
         DriverBody::Ready {

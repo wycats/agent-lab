@@ -62,3 +62,8 @@ script-loading, file-redirection, or external-command access. A future physical
 workspace projection needs a controller-mediated, attributable interface rather
 than ambient shell access. Keep the loopback workbench local and run the browser
 acceptance with `pnpm web:test`.
+
+The run-capable controller currently requires Unix. Its evidence and scoring
+paths use handle-relative, no-follow file reads to keep concurrent workspace
+processes confined; startup reports an unsupported-platform error until an
+equivalent Windows implementation exists.

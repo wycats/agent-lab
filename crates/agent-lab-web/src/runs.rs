@@ -333,6 +333,7 @@ impl RunController {
     ///
     /// Returns an error for an unreadable or invalid scenario directory.
     pub fn new(config: RunControllerConfig) -> Result<Self, RunError> {
+        require_race_free_confined_reads(cfg!(unix))?;
         let scenarios_dir = canonical_directory(&config.scenarios_dir)?;
         fs::create_dir_all(&config.data_dir)?;
         let data_dir = fs::canonicalize(&config.data_dir)?;
@@ -2841,6 +2842,14 @@ fn read_optional_confined_file_without_handle_relative_support(
     }
 }
 
+fn require_race_free_confined_reads(supported: bool) -> Result<(), RunError> {
+    if supported {
+        Ok(())
+    } else {
+        Err(RunError::UnsupportedPlatform)
+    }
+}
+
 fn redact_transcript(mut transcript: DriverTranscript, secrets: &[Vec<u8>]) -> DriverTranscript {
     for record in transcript
         .controller_records
@@ -2999,6 +3008,10 @@ pub enum RunError {
     UnsupportedWorkspaceEntry(PathBuf),
     #[error("race-free confined file reads are unavailable on this platform: {0}")]
     ConfinedReadUnavailable(PathBuf),
+    #[error(
+        "the run controller requires race-free confined output reads, which are not implemented for this platform"
+    )]
+    UnsupportedPlatform,
     #[error(transparent)]
     Process(#[from] agent_lab_driver_protocol::ProcessError),
     #[error(transparent)]
@@ -3505,6 +3518,15 @@ totalScore = 11
             Err(RunError::ConfinedReadUnavailable(_))
         ));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn run_controller_rejects_platforms_without_race_free_confined_reads() {
+        assert!(matches!(
+            require_race_free_confined_reads(false),
+            Err(RunError::UnsupportedPlatform)
+        ));
+        assert!(require_race_free_confined_reads(true).is_ok());
     }
 
     #[cfg(unix)]

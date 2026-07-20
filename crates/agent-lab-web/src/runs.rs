@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr},
@@ -2134,94 +2134,123 @@ fn load_runs(
 ) -> Result<HashMap<String, Arc<RunState>>, RunError> {
     let mut runs = HashMap::new();
     for entry in fs::read_dir(data_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let bundle_dir = entry.path();
-        let manifest_path = bundle_dir.join("manifest.json");
-        if !manifest_path.is_file() {
-            continue;
-        }
-        let mut summary: RunSummary = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-        if summary.id != entry.file_name().to_string_lossy() {
-            continue;
-        }
-        let scenario = scenarios.get(&summary.scenario_id);
-        let workspace = bundle_dir.join("workspace");
-        if !workspace.is_dir() && !summary.status.is_finished() {
-            continue;
-        }
-        let interrupted = matches!(summary.status, RunStatus::Starting | RunStatus::Running);
-        let (events, replay_failed, malformed_event_log) =
-            match read_events(&bundle_dir.join("events.jsonl")) {
-                Ok(events) => (events, false, false),
-                Err(error) => {
-                    let message = format!("stored event replay failed: {error}");
-                    if interrupted {
-                        (Vec::new(), false, true)
-                    } else {
-                        summary.status = RunStatus::Failed;
-                        summary.error = Some(message.clone());
-                        (
-                            vec![RunEvent {
-                                sequence: 1,
-                                at_ms: now_ms(),
-                                kind: "run.finished".to_owned(),
-                                payload: json!({
-                                    "status": RunStatus::Failed,
-                                    "error": message,
-                                    "recovered": true,
-                                }),
-                            }],
-                            true,
-                            true,
-                        )
-                    }
-                }
-            };
-        let mut assembly = if bundle_dir.join("assembly.json").is_file() {
-            serde_json::from_slice(&fs::read(bundle_dir.join("assembly.json"))?)?
-        } else {
-            let Some(scenario) = scenario else {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "skipping unreadable run directory entry");
                 continue;
-            };
-            recover_legacy_assembly(&summary, scenario, &events)
+            }
         };
-        if assembly.scenario.output.as_os_str().is_empty() {
-            let Some(scenario) = scenario else {
+        let bundle_dir = entry.path();
+        let is_directory = match entry.file_type() {
+            Ok(file_type) => file_type.is_dir(),
+            Err(error) => {
+                tracing::warn!(bundle = %bundle_dir.display(), %error, "skipping unreadable run bundle");
                 continue;
-            };
-            assembly.scenario.output.clone_from(&scenario.output);
+            }
+        };
+        if !is_directory {
+            continue;
         }
-        assembly.scenario.output = workspace_relative_path(&assembly.scenario.output)?;
-        let output = assembly.scenario.output.clone();
-        let initial_snapshot = (summary.status == RunStatus::Exploring)
-            .then(|| snapshot_tree(&bundle_dir.join("initial")).ok())
-            .flatten();
-        summary.event_count = events.len() as u64;
-        let (sender, _) = broadcast::channel(256);
-        let state = Arc::new(RunState {
-            summary: Mutex::new(summary),
-            assembly: Mutex::new(assembly),
-            events: Mutex::new(events),
-            sender,
-            cancel: CancellationToken::new(),
-            bundle_dir,
-            workspace,
-            output,
-            initial_snapshot,
-            capabilities: Mutex::new(Vec::new()),
-            secret_values: Mutex::new(Vec::new()),
-            replay_failed,
-        });
-        if interrupted && !recover_finalized_run(&state)? {
-            recover_interrupted_run(&state, malformed_event_log)?;
+        match load_run_bundle(&bundle_dir, &entry.file_name(), scenarios) {
+            Ok(Some(state)) => {
+                let id = lock(&state.summary).id.clone();
+                runs.insert(id, state);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(bundle = %bundle_dir.display(), %error, "skipping malformed run bundle");
+            }
         }
-        let id = lock(&state.summary).id.clone();
-        runs.insert(id, state);
     }
     Ok(runs)
+}
+
+fn load_run_bundle(
+    bundle_dir: &Path,
+    bundle_name: &OsStr,
+    scenarios: &BTreeMap<String, ScenarioManifest>,
+) -> Result<Option<Arc<RunState>>, RunError> {
+    let manifest_path = bundle_dir.join("manifest.json");
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let mut summary: RunSummary = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    if summary.id != bundle_name.to_string_lossy() {
+        return Ok(None);
+    }
+    let scenario = scenarios.get(&summary.scenario_id);
+    let workspace = bundle_dir.join("workspace");
+    if !workspace.is_dir() && !summary.status.is_finished() {
+        return Ok(None);
+    }
+    let interrupted = matches!(summary.status, RunStatus::Starting | RunStatus::Running);
+    let (events, replay_failed, malformed_event_log) =
+        match read_events(&bundle_dir.join("events.jsonl")) {
+            Ok(events) => (events, false, false),
+            Err(error) => {
+                let message = format!("stored event replay failed: {error}");
+                if interrupted {
+                    (Vec::new(), false, true)
+                } else {
+                    summary.status = RunStatus::Failed;
+                    summary.error = Some(message.clone());
+                    (
+                        vec![RunEvent {
+                            sequence: 1,
+                            at_ms: now_ms(),
+                            kind: "run.finished".to_owned(),
+                            payload: json!({
+                                "status": RunStatus::Failed,
+                                "error": message,
+                                "recovered": true,
+                            }),
+                        }],
+                        true,
+                        true,
+                    )
+                }
+            }
+        };
+    let mut assembly = if bundle_dir.join("assembly.json").is_file() {
+        serde_json::from_slice(&fs::read(bundle_dir.join("assembly.json"))?)?
+    } else {
+        let Some(scenario) = scenario else {
+            return Ok(None);
+        };
+        recover_legacy_assembly(&summary, scenario, &events)
+    };
+    if assembly.scenario.output.as_os_str().is_empty() {
+        let Some(scenario) = scenario else {
+            return Ok(None);
+        };
+        assembly.scenario.output.clone_from(&scenario.output);
+    }
+    assembly.scenario.output = workspace_relative_path(&assembly.scenario.output)?;
+    let output = assembly.scenario.output.clone();
+    let initial_snapshot = (summary.status == RunStatus::Exploring)
+        .then(|| snapshot_tree(&bundle_dir.join("initial")).ok())
+        .flatten();
+    summary.event_count = events.len() as u64;
+    let (sender, _) = broadcast::channel(256);
+    let state = Arc::new(RunState {
+        summary: Mutex::new(summary),
+        assembly: Mutex::new(assembly),
+        events: Mutex::new(events),
+        sender,
+        cancel: CancellationToken::new(),
+        bundle_dir: bundle_dir.to_path_buf(),
+        workspace,
+        output,
+        initial_snapshot,
+        capabilities: Mutex::new(Vec::new()),
+        secret_values: Mutex::new(Vec::new()),
+        replay_failed,
+    });
+    if interrupted && !recover_finalized_run(&state)? {
+        recover_interrupted_run(&state, malformed_event_log)?;
+    }
+    Ok(Some(state))
 }
 
 fn recover_finalized_run(state: &RunState) -> Result<bool, RunError> {
@@ -2788,21 +2817,28 @@ fn read_optional_confined_file(
 
 #[cfg(not(unix))]
 fn read_optional_confined_file(
-    root: &Path,
-    relative: &Path,
+    _root: &Path,
+    _relative: &Path,
     display_path: &Path,
 ) -> Result<Option<Vec<u8>>, RunError> {
+    read_optional_confined_file_without_handle_relative_support(display_path)
+}
+
+#[cfg(any(not(unix), test))]
+fn read_optional_confined_file_without_handle_relative_support(
+    display_path: &Path,
+) -> Result<Option<Vec<u8>>, RunError> {
+    // Checking a path and reopening it cannot enforce confinement across a
+    // concurrent symlink or reparse-point replacement. Until a target has a
+    // handle-relative implementation, report missing outputs and fail closed
+    // for existing ones.
     match fs::symlink_metadata(display_path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+        Ok(_) => Err(RunError::ConfinedReadUnavailable(
+            display_path.to_path_buf(),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
-    let path = confined_existing_child(root, relative)?;
-    let metadata = fs::symlink_metadata(&path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(RunError::PathEscape(display_path.to_path_buf()));
-    }
-    read_evidence_file(&path, &mut 0).map(Some)
 }
 
 fn redact_transcript(mut transcript: DriverTranscript, secrets: &[Vec<u8>]) -> DriverTranscript {
@@ -2961,6 +2997,8 @@ pub enum RunError {
     EvidenceLimit(String),
     #[error("workspace contains an unsupported filesystem entry: {0}")]
     UnsupportedWorkspaceEntry(PathBuf),
+    #[error("race-free confined file reads are unavailable on this platform: {0}")]
+    ConfinedReadUnavailable(PathBuf),
     #[error(transparent)]
     Process(#[from] agent_lab_driver_protocol::ProcessError),
     #[error(transparent)]
@@ -3446,6 +3484,26 @@ totalScore = 11
             read_optional_confined_json(&workspace, "result.json").unwrap(),
             None
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confined_read_fallback_fails_closed_for_existing_outputs() {
+        let root = temporary_root("output-existing");
+        let workspace = root.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let output = workspace.join("result.json");
+
+        assert_eq!(
+            read_optional_confined_file_without_handle_relative_support(&output).unwrap(),
+            None
+        );
+        fs::write(&output, br#"{"safe":true}"#).unwrap();
+
+        assert!(matches!(
+            read_optional_confined_file_without_handle_relative_support(&output),
+            Err(RunError::ConfinedReadUnavailable(_))
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4367,6 +4425,64 @@ totalScore = 11
             malformed_events
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_bundle_metadata_does_not_block_valid_replay() {
+        let root = temporary_root("malformed-metadata");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/driver-is-not-needed-for-replay"),
+        };
+        let controller = RunController::new(config()).unwrap();
+        let valid = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        drop(controller);
+
+        let malformed_manifest = data.join("run-malformed-manifest");
+        fs::create_dir(&malformed_manifest).unwrap();
+        fs::write(malformed_manifest.join("manifest.json"), b"{malformed").unwrap();
+
+        let malformed_assembly = data.join("run-malformed-assembly");
+        fs::create_dir(&malformed_assembly).unwrap();
+        let summary = RunSummary {
+            id: "run-malformed-assembly".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "test/model".to_owned(),
+            status: RunStatus::Passed,
+            started_at_ms: 1,
+            finished_at_ms: Some(2),
+            event_count: 0,
+            error: None,
+        };
+        write_json_atomic(
+            &malformed_assembly.join("manifest.json"),
+            &serde_json::to_value(summary).unwrap(),
+        )
+        .unwrap();
+        fs::write(malformed_assembly.join("events.jsonl"), []).unwrap();
+        fs::write(malformed_assembly.join("assembly.json"), b"{malformed").unwrap();
+
+        let replayed = RunController::new(config()).unwrap();
+        assert!(replayed.state(&valid.id).is_ok());
+        assert!(replayed.state("run-malformed-manifest").is_err());
+        assert!(replayed.state("run-malformed-assembly").is_err());
+        assert_eq!(lock(&replayed.inner.runs).len(), 1);
+
+        drop(replayed);
         fs::remove_dir_all(root).unwrap();
     }
 

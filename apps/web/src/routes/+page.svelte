@@ -78,7 +78,7 @@
   $: comparisonLabel = `Compare ${comparisonHarnessIds
     .map((id) => harnesses.find((harness) => harness.id === id)?.displayName ?? id)
     .join(' with ')}`;
-  $: activeModelAccess = modelAccess[0];
+  $: activeModelAccess = modelAccess.find((access) => access.status !== 'ready') ?? modelAccess[0];
   $: modelAccessReady = modelAccess.every((access) => access.status === 'ready');
 
   async function startTerminal(run?: RunSummary): Promise<void> {

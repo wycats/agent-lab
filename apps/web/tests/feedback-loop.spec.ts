@@ -19,6 +19,34 @@ test('terminal session errors remain visible after the socket closes', async ({ 
   await expect(page.getByRole('alert')).toContainText('run terminal is unavailable');
 });
 
+test('model access surfaces the provider blocking the shared selection', async ({ page }) => {
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workbench.modelAccess = [
+      ...workbench.modelAccess,
+      {
+        id: 'blocking-provider',
+        displayName: 'Blocking provider',
+        harnessIds: ['eve'],
+        status: 'needs-setup',
+        source: null,
+        expiresAtMs: null,
+        message: 'Connect the second provider.',
+        setupHint: 'Complete the second provider setup.'
+      }
+    ];
+    await route.fulfill({ response, json: workbench });
+  });
+
+  await page.goto('/');
+  const access = page.locator('.model-access-pill');
+  await expect(access).toContainText('Connect');
+  await expect(access).toHaveAttribute('title', 'Connect the second provider.');
+  await expect(page.getByRole('button', { name: 'Run harness', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Compare v0 with Eve' })).toBeDisabled();
+});
+
 test('a catalog run remains explorable and reopens from durable evidence', async ({ page }) => {
   const socketUrls: string[] = [];
   const terminalFrames: string[] = [];

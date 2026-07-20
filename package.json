@@ -8,5 +8,8 @@
     "web:demo": "pnpm web:build && cargo build -p agent-lab-nushell-mcp -p agent-lab-driver-protocol -p agent-lab-web --bins && cargo run -p agent-lab-web",
     "web:test": "pnpm web:build && pnpm web:test:e2e",
     "web:test:e2e": "pnpm --filter @agent-lab/web test:e2e"
+  },
+  "dependencies": {
+    "@vercel/oidc": "3.2.0"
   }
 }

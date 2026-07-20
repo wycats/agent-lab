@@ -6,5 +6,7 @@
 /apps/web/playwright-report/
 /apps/web/test-results/
 /.agent-lab/
+/.vercel/
 *.profraw
 .DS_Store
+.vercel

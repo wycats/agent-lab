@@ -5,6 +5,7 @@ use std::{
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -76,7 +77,12 @@ pub struct CatalogAssertions {
 #[serde(rename_all = "camelCase")]
 pub struct StartRunRequest {
     pub scenario_id: String,
-    pub model_id: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub harness_id: Option<String>,
+    #[serde(default)]
+    pub model_profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,7 +94,174 @@ pub struct PrepareRunRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartPreparedRunRequest {
-    pub model_id: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub harness_id: Option<String>,
+    #[serde(default)]
+    pub model_profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HarnessProfile {
+    pub id: String,
+    pub display_name: String,
+    pub launch: DriverLaunch,
+    pub models: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessMetadata {
+    pub id: String,
+    pub display_name: String,
+    pub model_profile_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfileMetadata {
+    pub id: String,
+    pub display_name: String,
+    pub harness_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelAccessProvider {
+    pub id: String,
+    pub display_name: String,
+    pub resolver: Option<DriverLaunch>,
+    pub environment_names: Vec<String>,
+    pub setup_hint: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelAccessStatus {
+    Ready,
+    NeedsSetup,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelAccessSnapshot {
+    pub id: String,
+    pub display_name: String,
+    pub harness_ids: Vec<String>,
+    pub status: ModelAccessStatus,
+    pub source: Option<String>,
+    pub expires_at_ms: Option<u128>,
+    pub message: Option<String>,
+    pub setup_hint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelAccessResolution {
+    status: ModelAccessStatus,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    expires_at_ms: Option<u128>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    environment: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartEvaluationRequest {
+    pub scenario_id: String,
+    pub model_profile_id: String,
+    pub source_workspace_id: String,
+    pub harness_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbenchSelection {
+    #[serde(default)]
+    pub harness_id: Option<String>,
+    #[serde(default)]
+    pub model_profile_id: Option<String>,
+    #[serde(default)]
+    pub comparison_harness_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateWorkbenchSelectionRequest {
+    #[serde(default)]
+    pub harness_id: Option<String>,
+    #[serde(default)]
+    pub model_profile_id: Option<String>,
+    #[serde(default)]
+    pub comparison_harness_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompareWorkbenchRequest {
+    #[serde(default)]
+    pub model_profile_id: Option<String>,
+    #[serde(default)]
+    pub harness_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkbenchOrigin {
+    Browser,
+    Nushell,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvaluationStatus {
+    Queued,
+    Running,
+    Passed,
+    Failed,
+    Cancelled,
+}
+
+impl EvaluationStatus {
+    #[must_use]
+    pub fn is_finished(self) -> bool {
+        matches!(self, Self::Passed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluationArmSummary {
+    pub harness_id: String,
+    pub run_id: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluationSummary {
+    pub id: String,
+    pub scenario_id: String,
+    pub model_profile_id: String,
+    pub source_workspace_id: String,
+    pub source_revision: String,
+    pub harness_ids: Vec<String>,
+    pub arms: Vec<EvaluationArmSummary>,
+    pub status: EvaluationStatus,
+    pub started_at_ms: u128,
+    pub finished_at_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluationDetail {
+    pub summary: EvaluationSummary,
+    pub events: Vec<RunEvent>,
+    pub comparison: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +289,10 @@ pub struct RunSummary {
     pub scenario_id: String,
     pub scenario_title: String,
     pub model_id: String,
+    #[serde(default)]
+    pub harness_id: Option<String>,
+    #[serde(default)]
+    pub model_profile_id: Option<String>,
     pub status: RunStatus,
     pub started_at_ms: u128,
     pub finished_at_ms: Option<u128>,
@@ -226,6 +403,18 @@ pub struct RunDetail {
     pub output_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbenchSnapshot {
+    pub workspace_id: String,
+    pub assembly: AssemblySnapshot,
+    pub selection: WorkbenchSelection,
+    pub harnesses: Vec<HarnessMetadata>,
+    pub model_profiles: Vec<ModelProfileMetadata>,
+    pub model_access: Vec<ModelAccessSnapshot>,
+    pub latest_evaluation: Option<EvaluationSummary>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunControllerConfig {
     pub scenarios_dir: PathBuf,
@@ -243,8 +432,15 @@ struct ControllerInner {
     scenarios_dir: PathBuf,
     data_dir: PathBuf,
     driver: DriverLaunch,
+    harnesses: BTreeMap<String, HarnessProfile>,
+    model_profiles: BTreeMap<String, String>,
+    model_access_providers: BTreeMap<String, ModelAccessProvider>,
+    harness_model_access: BTreeMap<String, String>,
     runs: Mutex<HashMap<String, Arc<RunState>>>,
     prepare_lock: tokio::sync::Mutex<()>,
+    evaluations_dir: PathBuf,
+    evaluations: Mutex<HashMap<String, Arc<EvaluationState>>>,
+    workbench_grants: Mutex<HashMap<String, String>>,
 }
 
 impl Drop for ControllerInner {
@@ -261,12 +457,20 @@ impl Drop for ControllerInner {
                 }
             }
         }
+        let evaluations = self
+            .evaluations
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for state in evaluations.values() {
+            state.cancel.cancel();
+        }
     }
 }
 
 struct RunState {
     summary: Mutex<RunSummary>,
     assembly: Mutex<AssemblySnapshot>,
+    selection: Mutex<WorkbenchSelection>,
     events: Mutex<Vec<RunEvent>>,
     sender: broadcast::Sender<RunEvent>,
     cancel: CancellationToken,
@@ -288,6 +492,16 @@ struct RunCompletion {
 enum ExitWait {
     Exited(Option<i32>),
     Cancelled,
+}
+
+struct EvaluationState {
+    summary: Mutex<EvaluationSummary>,
+    events: Mutex<Vec<RunEvent>>,
+    sender: broadcast::Sender<RunEvent>,
+    cancel: CancellationToken,
+    bundle_dir: PathBuf,
+    snapshot: PathBuf,
+    replay_failed: bool,
 }
 
 impl Drop for RunState {
@@ -316,6 +530,7 @@ struct CapabilityEndpoint {
 pub struct TerminalBinding {
     pub workspace: PathBuf,
     pub sources: Vec<TerminalCapabilityBinding>,
+    pub control_token: String,
 }
 
 /// One authenticated MCP source attached to a human shell.
@@ -333,27 +548,354 @@ impl RunController {
     ///
     /// Returns an error for an unreadable or invalid scenario directory.
     pub fn new(config: RunControllerConfig) -> Result<Self, RunError> {
+        Self::new_with_harnesses(config, Vec::new(), BTreeMap::new())
+    }
+
+    /// Load a server-only harness registry alongside the run store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate identifiers, missing model mappings, or invalid paths.
+    pub fn new_with_harnesses(
+        config: RunControllerConfig,
+        harnesses: Vec<HarnessProfile>,
+        model_profiles: BTreeMap<String, String>,
+    ) -> Result<Self, RunError> {
+        Self::new_with_harnesses_and_model_access(
+            config,
+            harnesses,
+            model_profiles,
+            Vec::new(),
+            BTreeMap::new(),
+        )
+    }
+
+    /// Load the harness registry with server-only model-access providers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid provider mappings or registry entries.
+    pub fn new_with_harnesses_and_model_access(
+        config: RunControllerConfig,
+        harnesses: Vec<HarnessProfile>,
+        model_profiles: BTreeMap<String, String>,
+        model_access_providers: Vec<ModelAccessProvider>,
+        harness_model_access: BTreeMap<String, String>,
+    ) -> Result<Self, RunError> {
         require_race_free_confined_reads(cfg!(unix))?;
         let scenarios_dir = canonical_directory(&config.scenarios_dir)?;
         fs::create_dir_all(&config.data_dir)?;
         let data_dir = fs::canonicalize(&config.data_dir)?;
+        let evaluations_dir = data_dir.parent().unwrap_or(&data_dir).join("evaluations");
+        fs::create_dir_all(&evaluations_dir)?;
+        let evaluations_dir = fs::canonicalize(evaluations_dir)?;
         let scenarios = load_scenarios(&scenarios_dir)?;
         if scenarios.is_empty() {
             return Err(RunError::InvalidScenario(
                 "scenario directory contains no TOML manifests".to_owned(),
             ));
         }
-        let runs = load_runs(&data_dir, &scenarios)?;
+        let mut harness_registry = BTreeMap::new();
+        for harness in harnesses {
+            if harness.id.trim().is_empty() || harness_registry.contains_key(&harness.id) {
+                return Err(RunError::InvalidRequest(format!(
+                    "duplicate or empty harness id: {}",
+                    harness.id
+                )));
+            }
+            for profile_id in harness.models.keys() {
+                if !model_profiles.contains_key(profile_id) {
+                    return Err(RunError::InvalidRequest(format!(
+                        "harness {} maps unknown model profile {profile_id}",
+                        harness.id
+                    )));
+                }
+            }
+            harness_registry.insert(harness.id.clone(), harness);
+        }
+        let mut model_access_registry = BTreeMap::new();
+        for provider in model_access_providers {
+            if provider.id.trim().is_empty() || model_access_registry.contains_key(&provider.id) {
+                return Err(RunError::InvalidRequest(format!(
+                    "duplicate or empty model-access provider id: {}",
+                    provider.id
+                )));
+            }
+            model_access_registry.insert(provider.id.clone(), provider);
+        }
+        for (harness_id, provider_id) in &harness_model_access {
+            if !harness_registry.contains_key(harness_id) {
+                return Err(RunError::InvalidRequest(format!(
+                    "model-access mapping references unknown harness: {harness_id}"
+                )));
+            }
+            if !model_access_registry.contains_key(provider_id) {
+                return Err(RunError::InvalidRequest(format!(
+                    "harness {harness_id} references unknown model-access provider: {provider_id}"
+                )));
+            }
+        }
+        let runs = load_runs(&data_dir, &scenarios, &harness_registry, &model_profiles)?;
+        let evaluations = load_evaluations(&evaluations_dir)?;
         Ok(Self {
             inner: Arc::new(ControllerInner {
                 scenarios,
                 scenarios_dir,
                 data_dir,
                 driver: config.driver,
+                harnesses: harness_registry,
+                model_profiles,
+                model_access_providers: model_access_registry,
+                harness_model_access,
                 runs: Mutex::new(runs),
                 prepare_lock: tokio::sync::Mutex::new(()),
+                evaluations_dir,
+                evaluations: Mutex::new(evaluations),
+                workbench_grants: Mutex::new(HashMap::new()),
             }),
         })
+    }
+
+    #[must_use]
+    pub fn harnesses(&self) -> Vec<HarnessMetadata> {
+        self.inner
+            .harnesses
+            .values()
+            .map(|harness| HarnessMetadata {
+                id: harness.id.clone(),
+                display_name: harness.display_name.clone(),
+                model_profile_ids: harness.models.keys().cloned().collect(),
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn model_profiles(&self) -> Vec<ModelProfileMetadata> {
+        self.inner
+            .model_profiles
+            .iter()
+            .map(|(id, display_name)| ModelProfileMetadata {
+                id: id.clone(),
+                display_name: display_name.clone(),
+                harness_ids: self
+                    .inner
+                    .harnesses
+                    .values()
+                    .filter(|harness| harness.models.contains_key(id))
+                    .map(|harness| harness.id.clone())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn model_access(&self, selection: &WorkbenchSelection) -> Vec<ModelAccessSnapshot> {
+        let mut harness_ids = selection.comparison_harness_ids.clone();
+        if let Some(harness_id) = &selection.harness_id
+            && !harness_ids.contains(harness_id)
+        {
+            harness_ids.push(harness_id.clone());
+        }
+        let mut grouped = BTreeMap::<String, Vec<String>>::new();
+        for harness_id in harness_ids {
+            if let Some(provider_id) = self.inner.harness_model_access.get(&harness_id) {
+                grouped
+                    .entry(provider_id.clone())
+                    .or_default()
+                    .push(harness_id);
+            }
+        }
+        grouped
+            .into_iter()
+            .filter_map(|(provider_id, harness_ids)| {
+                let provider = self.inner.model_access_providers.get(&provider_id)?;
+                let resolution = resolve_model_access(provider, false).unwrap_or_else(|error| {
+                    ModelAccessResolution {
+                        status: ModelAccessStatus::NeedsSetup,
+                        source: None,
+                        expires_at_ms: None,
+                        message: Some(error.to_string()),
+                        environment: BTreeMap::new(),
+                    }
+                });
+                Some(ModelAccessSnapshot {
+                    id: provider.id.clone(),
+                    display_name: provider.display_name.clone(),
+                    harness_ids,
+                    status: resolution.status,
+                    source: resolution.source,
+                    expires_at_ms: resolution.expires_at_ms,
+                    message: resolution.message,
+                    setup_hint: provider.setup_hint.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Return the controller-owned state projected into one attached workbench.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace does not exist or is no longer an
+    /// active Explore workspace.
+    pub fn workbench(&self, id: &str) -> Result<WorkbenchSnapshot, RunError> {
+        let state = self.state(id)?;
+        let summary = lock(&state.summary).clone();
+        if summary.status != RunStatus::Exploring {
+            return Err(RunError::RunUnavailable(id.to_owned()));
+        }
+        let latest_evaluation = self
+            .list_evaluations()
+            .into_iter()
+            .find(|evaluation| evaluation.source_workspace_id == id);
+        let selection = lock(&state.selection).clone();
+        let model_access = self.model_access(&selection);
+        Ok(WorkbenchSnapshot {
+            workspace_id: id.to_owned(),
+            assembly: lock(&state.assembly).clone(),
+            selection,
+            harnesses: self.harnesses(),
+            model_profiles: self.model_profiles(),
+            model_access,
+            latest_evaluation,
+        })
+    }
+
+    /// Update the shared workbench selection and record its human origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested harness or model is unavailable, or
+    /// when the workspace cannot persist the new selection.
+    pub fn update_workbench_selection(
+        &self,
+        id: &str,
+        request: UpdateWorkbenchSelectionRequest,
+        origin: WorkbenchOrigin,
+    ) -> Result<WorkbenchSelection, RunError> {
+        let state = self.state(id)?;
+        if lock(&state.summary).status != RunStatus::Exploring {
+            return Err(RunError::RunUnavailable(id.to_owned()));
+        }
+        let mut selection = lock(&state.selection).clone();
+        if let Some(harness_id) = request.harness_id {
+            validate_harness(&self.inner.harnesses, &harness_id)?;
+            selection.harness_id = Some(harness_id);
+        }
+        if let Some(harness_ids) = request.comparison_harness_ids {
+            validate_comparison_harnesses(&self.inner.harnesses, &harness_ids)?;
+            selection.comparison_harness_ids = harness_ids;
+        }
+        if let Some(model_profile_id) = request.model_profile_id {
+            validate_selection_model(&self.inner.harnesses, &model_profile_id, &selection)?;
+            selection.model_profile_id = Some(model_profile_id);
+        } else if selection
+            .model_profile_id
+            .as_deref()
+            .is_some_and(|profile| {
+                validate_selection_model(&self.inner.harnesses, profile, &selection).is_err()
+            })
+        {
+            selection.model_profile_id = first_compatible_model(
+                &self.inner.harnesses,
+                &self.inner.model_profiles,
+                &selection,
+            );
+        }
+        *lock(&state.selection) = selection.clone();
+        persist_selection(&state)?;
+        record_event(
+            &state,
+            "workbench.selection.changed",
+            json!({ "origin": origin, "selection": selection }),
+        )?;
+        Ok(selection)
+    }
+
+    /// Start a paired evaluation using shared defaults plus invocation-local overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selection is invalid, model access is not
+    /// ready, or the immutable evaluation snapshot cannot be created.
+    pub fn compare_workbench(
+        &self,
+        id: &str,
+        request: CompareWorkbenchRequest,
+        origin: WorkbenchOrigin,
+    ) -> Result<EvaluationSummary, RunError> {
+        let state = self.state(id)?;
+        let source = lock(&state.summary).clone();
+        if source.status != RunStatus::Exploring {
+            return Err(RunError::RunUnavailable(id.to_owned()));
+        }
+        let selection = lock(&state.selection).clone();
+        let harness_ids = request
+            .harness_ids
+            .unwrap_or_else(|| selection.comparison_harness_ids.clone());
+        validate_comparison_harnesses(&self.inner.harnesses, &harness_ids)?;
+        let model_profile_id = request
+            .model_profile_id
+            .or(selection.model_profile_id)
+            .ok_or_else(|| RunError::InvalidRequest("choose a model profile first".to_owned()))?;
+        for harness_id in &harness_ids {
+            let harness = self.inner.harnesses.get(harness_id).ok_or_else(|| {
+                RunError::InvalidRequest(format!("unknown harness: {harness_id}"))
+            })?;
+            if !harness.models.contains_key(&model_profile_id) {
+                return Err(RunError::InvalidRequest(format!(
+                    "model profile {model_profile_id} is unavailable for harness {harness_id}"
+                )));
+            }
+        }
+        let evaluation = self.start_evaluation(StartEvaluationRequest {
+            scenario_id: source.scenario_id,
+            model_profile_id,
+            source_workspace_id: id.to_owned(),
+            harness_ids,
+        })?;
+        record_event(
+            &state,
+            "workbench.evaluation.started",
+            json!({
+                "origin": origin,
+                "evaluationId": evaluation.id,
+                "modelProfileId": evaluation.model_profile_id,
+                "harnessIds": evaluation.harness_ids,
+            }),
+        )?;
+        Ok(evaluation)
+    }
+
+    /// Read an evaluation only when it belongs to the attached workbench.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workbench or evaluation does not exist, or
+    /// when the evaluation belongs to another workspace.
+    pub fn workbench_evaluation(
+        &self,
+        workspace_id: &str,
+        evaluation_id: Option<&str>,
+    ) -> Result<EvaluationDetail, RunError> {
+        self.state(workspace_id)?;
+        let evaluation_id = match evaluation_id {
+            Some(id) => id.to_owned(),
+            None => self
+                .list_evaluations()
+                .into_iter()
+                .find(|evaluation| evaluation.source_workspace_id == workspace_id)
+                .map(|evaluation| evaluation.id)
+                .ok_or_else(|| {
+                    RunError::InvalidRequest("this workbench has no evaluations yet".to_owned())
+                })?,
+        };
+        let detail = self.get_evaluation(&evaluation_id)?;
+        if detail.summary.source_workspace_id != workspace_id {
+            return Err(RunError::InvalidRequest(format!(
+                "evaluation {evaluation_id} does not belong to workbench {workspace_id}"
+            )));
+        }
+        Ok(detail)
     }
 
     #[must_use]
@@ -496,6 +1038,8 @@ impl RunController {
         if capabilities.is_empty() {
             return Err(RunError::RunUnavailable(id.to_owned()));
         }
+        let control_token = random_token();
+        lock(&self.inner.workbench_grants).insert(control_token.clone(), id.to_owned());
         Ok(TerminalBinding {
             workspace: state.workspace.clone(),
             sources: capabilities
@@ -506,7 +1050,19 @@ impl RunController {
                     token: capability.human_token,
                 })
                 .collect(),
+            control_token,
         })
+    }
+
+    #[must_use]
+    pub fn workbench_grant_allows(&self, token: &str, workspace_id: &str) -> bool {
+        lock(&self.inner.workbench_grants)
+            .get(token)
+            .is_some_and(|granted| granted == workspace_id)
+    }
+
+    pub fn revoke_workbench_grant(&self, token: &str) {
+        lock(&self.inner.workbench_grants).remove(token);
     }
 
     /// Prepare one scenario workspace and its controller-owned capability sources for exploration.
@@ -560,6 +1116,8 @@ impl RunController {
             scenario_id: scenario.id.clone(),
             scenario_title: scenario.title.clone(),
             model_id: String::new(),
+            harness_id: None,
+            model_profile_id: None,
             status: RunStatus::Exploring,
             started_at_ms: now_ms(),
             finished_at_ms: None,
@@ -571,6 +1129,10 @@ impl RunController {
         let state = Arc::new(RunState {
             summary: Mutex::new(summary),
             assembly: Mutex::new(assembly),
+            selection: Mutex::new(default_workbench_selection(
+                &self.inner.harnesses,
+                &self.inner.model_profiles,
+            )),
             events: Mutex::new(Vec::new()),
             sender,
             cancel: CancellationToken::new(),
@@ -585,6 +1147,7 @@ impl RunController {
         lock(&self.inner.runs).insert(id, state.clone());
         persist_manifest(&state)?;
         persist_assembly(&state)?;
+        persist_selection(&state)?;
         record_event(&state, "run.prepared", json!({ "scenario": scenario.id }))?;
         let capabilities = start_capability_sources(state.clone()).await?;
         extend_capability_secrets(&state, &capabilities);
@@ -601,15 +1164,17 @@ impl RunController {
     pub fn start_prepared(
         &self,
         id: &str,
-        request: StartPreparedRunRequest,
+        request: &StartPreparedRunRequest,
     ) -> Result<RunSummary, RunError> {
-        validate_model_id(&request.model_id)?;
+        let (harness_id, model_profile_id, model_id, driver) =
+            self.resolve_harness_selection(request)?;
+        validate_model_id(&model_id)?;
         let state = self.state(id)?;
         let capabilities = lock(&state.capabilities).clone();
         if capabilities.is_empty() {
             return Err(RunError::RunUnavailable(id.to_owned()));
         }
-        let scenario = {
+        let (scenario, previous_summary) = {
             let mut summary = lock(&state.summary);
             if summary.status != RunStatus::Exploring {
                 return Err(RunError::RunUnavailable(id.to_owned()));
@@ -620,11 +1185,22 @@ impl RunController {
                 .get(&summary.scenario_id)
                 .cloned()
                 .ok_or_else(|| RunError::UnknownScenario(summary.scenario_id.clone()))?;
-            summary.model_id.clone_from(&request.model_id);
+            let previous_summary = summary.clone();
+            summary.model_id.clone_from(&model_id);
+            summary.harness_id.clone_from(&harness_id);
+            summary.model_profile_id.clone_from(&model_profile_id);
             summary.status = RunStatus::Starting;
-            scenario
+            (scenario, previous_summary)
         };
-        lock(&state.assembly).harness.model_id = Some(request.model_id);
+        let previous_assembly = {
+            let mut assembly = lock(&state.assembly);
+            let previous = assembly.clone();
+            assembly.harness.adapter = harness_id
+                .clone()
+                .unwrap_or_else(|| "external-jsonl-v1".to_owned());
+            assembly.harness.model_id = Some(model_id);
+            previous
+        };
         let persist_start = (|| -> Result<(), RunError> {
             persist_manifest(&state)?;
             persist_assembly(&state)?;
@@ -635,11 +1211,10 @@ impl RunController {
             )
         })();
         if let Err(error) = persist_start {
-            rollback_prepared_start(&state);
+            rollback_prepared_start(&state, previous_summary, previous_assembly);
             return Err(error);
         }
         let summary = lock(&state.summary).clone();
-        let driver = self.inner.driver.clone();
         tokio::task::spawn_blocking(move || {
             execute_run(&state, &scenario, driver, &capabilities);
         });
@@ -653,7 +1228,6 @@ impl RunController {
     /// Returns an error for invalid input, unknown scenarios, unsafe paths, I/O failures, or
     /// capability-source startup failures.
     pub async fn start(&self, request: StartRunRequest) -> Result<RunSummary, RunError> {
-        validate_model_id(&request.model_id)?;
         let prepared = self
             .prepare(PrepareRunRequest {
                 scenario_id: request.scenario_id,
@@ -661,10 +1235,470 @@ impl RunController {
             .await?;
         self.start_prepared(
             &prepared.id,
-            StartPreparedRunRequest {
+            &StartPreparedRunRequest {
                 model_id: request.model_id,
+                harness_id: request.harness_id,
+                model_profile_id: request.model_profile_id,
             },
         )
+    }
+
+    #[must_use]
+    pub fn list_evaluations(&self) -> Vec<EvaluationSummary> {
+        let mut evaluations = lock(&self.inner.evaluations)
+            .values()
+            .map(|state| lock(&state.summary).clone())
+            .collect::<Vec<_>>();
+        evaluations.sort_by_key(|evaluation| std::cmp::Reverse(evaluation.started_at_ms));
+        evaluations
+    }
+
+    /// Read a paired evaluation and its durable comparison projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evaluation is unknown or its projection is unreadable.
+    pub fn get_evaluation(&self, id: &str) -> Result<EvaluationDetail, RunError> {
+        let state = self.evaluation_state(id)?;
+        Ok(EvaluationDetail {
+            summary: lock(&state.summary).clone(),
+            events: lock(&state.events).clone(),
+            comparison: if state.replay_failed {
+                None
+            } else {
+                read_optional_json(&state.bundle_dir.join("comparison.json"))?
+            },
+        })
+    }
+
+    /// Subscribe to the recorded prefix and live paired-evaluation events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evaluation is unknown.
+    pub fn subscribe_evaluation(
+        &self,
+        id: &str,
+    ) -> Result<(Vec<RunEvent>, broadcast::Receiver<RunEvent>), RunError> {
+        let state = self.evaluation_state(id)?;
+        Ok((lock(&state.events).clone(), state.sender.subscribe()))
+    }
+
+    /// Cancel the active arm and prevent queued arms from starting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evaluation is unknown.
+    pub fn cancel_evaluation(&self, id: &str) -> Result<(), RunError> {
+        self.evaluation_state(id)?.cancel.cancel();
+        Ok(())
+    }
+
+    /// Capture an immutable Explore snapshot and queue a sequential harness comparison.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unavailable source workspace, invalid harness/model selection, or
+    /// evidence-store failure.
+    pub fn start_evaluation(
+        &self,
+        request: StartEvaluationRequest,
+    ) -> Result<EvaluationSummary, RunError> {
+        if request.harness_ids.len() != 2 {
+            return Err(RunError::InvalidRequest(
+                "an evaluation requires exactly two harness ids".to_owned(),
+            ));
+        }
+        let unique = request.harness_ids.iter().collect::<HashSet<_>>();
+        if unique.len() != request.harness_ids.len() {
+            return Err(RunError::InvalidRequest(
+                "evaluation harness ids must be unique".to_owned(),
+            ));
+        }
+        for harness_id in &request.harness_ids {
+            let harness = self.inner.harnesses.get(harness_id).ok_or_else(|| {
+                RunError::InvalidRequest(format!("unknown harness: {harness_id}"))
+            })?;
+            if !harness.models.contains_key(&request.model_profile_id) {
+                return Err(RunError::InvalidRequest(format!(
+                    "model profile {} is unavailable for harness {harness_id}",
+                    request.model_profile_id
+                )));
+            }
+            self.resolve_harness_driver(harness)?;
+        }
+        let source = self.state(&request.source_workspace_id)?;
+        let source_summary = lock(&source.summary).clone();
+        if source_summary.scenario_id != request.scenario_id {
+            return Err(RunError::InvalidRequest(
+                "source workspace does not belong to the requested scenario".to_owned(),
+            ));
+        }
+        if source_summary.status != RunStatus::Exploring {
+            return Err(RunError::InvalidRequest(
+                "only an active Explore workspace can be snapshotted".to_owned(),
+            ));
+        }
+
+        let id = format!("evaluation-{}", run_id());
+        let bundle_dir = confined_child(&self.inner.evaluations_dir, &id)?;
+        fs::create_dir(&bundle_dir)?;
+        let snapshot = bundle_dir.join("source");
+        copy_tree(&source.workspace, &snapshot)?;
+        let source_revision = format!("revision-{}", run_id());
+        write_json_atomic(
+            &bundle_dir.join("source.json"),
+            &json!({
+                "workspaceId": request.source_workspace_id,
+                "revision": source_revision,
+                "assembly": lock(&source.assembly).clone(),
+            }),
+        )?;
+        let summary = EvaluationSummary {
+            id: id.clone(),
+            scenario_id: request.scenario_id,
+            model_profile_id: request.model_profile_id,
+            source_workspace_id: request.source_workspace_id,
+            source_revision,
+            harness_ids: request.harness_ids.clone(),
+            arms: request
+                .harness_ids
+                .iter()
+                .map(|harness_id| EvaluationArmSummary {
+                    harness_id: harness_id.clone(),
+                    run_id: None,
+                    status: "queued".to_owned(),
+                })
+                .collect(),
+            status: EvaluationStatus::Queued,
+            started_at_ms: now_ms(),
+            finished_at_ms: None,
+        };
+        let (sender, _) = broadcast::channel(256);
+        let state = Arc::new(EvaluationState {
+            summary: Mutex::new(summary.clone()),
+            events: Mutex::new(Vec::new()),
+            sender,
+            cancel: CancellationToken::new(),
+            bundle_dir,
+            snapshot,
+            replay_failed: false,
+        });
+        write_json_atomic(
+            &state.bundle_dir.join("manifest.json"),
+            &serde_json::to_value(&summary)?,
+        )?;
+        record_evaluation_event(
+            &state,
+            "evaluation.created",
+            json!({
+                "sourceRevision": summary.source_revision,
+                "harnessIds": summary.harness_ids,
+            }),
+        )?;
+        lock(&self.inner.evaluations).insert(id, state.clone());
+        let controller = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = controller.execute_evaluation(state.clone()).await {
+                let message = error.to_string();
+                finish_evaluation(&state, EvaluationStatus::Failed, Some(&message));
+            }
+        });
+        Ok(summary)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_evaluation(&self, state: Arc<EvaluationState>) -> Result<(), RunError> {
+        {
+            let mut summary = lock(&state.summary);
+            summary.status = EvaluationStatus::Running;
+        }
+        persist_evaluation(&state)?;
+        record_evaluation_event(&state, "evaluation.status", json!({ "status": "running" }))?;
+        let summary = lock(&state.summary).clone();
+        for (index, harness_id) in summary.harness_ids.iter().enumerate() {
+            if state.cancel.is_cancelled() {
+                set_evaluation_arm(&state, index, None, "cancelled")?;
+                continue;
+            }
+            let prepared = self
+                .prepare_snapshot_run(
+                    &summary.scenario_id,
+                    &state.snapshot,
+                    &summary.source_revision,
+                )
+                .await?;
+            set_evaluation_arm(&state, index, Some(prepared.id.clone()), "starting")?;
+            record_evaluation_event(
+                &state,
+                "evaluation.arm.started",
+                json!({
+                    "harnessId": harness_id,
+                    "runId": prepared.id,
+                }),
+            )?;
+            self.start_prepared(
+                &prepared.id,
+                &StartPreparedRunRequest {
+                    model_id: None,
+                    harness_id: Some(harness_id.clone()),
+                    model_profile_id: Some(summary.model_profile_id.clone()),
+                },
+            )?;
+            let mut projected_steps = 0;
+            let mut projected_events = 0;
+            loop {
+                if state.cancel.is_cancelled() {
+                    let _ = self.cancel(&prepared.id);
+                }
+                let run = self.get(&prepared.id)?;
+                for event in run.events.iter().skip(projected_events) {
+                    record_evaluation_event(
+                        &state,
+                        "evaluation.arm.event",
+                        json!({
+                            "harnessId": harness_id,
+                            "runId": prepared.id,
+                            "event": event,
+                        }),
+                    )?;
+                }
+                projected_events = run.events.len();
+                for step in run.review.steps.iter().skip(projected_steps) {
+                    record_evaluation_event(
+                        &state,
+                        "evaluation.arm.progress",
+                        json!({
+                            "harnessId": harness_id,
+                            "runId": prepared.id,
+                            "status": run.summary.status,
+                            "step": step,
+                        }),
+                    )?;
+                }
+                projected_steps = run.review.steps.len();
+                if run.summary.status.is_finished() {
+                    let status = match run.summary.status {
+                        RunStatus::Passed => "passed",
+                        RunStatus::Cancelled => "cancelled",
+                        _ => "failed",
+                    };
+                    set_evaluation_arm(&state, index, Some(prepared.id.clone()), status)?;
+                    record_evaluation_event(
+                        &state,
+                        "evaluation.arm.finished",
+                        json!({
+                            "harnessId": harness_id,
+                            "runId": prepared.id,
+                            "status": status,
+                        }),
+                    )?;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        let comparison = self.build_evaluation_comparison(&state)?;
+        write_json_atomic(&state.bundle_dir.join("comparison.json"), &comparison)?;
+        let final_status = if state.cancel.is_cancelled() {
+            EvaluationStatus::Cancelled
+        } else if lock(&state.summary)
+            .arms
+            .iter()
+            .all(|arm| arm.status == "passed")
+        {
+            EvaluationStatus::Passed
+        } else {
+            EvaluationStatus::Failed
+        };
+        finish_evaluation(&state, final_status, None);
+        Ok(())
+    }
+
+    async fn prepare_snapshot_run(
+        &self,
+        scenario_id: &str,
+        snapshot: &Path,
+        source_revision: &str,
+    ) -> Result<RunSummary, RunError> {
+        let scenario = self
+            .inner
+            .scenarios
+            .get(scenario_id)
+            .cloned()
+            .ok_or_else(|| RunError::UnknownScenario(scenario_id.to_owned()))?;
+        let id = run_id();
+        let bundle_dir = confined_child(&self.inner.data_dir, &id)?;
+        fs::create_dir(&bundle_dir)?;
+        let workspace = bundle_dir.join("workspace");
+        let initial_snapshot = snapshot_tree(snapshot)?;
+        copy_tree(snapshot, &workspace)?;
+        copy_tree(snapshot, &bundle_dir.join("initial"))?;
+        let summary = RunSummary {
+            id: id.clone(),
+            scenario_id: scenario.id.clone(),
+            scenario_title: scenario.title.clone(),
+            model_id: String::new(),
+            harness_id: None,
+            model_profile_id: None,
+            status: RunStatus::Exploring,
+            started_at_ms: now_ms(),
+            finished_at_ms: None,
+            event_count: 0,
+            error: None,
+        };
+        let (sender, _) = broadcast::channel(256);
+        let mut assembly = initial_assembly(&summary, &scenario);
+        assembly.workspace.seed_revision = source_revision.to_owned();
+        let state = Arc::new(RunState {
+            summary: Mutex::new(summary),
+            assembly: Mutex::new(assembly),
+            selection: Mutex::new(default_workbench_selection(
+                &self.inner.harnesses,
+                &self.inner.model_profiles,
+            )),
+            events: Mutex::new(Vec::new()),
+            sender,
+            cancel: CancellationToken::new(),
+            bundle_dir,
+            workspace,
+            output: scenario.output.clone(),
+            initial_snapshot: Some(initial_snapshot),
+            capabilities: Mutex::new(Vec::new()),
+            secret_values: Mutex::new(driver_secret_values(&self.inner.driver)),
+            replay_failed: false,
+        });
+        lock(&self.inner.runs).insert(id, state.clone());
+        persist_manifest(&state)?;
+        persist_assembly(&state)?;
+        persist_selection(&state)?;
+        record_event(
+            &state,
+            "run.prepared",
+            json!({
+                "scenario": scenario.id,
+                "sourceRevision": source_revision,
+            }),
+        )?;
+        let capabilities = start_capability_sources(state.clone()).await?;
+        lock(&state.capabilities).clone_from(&capabilities);
+        update_assembly_capabilities(&state, &capabilities)?;
+        Ok(lock(&state.summary).clone())
+    }
+
+    fn build_evaluation_comparison(&self, state: &EvaluationState) -> Result<JsonValue, RunError> {
+        let summary = lock(&state.summary).clone();
+        let mut arms = Vec::new();
+        let mut outputs = Vec::new();
+        for arm in &summary.arms {
+            let detail = arm.run_id.as_deref().map(|id| self.get(id)).transpose()?;
+            if let Some(detail) = detail {
+                let (usage, cache) = reported_usage(&detail.events);
+                outputs.push(detail.output.clone());
+                arms.push(json!({
+                    "harnessId": arm.harness_id,
+                    "runId": detail.summary.id,
+                    "status": arm.status,
+                    "score": detail.score,
+                    "metrics": detail.review.metrics,
+                    "output": detail.output,
+                    "firstUsefulAction": detail.review.steps.iter().find(|step| {
+                        matches!(step.kind.as_str(), "capability" | "native-action" | "workspace-effect")
+                    }),
+                    "evidenceComplete": detail.summary.status.is_finished(),
+                    "usage": usage,
+                    "cache": cache,
+                }));
+            } else {
+                arms.push(json!({
+                    "harnessId": arm.harness_id,
+                    "status": arm.status,
+                    "evidenceComplete": false,
+                    "usage": "not reported",
+                    "cache": "not reported",
+                }));
+            }
+        }
+        Ok(json!({
+            "version": 2,
+            "sourceRevision": summary.source_revision,
+            "modelProfileId": summary.model_profile_id,
+            "arms": arms,
+            "outputsMatch": outputs.len() == 2 && outputs[0] == outputs[1],
+            "outputDiff": if outputs.len() == 2 && outputs[0] != outputs[1] {
+                json!({ "left": outputs[0], "right": outputs[1] })
+            } else {
+                JsonValue::Null
+            },
+        }))
+    }
+
+    fn resolve_harness_selection(
+        &self,
+        request: &StartPreparedRunRequest,
+    ) -> Result<(Option<String>, Option<String>, String, DriverLaunch), RunError> {
+        match (&request.harness_id, &request.model_profile_id) {
+            (Some(harness_id), Some(profile_id)) => {
+                let harness = self.inner.harnesses.get(harness_id).ok_or_else(|| {
+                    RunError::InvalidRequest(format!("unknown harness: {harness_id}"))
+                })?;
+                let concrete_model = harness.models.get(profile_id).ok_or_else(|| {
+                    RunError::InvalidRequest(format!(
+                        "model profile {profile_id} is unavailable for harness {harness_id}"
+                    ))
+                })?;
+                Ok((
+                    Some(harness_id.clone()),
+                    Some(profile_id.clone()),
+                    concrete_model.clone(),
+                    self.resolve_harness_driver(harness)?,
+                ))
+            }
+            (None, None) => {
+                let model_id = request.model_id.clone().ok_or_else(|| {
+                    RunError::InvalidRequest(
+                        "modelId or harnessId/modelProfileId is required".to_owned(),
+                    )
+                })?;
+                Ok((None, None, model_id, self.inner.driver.clone()))
+            }
+            _ => Err(RunError::InvalidRequest(
+                "harnessId and modelProfileId must be supplied together".to_owned(),
+            )),
+        }
+    }
+
+    fn resolve_harness_driver(&self, harness: &HarnessProfile) -> Result<DriverLaunch, RunError> {
+        let Some(provider_id) = self.inner.harness_model_access.get(&harness.id) else {
+            return Ok(harness.launch.clone());
+        };
+        let provider = self
+            .inner
+            .model_access_providers
+            .get(provider_id)
+            .ok_or_else(|| {
+                RunError::InvalidRequest(format!(
+                    "unknown model-access provider for harness {}: {provider_id}",
+                    harness.id
+                ))
+            })?;
+        let resolution = resolve_model_access(provider, true)?;
+        if resolution.status != ModelAccessStatus::Ready {
+            return Err(RunError::ModelAccessUnavailable(
+                resolution
+                    .message
+                    .unwrap_or_else(|| provider.setup_hint.clone()),
+            ));
+        }
+        let mut launch = harness.launch.clone();
+        for (name, value) in resolution.environment {
+            launch.env.retain(|(existing, _)| existing != name.as_str());
+            launch
+                .env
+                .push((OsString::from(name), OsString::from(value)));
+        }
+        Ok(launch)
     }
 
     fn state(&self, id: &str) -> Result<Arc<RunState>, RunError> {
@@ -673,15 +1707,22 @@ impl RunController {
             .cloned()
             .ok_or_else(|| RunError::UnknownRun(id.to_owned()))
     }
+
+    fn evaluation_state(&self, id: &str) -> Result<Arc<EvaluationState>, RunError> {
+        lock(&self.inner.evaluations)
+            .get(id)
+            .cloned()
+            .ok_or_else(|| RunError::InvalidRequest(format!("unknown evaluation: {id}")))
+    }
 }
 
-fn rollback_prepared_start(state: &RunState) {
-    {
-        let mut summary = lock(&state.summary);
-        summary.status = RunStatus::Exploring;
-        summary.model_id.clear();
-    }
-    lock(&state.assembly).harness.model_id = None;
+fn rollback_prepared_start(
+    state: &RunState,
+    previous_summary: RunSummary,
+    previous_assembly: AssemblySnapshot,
+) {
+    *lock(&state.summary) = previous_summary;
+    *lock(&state.assembly) = previous_assembly;
     let _ = persist_manifest(state);
     let _ = persist_assembly(state);
     let _ = record_event(
@@ -762,6 +1803,99 @@ fn configured_limit_error(
             format!("scenario exceeded max {name} count: observed {actual}, allowed {maximum}")
         })
     })
+}
+
+fn resolve_model_access(
+    provider: &ModelAccessProvider,
+    include_environment: bool,
+) -> Result<ModelAccessResolution, RunError> {
+    let allowed = provider
+        .environment_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let Some(resolver) = &provider.resolver else {
+        let environment = resolver_environment(&DriverLaunch::new(""), &allowed);
+        return Ok(ModelAccessResolution {
+            status: if environment.is_empty() {
+                ModelAccessStatus::NeedsSetup
+            } else {
+                ModelAccessStatus::Ready
+            },
+            source: (!environment.is_empty()).then(|| "environment".to_owned()),
+            expires_at_ms: None,
+            message: environment.is_empty().then(|| provider.setup_hint.clone()),
+            environment: if include_environment {
+                environment
+            } else {
+                BTreeMap::new()
+            },
+        });
+    };
+
+    let mut command = Command::new(&resolver.executable);
+    command.args(&resolver.args).arg(if include_environment {
+        "resolve"
+    } else {
+        "probe"
+    });
+    if let Some(cwd) = &resolver.cwd {
+        command.current_dir(cwd);
+    }
+    if resolver.clear_env {
+        command.env_clear();
+    }
+    command
+        .envs(resolver.env.iter().cloned())
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    let output = command.output().map_err(|error| {
+        RunError::ModelAccessUnavailable(format!(
+            "could not check {}: {error}",
+            provider.display_name
+        ))
+    })?;
+    if !output.status.success() || output.stdout.len() > 64 * 1024 {
+        return Err(RunError::ModelAccessUnavailable(format!(
+            "{} could not establish model access. {}",
+            provider.display_name, provider.setup_hint
+        )));
+    }
+    let mut resolution: ModelAccessResolution =
+        serde_json::from_slice(&output.stdout).map_err(|_| {
+            RunError::ModelAccessUnavailable(format!(
+                "{} returned an invalid readiness response",
+                provider.display_name
+            ))
+        })?;
+    resolution
+        .environment
+        .retain(|name, value| allowed.contains(name.as_str()) && !value.is_empty());
+    if !include_environment {
+        resolution.environment.clear();
+    } else if resolution.status == ModelAccessStatus::Ready && resolution.environment.is_empty() {
+        return Err(RunError::ModelAccessUnavailable(format!(
+            "{} reported ready without launch credentials",
+            provider.display_name
+        )));
+    }
+    Ok(resolution)
+}
+
+fn resolver_environment(
+    resolver: &DriverLaunch,
+    allowed: &HashSet<&str>,
+) -> BTreeMap<String, String> {
+    resolver
+        .env
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.to_str()?;
+            let value = value.to_str()?;
+            (allowed.contains(name) && !value.is_empty())
+                .then(|| (name.to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 async fn start_capability_sources(
@@ -996,6 +2130,12 @@ fn run_driver(
 ) -> Result<(), RunError> {
     update_status(state, RunStatus::Running)?;
     record_event(state, "driver.starting", JsonValue::Null)?;
+    record_startup_event(
+        state,
+        "driver-process",
+        "started",
+        Some("Launching the external driver process"),
+    )?;
     let mut secret_values = driver_secret_values(&driver_launch);
     secret_values.extend(
         capabilities
@@ -1005,14 +2145,38 @@ fn run_driver(
     );
     lock(&state.secret_values).clone_from(&secret_values);
     let mut driver = DriverProcess::spawn_with(driver_launch)?;
+    record_startup_event(
+        state,
+        "driver-process",
+        "completed",
+        Some(&format!("Process {} started", driver.process_id())),
+    )?;
+    record_startup_event(
+        state,
+        "adapter-load",
+        "started",
+        Some("Loading the adapter and its module graph"),
+    )?;
     let result = (|| -> Result<RunCompletion, RunError> {
-        let Some(ready) =
-            receive_with_cancellation(&mut driver, DRIVER_READY_TIMEOUT, &state.cancel)?
-        else {
-            return Ok(cancelled_completion());
-        };
-        let DriverBody::Ready { driver: descriptor } = ready.parsed.body else {
-            return Err(RunError::Protocol("expected driver.ready".to_owned()));
+        let descriptor = loop {
+            let Some(message) =
+                receive_with_cancellation(&mut driver, DRIVER_READY_TIMEOUT, &state.cancel)?
+            else {
+                return Ok(cancelled_completion());
+            };
+            match message.parsed.body {
+                DriverBody::StartupEvent {
+                    phase,
+                    status,
+                    detail,
+                } => record_startup_event(state, &phase, &status, detail.as_deref())?,
+                DriverBody::Ready { driver } => break driver,
+                _ => {
+                    return Err(RunError::Protocol(
+                        "expected startup.event or driver.ready".to_owned(),
+                    ));
+                }
+            }
         };
         let descriptor = redact_driver_descriptor(descriptor, &secret_values);
         lock(&state.assembly).harness.driver = Some(descriptor.clone());
@@ -1037,6 +2201,12 @@ fn run_driver(
                 })
             })
             .collect::<Vec<_>>();
+        record_startup_event(
+            state,
+            "session",
+            "started",
+            Some("Opening the harness session"),
+        )?;
         driver.send(&command(
             "run-open",
             CommandBody::OpenSession {
@@ -1045,32 +2215,47 @@ fn run_driver(
                     "files": {},
                     "modelId": summary.model_id,
                     "workspaceRoot": state.workspace,
+                    "capabilitySources": capability_sources.clone(),
                 }),
                 limits: serde_json::to_value(&scenario.limits)?,
             },
         ))?;
-        let Some(opened) =
-            receive_with_cancellation(&mut driver, DRIVER_RESPONSE_TIMEOUT, &state.cancel)?
-        else {
-            return Ok(cancelled_completion());
-        };
-        match opened.parsed.body {
-            DriverBody::SessionOpened {
-                session_id: opened_session,
-                ..
-            } if opened_session == session_id => {}
-            DriverBody::Failed { code, message, .. } => {
-                return Err(RunError::Protocol(format!(
-                    "driver failed while opening session: {code}: {message}"
-                )));
-            }
-            _ => {
-                return Err(RunError::Protocol(
-                    "expected session.opened for the requested session".to_owned(),
-                ));
+        loop {
+            let Some(message) =
+                receive_with_cancellation(&mut driver, DRIVER_RESPONSE_TIMEOUT, &state.cancel)?
+            else {
+                return Ok(cancelled_completion());
+            };
+            match message.parsed.body {
+                DriverBody::StartupEvent {
+                    phase,
+                    status,
+                    detail,
+                } => record_startup_event(state, &phase, &status, detail.as_deref())?,
+                DriverBody::SessionOpened {
+                    session_id: opened_session,
+                    ..
+                } if opened_session == session_id => break,
+                DriverBody::Failed { code, message, .. } => {
+                    return Err(RunError::Protocol(format!(
+                        "driver failed while opening session: {code}: {message}"
+                    )));
+                }
+                _ => {
+                    return Err(RunError::Protocol(
+                        "expected startup.event or session.opened for the requested session"
+                            .to_owned(),
+                    ));
+                }
             }
         }
         record_event(state, "driver.session-opened", JsonValue::Null)?;
+        record_startup_event(
+            state,
+            "session",
+            "completed",
+            Some("Harness session opened"),
+        )?;
 
         driver.send(&command(
             "run-turn",
@@ -1143,6 +2328,11 @@ fn run_driver(
             }
             match driver.receive(DRIVER_POLL) {
                 Ok(message) => match message.parsed.body {
+                    DriverBody::StartupEvent {
+                        phase,
+                        status,
+                        detail,
+                    } => record_startup_event(state, &phase, &status, detail.as_deref())?,
                     DriverBody::TurnEvent {
                         session_id: event_session,
                         turn_id: event_turn,
@@ -1332,6 +2522,23 @@ fn redact_driver_descriptor(
         .map(|feature| redact_string(&feature, secrets))
         .collect();
     descriptor
+}
+
+fn record_startup_event(
+    state: &RunState,
+    phase: &str,
+    status: &str,
+    detail: Option<&str>,
+) -> Result<(), RunError> {
+    record_event(
+        state,
+        "startup.event",
+        json!({
+            "phase": phase,
+            "status": status,
+            "detail": detail,
+        }),
+    )
 }
 
 fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonValue, RunError> {
@@ -1620,6 +2827,71 @@ fn record_event(state: &RunState, kind: &str, payload: JsonValue) -> Result<(), 
     Ok(())
 }
 
+fn record_evaluation_event(
+    state: &EvaluationState,
+    kind: &str,
+    payload: JsonValue,
+) -> Result<(), RunError> {
+    let event = {
+        let mut events = lock(&state.events);
+        let event = RunEvent {
+            sequence: events.len() as u64 + 1,
+            at_ms: now_ms(),
+            kind: kind.to_owned(),
+            payload,
+        };
+        let mut line = serde_json::to_vec(&event)?;
+        line.push(b'\n');
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(state.bundle_dir.join("events.jsonl"))?;
+        file.write_all(&line)?;
+        events.push(event.clone());
+        event
+    };
+    let _ = state.sender.send(event);
+    Ok(())
+}
+
+fn persist_evaluation(state: &EvaluationState) -> Result<(), RunError> {
+    write_json_atomic(
+        &state.bundle_dir.join("manifest.json"),
+        &serde_json::to_value(lock(&state.summary).clone())?,
+    )
+}
+
+fn set_evaluation_arm(
+    state: &EvaluationState,
+    index: usize,
+    run_id: Option<String>,
+    status: &str,
+) -> Result<(), RunError> {
+    let mut summary = lock(&state.summary);
+    let arm = summary.arms.get_mut(index).ok_or_else(|| {
+        RunError::InvalidRequest(format!("evaluation arm index {index} is out of bounds"))
+    })?;
+    arm.run_id = run_id;
+    status.clone_into(&mut arm.status);
+    drop(summary);
+    persist_evaluation(state)
+}
+
+fn finish_evaluation(state: &EvaluationState, status: EvaluationStatus, error: Option<&str>) {
+    {
+        let mut summary = lock(&state.summary);
+        summary.status = status;
+        summary.finished_at_ms = Some(now_ms());
+    }
+    let _ = persist_evaluation(state);
+    let _ = record_evaluation_event(
+        state,
+        "evaluation.finished",
+        json!({ "status": status, "error": error }),
+    );
+    state.cancel.cancel();
+}
+
 fn persist_manifest(state: &RunState) -> Result<(), RunError> {
     write_json_atomic(
         &state.bundle_dir.join("manifest.json"),
@@ -1631,6 +2903,13 @@ fn persist_assembly(state: &RunState) -> Result<(), RunError> {
     write_json_atomic(
         &state.bundle_dir.join("assembly.json"),
         &serde_json::to_value(lock(&state.assembly).clone())?,
+    )
+}
+
+fn persist_selection(state: &RunState) -> Result<(), RunError> {
+    write_json_atomic(
+        &state.bundle_dir.join("workbench.json"),
+        &serde_json::to_value(lock(&state.selection).clone())?,
     )
 }
 
@@ -1658,6 +2937,7 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
     };
     let mut current_turn = None;
     let mut pending_capabilities: HashMap<(String, String), VecDeque<u64>> = HashMap::new();
+    let mut pending_startup: HashMap<String, Vec<u64>> = HashMap::new();
     let mut native_actions = HashSet::new();
     let mut driver_turn_active = false;
     let mut outcome_recorded = false;
@@ -1667,20 +2947,42 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
             continue;
         }
         match event.kind.as_str() {
+            "startup.event" => {
+                let phase = json_string(&event.payload, "phase").unwrap_or("startup");
+                let status = json_string(&event.payload, "status").unwrap_or("completed");
+                if status == "started" {
+                    pending_startup
+                        .entry(phase.to_owned())
+                        .or_insert_with(|| vec![event.sequence]);
+                    continue;
+                }
+                let mut sequences = pending_startup.remove(phase).unwrap_or_default();
+                sequences.push(event.sequence);
+                push_review_step(
+                    &mut review,
+                    "startup",
+                    startup_title(phase),
+                    json_string(&event.payload, "detail").map(str::to_owned),
+                    status,
+                    sequences,
+                    Some(phase.to_owned()),
+                    None,
+                );
+            }
             "driver.ready" => {
                 let name = json_string(&event.payload, "name").unwrap_or("External driver");
                 let version = json_string(&event.payload, "version");
                 push_review_step(
                     &mut review,
-                    "harness",
-                    "Harness ready".to_owned(),
+                    "startup",
+                    "Driver protocol ready".to_owned(),
                     Some(match version {
                         Some(version) => format!("{name} v{version}"),
                         None => name.to_owned(),
                     }),
                     "completed",
                     vec![event.sequence],
-                    None,
+                    Some("protocol-ready".to_owned()),
                     None,
                 );
             }
@@ -1714,8 +3016,35 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
                     review.steps[index].event_sequences.push(event.sequence);
                 }
             }
-            "v0.turn-finish" => {
+            "v0.turn-finish" | "model.step.completed" => {
                 if let Some(index) = current_turn.take() {
+                    review.steps[index].event_sequences.push(event.sequence);
+                }
+            }
+            "model.step.started" => {
+                review.metrics.model_turns += 1;
+                let turn = review.metrics.model_turns;
+                push_review_step(
+                    &mut review,
+                    "model-turn",
+                    format!("Model step {turn}"),
+                    None,
+                    "completed",
+                    vec![event.sequence],
+                    None,
+                    None,
+                );
+                current_turn = review.steps.len().checked_sub(1);
+            }
+            "model.message.delta" => {
+                if let (Some(index), Some(content)) = (
+                    current_turn,
+                    event
+                        .payload
+                        .pointer("/data/messageDelta")
+                        .and_then(JsonValue::as_str),
+                ) {
+                    append_review_detail(&mut review.steps[index], content);
                     review.steps[index].event_sequences.push(event.sequence);
                 }
             }
@@ -1807,6 +3136,41 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
                     );
                 }
             }
+            "harness.action.result" => {
+                let result = &event.payload["data"]["result"];
+                let tool = json_string(result, "toolName");
+                let status = json_string(&event.payload["data"], "status");
+                if status == Some("completed")
+                    && matches!(tool, Some("write_file" | "read_file" | "bash"))
+                {
+                    let id = json_string(result, "callId").unwrap_or("eve-native-action");
+                    if native_actions.insert(id.to_owned()) {
+                        review.metrics.native_actions += 1;
+                        let path = result["output"]["path"].as_str().map(str::to_owned);
+                        let title = match tool {
+                            Some("write_file") => path.as_deref().map_or_else(
+                                || "Wrote file".to_owned(),
+                                |path| format!("Wrote {path}"),
+                            ),
+                            Some("read_file") => path.as_deref().map_or_else(
+                                || "Read file".to_owned(),
+                                |path| format!("Read {path}"),
+                            ),
+                            _ => "Ran shell command".to_owned(),
+                        };
+                        push_review_step(
+                            &mut review,
+                            "native-action",
+                            title,
+                            Some("Harness-native tool completed".to_owned()),
+                            "completed",
+                            vec![event.sequence],
+                            None,
+                            path,
+                        );
+                    }
+                }
+            }
             "workspace.finalized" => add_workspace_steps(&mut review, event),
             "run.finished" | "run.persistence-failed" => {
                 review.steps.retain(|step| step.kind != "outcome");
@@ -1842,6 +3206,54 @@ fn build_review(summary: &RunSummary, events: &[RunEvent]) -> RunReview {
         }
     }
     review
+}
+
+fn startup_title(phase: &str) -> String {
+    match phase {
+        "driver-process" => "Driver process".to_owned(),
+        "adapter-load" => "Adapter loaded".to_owned(),
+        "runtime-build" => "Harness runtime built".to_owned(),
+        "runtime-process" => "Harness runtime process".to_owned(),
+        "workspace" => "Workspace attached".to_owned(),
+        "capabilities" => "Capabilities ready".to_owned(),
+        "session" => "Harness session ready".to_owned(),
+        _ => phase.replace('-', " "),
+    }
+}
+
+fn reported_usage(events: &[RunEvent]) -> (JsonValue, JsonValue) {
+    let mut saw_usage = false;
+    let mut input_tokens = 0_u64;
+    let mut output_tokens = 0_u64;
+    let mut cache_read_tokens = 0_u64;
+    let mut cache_write_tokens = 0_u64;
+    for usage in events
+        .iter()
+        .filter(|event| event.kind == "model.step.completed")
+        .filter_map(|event| event.payload.pointer("/data/usage"))
+    {
+        saw_usage = true;
+        input_tokens = input_tokens.saturating_add(usage["inputTokens"].as_u64().unwrap_or(0));
+        output_tokens = output_tokens.saturating_add(usage["outputTokens"].as_u64().unwrap_or(0));
+        cache_read_tokens =
+            cache_read_tokens.saturating_add(usage["cacheReadTokens"].as_u64().unwrap_or(0));
+        cache_write_tokens =
+            cache_write_tokens.saturating_add(usage["cacheWriteTokens"].as_u64().unwrap_or(0));
+    }
+    if saw_usage {
+        (
+            json!({
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens,
+            }),
+            json!({
+                "readTokens": cache_read_tokens,
+                "writeTokens": cache_write_tokens,
+            }),
+        )
+    } else {
+        (json!("not reported"), json!("not reported"))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2097,6 +3509,118 @@ fn workspace_relative_path(path: &Path) -> Result<PathBuf, RunError> {
     Ok(relative.to_path_buf())
 }
 
+fn default_workbench_selection(
+    harnesses: &BTreeMap<String, HarnessProfile>,
+    model_profiles: &BTreeMap<String, String>,
+) -> WorkbenchSelection {
+    let harness_id = harnesses.keys().next().cloned();
+    let comparison_harness_ids = if harnesses.contains_key("v0") && harnesses.contains_key("eve") {
+        vec!["v0".to_owned(), "eve".to_owned()]
+    } else {
+        harnesses.keys().take(2).cloned().collect()
+    };
+    let mut selection = WorkbenchSelection {
+        harness_id,
+        model_profile_id: None,
+        comparison_harness_ids,
+    };
+    selection.model_profile_id = first_compatible_model(harnesses, model_profiles, &selection);
+    selection
+}
+
+fn repair_workbench_selection(
+    selection: &mut WorkbenchSelection,
+    harnesses: &BTreeMap<String, HarnessProfile>,
+    model_profiles: &BTreeMap<String, String>,
+) {
+    if selection
+        .harness_id
+        .as_ref()
+        .is_none_or(|id| !harnesses.contains_key(id))
+    {
+        selection.harness_id = harnesses.keys().next().cloned();
+    }
+    if validate_comparison_harnesses(harnesses, &selection.comparison_harness_ids).is_err() {
+        selection.comparison_harness_ids =
+            default_workbench_selection(harnesses, model_profiles).comparison_harness_ids;
+    }
+    if selection
+        .model_profile_id
+        .as_deref()
+        .is_none_or(|profile| validate_selection_model(harnesses, profile, selection).is_err())
+    {
+        selection.model_profile_id = first_compatible_model(harnesses, model_profiles, selection);
+    }
+}
+
+fn first_compatible_model(
+    harnesses: &BTreeMap<String, HarnessProfile>,
+    model_profiles: &BTreeMap<String, String>,
+    selection: &WorkbenchSelection,
+) -> Option<String> {
+    model_profiles
+        .keys()
+        .find(|profile| validate_selection_model(harnesses, profile, selection).is_ok())
+        .cloned()
+}
+
+fn validate_selection_model(
+    harnesses: &BTreeMap<String, HarnessProfile>,
+    profile: &str,
+    selection: &WorkbenchSelection,
+) -> Result<(), RunError> {
+    let mut selected = selection.comparison_harness_ids.clone();
+    if let Some(harness_id) = &selection.harness_id
+        && !selected.contains(harness_id)
+    {
+        selected.push(harness_id.clone());
+    }
+    for harness_id in selected {
+        let harness = harnesses
+            .get(&harness_id)
+            .ok_or_else(|| RunError::InvalidRequest(format!("unknown harness: {harness_id}")))?;
+        if !harness.models.contains_key(profile) {
+            return Err(RunError::InvalidRequest(format!(
+                "model profile {profile} is unavailable for harness {harness_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_harness(
+    harnesses: &BTreeMap<String, HarnessProfile>,
+    harness_id: &str,
+) -> Result<(), RunError> {
+    if harnesses.contains_key(harness_id) {
+        Ok(())
+    } else {
+        Err(RunError::InvalidRequest(format!(
+            "unknown harness: {harness_id}"
+        )))
+    }
+}
+
+fn validate_comparison_harnesses(
+    harnesses: &BTreeMap<String, HarnessProfile>,
+    harness_ids: &[String],
+) -> Result<(), RunError> {
+    if harness_ids.len() != 2 {
+        return Err(RunError::InvalidRequest(
+            "a comparison requires exactly two harness ids".to_owned(),
+        ));
+    }
+    if harness_ids[0] == harness_ids[1] {
+        return Err(RunError::InvalidRequest(
+            "comparison harness ids must be unique".to_owned(),
+        ));
+    }
+    for harness_id in harness_ids {
+        validate_harness(harnesses, harness_id)?;
+    }
+    Ok(())
+}
+
 fn load_scenarios(root: &Path) -> Result<BTreeMap<String, ScenarioManifest>, RunError> {
     let mut scenarios = BTreeMap::new();
     for entry in fs::read_dir(root)? {
@@ -2132,6 +3656,8 @@ fn load_scenarios(root: &Path) -> Result<BTreeMap<String, ScenarioManifest>, Run
 fn load_runs(
     data_dir: &Path,
     scenarios: &BTreeMap<String, ScenarioManifest>,
+    harnesses: &BTreeMap<String, HarnessProfile>,
+    model_profiles: &BTreeMap<String, String>,
 ) -> Result<HashMap<String, Arc<RunState>>, RunError> {
     let mut runs = HashMap::new();
     for entry in fs::read_dir(data_dir)? {
@@ -2153,7 +3679,13 @@ fn load_runs(
         if !is_directory {
             continue;
         }
-        match load_run_bundle(&bundle_dir, &entry.file_name(), scenarios) {
+        match load_run_bundle(
+            &bundle_dir,
+            &entry.file_name(),
+            scenarios,
+            harnesses,
+            model_profiles,
+        ) {
             Ok(Some(state)) => {
                 let id = lock(&state.summary).id.clone();
                 runs.insert(id, state);
@@ -2171,6 +3703,8 @@ fn load_run_bundle(
     bundle_dir: &Path,
     bundle_name: &OsStr,
     scenarios: &BTreeMap<String, ScenarioManifest>,
+    harnesses: &BTreeMap<String, HarnessProfile>,
+    model_profiles: &BTreeMap<String, String>,
 ) -> Result<Option<Arc<RunState>>, RunError> {
     let manifest_path = bundle_dir.join("manifest.json");
     if !manifest_path.is_file() {
@@ -2232,11 +3766,18 @@ fn load_run_bundle(
     let initial_snapshot = (summary.status == RunStatus::Exploring)
         .then(|| snapshot_tree(&bundle_dir.join("initial")).ok())
         .flatten();
+    let mut selection = if bundle_dir.join("workbench.json").is_file() {
+        serde_json::from_slice(&fs::read(bundle_dir.join("workbench.json"))?)?
+    } else {
+        default_workbench_selection(harnesses, model_profiles)
+    };
+    repair_workbench_selection(&mut selection, harnesses, model_profiles);
     summary.event_count = events.len() as u64;
     let (sender, _) = broadcast::channel(256);
     let state = Arc::new(RunState {
         summary: Mutex::new(summary),
         assembly: Mutex::new(assembly),
+        selection: Mutex::new(selection),
         events: Mutex::new(events),
         sender,
         cancel: CancellationToken::new(),
@@ -2248,6 +3789,7 @@ fn load_run_bundle(
         secret_values: Mutex::new(Vec::new()),
         replay_failed,
     });
+    persist_selection(&state)?;
     if interrupted && !recover_finalized_run(&state)? {
         recover_interrupted_run(&state, malformed_event_log)?;
     }
@@ -2355,6 +3897,112 @@ fn recover_interrupted_run(state: &RunState, reset_event_log: bool) -> Result<()
     persist_manifest(state)?;
     state.cancel.cancel();
     Ok(())
+}
+
+fn load_evaluations(
+    evaluations_dir: &Path,
+) -> Result<HashMap<String, Arc<EvaluationState>>, RunError> {
+    let mut evaluations = HashMap::new();
+    for entry in fs::read_dir(evaluations_dir)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "skipping unreadable evaluation directory entry");
+                continue;
+            }
+        };
+        let bundle_dir = entry.path();
+        let is_directory = match entry.file_type() {
+            Ok(file_type) => file_type.is_dir(),
+            Err(error) => {
+                tracing::warn!(bundle = %bundle_dir.display(), %error, "skipping unreadable evaluation bundle");
+                continue;
+            }
+        };
+        if !is_directory {
+            continue;
+        }
+        match load_evaluation_bundle(&bundle_dir, &entry.file_name()) {
+            Ok(Some(state)) => {
+                let id = lock(&state.summary).id.clone();
+                evaluations.insert(id, state);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(bundle = %bundle_dir.display(), %error, "skipping malformed evaluation bundle");
+            }
+        }
+    }
+    Ok(evaluations)
+}
+
+fn load_evaluation_bundle(
+    bundle_dir: &Path,
+    bundle_name: &OsStr,
+) -> Result<Option<Arc<EvaluationState>>, RunError> {
+    let manifest = bundle_dir.join("manifest.json");
+    let snapshot = bundle_dir.join("source");
+    if !manifest.is_file() || !snapshot.is_dir() {
+        return Ok(None);
+    }
+    let mut summary: EvaluationSummary = serde_json::from_slice(&fs::read(&manifest)?)?;
+    if summary.id != bundle_name.to_string_lossy() {
+        return Ok(None);
+    }
+    let (events, replay_failed) = match read_events(&bundle_dir.join("events.jsonl")) {
+        Ok(events) => (events, false),
+        Err(error) => {
+            let message = format!("stored evaluation event replay failed: {error}");
+            summary.status = EvaluationStatus::Failed;
+            summary.finished_at_ms.get_or_insert_with(now_ms);
+            (
+                vec![RunEvent {
+                    sequence: 1,
+                    at_ms: now_ms(),
+                    kind: "evaluation.finished".to_owned(),
+                    payload: json!({
+                        "status": EvaluationStatus::Failed,
+                        "error": message,
+                        "recovered": true,
+                    }),
+                }],
+                true,
+            )
+        }
+    };
+    let interrupted = !summary.status.is_finished();
+    if interrupted {
+        summary.status = EvaluationStatus::Cancelled;
+        summary.finished_at_ms = Some(now_ms());
+        for arm in &mut summary.arms {
+            if arm.status == "queued" || arm.status == "starting" || arm.status == "running" {
+                "cancelled".clone_into(&mut arm.status);
+            }
+        }
+    }
+    let (sender, _) = broadcast::channel(256);
+    let state = Arc::new(EvaluationState {
+        summary: Mutex::new(summary),
+        events: Mutex::new(events),
+        sender,
+        cancel: CancellationToken::new(),
+        bundle_dir: bundle_dir.to_owned(),
+        snapshot,
+        replay_failed,
+    });
+    if interrupted {
+        persist_evaluation(&state)?;
+        record_evaluation_event(
+            &state,
+            "evaluation.finished",
+            json!({
+                "status": EvaluationStatus::Cancelled,
+                "error": "controller stopped before the evaluation finalized",
+                "recovered": true,
+            }),
+        )?;
+    }
+    Ok(Some(state))
 }
 
 fn read_events(path: &Path) -> Result<Vec<RunEvent>, RunError> {
@@ -2992,6 +4640,8 @@ pub enum RunError {
     UnknownRun(String),
     #[error("run is not ready for an attached terminal: {0}")]
     RunUnavailable(String),
+    #[error("model access is not ready: {0}")]
+    ModelAccessUnavailable(String),
     #[error("invalid run request: {0}")]
     InvalidRequest(String),
     #[error("invalid scenario: {0}")]
@@ -3027,6 +4677,7 @@ impl From<RunError> for (StatusCode, String) {
         let status = match error {
             RunError::UnknownRun(_) | RunError::UnknownScenario(_) => StatusCode::NOT_FOUND,
             RunError::RunUnavailable(_) => StatusCode::CONFLICT,
+            RunError::ModelAccessUnavailable(_) => StatusCode::PRECONDITION_FAILED,
             RunError::InvalidRequest(_)
             | RunError::InvalidScenario(_)
             | RunError::PathEscape(_) => StatusCode::BAD_REQUEST,
@@ -3132,6 +4783,8 @@ totalScore = 11
                 scenario_id: "catalog".to_owned(),
                 scenario_title: "Catalog".to_owned(),
                 model_id: "test/model".to_owned(),
+                harness_id: None,
+                model_profile_id: None,
                 status: RunStatus::Running,
                 started_at_ms: 1,
                 finished_at_ms: None,
@@ -3166,6 +4819,11 @@ totalScore = 11
                     max_orchestrator_invocations: 1,
                     max_tool_invocations: 1,
                 },
+            }),
+            selection: Mutex::new(WorkbenchSelection {
+                harness_id: None,
+                model_profile_id: None,
+                comparison_harness_ids: Vec::new(),
             }),
             events: Mutex::new(Vec::new()),
             sender,
@@ -3751,8 +5409,10 @@ totalScore = 11
         let unavailable = restarted
             .start_prepared(
                 &prepared.id,
-                StartPreparedRunRequest {
-                    model_id: "test/model".to_owned(),
+                &StartPreparedRunRequest {
+                    model_id: Some("test/model".to_owned()),
+                    harness_id: None,
+                    model_profile_id: None,
                 },
             )
             .unwrap_err();
@@ -3882,11 +5542,20 @@ totalScore = 11
         fs::create_dir(&scenarios).unwrap();
         fs::create_dir(&data).unwrap();
         write_scenario(&scenarios);
-        let controller = RunController::new(RunControllerConfig {
-            scenarios_dir: scenarios,
-            data_dir: data,
-            driver: DriverLaunch::new("/driver-must-not-start"),
-        })
+        let controller = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/driver-must-not-start"),
+            },
+            vec![HarnessProfile {
+                id: "v0".to_owned(),
+                display_name: "v0".to_owned(),
+                launch: DriverLaunch::new("/driver-must-not-start"),
+                models: BTreeMap::from([("haiku".to_owned(), "v0/haiku".to_owned())]),
+            }],
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+        )
         .unwrap();
         let prepared = controller
             .prepare(PrepareRunRequest {
@@ -3894,14 +5563,22 @@ totalScore = 11
             })
             .await
             .unwrap();
+        let before_adapter = controller
+            .get(&prepared.id)
+            .unwrap()
+            .assembly
+            .harness
+            .adapter;
         let state = controller.state(&prepared.id).unwrap();
         fs::create_dir(state.bundle_dir.join("assembly.json.tmp")).unwrap();
 
         controller
             .start_prepared(
                 &prepared.id,
-                StartPreparedRunRequest {
-                    model_id: "test/model".to_owned(),
+                &StartPreparedRunRequest {
+                    model_id: None,
+                    harness_id: Some("v0".to_owned()),
+                    model_profile_id: Some("haiku".to_owned()),
                 },
             )
             .unwrap_err();
@@ -3909,12 +5586,17 @@ totalScore = 11
         let detail = controller.get(&prepared.id).unwrap();
         assert_eq!(detail.summary.status, RunStatus::Exploring);
         assert!(detail.summary.model_id.is_empty());
+        assert!(detail.summary.harness_id.is_none());
+        assert!(detail.summary.model_profile_id.is_none());
+        assert_eq!(detail.assembly.harness.adapter, before_adapter);
         assert!(detail.assembly.harness.model_id.is_none());
         let manifest: RunSummary =
             serde_json::from_slice(&fs::read(state.bundle_dir.join("manifest.json")).unwrap())
                 .unwrap();
         assert_eq!(manifest.status, RunStatus::Exploring);
         assert!(manifest.model_id.is_empty());
+        assert!(manifest.harness_id.is_none());
+        assert!(manifest.model_profile_id.is_none());
         assert!(!state.cancel.is_cancelled());
         assert!(!lock(&state.capabilities).is_empty());
 
@@ -3976,6 +5658,8 @@ totalScore = 11
             scenario_id: "catalog".to_owned(),
             scenario_title: "Catalog".to_owned(),
             model_id: "test/model".to_owned(),
+            harness_id: None,
+            model_profile_id: None,
             status: RunStatus::Running,
             started_at_ms: 1,
             finished_at_ms: None,
@@ -4050,6 +5734,8 @@ totalScore = 11
             scenario_id: "catalog".to_owned(),
             scenario_title: "Catalog".to_owned(),
             model_id: "test/model".to_owned(),
+            harness_id: None,
+            model_profile_id: None,
             status: RunStatus::Running,
             started_at_ms: 1,
             finished_at_ms: None,
@@ -4177,6 +5863,548 @@ totalScore = 11
     }
 
     #[test]
+    fn harness_registry_rejects_duplicates_and_unknown_model_profiles() {
+        let root = temporary_root("harness-registry");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/bin/false"),
+        };
+        let profile = HarnessProfile {
+            id: "same".to_owned(),
+            display_name: "Same".to_owned(),
+            launch: DriverLaunch::new("/bin/false"),
+            models: BTreeMap::from([("missing".to_owned(), "model".to_owned())]),
+        };
+        assert!(
+            RunController::new_with_harnesses(config(), vec![profile.clone()], BTreeMap::new())
+                .is_err()
+        );
+        assert!(
+            RunController::new_with_harnesses(
+                config(),
+                vec![profile.clone(), profile],
+                BTreeMap::from([("missing".to_owned(), "Missing".to_owned())]),
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn workbench_selection_persists_and_compare_records_its_origin() {
+        let root = temporary_root("workbench-selection");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let harnesses = || {
+            ["v0", "eve"]
+                .into_iter()
+                .map(|id| HarnessProfile {
+                    id: id.to_owned(),
+                    display_name: id.to_owned(),
+                    launch: DriverLaunch::new("/bin/false"),
+                    models: BTreeMap::from([("haiku".to_owned(), format!("{id}/haiku"))]),
+                })
+                .collect::<Vec<_>>()
+        };
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/bin/false"),
+        };
+        let models = BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let initial = controller.workbench(&explore.id).unwrap();
+        assert_eq!(initial.selection.model_profile_id.as_deref(), Some("haiku"));
+        assert_eq!(initial.selection.comparison_harness_ids, ["v0", "eve"]);
+        let selected = controller
+            .update_workbench_selection(
+                &explore.id,
+                UpdateWorkbenchSelectionRequest {
+                    harness_id: Some("v0".to_owned()),
+                    model_profile_id: Some("haiku".to_owned()),
+                    comparison_harness_ids: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        assert_eq!(selected.harness_id.as_deref(), Some("v0"));
+        let evaluation = controller
+            .compare_workbench(
+                &explore.id,
+                CompareWorkbenchRequest {
+                    model_profile_id: None,
+                    harness_ids: Some(vec!["eve".to_owned(), "v0".to_owned()]),
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        assert_eq!(evaluation.harness_ids, ["eve", "v0"]);
+        assert!(
+            lock(&controller.state(&explore.id).unwrap().events)
+                .iter()
+                .any(|event| {
+                    event.kind == "workbench.evaluation.started"
+                        && event.payload["origin"] == "nushell"
+                })
+        );
+        let binding = controller.terminal_binding(&explore.id).unwrap();
+        assert!(controller.workbench_grant_allows(&binding.control_token, &explore.id));
+        let evidence = fs::read_to_string(
+            controller
+                .state(&explore.id)
+                .unwrap()
+                .bundle_dir
+                .join("events.jsonl"),
+        )
+        .unwrap();
+        assert!(!evidence.contains(&binding.control_token));
+        controller.revoke_workbench_grant(&binding.control_token);
+        assert!(!controller.workbench_grant_allows(&binding.control_token, &explore.id));
+        let bundle_dir = controller.state(&explore.id).unwrap().bundle_dir.clone();
+        drop(controller);
+
+        let reopened = RunController::new_with_harnesses(config(), harnesses(), models).unwrap();
+        let persisted = reopened.workbench(&explore.id).unwrap().selection;
+        assert_eq!(persisted.harness_id.as_deref(), Some("v0"));
+        assert_eq!(persisted.comparison_harness_ids, ["v0", "eve"]);
+        drop(reopened);
+
+        fs::write(
+            bundle_dir.join("workbench.json"),
+            br#"{
+  "harnessId": "removed-harness",
+  "modelProfileId": "removed-model",
+  "comparisonHarnessIds": ["removed-harness"]
+}
+"#,
+        )
+        .unwrap();
+        let repaired = RunController::new_with_harnesses(
+            config(),
+            harnesses(),
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+        )
+        .unwrap();
+        let repaired = repaired.workbench(&explore.id).unwrap().selection;
+        assert_eq!(repaired.harness_id.as_deref(), Some("eve"));
+        assert_eq!(repaired.model_profile_id.as_deref(), Some("haiku"));
+        assert_eq!(repaired.comparison_harness_ids, ["v0", "eve"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_model_access_is_workbench_state_not_a_failed_evaluation() {
+        let root = temporary_root("model-access-missing");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let harness = |id: &str| HarnessProfile {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            launch: DriverLaunch::new("/bin/false"),
+            models: BTreeMap::from([("haiku".to_owned(), format!("{id}/haiku"))]),
+        };
+        let controller = RunController::new_with_harnesses_and_model_access(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![harness("v0"), harness("eve")],
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+            vec![ModelAccessProvider {
+                id: "gateway".to_owned(),
+                display_name: "Gateway".to_owned(),
+                resolver: None,
+                environment_names: vec!["TOKEN".to_owned()],
+                setup_hint: "Connect the gateway".to_owned(),
+            }],
+            BTreeMap::from([
+                ("v0".to_owned(), "gateway".to_owned()),
+                ("eve".to_owned(), "gateway".to_owned()),
+            ]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let workbench = controller.workbench(&explore.id).unwrap();
+        assert_eq!(workbench.model_access.len(), 1);
+        assert_eq!(
+            workbench.model_access[0].status,
+            ModelAccessStatus::NeedsSetup
+        );
+        let error = controller
+            .compare_workbench(
+                &explore.id,
+                CompareWorkbenchRequest::default(),
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap_err();
+        assert!(matches!(error, RunError::ModelAccessUnavailable(_)));
+        assert!(controller.list_evaluations().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_access_secrets_are_injected_only_into_the_resolved_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("model-access-ready");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let resolver_path = root.join("resolver.sh");
+        fs::write(
+            &resolver_path,
+            r#"#!/bin/sh
+if [ "$1" = "resolve" ]; then
+  printf '%s\n' '{"status":"ready","source":"test","environment":{"TOKEN":"secret-model-token"}}'
+else
+  printf '%s\n' '{"status":"ready","source":"test"}'
+fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&resolver_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let harness = HarnessProfile {
+            id: "v0".to_owned(),
+            display_name: "v0".to_owned(),
+            launch: DriverLaunch::new("/bin/false"),
+            models: BTreeMap::from([("haiku".to_owned(), "v0/haiku".to_owned())]),
+        };
+        let controller = RunController::new_with_harnesses_and_model_access(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![harness.clone()],
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+            vec![ModelAccessProvider {
+                id: "gateway".to_owned(),
+                display_name: "Gateway".to_owned(),
+                resolver: Some(DriverLaunch::new(resolver_path)),
+                environment_names: vec!["TOKEN".to_owned()],
+                setup_hint: "Connect the gateway".to_owned(),
+            }],
+            BTreeMap::from([("v0".to_owned(), "gateway".to_owned())]),
+        )
+        .unwrap();
+        let launch = controller.resolve_harness_driver(&harness).unwrap();
+        assert!(
+            launch
+                .env
+                .iter()
+                .any(|(name, value)| name == "TOKEN" && value == "secret-model-token")
+        );
+        let snapshot = controller.model_access(&WorkbenchSelection {
+            harness_id: Some("v0".to_owned()),
+            model_profile_id: Some("haiku".to_owned()),
+            comparison_harness_ids: Vec::new(),
+        });
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(snapshot[0].status, ModelAccessStatus::Ready);
+        assert!(!serialized.contains("secret-model-token"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn evaluation_snapshots_once_and_runs_second_arm_after_first_failure() {
+        let root = temporary_root("evaluation");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let harness = |id: &str| HarnessProfile {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            launch: DriverLaunch::new("/bin/false"),
+            models: BTreeMap::from([("haiku".to_owned(), format!("{id}/haiku"))]),
+        };
+        let controller = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios.clone(),
+                data_dir: data.clone(),
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![harness("v0"), harness("eve")],
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        fs::write(
+            controller
+                .workspace(&explore.id)
+                .unwrap()
+                .join("before.txt"),
+            "before",
+        )
+        .unwrap();
+        let evaluation = controller
+            .start_evaluation(StartEvaluationRequest {
+                scenario_id: "catalog".to_owned(),
+                model_profile_id: "haiku".to_owned(),
+                source_workspace_id: explore.id.clone(),
+                harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
+            })
+            .unwrap();
+        fs::write(
+            controller.workspace(&explore.id).unwrap().join("after.txt"),
+            "after",
+        )
+        .unwrap();
+
+        let detail = loop {
+            let detail = controller.get_evaluation(&evaluation.id).unwrap();
+            if detail.summary.status.is_finished() {
+                break detail;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(detail.summary.status, EvaluationStatus::Failed);
+        assert_eq!(detail.summary.arms.len(), 2);
+        for arm in &detail.summary.arms {
+            assert_eq!(arm.status, "failed");
+            let workspace = controller
+                .workspace(arm.run_id.as_deref().unwrap())
+                .unwrap();
+            assert!(workspace.join("before.txt").is_file());
+            assert!(!workspace.join("after.txt").exists());
+        }
+        assert!(detail.comparison.is_some());
+        drop(controller);
+        let reopened = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![harness("v0"), harness("eve")],
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+        )
+        .unwrap();
+        let replay = reopened.get_evaluation(&evaluation.id).unwrap();
+        assert_eq!(replay.summary.status, EvaluationStatus::Failed);
+        assert_eq!(replay.comparison, detail.comparison);
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_evaluation_cancels_both_arms() {
+        let root = temporary_root("evaluation-cancel");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let harness = |id: &str| HarnessProfile {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            launch: DriverLaunch::new("/bin/false"),
+            models: BTreeMap::from([("haiku".to_owned(), format!("{id}/haiku"))]),
+        };
+        let controller = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![harness("v0"), harness("eve")],
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let evaluation = controller
+            .start_evaluation(StartEvaluationRequest {
+                scenario_id: "catalog".to_owned(),
+                model_profile_id: "haiku".to_owned(),
+                source_workspace_id: explore.id,
+                harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
+            })
+            .unwrap();
+        controller.cancel_evaluation(&evaluation.id).unwrap();
+
+        let detail = loop {
+            let detail = controller.get_evaluation(&evaluation.id).unwrap();
+            if detail.summary.status.is_finished() {
+                break detail;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(detail.summary.status, EvaluationStatus::Cancelled);
+        assert!(
+            detail
+                .summary
+                .arms
+                .iter()
+                .all(|arm| arm.status == "cancelled")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_event_evidence_fails_only_that_replayed_evaluation() {
+        let root = temporary_root("malformed-evaluation-replay");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        let evaluations = root.join("evaluations");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        fs::create_dir(&evaluations).unwrap();
+        write_scenario(&scenarios);
+
+        let id = "evaluation-run-malformed";
+        let bundle = evaluations.join(id);
+        fs::create_dir_all(bundle.join("source")).unwrap();
+        let summary = EvaluationSummary {
+            id: id.to_owned(),
+            scenario_id: "catalog".to_owned(),
+            model_profile_id: "haiku".to_owned(),
+            source_workspace_id: "run-explore".to_owned(),
+            source_revision: "revision-1".to_owned(),
+            harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
+            arms: vec![
+                EvaluationArmSummary {
+                    harness_id: "v0".to_owned(),
+                    run_id: Some("run-v0".to_owned()),
+                    status: "passed".to_owned(),
+                },
+                EvaluationArmSummary {
+                    harness_id: "eve".to_owned(),
+                    run_id: Some("run-eve".to_owned()),
+                    status: "passed".to_owned(),
+                },
+            ],
+            status: EvaluationStatus::Passed,
+            started_at_ms: 1,
+            finished_at_ms: Some(2),
+        };
+        let manifest = serde_json::to_vec(&summary).unwrap();
+        let malformed_events = br#"{"sequence":1}{"sequence":2}\n"#;
+        let comparison = br#"{"version":2,"outputsMatch":true}"#;
+        fs::write(bundle.join("manifest.json"), &manifest).unwrap();
+        fs::write(bundle.join("events.jsonl"), malformed_events).unwrap();
+        fs::write(bundle.join("comparison.json"), comparison).unwrap();
+
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-replay"),
+        })
+        .unwrap();
+        let detail = controller.get_evaluation(id).unwrap();
+        assert_eq!(detail.summary.status, EvaluationStatus::Failed);
+        assert_eq!(detail.events.len(), 1);
+        assert_eq!(detail.events[0].kind, "evaluation.finished");
+        assert_eq!(detail.events[0].payload["recovered"], true);
+        assert!(detail.comparison.is_none());
+        assert_eq!(fs::read(bundle.join("manifest.json")).unwrap(), manifest);
+        assert_eq!(
+            fs::read(bundle.join("events.jsonl")).unwrap(),
+            malformed_events
+        );
+        assert_eq!(
+            fs::read(bundle.join("comparison.json")).unwrap(),
+            comparison
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_evaluation_metadata_does_not_block_valid_replay() {
+        let root = temporary_root("malformed-evaluation-metadata");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        let evaluations = root.join("evaluations");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        fs::create_dir(&evaluations).unwrap();
+        write_scenario(&scenarios);
+
+        let valid_id = "evaluation-run-valid";
+        let valid_bundle = evaluations.join(valid_id);
+        fs::create_dir_all(valid_bundle.join("source")).unwrap();
+        let summary = EvaluationSummary {
+            id: valid_id.to_owned(),
+            scenario_id: "catalog".to_owned(),
+            model_profile_id: "haiku".to_owned(),
+            source_workspace_id: "run-explore".to_owned(),
+            source_revision: "revision-1".to_owned(),
+            harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
+            arms: Vec::new(),
+            status: EvaluationStatus::Passed,
+            started_at_ms: 1,
+            finished_at_ms: Some(2),
+        };
+        write_json_atomic(
+            &valid_bundle.join("manifest.json"),
+            &serde_json::to_value(&summary).unwrap(),
+        )
+        .unwrap();
+        fs::write(valid_bundle.join("events.jsonl"), []).unwrap();
+
+        let malformed_bundle = evaluations.join("evaluation-run-malformed");
+        fs::create_dir_all(malformed_bundle.join("source")).unwrap();
+        fs::write(malformed_bundle.join("manifest.json"), b"{not-json").unwrap();
+
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-replay"),
+        })
+        .unwrap();
+        let replayed = controller.get_evaluation(valid_id).unwrap().summary;
+        assert_eq!(replayed.id, summary.id);
+        assert_eq!(replayed.status, EvaluationStatus::Passed);
+        assert!(matches!(
+            controller.get_evaluation("evaluation-run-malformed"),
+            Err(RunError::InvalidRequest(message)) if message.contains("unknown evaluation")
+        ));
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn legacy_bundles_recover_their_assembly_from_events() {
         let root = temporary_root("replay");
         let scenarios = root.join("scenarios");
@@ -4203,6 +6431,8 @@ totalScore = 11
             scenario_id: "catalog".to_owned(),
             scenario_title: "Catalog".to_owned(),
             model_id: "test/model".to_owned(),
+            harness_id: None,
+            model_profile_id: None,
             status: RunStatus::Passed,
             started_at_ms: 1,
             finished_at_ms: Some(2),
@@ -4296,6 +6526,8 @@ totalScore = 11
             scenario_id: "catalog".to_owned(),
             scenario_title: "Catalog".to_owned(),
             model_id: "test/model".to_owned(),
+            harness_id: None,
+            model_profile_id: None,
             status: RunStatus::Passed,
             started_at_ms: 1,
             finished_at_ms: Some(2),
@@ -4356,6 +6588,8 @@ totalScore = 11
             scenario_id: "catalog".to_owned(),
             scenario_title: "Catalog".to_owned(),
             model_id: "test/model".to_owned(),
+            harness_id: None,
+            model_profile_id: None,
             status: RunStatus::Failed,
             started_at_ms: 1,
             finished_at_ms: Some(2),
@@ -4392,6 +6626,66 @@ totalScore = 11
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn malformed_bundle_metadata_does_not_block_valid_replay() {
+        let root = temporary_root("malformed-metadata");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/driver-is-not-needed-for-replay"),
+        };
+        let controller = RunController::new(config()).unwrap();
+        let valid = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        drop(controller);
+
+        let malformed_manifest = data.join("run-malformed-manifest");
+        fs::create_dir(&malformed_manifest).unwrap();
+        fs::write(malformed_manifest.join("manifest.json"), b"{malformed").unwrap();
+
+        let malformed_assembly = data.join("run-malformed-assembly");
+        fs::create_dir(&malformed_assembly).unwrap();
+        let summary = RunSummary {
+            id: "run-malformed-assembly".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "test/model".to_owned(),
+            harness_id: None,
+            model_profile_id: None,
+            status: RunStatus::Passed,
+            started_at_ms: 1,
+            finished_at_ms: Some(2),
+            event_count: 0,
+            error: None,
+        };
+        write_json_atomic(
+            &malformed_assembly.join("manifest.json"),
+            &serde_json::to_value(summary).unwrap(),
+        )
+        .unwrap();
+        fs::write(malformed_assembly.join("events.jsonl"), []).unwrap();
+        fs::write(malformed_assembly.join("assembly.json"), b"{malformed").unwrap();
+
+        let replayed = RunController::new(config()).unwrap();
+        assert!(replayed.state(&valid.id).is_ok());
+        assert!(replayed.state("run-malformed-manifest").is_err());
+        assert!(replayed.state("run-malformed-assembly").is_err());
+        assert_eq!(lock(&replayed.inner.runs).len(), 1);
+
+        drop(replayed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn malformed_event_evidence_fails_only_that_replayed_run() {
         let root = temporary_root("malformed-replay");
@@ -4411,6 +6705,8 @@ totalScore = 11
             scenario_id: "catalog".to_owned(),
             scenario_title: "Catalog".to_owned(),
             model_id: "test/model".to_owned(),
+            harness_id: None,
+            model_profile_id: None,
             status: RunStatus::Passed,
             started_at_ms: 1,
             finished_at_ms: Some(2),
@@ -4450,65 +6746,8 @@ totalScore = 11
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[tokio::test]
-    async fn malformed_bundle_metadata_does_not_block_valid_replay() {
-        let root = temporary_root("malformed-metadata");
-        let scenarios = root.join("scenarios");
-        let data = root.join("runs");
-        fs::create_dir(&scenarios).unwrap();
-        fs::create_dir(&data).unwrap();
-        write_scenario(&scenarios);
-
-        let config = || RunControllerConfig {
-            scenarios_dir: scenarios.clone(),
-            data_dir: data.clone(),
-            driver: DriverLaunch::new("/driver-is-not-needed-for-replay"),
-        };
-        let controller = RunController::new(config()).unwrap();
-        let valid = controller
-            .prepare(PrepareRunRequest {
-                scenario_id: "catalog".to_owned(),
-            })
-            .await
-            .unwrap();
-        drop(controller);
-
-        let malformed_manifest = data.join("run-malformed-manifest");
-        fs::create_dir(&malformed_manifest).unwrap();
-        fs::write(malformed_manifest.join("manifest.json"), b"{malformed").unwrap();
-
-        let malformed_assembly = data.join("run-malformed-assembly");
-        fs::create_dir(&malformed_assembly).unwrap();
-        let summary = RunSummary {
-            id: "run-malformed-assembly".to_owned(),
-            scenario_id: "catalog".to_owned(),
-            scenario_title: "Catalog".to_owned(),
-            model_id: "test/model".to_owned(),
-            status: RunStatus::Passed,
-            started_at_ms: 1,
-            finished_at_ms: Some(2),
-            event_count: 0,
-            error: None,
-        };
-        write_json_atomic(
-            &malformed_assembly.join("manifest.json"),
-            &serde_json::to_value(summary).unwrap(),
-        )
-        .unwrap();
-        fs::write(malformed_assembly.join("events.jsonl"), []).unwrap();
-        fs::write(malformed_assembly.join("assembly.json"), b"{malformed").unwrap();
-
-        let replayed = RunController::new(config()).unwrap();
-        assert!(replayed.state(&valid.id).is_ok());
-        assert!(replayed.state("run-malformed-manifest").is_err());
-        assert!(replayed.state("run-malformed-assembly").is_err());
-        assert_eq!(lock(&replayed.inner.runs).len(), 1);
-
-        drop(replayed);
-        fs::remove_dir_all(root).unwrap();
-    }
-
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn finalized_workspace_records_a_replayable_diff() {
         let root = temporary_root("diff");
         fs::create_dir(root.join("initial")).unwrap();
@@ -4528,6 +6767,8 @@ totalScore = 11
                 scenario_id: "catalog".to_owned(),
                 scenario_title: "Catalog".to_owned(),
                 model_id: "test/model".to_owned(),
+                harness_id: None,
+                model_profile_id: None,
                 status: RunStatus::Running,
                 started_at_ms: 1,
                 finished_at_ms: None,
@@ -4562,6 +6803,11 @@ totalScore = 11
                     max_orchestrator_invocations: 1,
                     max_tool_invocations: 1,
                 },
+            }),
+            selection: Mutex::new(WorkbenchSelection {
+                harness_id: None,
+                model_profile_id: None,
+                comparison_harness_ids: Vec::new(),
             }),
             events: Mutex::new(Vec::new()),
             sender,
@@ -4836,6 +7082,8 @@ totalScore = 11
             scenario_id: "catalog".to_owned(),
             scenario_title: "Catalog".to_owned(),
             model_id: "test/model".to_owned(),
+            harness_id: None,
+            model_profile_id: None,
             status: RunStatus::Passed,
             started_at_ms: 10,
             finished_at_ms: Some(30),
@@ -4901,7 +7149,7 @@ totalScore = 11
         assert_eq!(review.metrics.workspace_changes, 1);
         assert_eq!(review.metrics.duration_ms, Some(20));
         assert_eq!(review.steps.len(), 6);
-        assert_eq!(review.steps[0].title, "Harness ready");
+        assert_eq!(review.steps[0].title, "Driver protocol ready");
         assert_eq!(
             review.steps[1].detail.as_deref(),
             Some("I will inspect the catalog.")
@@ -4923,6 +7171,8 @@ totalScore = 11
             scenario_id: "catalog".to_owned(),
             scenario_title: "Catalog".to_owned(),
             model_id: "test/model".to_owned(),
+            harness_id: None,
+            model_profile_id: None,
             status: RunStatus::Running,
             started_at_ms: 1,
             finished_at_ms: None,
@@ -4965,6 +7215,8 @@ totalScore = 11
             scenario_id: "catalog".to_owned(),
             scenario_title: "Catalog".to_owned(),
             model_id: "test/model".to_owned(),
+            harness_id: None,
+            model_profile_id: None,
             status: RunStatus::Running,
             started_at_ms: 1,
             finished_at_ms: None,
@@ -5001,12 +7253,101 @@ totalScore = 11
     }
 
     #[test]
+    fn causal_review_projects_eve_steps_native_actions_and_reported_usage() {
+        let summary = RunSummary {
+            id: "run-eve-review".to_owned(),
+            scenario_id: "catalog".to_owned(),
+            scenario_title: "Catalog".to_owned(),
+            model_id: "claude-haiku-4-5-20251001".to_owned(),
+            harness_id: Some("eve".to_owned()),
+            model_profile_id: Some("haiku-4-5".to_owned()),
+            status: RunStatus::Passed,
+            started_at_ms: 10,
+            finished_at_ms: Some(30),
+            event_count: 8,
+            error: None,
+        };
+        let events = vec![
+            event(1, "driver.session-opened", JsonValue::Null),
+            event(
+                2,
+                "model.step.started",
+                json!({ "data": { "stepIndex": 0 } }),
+            ),
+            event(
+                3,
+                "model.message.delta",
+                json!({ "data": { "messageDelta": "I will write the result." } }),
+            ),
+            event(
+                4,
+                "model.step.completed",
+                json!({
+                    "data": {
+                        "usage": {
+                            "inputTokens": 100,
+                            "outputTokens": 20,
+                            "cacheReadTokens": 80,
+                            "cacheWriteTokens": 10
+                        }
+                    }
+                }),
+            ),
+            event(
+                5,
+                "harness.action.result",
+                json!({
+                    "data": {
+                        "status": "completed",
+                        "result": {
+                            "callId": "write-1",
+                            "toolName": "write_file",
+                            "output": { "path": "/workspace/result.json" }
+                        }
+                    }
+                }),
+            ),
+            event(
+                6,
+                "mcp.tool.completed",
+                json!({ "source": "catalog", "name": "list", "actor": "agent", "isError": false }),
+            ),
+            event(
+                7,
+                "workspace.finalized",
+                json!({ "changes": [{ "path": "result.json", "kind": "created" }] }),
+            ),
+            event(
+                8,
+                "run.finished",
+                json!({ "status": "passed", "score": {} }),
+            ),
+        ];
+
+        let review = build_review(&summary, &events);
+        assert_eq!(review.metrics.model_turns, 1);
+        assert_eq!(review.metrics.capability_calls, 1);
+        assert_eq!(review.metrics.native_actions, 1);
+        assert_eq!(review.steps[0].title, "Model step 1");
+        assert_eq!(
+            review.steps[0].detail.as_deref(),
+            Some("I will write the result.")
+        );
+        assert_eq!(review.steps[1].title, "Wrote /workspace/result.json");
+        let (usage, cache) = reported_usage(&events);
+        assert_eq!(usage, json!({ "inputTokens": 100, "outputTokens": 20 }));
+        assert_eq!(cache, json!({ "readTokens": 80, "writeTokens": 10 }));
+    }
+
+    #[test]
     fn causal_review_explains_model_provider_failures() {
         let summary = RunSummary {
             id: "run-provider-failure".to_owned(),
             scenario_id: "catalog".to_owned(),
             scenario_title: "Catalog".to_owned(),
             model_id: "test/model".to_owned(),
+            harness_id: None,
+            model_profile_id: None,
             status: RunStatus::Failed,
             started_at_ms: 10,
             finished_at_ms: Some(30),
@@ -5053,6 +7394,8 @@ totalScore = 11
             scenario_id: "catalog".to_owned(),
             scenario_title: "Catalog".to_owned(),
             model_id: "test/model".to_owned(),
+            harness_id: None,
+            model_profile_id: None,
             status: RunStatus::Passed,
             started_at_ms: 1,
             finished_at_ms: Some(2),

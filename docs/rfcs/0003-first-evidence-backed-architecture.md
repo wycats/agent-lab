@@ -1,7 +1,7 @@
 # RFC 0003: First evidence-backed architecture
 
 - Status: Candidate
-- Evidence: [steel thread 0001](../steel-threads/0001-nushell-mcp-session.md), [steel thread 0002](../steel-threads/0002-external-agent-driver.md), [steel thread 0003](../steel-threads/0003-catalog-feedback-loop.md)
+- Evidence: [steel thread 0001](../steel-threads/0001-nushell-mcp-session.md), [steel thread 0002](../steel-threads/0002-external-agent-driver.md), [steel thread 0003](../steel-threads/0003-catalog-feedback-loop.md), [steel thread 0004](../steel-threads/0004-two-harness-workbench.md)
 
 ## Summary
 
@@ -10,13 +10,14 @@ independent capability sources, execution hosts, agent drivers, and human
 surfaces. It should not be a shell runtime, MCP framework, v0 extraction, or
 universal virtual machine.
 
-The first three steel threads support a hybrid product shape. Embedded Nushell
+The first four steel threads support a hybrid product shape. Embedded Nushell
 is the first rich human surface because it preserves structured exploration,
 state, pipelines, and dynamically discovered commands. A just-bash-backed v0
 host is the first bounded agent execution host because it is small, in-process,
-and easy to instrument. The catalog slice demonstrates that a person and an
-external agent can operate against the same workspace and capability-source
-revisions while retaining distinct sessions and native interfaces.
+and easy to instrument. The catalog and two-harness slices demonstrate that a
+person and independent agent harnesses can operate against controlled workspace
+and capability-source revisions while retaining distinct sessions and native
+interfaces.
 
 The public Rust controller runs agents as external drivers, observes capability
 sources separately, and retains exact evidence plus named canonical
@@ -131,10 +132,10 @@ a durable source contract.
 ### Shared capability identity across surfaces
 
 The catalog source is projected into Nushell for direct human exploration and
-into each external agent session over authenticated MCP. Both projections
-retain the source identity and revision while using separate protocol sessions.
-The run controller records capability-owned observations independently from
-the driver's native events, so agent activity cannot stand in for proof that a
+into each external agent session over authenticated MCP. Every projection
+retains the source identity and revision while using a separate protocol
+session. The controller records capability-owned observations independently
+from driver-native events, so agent activity cannot stand in for proof that a
 source operation occurred.
 
 Future harness-native projections may present the same source facts with
@@ -197,34 +198,89 @@ duration, and any usage or cache data the harness reports. Later scenarios may
 add domain-specific measurements, but Agent Lab should provide evaluation
 mechanics without prematurely publishing a universal scalar score.
 
+### Shared workbench control evidence
+
+The two-harness product slice now proves that Nushell and the browser can be
+projections of one controller-owned workbench rather than adjacent interfaces.
+An Explore workspace has a persisted harness, model profile, and comparison
+pair. `lab assembly` inspects that state as structured data, while `lab compare`
+starts the same evaluation operation as the browser and streams stable progress
+records. The browser observes the shell-originated operation, opens the aligned
+comparison without unmounting the terminal, and can reopen the completed
+evaluation from its immutable evidence.
+
+The control path remains narrower than a universal operation registry. Shell
+grants are scoped to the attached Explore workspace and revoked with its PTY;
+explicit command arguments override one evaluation without mutating the shared
+selection. Browser and shell actions retain their origin in the Explore event
+stream, but credentials and grants do not enter events or evidence. This is the
+first demonstrated feedback loop in which human exploration, harness execution,
+visual comparison, and durable evaluation share one state model.
+
+### Two-harness acceptance evidence
+
+One local real-model evaluation ran v0 and Eve sequentially from the same
+catalog-to-file snapshot, capability revisions, Haiku 4.5 model profile, prompt,
+and limits. Both produced the expected `alpha` and `gamma` result with active
+count 2 and total score 11. v0 completed in 20.475 seconds with five model turns;
+Eve completed in 14.891 seconds with six. Each made two capability calls, two
+native actions, and one workspace change.
+
+The result demonstrates protocol portability and paired replay, not a universal
+harness ranking. Eve reported usage and cache data while v0 did not, so metric
+availability remains an adapter fact rather than a zero value. The live bundle
+is local-only; the public repository retains synthetic fixtures and this
+summary.
+
 ## What remains provisional
 
 - The JSON Lines message names and schemas are experimental.
-- Interactive completion covers the current MCP command surface; broader
-  workspace-oriented completion remains provisional.
+- Completion currently covers the workbench harnesses, model profiles, and
+  command flags; broader capability-driven completion remains provisional.
 - Capability events do not yet have a first-class public envelope.
-- Public conformance evidence currently covers one synthetic driver fixture.
-- Cross-harness comparison and model-profile matching remain unproven.
-- Detach/reconnect, durable checkpoints, caching, and multi-agent scheduling
-  remain unproven.
+- Promotion from exploration into an editable evaluation is not implemented.
+- The catalog comparison is one real-model observation, not a repeated claim.
+- Harness-reported usage and cache metrics are asymmetric.
+- A live VS Code Problems adapter has not yet been attempted.
+- Reconnection to an interrupted live stream, durable checkpoints, caching,
+  and multi-agent scheduling remain unproven. Detached evaluations and durable
+  reopening are demonstrated.
 
 These gaps are boundaries for later steel threads, not reasons to generalize
 the current adapters into a framework now.
 
-## Next validation boundary
+## Architecture consequence
 
-Run the same catalog scenario through v0 and Eve from one immutable Explore
-workspace snapshot. Each harness must use its native loop and execution host,
-stream its native events, operate against the same capability revisions, and
-produce independently replayable evidence. The workbench should compare task
-correctness and observable behavior without forcing the harnesses to share a
-tool loop or claiming a universal winner.
+The v0 and Eve result demonstrates that the public controller can coordinate
+two real harnesses without owning either loop. The workbench still needs to
+promote an exploratory agent session into an editable, replayable evaluation.
+Once that product-flow thread is complete, the next architecture experiment can
+pressure a richer capability projection inside the same loop rather than
+inventing separate evaluation machinery.
 
-This boundary must also make Nushell and the browser two controls for the same
-workbench state: shared harness and model selection, shell- or browser-initiated
-evaluation, origin-labelled events, aligned visual review, and durable paired
-replay. Editor diagnostics, a universal operation registry, and publication of
-product-specific adapters remain outside that change.
+## Next architecture-validation boundary
+
+After interactive sessions and evaluation promotion are demonstrated, build
+one real VS Code/code-server diagnostic adapter behind the public diagnostic
+snapshot contract. The extension uses
+`vscode.languages.getDiagnostics()` and a bounded local transport. It must
+prove workspace binding, pending and settled revisions, cancellation, timeout,
+extension restart, no-listener behavior, and a repair followed by a settled
+empty snapshot.
+
+Run the same seeded TypeScript task through controlled harness projections with
+identical source observations. First use the scripted model to pin the
+evidence, then run repeated real-model trials. Do not add rename-symbol,
+generic VS Code command execution, a universal workspace host, or a stable
+public driver SDK in that change.
+
+After that evidence, decide two questions before proposing the v0 work or
+promoting public contracts:
+
+1. Should semantic services remain a facet of `AgentFileSystem`, or become a
+   separate injected interface?
+2. What diagnostic facts must v0 retain after its native LSP compression step
+   to preserve recovery without keeping the full snapshot in agent context?
 
 Repository pushes, pull requests, and public design communication remain
 separate approval boundaries.

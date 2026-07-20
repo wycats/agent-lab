@@ -919,6 +919,7 @@ fn driver_secret_values(driver_launch: &DriverLaunch) -> Vec<Vec<u8>> {
     driver_launch
         .env
         .iter()
+        .filter(|(name, _)| !matches!(name.to_str(), Some("PATH" | "HOME" | "TMPDIR" | "SHELL")))
         .map(|(_, value)| value.to_string_lossy().as_bytes().to_vec())
         .filter(|value| value.len() >= 4)
         .collect()
@@ -2285,6 +2286,8 @@ fn recover_finalized_run(state: &RunState) -> Result<bool, RunError> {
 fn recover_interrupted_run(state: &RunState, reset_event_log: bool) -> Result<(), RunError> {
     for directory in [
         state.workspace.clone(),
+        state.bundle_dir.join("initial"),
+        state.bundle_dir.join("initial.tmp"),
         state.bundle_dir.join("final"),
         state.bundle_dir.join("final.tmp"),
     ] {
@@ -2499,12 +2502,13 @@ fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, RunError> {
             if file_type.is_dir() {
                 visit(root, &entry.path(), files, retained_bytes)?;
             } else if file_type.is_file() {
-                let relative = entry
-                    .path()
+                let entry_path = entry.path();
+                let relative = entry_path
                     .strip_prefix(root)
-                    .map_err(|_| RunError::PathEscape(entry.path()))?
-                    .to_string_lossy()
-                    .into_owned();
+                    .map_err(|_| RunError::PathEscape(entry_path.clone()))?
+                    .to_str()
+                    .ok_or_else(|| RunError::UnsupportedWorkspaceEntry(entry_path.clone()))?
+                    .to_owned();
                 files.insert(relative, read_evidence_file(&entry.path(), retained_bytes)?);
             } else {
                 return Err(RunError::UnsupportedWorkspaceEntry(entry.path()));
@@ -3266,6 +3270,21 @@ totalScore = 11
     }
 
     #[test]
+    fn driver_secrets_exclude_routine_process_environment() {
+        let mut launch = DriverLaunch::new("driver");
+        launch.env.extend([
+            ("PATH".into(), "/routine/bin".into()),
+            ("HOME".into(), "/routine/home".into()),
+            ("PROVIDER_TOKEN".into(), "provider-secret".into()),
+        ]);
+
+        assert_eq!(
+            driver_secret_values(&launch),
+            vec![b"provider-secret".to_vec()]
+        );
+    }
+
+    #[test]
     fn only_a_zero_driver_exit_is_successful() {
         assert!(require_successful_driver_exit(Some(0)).is_ok());
         assert!(require_successful_driver_exit(Some(17)).is_err());
@@ -3864,6 +3883,7 @@ totalScore = 11
         fs::create_dir_all(bundle.join("final")).unwrap();
         fs::create_dir_all(bundle.join("final.tmp")).unwrap();
         for path in [
+            bundle.join("initial/result.json"),
             bundle.join("workspace/result.json"),
             bundle.join("final/result.json"),
             bundle.join("final.tmp/result.json"),
@@ -3904,6 +3924,7 @@ totalScore = 11
         assert_eq!(detail.summary.status, RunStatus::Cancelled);
         assert!(detail.output.is_none());
         assert!(!bundle.join("workspace").exists());
+        assert!(!bundle.join("initial").exists());
         assert!(!bundle.join("final").exists());
         assert!(!bundle.join("final.tmp").exists());
         assert!(!bundle.join("diff.json").exists());
@@ -4597,6 +4618,25 @@ totalScore = 11
         assert!(!root.join("final").exists());
 
         drop(socket);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_workspace_paths_are_rejected_before_snapshotting() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temporary_root("non-utf8-evidence");
+        fs::create_dir(root.join("initial")).unwrap();
+        let state = test_run_state(&root);
+        let invalid_name = std::ffi::OsString::from_vec(vec![b'f', b'i', b'l', b'e', 0xff]);
+        fs::write(state.workspace.join(invalid_name), b"content").unwrap();
+
+        assert!(matches!(
+            finalize_workspace(&state),
+            Err(RunError::UnsupportedWorkspaceEntry(_))
+        ));
+        assert!(!root.join("final").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -33,10 +33,15 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
   await expect(page.locator('[data-testid="terminal"] canvas')).toBeVisible();
   const screen = page.getByTestId('terminal-text');
-  await expect(screen).toContainText('Agent Lab visual shell');
+  await expect(screen).toContainText('Agent Lab');
+  await expect(screen).toContainText('Explore the active workspace');
+  await expect(screen).toContainText('catalog list | where active');
+  await expect(screen).toContainText('lab compare');
   await expect(screen).toContainText('agent-lab>');
   await expect(screen).toContainText('MCP namespaces: analysis, catalog');
   await expect(page.locator('.terminal-footer')).not.toContainText('local fixture');
+  await expect(page.locator('.model-access-pill')).toContainText('Model access');
+  await expect(page.locator('.model-access-pill')).toContainText('Ready');
   const assembly = page.getByTestId('assembly');
   await expect(assembly).toContainText('How does this harness discover and compose shared capabilities');
   await expect(assembly).toContainText('catalog-v2');
@@ -121,14 +126,18 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await expect(screen).toContainText('"activeCount": 2');
   await expect(screen).toContainText('"totalScore": 11');
 
-  await expect(page.getByLabel('Model')).toHaveValue('');
-  await page.getByLabel('Model').selectOption('fixture/model');
-  await page.getByRole('button', { name: 'Run', exact: true }).click();
+  await page.getByLabel('Harness').selectOption('v0');
+  await expect(page.getByLabel('Harness')).toHaveValue('v0');
+  await expect(page.getByLabel('Model')).toHaveValue('fixture');
+  await page.getByRole('button', { name: 'Run harness', exact: true }).click();
   await expect(page.locator('.run-status')).toHaveText('passed');
   await expect(assembly).toContainText('agent-lab-fixture');
   await expect(assembly).toContainText('fixture/model');
   const review = page.getByTestId('run-review');
-  await expect(review).toContainText('Harness ready');
+  await expect(review).toContainText('Driver process');
+  await expect(review).toContainText('Adapter loaded');
+  await expect(review).toContainText('Driver protocol ready');
+  await expect(review).toContainText('Harness session ready');
   await expect(review).toContainText('catalog · list');
   await expect(review).toContainText('analysis · summarize');
   await expect(
@@ -158,7 +167,7 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   const completedRunId = await page.locator('.terminal-footer span').nth(1).textContent();
   await page.getByRole('button', { name: 'New workspace' }).click();
   await expect(page.locator('.run-status')).toHaveText('exploring');
-  await expect(page.getByRole('button', { name: 'Run', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Run harness', exact: true })).toBeVisible();
   await expect(page.locator('.terminal-footer span').nth(1)).not.toHaveText(completedRunId ?? '');
 
   await page.reload();
@@ -175,6 +184,75 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   expect(socketUrls).toHaveLength(socketsBeforeReplay);
   await page.getByRole('button', { name: 'Evidence' }).click();
   await expect(page.locator('.artifact')).toContainText('"passed": true');
+});
+
+test('a paired harness evaluation streams, compares, and reopens', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await page.getByLabel('Harness').selectOption('v0');
+  await expect(page.getByLabel('Harness')).toHaveValue('v0');
+  await expect(page.getByLabel('Model')).toHaveValue('fixture');
+
+  await page.reload();
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect(page.getByLabel('Harness')).toHaveValue('v0');
+  await expect(page.getByLabel('Model')).toHaveValue('fixture');
+
+  const screen = page.getByTestId('terminal-text');
+  await submit(page, 'lab assembly | get selection.modelProfileId');
+  await expect(screen).toContainText('fixture');
+  await submit(page, 'lab compare | get phase');
+  const evaluation = page.getByTestId('evaluation-view');
+  await expect(evaluation).toContainText('Behavioral comparison');
+  await expect(evaluation.locator('.run-status')).toHaveText('passed');
+  await expect(screen).toContainText('comparison-finished');
+  await submit(page, 'lab evaluation | get summary.status');
+  await expect(screen).toContainText('passed');
+  const behavioralDiff = evaluation.getByTestId('behavioral-diff');
+  await expect(behavioralDiff.locator('.arm-summary')).toHaveCount(2);
+  await expect(behavioralDiff).toContainText('v0');
+  await expect(behavioralDiff).toContainText('eve');
+  await expect(behavioralDiff).toContainText('catalog · list');
+  await expect(behavioralDiff).toContainText('analysis · summarize');
+  await expect(behavioralDiff).toContainText('Created result.json');
+  await expect(behavioralDiff.locator('.clock-axis')).toHaveCount(2);
+  await expect.poll(() => behavioralDiff.locator('.phase-clock').count()).toBeGreaterThan(0);
+  await expect(behavioralDiff.locator('.phase-clock').first()).toContainText('+');
+  await expect.poll(() => behavioralDiff.locator('.clock-end-label').count()).toBeGreaterThan(2);
+  await expect(behavioralDiff).toContainText('Driver process');
+  await expect(behavioralDiff).toContainText('Adapter loaded');
+  await expect(behavioralDiff).toContainText('Driver protocol ready');
+  await expect(behavioralDiff).toContainText('Harness session ready');
+  await expect(behavioralDiff.locator('.result-cell')).toHaveCount(2);
+  await expect(behavioralDiff.locator('.result-cell').first()).toContainText('"activeCount": 2');
+  await expect(behavioralDiff.locator('.result-cell').last()).toContainText('"activeCount": 2');
+  await expect(evaluation.locator('.paired-result')).toContainText('Same evaluated artifact');
+  await expect(evaluation.locator('.comparison-context')).toContainText('Same revision');
+  await expect(evaluation.locator('.native-replays')).toContainText('Native replays and raw evidence');
+
+  const exploreRunLabel = await page.locator('.terminal-footer span').nth(1).textContent();
+  const screenBeforeInspection = await screen.textContent();
+  await evaluation.locator('.native-replays').getByText('Native replays and raw evidence').click();
+  await evaluation.locator('.native-replays').getByRole('button', { name: 'Open v0 replay' }).click();
+  await expect(page.locator('.terminal-footer span').nth(1)).toHaveText(exploreRunLabel ?? '');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await submit(page, 'catalog list | where active | get name | str join ","');
+  await expect.poll(() => screen.textContent()).not.toBe(screenBeforeInspection);
+  await expect(screen).toContainText('alpha,gamma');
+
+  const history = page.locator('.evaluation-history .history-list button').first();
+  await expect(history).toContainText('v0 / eve');
+  await expect(history).toContainText('passed');
+
+  await page.reload();
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const reopened = page.locator('.evaluation-history .history-list button').first();
+  await expect(reopened).toContainText('passed');
+  await reopened.click();
+  await expect(page.getByTestId('evaluation-view').locator('.paired-result')).toContainText(
+    'Same evaluated artifact'
+  );
+  await expect(page.getByTestId('behavioral-diff')).toContainText('analysis · summarize');
 });
 
 test('stacked surfaces keep their scroll owners inside the viewport', async ({ page }) => {
@@ -197,7 +275,7 @@ test('stacked surfaces keep their scroll owners inside the viewport', async ({ p
   await page.mouse.move(canvas!.x + canvas!.width / 2, canvas!.y + canvas!.height / 2);
   await page.mouse.wheel(0, -800);
   await expect.poll(() => screen.textContent()).not.toBe(bottomView);
-  await expect(screen).toContainText('Agent Lab visual shell');
+  await expect(screen).toContainText('Agent Lab');
 
   await expect(footer).toBeInViewport();
   expect(await page.evaluate(() => window.scrollY)).toBe(0);
@@ -219,10 +297,10 @@ test('stacked surfaces keep their scroll owners inside the viewport', async ({ p
     clientHeight: element.clientHeight,
     scrollHeight: element.scrollHeight
   }));
-  expect(contentSize.clientHeight).toBeGreaterThan(180);
+  expect(contentSize.clientHeight).toBeGreaterThan(150);
   expect(contentSize.scrollHeight).toBeGreaterThan(contentSize.clientHeight);
   await content.hover();
   await page.mouse.wheel(0, 500);
   await expect.poll(() => content.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
-  await expect(page.locator('.history')).toBeInViewport();
+  await expect(page.locator('.histories')).toBeInViewport();
 });

@@ -1,14 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{self, BufRead, IsTerminal, Write},
-    sync::Arc,
+    sync::{Arc, OnceLock, atomic::AtomicBool, mpsc},
+    time::Duration,
 };
 
 use nu_ansi_term::{Color, Style};
 use nu_engine::CallExt;
 use nu_parser::FlatShape;
 use nu_protocol::{
-    IntoPipelineData, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
+    IntoPipelineData, ListStream, PipelineData, ShellError, Signals, Signature, Span, SyntaxShape,
+    Type, Value,
     ast::{Block, Expr, PipelineRedirection, RedirectionTarget, Traverse},
     debugger::WithoutDebug,
     engine::{Command, EngineState, Stack, StateWorkingSet},
@@ -29,6 +31,7 @@ use crate::{
     McpBridge,
     bridge::BridgeError,
     value::{json_to_nu, json_to_nu_tool_result, nu_record_to_json, nu_to_json},
+    workbench::{ComparisonStream, WorkbenchBridge},
 };
 
 #[derive(Debug, Error)]
@@ -282,6 +285,9 @@ pub struct NushellHost {
     sessions: HashMap<String, McpBridge>,
     registered_tool_lists: HashSet<String>,
     registered_tools: HashMap<String, HashMap<String, Tool>>,
+    workbench: Option<WorkbenchBridge>,
+    workbench_harnesses: Vec<String>,
+    workbench_models: Vec<String>,
 }
 
 impl NushellHost {
@@ -295,6 +301,7 @@ impl NushellHost {
     pub fn new() -> Self {
         let mut engine_state =
             nu_command::add_shell_command_context(nu_cmd_lang::create_default_context());
+        engine_state.set_signals(shell_signals());
         let mut working_set = StateWorkingSet::new(&engine_state);
         let allowed = EXPLORE_COMMANDS
             .iter()
@@ -327,7 +334,41 @@ impl NushellHost {
             sessions: HashMap::new(),
             registered_tool_lists: HashSet::new(),
             registered_tools: HashMap::new(),
+            workbench: None,
+            workbench_harnesses: Vec::new(),
+            workbench_models: Vec::new(),
         }
+    }
+
+    /// Attach the controller-owned workbench projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the initial workbench snapshot cannot be loaded or
+    /// its Nushell commands cannot be registered.
+    pub fn attach_workbench(&mut self, bridge: WorkbenchBridge) -> Result<(), HostError> {
+        let snapshot = bridge.assembly().map_err(|error| {
+            HostError::Shell(shell_error(
+                "Workbench attachment failed",
+                error.to_string(),
+                Span::unknown(),
+            ))
+        })?;
+        self.workbench_harnesses = workbench_ids(&snapshot, "harnesses");
+        self.workbench_models = workbench_ids(&snapshot, "modelProfiles");
+        let mut working_set = StateWorkingSet::new(&self.engine_state);
+        working_set.add_decl(Box::new(LabAssemblyCommand {
+            bridge: bridge.clone(),
+        }));
+        working_set.add_decl(Box::new(LabCompareCommand {
+            bridge: bridge.clone(),
+        }));
+        working_set.add_decl(Box::new(LabEvaluationCommand {
+            bridge: bridge.clone(),
+        }));
+        self.engine_state.merge_delta(working_set.render())?;
+        self.workbench = Some(bridge);
+        Ok(())
     }
 
     /// Attach one MCP bridge and register its current tools as Nushell commands.
@@ -493,15 +534,26 @@ impl NushellHost {
 
         let mut namespaces = self.sessions.keys().cloned().collect::<Vec<_>>();
         namespaces.sort();
-        writeln!(stdout, "Agent Lab visual shell")?;
+        writeln!(stdout, "Agent Lab")?;
+        writeln!(
+            stdout,
+            "Explore the active workspace and learn how its agent harnesses behave."
+        )?;
         if namespaces.is_empty() {
             writeln!(stdout, "MCP namespaces: none")?;
         } else {
             writeln!(stdout, "MCP namespaces: {}", namespaces.join(", "))?;
         }
+        if self.workbench.is_some() {
+            writeln!(stdout, "Try:")?;
+            writeln!(stdout, "  catalog list | where active")?;
+            writeln!(stdout, "  catalog list | where active | analysis summarize")?;
+            writeln!(stdout, "  lab assembly")?;
+            writeln!(stdout, "  lab compare")?;
+        }
         writeln!(
             stdout,
-            "Nushell evaluates each submitted line; `exit` leaves."
+            "Use `help <command>` to inspect any command; `exit` leaves."
         )?;
 
         // Raw PTY test harnesses do not emulate terminal cursor-position
@@ -517,6 +569,7 @@ impl NushellHost {
         );
         let mut line_editor = self.line_editor();
         loop {
+            self.engine_state.reset_signals();
             let refreshed = self.refresh_stale()?;
             for namespace in &refreshed {
                 writeln!(stdout, "[capabilities refreshed: {namespace}]")?;
@@ -550,6 +603,7 @@ impl NushellHost {
         let stdin = io::stdin();
         let mut lines = stdin.lock().lines();
         loop {
+            self.engine_state.reset_signals();
             for namespace in self.refresh_stale()? {
                 writeln!(stdout, "[capabilities refreshed: {namespace}]")?;
             }
@@ -583,7 +637,11 @@ impl NushellHost {
         );
         Reedline::create()
             .with_highlighter(Box::new(AgentLabHighlighter::new(engine_state.clone())))
-            .with_completer(Box::new(AgentLabCompleter::new(&engine_state)))
+            .with_completer(Box::new(AgentLabCompleter::new(
+                &engine_state,
+                self.workbench_harnesses.clone(),
+                self.workbench_models.clone(),
+            )))
             .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
             .with_edit_mode(Box::new(Emacs::new(keybindings)))
             .with_quick_completions(true)
@@ -750,6 +808,228 @@ fn style_for_shape(shape: &FlatShape) -> Style {
 
 struct AgentLabCompleter {
     commands: Vec<String>,
+    workbench_harnesses: Vec<String>,
+    workbench_models: Vec<String>,
+}
+
+fn workbench_ids(snapshot: &serde_json::Value, key: &str) -> Vec<String> {
+    snapshot[key]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn shell_signals() -> Signals {
+    static INTERRUPTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    let interrupted = INTERRUPTED
+        .get_or_init(|| {
+            let interrupted = Arc::new(AtomicBool::new(false));
+            let handler = interrupted.clone();
+            let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, handler);
+            interrupted
+        })
+        .clone();
+    Signals::new(interrupted)
+}
+
+#[derive(Clone)]
+struct LabAssemblyCommand {
+    bridge: WorkbenchBridge,
+}
+
+impl Command for LabAssemblyCommand {
+    fn name(&self) -> &'static str {
+        "lab assembly"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::Record(Vec::new().into()))
+    }
+
+    fn description(&self) -> &'static str {
+        "Inspect the active Agent Lab assembly and shared workbench selection"
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let value = self.bridge.assembly().map_err(|error| {
+            shell_error("Workbench request failed", error.to_string(), call.head)
+        })?;
+        Ok(json_to_nu(value, call.head).into_pipeline_data())
+    }
+}
+
+#[derive(Clone)]
+struct LabEvaluationCommand {
+    bridge: WorkbenchBridge,
+}
+
+impl Command for LabEvaluationCommand {
+    fn name(&self) -> &'static str {
+        "lab evaluation"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::Record(Vec::new().into()))
+            .optional(
+                "evaluation-id",
+                SyntaxShape::String,
+                "evaluation id; defaults to the latest evaluation for this workbench",
+            )
+    }
+
+    fn description(&self) -> &'static str {
+        "Inspect a durable evaluation associated with this workbench"
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let id = call.opt::<String>(engine_state, stack, 0)?;
+        let value = self.bridge.evaluation(id.as_deref()).map_err(|error| {
+            shell_error("Workbench request failed", error.to_string(), call.head)
+        })?;
+        Ok(json_to_nu(value, call.head).into_pipeline_data())
+    }
+}
+
+#[derive(Clone)]
+struct LabCompareCommand {
+    bridge: WorkbenchBridge,
+}
+
+impl Command for LabCompareCommand {
+    fn name(&self) -> &'static str {
+        "lab compare"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::Table(Vec::new().into()))
+            .rest(
+                "harnesses",
+                SyntaxShape::String,
+                "exactly two harness ids; defaults to the shared workbench pair",
+            )
+            .named(
+                "model",
+                SyntaxShape::String,
+                "model profile override for this comparison",
+                None,
+            )
+            .switch("raw", "stream raw source-labelled events", None)
+            .switch("detach", "return after creating the evaluation", None)
+    }
+
+    fn description(&self) -> &'static str {
+        "Compare two real harnesses from the active workspace snapshot"
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let harnesses = call.rest::<String>(engine_state, stack, 0)?;
+        if !harnesses.is_empty() && harnesses.len() != 2 {
+            return Err(shell_error(
+                "Invalid comparison",
+                "provide exactly two harness ids or omit both to use the shared selection"
+                    .to_owned(),
+                call.head,
+            ));
+        }
+        let model = call.get_flag::<String>(engine_state, stack, "model")?;
+        let raw = call.has_flag(engine_state, stack, "raw")?;
+        let detach = call.has_flag(engine_state, stack, "detach")?;
+        let comparison = self
+            .bridge
+            .compare(&harnesses, model, raw, !detach)
+            .map_err(|error| shell_error("Comparison failed", error.to_string(), call.head))?;
+        if detach {
+            return Ok(json_to_nu(comparison.evaluation, call.head).into_pipeline_data());
+        }
+        let evaluation_id = comparison
+            .evaluation
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let stream = WorkbenchValueStream {
+            comparison,
+            bridge: self.bridge.clone(),
+            evaluation_id,
+            signals: engine_state.signals().clone(),
+            span: call.head,
+            finished: false,
+        };
+        Ok(ListStream::new(stream, call.head, Signals::empty()).into())
+    }
+}
+
+struct WorkbenchValueStream {
+    comparison: ComparisonStream,
+    bridge: WorkbenchBridge,
+    evaluation_id: String,
+    signals: Signals,
+    span: Span,
+    finished: bool,
+}
+
+impl Iterator for WorkbenchValueStream {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.signals.interrupted() {
+                self.bridge.cancel(&self.evaluation_id);
+                self.finished = true;
+                return None;
+            }
+            match self
+                .comparison
+                .receiver
+                .recv_timeout(Duration::from_millis(100))
+            {
+                Ok(Ok(value)) => return Some(json_to_nu(value, self.span)),
+                Ok(Err(error)) => {
+                    self.finished = true;
+                    return Some(Value::error(
+                        shell_error("Comparison stream failed", error.to_string(), self.span),
+                        self.span,
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.finished = true;
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for WorkbenchValueStream {
+    fn drop(&mut self) {
+        if !self.finished && self.signals.interrupted() {
+            self.bridge.cancel(&self.evaluation_id);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -805,7 +1085,11 @@ impl Command for AgentLabExternalGuard {
 }
 
 impl AgentLabCompleter {
-    fn new(engine_state: &EngineState) -> Self {
+    fn new(
+        engine_state: &EngineState,
+        workbench_harnesses: Vec<String>,
+        workbench_models: Vec<String>,
+    ) -> Self {
         let mut commands = engine_state
             .get_decls_sorted(false)
             .into_iter()
@@ -818,7 +1102,11 @@ impl AgentLabCompleter {
                 .is_some_and(|suffix| !suffix.contains(' '));
             !is_mcp_namespace_root || !canonical_commands.contains(&format!("{command} tools"))
         });
-        Self { commands }
+        Self {
+            commands,
+            workbench_harnesses,
+            workbench_models,
+        }
     }
 }
 
@@ -826,7 +1114,25 @@ impl AgentLabCompleter {
 mod tests {
     use std::fs;
 
-    use super::{EXPLORE_COMMANDS, HostError, NushellHost};
+    use reedline::Completer;
+
+    use super::{AgentLabCompleter, EXPLORE_COMMANDS, HostError, NushellHost};
+
+    fn completer() -> AgentLabCompleter {
+        AgentLabCompleter {
+            commands: vec!["lab assembly".to_owned(), "lab compare".to_owned()],
+            workbench_harnesses: vec!["v0".to_owned(), "eve".to_owned()],
+            workbench_models: vec!["haiku-4.5".to_owned()],
+        }
+    }
+
+    fn completion_values(line: &str) -> Vec<String> {
+        completer()
+            .complete(line, line.len())
+            .into_iter()
+            .map(|suggestion| suggestion.value)
+            .collect()
+    }
 
     #[test]
     fn explore_shell_exposes_only_the_positive_command_set() {
@@ -878,6 +1184,14 @@ mod tests {
         assert!(!path.exists());
         let _ = fs::remove_file(path);
     }
+
+    #[test]
+    fn compare_completion_distinguishes_harnesses_models_and_flags() {
+        assert_eq!(completion_values("lab compare e"), ["eve"]);
+        assert_eq!(completion_values("lab compare --model h"), ["haiku-4.5"]);
+        assert_eq!(completion_values("lab compare --r"), ["--raw"]);
+        assert_eq!(completion_values("lab compare v0 "), ["eve"]);
+    }
 }
 
 impl Completer for AgentLabCompleter {
@@ -892,6 +1206,53 @@ impl Completer for AgentLabCompleter {
         if let Some(help_target) = prefix.strip_prefix("help ") {
             replace_start += "help ".len();
             prefix = help_target;
+        }
+
+        if let Some(arguments) = prefix.strip_prefix("lab compare ") {
+            let value_start = arguments.rfind(' ').map_or(0, |index| index + 1);
+            let value_prefix = &arguments[value_start..];
+            let replace_start = replace_start + "lab compare ".len() + value_start;
+            let prior = arguments[..value_start]
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            if value_prefix.starts_with('-') {
+                return ["--model", "--raw", "--detach"]
+                    .into_iter()
+                    .filter(|flag| flag.starts_with(value_prefix) && *flag != value_prefix)
+                    .map(|flag| Suggestion {
+                        value: flag.to_owned(),
+                        description: Some("lab compare option".to_owned()),
+                        span: ReedlineSpan::new(replace_start, pos),
+                        append_whitespace: true,
+                        ..Suggestion::default()
+                    })
+                    .collect();
+            }
+            let is_model = prior.last() == Some(&"--model");
+            let values = if is_model {
+                &self.workbench_models
+            } else {
+                &self.workbench_harnesses
+            };
+            return values
+                .iter()
+                .filter(|value| {
+                    value.starts_with(value_prefix)
+                        && value.as_str() != value_prefix
+                        && !prior.contains(&value.as_str())
+                })
+                .map(|value| Suggestion {
+                    value: value.clone(),
+                    description: Some(if is_model {
+                        "Agent Lab model profile".to_owned()
+                    } else {
+                        "Agent Lab harness".to_owned()
+                    }),
+                    span: ReedlineSpan::new(replace_start, pos),
+                    append_whitespace: true,
+                    ..Suggestion::default()
+                })
+                .collect();
         }
 
         self.commands

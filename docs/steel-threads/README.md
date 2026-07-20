@@ -6,6 +6,7 @@ implementation and record the result afterward.
 
 - [0001: Embedded Nushell with a persistent MCP session](0001-nushell-mcp-session.md)
 - [0002: Neutral external agent driver and evidence](0002-external-agent-driver.md)
+- [0003: Catalog feedback loop](0003-catalog-feedback-loop.md)
 
 ## Feedback loops
 

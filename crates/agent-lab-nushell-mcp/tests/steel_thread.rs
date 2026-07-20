@@ -31,39 +31,52 @@ fn persistent_nushell_and_mcp_session_preserve_structured_behavior() {
     assert_eq!(host.eval("$answer += 1; $answer").unwrap().as_int(), Ok(42));
 
     let first_pid = host
-        .eval("tool fixture session | get pid")
+        .eval("fixture session | get pid")
         .unwrap()
         .as_int()
         .unwrap();
     assert_eq!(
-        host.eval("tool fixture increment | get count")
-            .unwrap()
-            .as_int(),
+        host.eval("fixture increment | get count").unwrap().as_int(),
         Ok(1)
     );
     assert_eq!(
-        host.eval("tool fixture increment | get count")
-            .unwrap()
-            .as_int(),
+        host.eval("fixture increment | get count").unwrap().as_int(),
         Ok(2)
     );
     assert_eq!(
-        host.eval("tool fixture session | get pid")
-            .unwrap()
-            .as_int(),
+        host.eval("fixture session | get pid").unwrap().as_int(),
         Ok(first_pid)
     );
     assert_eq!(bridge.runtime_id(), runtime_id);
 
     let active_names = host
-        .eval("tool fixture catalog | get items | where active | get name")
+        .eval("fixture catalog | get items | where active | get name")
         .expect("structured pipeline should evaluate");
     assert_eq!(strings(active_names), vec!["alpha", "gamma"]);
+    assert_eq!(
+        host.eval(r#"{ probe: "pipeline" } | fixture catalog | get request.probe"#)
+            .expect("pipeline input should become MCP arguments")
+            .as_str(),
+        Ok("pipeline")
+    );
 
     let discovered = host
         .eval("mcp fixture tools | where name == catalog | get name.0")
         .expect("discovery should be structured");
     assert_eq!(discovered.as_str(), Ok("catalog"));
+    let discovered_from_namespace = host
+        .eval("mcp fixture | where name == catalog | get name.0")
+        .expect("the namespace root should make discovery forgiving");
+    assert_eq!(discovered_from_namespace.as_str(), Ok("catalog"));
+
+    let unknown = host
+        .eval("mcp fix")
+        .expect_err("an incomplete namespace should remain a REPL error");
+    assert!(
+        unknown.to_string().contains("Unknown Agent Lab command"),
+        "unknown commands should not expose the missing external runner: {unknown}"
+    );
+    assert!(!unknown.to_string().contains("run-external"));
 }
 
 #[test]
@@ -74,7 +87,7 @@ fn lifecycle_and_discovery_changes_remain_observable() {
         .expect("fixture should attach");
 
     assert_eq!(
-        host.eval("tool fixture lifecycle | get complete")
+        host.eval("fixture lifecycle | get complete")
             .unwrap()
             .as_bool(),
         Ok(true)
@@ -89,7 +102,7 @@ fn lifecycle_and_discovery_changes_remain_observable() {
     );
     assert!(events.iter().any(|event| event.kind == "mcp.log"));
 
-    host.eval("tool fixture enable_extra")
+    host.eval("fixture enable_extra")
         .expect("fixture should change its tool list");
     wait_for_stale_discovery(&bridge);
     host.eval("mcp fixture tools")
@@ -102,13 +115,13 @@ fn lifecycle_and_discovery_changes_remain_observable() {
         .expect("refresh should merge commands");
     assert!(!bridge.discovery_is_stale());
     assert_eq!(
-        host.eval("tool fixture extra | get available")
+        host.eval("fixture extra | get available")
             .unwrap()
             .as_bool(),
         Ok(true)
     );
     let initial_help = host
-        .eval(r#"help "tool fixture extra""#)
+        .eval(r#"help "fixture extra""#)
         .expect("dynamic command help should be visible");
     assert!(
         initial_help
@@ -117,13 +130,13 @@ fn lifecycle_and_discovery_changes_remain_observable() {
             .starts_with("A tool added during the live session")
     );
 
-    host.eval("tool fixture revise_extra")
+    host.eval("fixture revise_extra")
         .expect("fixture should revise a tool descriptor");
     wait_for_stale_discovery(&bridge);
     host.refresh("fixture")
         .expect("refresh should replace revised commands");
     let revised_help = host
-        .eval(r#"help "tool fixture extra""#)
+        .eval(r#"help "fixture extra""#)
         .expect("revised dynamic command help should be visible");
     assert!(
         revised_help
@@ -132,16 +145,18 @@ fn lifecycle_and_discovery_changes_remain_observable() {
             .starts_with("A revised tool in the live session")
     );
 
-    host.eval("tool fixture disable_extra")
+    host.eval("fixture disable_extra")
         .expect("fixture should remove a tool from its tool list");
     wait_for_stale_discovery(&bridge);
     host.refresh("fixture")
         .expect("refresh should hide removed commands");
     let removed_tool_error = host
-        .eval("tool fixture extra")
+        .eval("fixture extra")
         .expect_err("removed command should no longer evaluate");
     assert!(
-        matches!(removed_tool_error, HostError::Compile(_)),
+        removed_tool_error
+            .to_string()
+            .contains("Unknown Agent Lab command"),
         "unexpected removed-command error: {removed_tool_error:?}"
     );
     let discovered_extra = host
@@ -198,9 +213,9 @@ fn stale_namespaces_refresh_in_stable_visible_order() {
     host.attach("alpha", alpha.clone())
         .expect("alpha fixture should attach");
 
-    host.eval("tool zeta enable_extra")
+    host.eval("zeta enable_extra")
         .expect("zeta fixture should change its tool list");
-    host.eval("tool alpha enable_extra")
+    host.eval("alpha enable_extra")
         .expect("alpha fixture should change its tool list");
     wait_for_stale_discovery(&alpha);
     wait_for_stale_discovery(&zeta);

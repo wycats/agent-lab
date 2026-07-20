@@ -52,7 +52,8 @@ function parseSessionEvent(payload: string): SessionEvent | undefined {
 
 export async function connectSession(
   surface: TerminalSurface,
-  callbacks: SessionCallbacks
+  callbacks: SessionCallbacks,
+  runId?: string
 ): Promise<BrowserSession> {
   callbacks.onState('starting');
   const tokenResponse = await fetch('/api/session-token', { cache: 'no-store' });
@@ -74,12 +75,23 @@ export async function connectSession(
   const url = new URL(`${protocol}//${location.host}/api/terminal`);
   url.searchParams.set('cols', String(dimensions.cols));
   url.searchParams.set('rows', String(dimensions.rows));
+  if (runId) url.searchParams.set('runId', runId);
 
   const socket = new WebSocket(url, [`agent-lab.auth.${token}`]);
   socket.binaryType = 'arraybuffer';
   let disposed = false;
-  const refreshScreen = () => {
+  let screenRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  const flushScreen = () => {
+    if (screenRefreshTimer !== undefined) {
+      clearTimeout(screenRefreshTimer);
+      screenRefreshTimer = undefined;
+    }
     if (!disposed) callbacks.onScreen(surface.readText());
+  };
+  const scheduleScreenRefresh = () => {
+    if (disposed) return;
+    if (screenRefreshTimer !== undefined) clearTimeout(screenRefreshTimer);
+    screenRefreshTimer = setTimeout(flushScreen, 150);
   };
   const encoder = new TextEncoder();
   const input = surface.onData((data) => {
@@ -89,9 +101,10 @@ export async function connectSession(
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: 'resize', cols, rows }));
     }
-    callbacks.onScreen(surface.readText());
+    flushScreen();
   });
-  const scroll = surface.onScroll(() => callbacks.onScreen(surface.readText()));
+  const scroll = surface.onScroll(flushScreen);
+  let sawError = false;
 
   socket.addEventListener('open', () => {
     if (!disposed) callbacks.onState('connected');
@@ -100,17 +113,22 @@ export async function connectSession(
     if (disposed) return;
     if (typeof message.data === 'string') {
       const event = parseSessionEvent(message.data);
-      if (event) callbacks.onEvent(event);
+      if (event) {
+        if (event.type === 'error') {
+          sawError = true;
+          callbacks.onState('error');
+        }
+        callbacks.onEvent(event);
+      }
     } else if (message.data instanceof ArrayBuffer) {
-      surface.write(new Uint8Array(message.data), refreshScreen);
+      surface.write(new Uint8Array(message.data), scheduleScreenRefresh);
     } else if (message.data instanceof Blob) {
       void message.data.arrayBuffer().then((data) => {
         if (disposed) return;
-        surface.write(new Uint8Array(data), refreshScreen);
+        surface.write(new Uint8Array(data), scheduleScreenRefresh);
       });
     }
   });
-  let sawError = false;
   socket.addEventListener('error', () => {
     sawError = true;
     if (!disposed) callbacks.onState('error');
@@ -122,6 +140,7 @@ export async function connectSession(
   return {
     dispose() {
       disposed = true;
+      if (screenRefreshTimer !== undefined) clearTimeout(screenRefreshTimer);
       input.dispose();
       resize.dispose();
       scroll.dispose();

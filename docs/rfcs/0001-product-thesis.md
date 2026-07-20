@@ -399,32 +399,27 @@ evolving.
 
 ## Current evidence
 
-The public steel threads on `main` have demonstrated:
+Existing steel threads have demonstrated:
 
 - an embedded Nushell session with structured MCP discovery and invocation;
 - dynamic command refresh, help, pipelines, and native structured values;
-- browser-visible live activity through the same PTY boundary as the direct
-  interactive session;
-- a neutral external-driver lifecycle with streamed native events, explicit
-  cancellation and failure behavior, and reopenable process evidence that
-  preserves raw transcripts separately from named comparison projections.
+- an external agent-driver process boundary;
+- distinct capability, harness, workspace, and session identities;
+- browser-visible live activity;
+- a real-model run against an authenticated capability source and physical
+  workspace;
+- durable evidence that can reopen after the live driver and capability source
+  are gone.
 
-This evidence supports the structured human surface of the workbench and the
-process-level seam for attaching a harness without absorbing its native loop.
-The public repository has not yet demonstrated a real harness bound to a
-controlled workspace, complete run replay across workspace and capability
-effects, two independently integrated harnesses, or promotion of an
-exploratory discovery into an evaluation. Those remain validation boundaries
-rather than evidence for the current architecture.
+This evidence supports the architectural pieces, but it does not yet prove the
+complete product loop described by this RFC. In particular, the product has
+not yet demonstrated that a builder can begin with a legible question, explore
+the assembly, run more than one real harness, and promote a discovery into an
+evaluation through one coherent workbench.
 
-## Next product validation boundary
+## Next validation boundary
 
-With the neutral driver and process-evidence foundation in place, bind a first
-real harness to the controlled workspace and capability-source lifecycle in
-[RFC 0002](0002-steel-thread-method.md). Then build the smallest "two harnesses,
-one workbench" experience using a public Eve integration and a v0 adapter
-retained in v0's owning repository.
-
+Build the smallest "two harnesses, one workbench" experience using v0 and Eve.
 Each harness should be independently inspectable, attach to the same kind of
 resettable seeded environment, run through its native loop, stream its native
 activity, produce attributable workspace effects, and receive a simple

@@ -137,7 +137,7 @@ The tests directly establish:
 - two evaluations retain a mutable Nushell variable;
 - multiple tool calls report the same fixture PID and bridge runtime ID while a
   session-local counter advances from 1 to 2;
-- `tool fixture catalog | get items | where active | get name` returns the
+- `fixture catalog | get items | where active | get name` returns the
   native string list `alpha`, `gamma`;
 - `mcp fixture tools` yields structured discovery records;
 - one lifecycle call produces two `mcp.progress` events and one `mcp.log`

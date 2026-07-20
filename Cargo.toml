@@ -2,6 +2,7 @@
 members = [
     "crates/agent-lab-cli",
     "crates/agent-lab-core",
+    "crates/agent-lab-catalog-source",
     "crates/agent-lab-driver-protocol",
     "crates/agent-lab-nushell-mcp",
     "crates/agent-lab-web",

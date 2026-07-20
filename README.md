@@ -56,8 +56,14 @@ Local Nushell + fixture MCP sessions; press Ctrl-C to stop.
 
 The server fixes its provider to the repository's visual-shell binary and the
 synthetic MCP fixture; clients cannot select another executable or configure an
-arbitrary MCP server through the gateway. The visual shell is still a full
-local Nushell session, including filesystem and external-command capabilities.
-Treat access to the workbench as local shell access, and do not expose this
-gateway to untrusted or remote clients. Run the browser acceptance with
-`pnpm web:test`.
+arbitrary MCP server through the gateway. Explore uses Nushell's structured
+language and projected capabilities without exposing ambient filesystem,
+script-loading, file-redirection, or external-command access. A future physical
+workspace projection needs a controller-mediated, attributable interface rather
+than ambient shell access. Keep the loopback workbench local and run the browser
+acceptance with `pnpm web:test`.
+
+The run-capable controller currently requires Unix. Its evidence and scoring
+paths use handle-relative, no-follow file reads to keep concurrent workspace
+processes confined; startup reports an unsupported-platform error until an
+equivalent Windows implementation exists.

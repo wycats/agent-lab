@@ -1,0 +1,20 @@
+version = 1
+id = "catalog-to-file"
+title = "Catalog to file"
+description = "Discover shared catalog tools, analyze active items, and persist the structured result."
+question = "How does this harness discover and compose shared capabilities to produce a checked workspace artifact?"
+seed = "catalog-to-file/workspace"
+output = "result.json"
+prompt = """
+Call the catalog MCP source's `list` tool first, then pass its complete result to the analysis MCP source's `summarize` tool. Do not inspect the workspace with Bash. Use the native Write file tool to write `result.json` in the workspace with exactly these fields from the analysis result: `active`, `activeCount`, and `totalScore`. Preserve each active item's `name`, `active`, and `score`. Use the native Read file tool to verify `result.json`, then finish.
+"""
+
+[limits]
+maxDurationMs = 420000
+maxCommandCount = 24
+maxOrchestratorInvocations = 8
+maxToolInvocations = 16
+
+[assertions]
+activeNames = ["alpha", "gamma"]
+totalScore = 11

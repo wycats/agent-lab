@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut host = NushellHost::new();
     host.attach("everything", bridge.clone())?;
     let result = host.eval(
-        "tool everything get-structured-content { location: 'New York' } \
+        "everything get-structured-content { location: 'New York' } \
          | select temperature conditions humidity",
     )?;
 

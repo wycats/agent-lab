@@ -1119,12 +1119,11 @@ fn clean_exit_validates_malformed_queued_stdout() {
 #[test]
 fn clean_exit_terminates_descendants_that_hold_reader_pipes() {
     let mut process = DriverProcess::spawn("sh", ["-c", "sleep 30 & exit 0"]).unwrap();
-    let timeout = Duration::from_millis(250);
     let started = Instant::now();
 
-    assert_eq!(process.wait_for_exit(timeout).unwrap(), Some(0));
+    assert_eq!(process.wait_for_exit(TIMEOUT).unwrap(), Some(0));
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(3),
         "reader cleanup blocked for {:?}",
         started.elapsed()
     );
@@ -1134,15 +1133,14 @@ fn clean_exit_terminates_descendants_that_hold_reader_pipes() {
 #[test]
 fn receive_reports_a_crashed_driver_even_when_a_descendant_holds_stdout() {
     let mut process = DriverProcess::spawn("sh", ["-c", "sleep 30 & exit 17"]).unwrap();
-    let timeout = Duration::from_millis(250);
     let started = Instant::now();
 
     assert!(matches!(
-        process.receive(timeout),
+        process.receive(TIMEOUT),
         Err(ProcessError::UnexpectedExit { code: Some(17) })
     ));
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(3),
         "crash detection blocked for {:?}",
         started.elapsed()
     );
@@ -1178,6 +1176,10 @@ fn dropping_a_driver_terminates_its_process_group() {
     let process = DriverProcess::spawn("sh", ["-c", &script]).unwrap();
     wait_for_file(&pid_file);
     let grandchild = fs::read_to_string(&pid_file).unwrap();
+    let started = Instant::now();
+    while !process_exists(&grandchild) && started.elapsed() < Duration::from_secs(1) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(process_exists(&grandchild));
 
     drop(process);

@@ -1,5 +1,6 @@
 import { getVercelOidcToken } from '@vercel/oidc';
 
+const OIDC_EXPIRATION_BUFFER_MS = 5 * 60 * 1000;
 const mode = process.argv[2] ?? 'probe';
 if (mode !== 'probe' && mode !== 'resolve') {
   process.stderr.write('usage: resolve-model-access.mjs [probe|resolve]\n');
@@ -15,17 +16,24 @@ const ambientCredentials = [
 for (const [name, source] of ambientCredentials) {
   const value = process.env[name]?.trim();
   if (value) {
+    const expiresAtMs = name === 'VERCEL_OIDC_TOKEN' ? jwtExpiry(value) : null;
+    if (
+      name === 'VERCEL_OIDC_TOKEN' &&
+      (expiresAtMs === null || expiresAtMs <= Date.now() + OIDC_EXPIRATION_BUFFER_MS)
+    ) {
+      continue;
+    }
     respond({
       status: 'ready',
       source,
-      expiresAtMs: name === 'VERCEL_OIDC_TOKEN' ? jwtExpiry(value) : null,
+      expiresAtMs,
       environment: mode === 'resolve' ? { [name]: value } : undefined,
     });
   }
 }
 
 try {
-  const token = (await getVercelOidcToken({ expirationBufferMs: 5 * 60 * 1000 })).trim();
+  const token = (await getVercelOidcToken({ expirationBufferMs: OIDC_EXPIRATION_BUFFER_MS })).trim();
   if (!token) throw new Error('empty token');
   respond({
     status: 'ready',

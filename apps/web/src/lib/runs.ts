@@ -128,6 +128,7 @@ export interface EvaluationDetail {
     modelProfileId: string;
     arms: EvaluationComparisonArm[];
     outputsMatch: boolean;
+    artifactComparison?: 'same' | 'different' | 'missing';
     outputDiff?: unknown;
   };
 }

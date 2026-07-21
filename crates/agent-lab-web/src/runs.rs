@@ -22,6 +22,11 @@ use axum::{
     middleware::{self, Next},
     response::Response,
 };
+#[cfg(windows)]
+use process_wrap::std::JobObject;
+#[cfg(unix)]
+use process_wrap::std::ProcessGroup;
+use process_wrap::std::{ChildWrapper, CommandWrap};
 use rand::Rng;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -37,6 +42,7 @@ const DRIVER_POLL: Duration = Duration::from_millis(250);
 // a development checkout, while subsequent protocol replies remain fast.
 const DRIVER_READY_TIMEOUT: Duration = Duration::from_mins(2);
 const DRIVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const MODEL_ACCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EVIDENCE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_EVIDENCE_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const CATALOG_REQUIRED_SOURCES: &[&str] = &["catalog", "analysis"];
@@ -586,7 +592,7 @@ impl RunController {
         let scenarios_dir = canonical_directory(&config.scenarios_dir)?;
         fs::create_dir_all(&config.data_dir)?;
         let data_dir = fs::canonicalize(&config.data_dir)?;
-        let evaluations_dir = data_dir.parent().unwrap_or(&data_dir).join("evaluations");
+        let evaluations_dir = data_dir.join("evaluations");
         fs::create_dir_all(&evaluations_dir)?;
         let evaluations_dir = fs::canonicalize(evaluations_dir)?;
         let scenarios = load_scenarios(&scenarios_dir)?;
@@ -1281,7 +1287,27 @@ impl RunController {
         id: &str,
     ) -> Result<(Vec<RunEvent>, broadcast::Receiver<RunEvent>), RunError> {
         let state = self.evaluation_state(id)?;
-        Ok((lock(&state.events).clone(), state.sender.subscribe()))
+        let events = lock(&state.events);
+        let receiver = state.sender.subscribe();
+        Ok((events.clone(), receiver))
+    }
+
+    /// Re-read the durable paired-evaluation suffix after a streaming receiver reports lag.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evaluation is unknown.
+    pub fn evaluation_events_after(
+        &self,
+        id: &str,
+        sequence: u64,
+    ) -> Result<Vec<RunEvent>, RunError> {
+        let state = self.evaluation_state(id)?;
+        Ok(lock(&state.events)
+            .iter()
+            .filter(|event| event.sequence > sequence)
+            .cloned()
+            .collect())
     }
 
     /// Cancel the active arm and prevent queued arms from starting.
@@ -1304,54 +1330,20 @@ impl RunController {
         &self,
         request: StartEvaluationRequest,
     ) -> Result<EvaluationSummary, RunError> {
-        if request.harness_ids.len() != 2 {
-            return Err(RunError::InvalidRequest(
-                "an evaluation requires exactly two harness ids".to_owned(),
-            ));
-        }
-        let unique = request.harness_ids.iter().collect::<HashSet<_>>();
-        if unique.len() != request.harness_ids.len() {
-            return Err(RunError::InvalidRequest(
-                "evaluation harness ids must be unique".to_owned(),
-            ));
-        }
-        for harness_id in &request.harness_ids {
-            let harness = self.inner.harnesses.get(harness_id).ok_or_else(|| {
-                RunError::InvalidRequest(format!("unknown harness: {harness_id}"))
-            })?;
-            if !harness.models.contains_key(&request.model_profile_id) {
-                return Err(RunError::InvalidRequest(format!(
-                    "model profile {} is unavailable for harness {harness_id}",
-                    request.model_profile_id
-                )));
-            }
-            self.resolve_harness_driver(harness)?;
-        }
-        let source = self.state(&request.source_workspace_id)?;
-        let source_summary = lock(&source.summary).clone();
-        if source_summary.scenario_id != request.scenario_id {
-            return Err(RunError::InvalidRequest(
-                "source workspace does not belong to the requested scenario".to_owned(),
-            ));
-        }
-        if source_summary.status != RunStatus::Exploring {
-            return Err(RunError::InvalidRequest(
-                "only an active Explore workspace can be snapshotted".to_owned(),
-            ));
-        }
+        let (source_files, source_assembly) = self.validate_evaluation_request(&request)?;
 
         let id = format!("evaluation-{}", run_id());
         let bundle_dir = confined_child(&self.inner.evaluations_dir, &id)?;
         fs::create_dir(&bundle_dir)?;
         let snapshot = bundle_dir.join("source");
-        copy_tree(&source.workspace, &snapshot)?;
+        write_snapshot_tree(&snapshot, &source_files)?;
         let source_revision = format!("revision-{}", run_id());
         write_json_atomic(
             &bundle_dir.join("source.json"),
             &json!({
                 "workspaceId": request.source_workspace_id,
                 "revision": source_revision,
-                "assembly": lock(&source.assembly).clone(),
+                "assembly": source_assembly,
             }),
         )?;
         let summary = EvaluationSummary {
@@ -1405,6 +1397,54 @@ impl RunController {
             }
         });
         Ok(summary)
+    }
+
+    fn validate_evaluation_request(
+        &self,
+        request: &StartEvaluationRequest,
+    ) -> Result<(BTreeMap<String, Vec<u8>>, AssemblySnapshot), RunError> {
+        if request.harness_ids.len() != 2 {
+            return Err(RunError::InvalidRequest(
+                "an evaluation requires exactly two harness ids".to_owned(),
+            ));
+        }
+        let unique = request.harness_ids.iter().collect::<HashSet<_>>();
+        if unique.len() != request.harness_ids.len() {
+            return Err(RunError::InvalidRequest(
+                "evaluation harness ids must be unique".to_owned(),
+            ));
+        }
+        for harness_id in &request.harness_ids {
+            let harness = self.inner.harnesses.get(harness_id).ok_or_else(|| {
+                RunError::InvalidRequest(format!("unknown harness: {harness_id}"))
+            })?;
+            if !harness.models.contains_key(&request.model_profile_id) {
+                return Err(RunError::InvalidRequest(format!(
+                    "model profile {} is unavailable for harness {harness_id}",
+                    request.model_profile_id
+                )));
+            }
+            self.ensure_harness_model_access_ready(harness)?;
+        }
+        let source = self.state(&request.source_workspace_id)?;
+        let source_summary = lock(&source.summary).clone();
+        if source_summary.scenario_id != request.scenario_id {
+            return Err(RunError::InvalidRequest(
+                "source workspace does not belong to the requested scenario".to_owned(),
+            ));
+        }
+        if source_summary.status != RunStatus::Exploring {
+            return Err(RunError::InvalidRequest(
+                "only an active Explore workspace can be snapshotted".to_owned(),
+            ));
+        }
+
+        // Validate and capture the full source before creating a bundle. Writing this exact
+        // in-memory snapshot also prevents Explore edits from racing the evaluation copy.
+        Ok((
+            snapshot_tree(&source.workspace)?,
+            lock(&source.assembly).clone(),
+        ))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1620,13 +1660,19 @@ impl RunController {
                 }));
             }
         }
+        let artifact_comparison = match outputs.as_slice() {
+            [Some(left), Some(right)] if left == right => "same",
+            [Some(_), Some(_)] => "different",
+            _ => "missing",
+        };
         Ok(json!({
             "version": 2,
             "sourceRevision": summary.source_revision,
             "modelProfileId": summary.model_profile_id,
             "arms": arms,
-            "outputsMatch": outputs.len() == 2 && outputs[0] == outputs[1],
-            "outputDiff": if outputs.len() == 2 && outputs[0] != outputs[1] {
+            "outputsMatch": artifact_comparison == "same",
+            "artifactComparison": artifact_comparison,
+            "outputDiff": if artifact_comparison == "different" {
                 json!({ "left": outputs[0], "right": outputs[1] })
             } else {
                 JsonValue::Null
@@ -1699,6 +1745,32 @@ impl RunController {
                 .push((OsString::from(name), OsString::from(value)));
         }
         Ok(launch)
+    }
+
+    fn ensure_harness_model_access_ready(&self, harness: &HarnessProfile) -> Result<(), RunError> {
+        let Some(provider_id) = self.inner.harness_model_access.get(&harness.id) else {
+            return Ok(());
+        };
+        let provider = self
+            .inner
+            .model_access_providers
+            .get(provider_id)
+            .ok_or_else(|| {
+                RunError::InvalidRequest(format!(
+                    "unknown model-access provider for harness {}: {provider_id}",
+                    harness.id
+                ))
+            })?;
+        let resolution = resolve_model_access(provider, false)?;
+        if resolution.status == ModelAccessStatus::Ready {
+            Ok(())
+        } else {
+            Err(RunError::ModelAccessUnavailable(
+                resolution
+                    .message
+                    .unwrap_or_else(|| provider.setup_hint.clone()),
+            ))
+        }
     }
 
     fn state(&self, id: &str) -> Result<Arc<RunState>, RunError> {
@@ -1809,6 +1881,14 @@ fn resolve_model_access(
     provider: &ModelAccessProvider,
     include_environment: bool,
 ) -> Result<ModelAccessResolution, RunError> {
+    resolve_model_access_with_timeout(provider, include_environment, MODEL_ACCESS_TIMEOUT)
+}
+
+fn resolve_model_access_with_timeout(
+    provider: &ModelAccessProvider,
+    include_environment: bool,
+    timeout: Duration,
+) -> Result<ModelAccessResolution, RunError> {
     let allowed = provider
         .environment_names
         .iter()
@@ -1833,6 +1913,33 @@ fn resolve_model_access(
         });
     };
 
+    let output = run_model_access_resolver(provider, resolver, include_environment, timeout)?;
+    let mut resolution: ModelAccessResolution = serde_json::from_slice(&output).map_err(|_| {
+        RunError::ModelAccessUnavailable(format!(
+            "{} returned an invalid readiness response",
+            provider.display_name
+        ))
+    })?;
+    resolution
+        .environment
+        .retain(|name, value| allowed.contains(name.as_str()) && !value.is_empty());
+    if !include_environment {
+        resolution.environment.clear();
+    } else if resolution.status == ModelAccessStatus::Ready && resolution.environment.is_empty() {
+        return Err(RunError::ModelAccessUnavailable(format!(
+            "{} reported ready without launch credentials",
+            provider.display_name
+        )));
+    }
+    Ok(resolution)
+}
+
+fn run_model_access_resolver(
+    provider: &ModelAccessProvider,
+    resolver: &DriverLaunch,
+    include_environment: bool,
+    timeout: Duration,
+) -> Result<Vec<u8>, RunError> {
     let mut command = Command::new(&resolver.executable);
     command.args(&resolver.args).arg(if include_environment {
         "resolve"
@@ -1848,38 +1955,85 @@ fn resolve_model_access(
     command
         .envs(resolver.env.iter().cloned())
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let output = command.output().map_err(|error| {
+    let mut command = CommandWrap::from(command);
+    #[cfg(unix)]
+    command.wrap(ProcessGroup::leader());
+    #[cfg(windows)]
+    command.wrap(JobObject);
+    let mut child = command.spawn().map_err(|error| {
         RunError::ModelAccessUnavailable(format!(
             "could not check {}: {error}",
             provider.display_name
         ))
     })?;
-    if !output.status.success() || output.stdout.len() > 64 * 1024 {
+    let stdout = child.stdout().take().ok_or_else(|| {
+        RunError::ModelAccessUnavailable(format!(
+            "{} could not capture model-access readiness",
+            provider.display_name
+        ))
+    })?;
+    let (output_sender, output_receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stdout.take(64 * 1024 + 1).read_to_end(&mut output);
+        let _ = output_sender.send(result.map(|_| output));
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                terminate_resolver_process(child.as_mut());
+                return Err(model_access_timeout(provider, timeout));
+            }
+            Err(error) => {
+                terminate_resolver_process(child.as_mut());
+                return Err(RunError::ModelAccessUnavailable(format!(
+                    "could not check {}: {error}",
+                    provider.display_name
+                )));
+            }
+        }
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let output = match output_receiver.recv_timeout(remaining) {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            terminate_resolver_process(child.as_mut());
+            return Err(RunError::ModelAccessUnavailable(format!(
+                "could not read {} readiness: {error}",
+                provider.display_name
+            )));
+        }
+        Err(_) => {
+            terminate_resolver_process(child.as_mut());
+            return Err(model_access_timeout(provider, timeout));
+        }
+    };
+    if !status.success() || output.len() > 64 * 1024 {
         return Err(RunError::ModelAccessUnavailable(format!(
             "{} could not establish model access. {}",
             provider.display_name, provider.setup_hint
         )));
     }
-    let mut resolution: ModelAccessResolution =
-        serde_json::from_slice(&output.stdout).map_err(|_| {
-            RunError::ModelAccessUnavailable(format!(
-                "{} returned an invalid readiness response",
-                provider.display_name
-            ))
-        })?;
-    resolution
-        .environment
-        .retain(|name, value| allowed.contains(name.as_str()) && !value.is_empty());
-    if !include_environment {
-        resolution.environment.clear();
-    } else if resolution.status == ModelAccessStatus::Ready && resolution.environment.is_empty() {
-        return Err(RunError::ModelAccessUnavailable(format!(
-            "{} reported ready without launch credentials",
-            provider.display_name
-        )));
-    }
-    Ok(resolution)
+    Ok(output)
+}
+
+fn model_access_timeout(provider: &ModelAccessProvider, timeout: Duration) -> RunError {
+    RunError::ModelAccessUnavailable(format!(
+        "{} model-access check timed out after {} ms. {}",
+        provider.display_name,
+        timeout.as_millis(),
+        provider.setup_hint
+    ))
+}
+
+fn terminate_resolver_process(child: &mut dyn ChildWrapper) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn resolver_environment(
@@ -4101,6 +4255,21 @@ fn persist_initial_snapshot(
     Ok(())
 }
 
+fn write_snapshot_tree(
+    destination: &Path,
+    snapshot: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), RunError> {
+    fs::create_dir(destination)?;
+    for (relative, contents) in snapshot {
+        let path = confined_child(destination, relative)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, contents)?;
+    }
+    Ok(())
+}
+
 fn remove_evidence_entry(path: &Path) -> Result<(), RunError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -5862,6 +6031,81 @@ totalScore = 11
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn lagged_evaluation_subscriptions_replay_the_missing_durable_suffix() {
+        use futures_util::StreamExt;
+
+        let root = temporary_root("lagged-evaluation-subscribe");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let harness = |id: &str| HarnessProfile {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            launch: DriverLaunch::new("/bin/false"),
+            models: BTreeMap::from([("haiku".to_owned(), format!("{id}/haiku"))]),
+        };
+        let controller = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![harness("v0"), harness("eve")],
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let evaluation = controller
+            .start_evaluation(StartEvaluationRequest {
+                scenario_id: "catalog".to_owned(),
+                model_profile_id: "haiku".to_owned(),
+                source_workspace_id: explore.id,
+                harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
+            })
+            .unwrap();
+        loop {
+            if controller
+                .get_evaluation(&evaluation.id)
+                .unwrap()
+                .summary
+                .status
+                .is_finished()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (history, receiver) = controller.subscribe_evaluation(&evaluation.id).unwrap();
+        let state = controller.evaluation_state(&evaluation.id).unwrap();
+        for index in 0..300 {
+            record_evaluation_event(&state, "test.lag", json!({ "index": index })).unwrap();
+        }
+        let expected = lock(&state.events).len();
+        let events =
+            crate::evaluation_event_stream(controller.clone(), evaluation.id, history, receiver)
+                .take(expected)
+                .collect::<Vec<_>>()
+                .await;
+        assert_eq!(events.len(), expected);
+        assert!(
+            events
+                .iter()
+                .enumerate()
+                .all(|(index, event)| event.sequence == index as u64 + 1)
+        );
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn harness_registry_rejects_duplicates_and_unknown_model_profiles() {
         let root = temporary_root("harness-registry");
@@ -6134,6 +6378,107 @@ fi
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn evaluation_preflight_probes_without_resolving_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("model-access-preflight");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let mode_log = root.join("resolver-modes.log");
+        let resolver_path = root.join("resolver.sh");
+        fs::write(
+            &resolver_path,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$1" >> '{}'
+if [ "$1" = "resolve" ]; then
+  printf '%s\n' '{{"status":"ready","source":"test","environment":{{"TOKEN":"secret-model-token"}}}}'
+else
+  printf '%s\n' '{{"status":"ready","source":"test"}}'
+fi
+"#,
+                mode_log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&resolver_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let harness = |id: &str| HarnessProfile {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            launch: DriverLaunch::new("/bin/false"),
+            models: BTreeMap::from([("haiku".to_owned(), format!("{id}/haiku"))]),
+        };
+        let provider = ModelAccessProvider {
+            id: "gateway".to_owned(),
+            display_name: "Gateway".to_owned(),
+            resolver: Some(DriverLaunch::new(resolver_path)),
+            environment_names: vec!["TOKEN".to_owned()],
+            setup_hint: "Connect the gateway".to_owned(),
+        };
+        let controller = RunController::new_with_harnesses_and_model_access(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![harness("v0"), harness("eve")],
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+            vec![provider],
+            BTreeMap::from([
+                ("v0".to_owned(), "gateway".to_owned()),
+                ("eve".to_owned(), "gateway".to_owned()),
+            ]),
+        )
+        .unwrap();
+
+        let error = controller
+            .start_evaluation(StartEvaluationRequest {
+                scenario_id: "catalog".to_owned(),
+                model_profile_id: "haiku".to_owned(),
+                source_workspace_id: "missing-workspace".to_owned(),
+                harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
+            })
+            .unwrap_err();
+        assert!(matches!(error, RunError::UnknownRun(_)));
+        let modes = fs::read_to_string(mode_log).unwrap();
+        assert_eq!(modes.lines().collect::<Vec<_>>(), ["probe", "probe"]);
+        assert!(controller.list_evaluations().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_access_resolvers_are_bounded_by_a_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("model-access-timeout");
+        let resolver_path = root.join("resolver.sh");
+        fs::write(&resolver_path, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&resolver_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let provider = ModelAccessProvider {
+            id: "gateway".to_owned(),
+            display_name: "Gateway".to_owned(),
+            resolver: Some(DriverLaunch::new(resolver_path)),
+            environment_names: vec!["TOKEN".to_owned()],
+            setup_hint: "Connect the gateway".to_owned(),
+        };
+
+        let started = Instant::now();
+        let error = resolve_model_access_with_timeout(&provider, false, Duration::from_millis(50))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RunError::ModelAccessUnavailable(message) if message.contains("timed out")
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn evaluation_snapshots_once_and_runs_second_arm_after_first_failure() {
         let root = temporary_root("evaluation");
@@ -6203,7 +6548,9 @@ fi
             assert!(workspace.join("before.txt").is_file());
             assert!(!workspace.join("after.txt").exists());
         }
-        assert!(detail.comparison.is_some());
+        let comparison = detail.comparison.as_ref().unwrap();
+        assert_eq!(comparison["outputsMatch"], false);
+        assert_eq!(comparison["artifactComparison"], "missing");
         drop(controller);
         let reopened = RunController::new_with_harnesses(
             RunControllerConfig {
@@ -6219,6 +6566,119 @@ fi
         assert_eq!(replay.summary.status, EvaluationStatus::Failed);
         assert_eq!(replay.comparison, detail.comparison);
         drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn evaluation_rejects_oversized_sources_before_creating_a_bundle() {
+        let root = temporary_root("oversized-evaluation-source");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let harness = |id: &str| HarnessProfile {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            launch: DriverLaunch::new("/bin/false"),
+            models: BTreeMap::from([("haiku".to_owned(), format!("{id}/haiku"))]),
+        };
+        let controller = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data.clone(),
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![harness("v0"), harness("eve")],
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        fs::File::create(
+            controller
+                .workspace(&explore.id)
+                .unwrap()
+                .join("oversized.bin"),
+        )
+        .unwrap()
+        .set_len(MAX_EVIDENCE_FILE_BYTES + 1)
+        .unwrap();
+
+        assert!(matches!(
+            controller.start_evaluation(StartEvaluationRequest {
+                scenario_id: "catalog".to_owned(),
+                model_profile_id: "haiku".to_owned(),
+                source_workspace_id: explore.id,
+                harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
+            }),
+            Err(RunError::EvidenceLimit(_))
+        ));
+        assert!(controller.list_evaluations().is_empty());
+        assert_eq!(fs::read_dir(data.join("evaluations")).unwrap().count(), 0);
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn evaluation_storage_is_isolated_by_the_selected_data_root() {
+        let root = temporary_root("evaluation-data-root-isolation");
+        let scenarios = root.join("scenarios");
+        let first_data = root.join("first-runs");
+        let second_data = root.join("second-runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&first_data).unwrap();
+        fs::create_dir(&second_data).unwrap();
+        write_scenario(&scenarios);
+        let harness = |id: &str| HarnessProfile {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            launch: DriverLaunch::new("/bin/false"),
+            models: BTreeMap::from([("haiku".to_owned(), format!("{id}/haiku"))]),
+        };
+        let controller = |data_dir: PathBuf| {
+            RunController::new_with_harnesses(
+                RunControllerConfig {
+                    scenarios_dir: scenarios.clone(),
+                    data_dir,
+                    driver: DriverLaunch::new("/bin/false"),
+                },
+                vec![harness("v0"), harness("eve")],
+                BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+            )
+            .unwrap()
+        };
+        let first = controller(first_data.clone());
+        let explore = first
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        first
+            .start_evaluation(StartEvaluationRequest {
+                scenario_id: "catalog".to_owned(),
+                model_profile_id: "haiku".to_owned(),
+                source_workspace_id: explore.id,
+                harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
+            })
+            .unwrap();
+        let second = controller(second_data.clone());
+
+        assert_eq!(first.list_evaluations().len(), 1);
+        assert!(second.list_evaluations().is_empty());
+        assert!(first_data.join("evaluations").is_dir());
+        assert!(second_data.join("evaluations").is_dir());
+        assert!(!root.join("evaluations").exists());
+
+        drop(first);
+        drop(second);
+        tokio::time::sleep(Duration::from_millis(50)).await;
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6285,7 +6745,7 @@ fi
         let root = temporary_root("malformed-evaluation-replay");
         let scenarios = root.join("scenarios");
         let data = root.join("runs");
-        let evaluations = root.join("evaluations");
+        let evaluations = data.join("evaluations");
         fs::create_dir(&scenarios).unwrap();
         fs::create_dir(&data).unwrap();
         fs::create_dir(&evaluations).unwrap();
@@ -6354,7 +6814,7 @@ fi
         let root = temporary_root("malformed-evaluation-metadata");
         let scenarios = root.join("scenarios");
         let data = root.join("runs");
-        let evaluations = root.join("evaluations");
+        let evaluations = data.join("evaluations");
         fs::create_dir(&scenarios).unwrap();
         fs::create_dir(&data).unwrap();
         fs::create_dir(&evaluations).unwrap();

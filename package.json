@@ -5,8 +5,8 @@
   "scripts": {
     "web:build": "pnpm --filter @agent-lab/web build",
     "web:check": "pnpm --filter @agent-lab/web check",
-    "web:demo": "pnpm web:build && cargo build -p agent-lab-nushell-mcp -p agent-lab-driver-protocol -p agent-lab-web --bins && cargo run -p agent-lab-web",
-    "web:test": "pnpm web:build && pnpm web:test:e2e",
+    "web:demo": "pnpm web:build && cargo build -p agent-lab-nushell-mcp -p agent-lab-driver-protocol -p agent-lab-web --bins && cargo run -p agent-lab-web -- --harness-config apps/web/tests/fixtures/harnesses.toml",
+    "web:test": "node --test scripts/resolve-model-access.test.mjs && pnpm web:build && pnpm web:test:e2e",
     "web:test:e2e": "pnpm --filter @agent-lab/web test:e2e"
   },
   "dependencies": {

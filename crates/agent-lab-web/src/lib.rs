@@ -24,7 +24,6 @@ use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, P
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -476,17 +475,29 @@ async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Respo
 }
 
 async fn list_harnesses(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(runs) = authorized_runs(&state, &headers) else {
+    if !run_request_is_authorized(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
-    };
-    Json(runs.harnesses()).into_response()
+    }
+    Json(
+        state
+            .runs
+            .as_ref()
+            .map_or_else(Vec::new, RunController::harnesses),
+    )
+    .into_response()
 }
 
 async fn list_model_profiles(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(runs) = authorized_runs(&state, &headers) else {
+    if !run_request_is_authorized(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
-    };
-    Json(runs.model_profiles()).into_response()
+    }
+    Json(
+        state
+            .runs
+            .as_ref()
+            .map_or_else(Vec::new, RunController::model_profiles),
+    )
+    .into_response()
 }
 
 async fn list_scenarios(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -675,10 +686,16 @@ fn event_is_after_history(event: &RunEvent, live_after_sequence: u64) -> bool {
 }
 
 async fn list_evaluations(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(runs) = authorized_runs(&state, &headers) else {
+    if !run_request_is_authorized(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
-    };
-    Json(runs.list_evaluations()).into_response()
+    }
+    Json(
+        state
+            .runs
+            .as_ref()
+            .map_or_else(Vec::new, RunController::list_evaluations),
+    )
+    .into_response()
 }
 
 async fn get_workbench(
@@ -754,7 +771,13 @@ async fn workbench_evaluation_events(
     let Ok((history, receiver)) = runs.subscribe_evaluation(&detail.summary.id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    evaluation_event_response(history, receiver, state.config.shutdown)
+    evaluation_event_response(
+        runs,
+        detail.summary.id,
+        history,
+        receiver,
+        state.config.shutdown,
+    )
 }
 
 async fn cancel_workbench_evaluation(
@@ -830,18 +853,17 @@ async fn evaluation_events(
     let Ok((history, receiver)) = runs.subscribe_evaluation(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    evaluation_event_response(history, receiver, state.config.shutdown)
+    evaluation_event_response(runs, id, history, receiver, state.config.shutdown)
 }
 
 fn evaluation_event_response(
+    runs: RunController,
+    id: String,
     history: Vec<RunEvent>,
     receiver: tokio::sync::broadcast::Receiver<RunEvent>,
     shutdown: CancellationToken,
 ) -> Response {
-    let history = futures_util::stream::iter(history);
-    let live = BroadcastStream::new(receiver).filter_map(|event| async move { event.ok() });
-    let stream = history
-        .chain(live)
+    let stream = evaluation_event_stream(runs, id, history, receiver)
         .map(|event| {
             Event::default()
                 .id(event.sequence.to_string())
@@ -852,6 +874,38 @@ fn evaluation_event_response(
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
+}
+
+fn evaluation_event_stream(
+    runs: RunController,
+    id: String,
+    history: Vec<RunEvent>,
+    receiver: tokio::sync::broadcast::Receiver<RunEvent>,
+) -> impl futures_util::Stream<Item = RunEvent> {
+    futures_util::stream::unfold(
+        (VecDeque::from(history), receiver, runs, id, 0_u64),
+        |(mut pending, mut receiver, runs, id, mut last_sequence)| async move {
+            loop {
+                if let Some(event) = pending.pop_front() {
+                    if event_is_after_history(&event, last_sequence) {
+                        last_sequence = event.sequence;
+                        return Some((event, (pending, receiver, runs, id, last_sequence)));
+                    }
+                    continue;
+                }
+                match receiver.recv().await {
+                    Ok(event) => pending.push_back(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let Ok(events) = runs.evaluation_events_after(&id, last_sequence) else {
+                            return None;
+                        };
+                        pending.extend(events);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
 }
 
 fn authorized_workbench(
@@ -1388,7 +1442,25 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(
-            list_runs(State(state), headers).await.status(),
+            list_runs(State(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            list_harnesses(State(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            list_model_profiles(State(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            list_evaluations(State(state), headers).await.status(),
             StatusCode::OK
         );
     }

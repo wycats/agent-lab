@@ -1052,7 +1052,12 @@
               <div class="paired-result" data-match={selectedEvaluation.comparison?.outputsMatch ?? false}>
                 <span class="label">Result</span>
                 {#if selectedEvaluation.comparison}
-                  <strong>{selectedEvaluation.comparison.outputsMatch ? 'Same evaluated artifact' : 'Artifacts differ'}</strong>
+                  <strong>{selectedEvaluation.comparison.artifactComparison === 'same' ||
+                  (!selectedEvaluation.comparison.artifactComparison && selectedEvaluation.comparison.outputsMatch)
+                    ? 'Same evaluated artifact'
+                    : selectedEvaluation.comparison.artifactComparison === 'different'
+                      ? 'Artifacts differ'
+                      : 'Artifact unavailable'}</strong>
                   <p>Both scores remain scenario-specific. Timing, turns, and usage are supporting evidence rather than a universal ranking.</p>
                 {:else}
                   <strong>Comparison in progress</strong>

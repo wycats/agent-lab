@@ -9,6 +9,10 @@ use reqwest::blocking::Client;
 use serde_json::{Map, Value as JsonValue, json};
 use thiserror::Error;
 
+// A workbench snapshot can probe the single-run harness and a two-harness comparison, with each
+// distinct model-access provider bounded to 10 seconds by the controller.
+const WORKBENCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
 #[derive(Debug, Error)]
 pub enum WorkbenchError {
     #[error("workbench request failed: {0}")]
@@ -70,7 +74,7 @@ impl WorkbenchBridge {
                         .client
                         .request(request.method, format!("{}{}", worker.origin, request.path))
                         .bearer_auth(&worker.token)
-                        .timeout(Duration::from_secs(10));
+                        .timeout(WORKBENCH_REQUEST_TIMEOUT);
                     if let Some(body) = request.body {
                         builder = builder.json(&body);
                     }
@@ -347,6 +351,11 @@ fn raw_envelope(evaluation_id: &str, event: &JsonValue) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_requests_outlive_the_controller_model_access_preflight() {
+        assert!(WORKBENCH_REQUEST_TIMEOUT > Duration::from_secs(30));
+    }
 
     #[test]
     fn raw_arm_events_use_the_stable_source_labelled_envelope() {

@@ -1,4 +1,5 @@
 import { getVercelOidcToken } from '@vercel/oidc';
+import { existsSync, readFileSync } from 'node:fs';
 
 const OIDC_EXPIRATION_BUFFER_MS = 5 * 60 * 1000;
 const mode = process.argv[2] ?? 'probe';
@@ -32,6 +33,23 @@ for (const [name, source] of ambientCredentials) {
   }
 }
 
+if (mode === 'probe') {
+  respond(
+    linkedVercelProject()
+      ? {
+          status: 'ready',
+          source: 'vercel-project-link',
+          expiresAtMs: null
+        }
+      : {
+          status: 'needs-setup',
+          source: null,
+          expiresAtMs: null,
+          message: 'Link Agent Lab to a Vercel project or provide an AI Gateway credential.'
+        }
+  );
+}
+
 try {
   const token = (await getVercelOidcToken({ expirationBufferMs: OIDC_EXPIRATION_BUFFER_MS })).trim();
   if (!token) throw new Error('empty token');
@@ -48,6 +66,17 @@ try {
     expiresAtMs: null,
     message: 'Link Agent Lab to a Vercel project or provide an AI Gateway credential.',
   });
+}
+
+function linkedVercelProject() {
+  const projectPath = '.vercel/project.json';
+  if (!existsSync(projectPath)) return false;
+  try {
+    const project = JSON.parse(readFileSync(projectPath, 'utf8'));
+    return typeof project.projectId === 'string' && typeof project.orgId === 'string';
+  } catch {
+    return false;
+  }
 }
 
 function jwtExpiry(token) {

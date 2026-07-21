@@ -1172,7 +1172,7 @@ impl RunController {
         id: &str,
         request: &StartPreparedRunRequest,
     ) -> Result<RunSummary, RunError> {
-        let (harness_id, model_profile_id, model_id, driver) =
+        let (harness_id, model_profile_id, model_id, selected_driver) =
             self.resolve_harness_selection(request)?;
         validate_model_id(&model_id)?;
         let state = self.state(id)?;
@@ -1217,9 +1217,33 @@ impl RunController {
             )
         })();
         if let Err(error) = persist_start {
-            rollback_prepared_start(&state, previous_summary, previous_assembly);
+            rollback_prepared_start(
+                &state,
+                previous_summary,
+                previous_assembly,
+                "start persistence failed",
+            );
             return Err(error);
         }
+        let driver = if let Some(harness_id) = &harness_id {
+            let harness = self.inner.harnesses.get(harness_id).ok_or_else(|| {
+                RunError::InvalidRequest(format!("unknown harness: {harness_id}"))
+            })?;
+            match self.resolve_harness_driver(harness) {
+                Ok(driver) => driver,
+                Err(error) => {
+                    rollback_prepared_start(
+                        &state,
+                        previous_summary,
+                        previous_assembly,
+                        "model access was unavailable at launch",
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            selected_driver
+        };
         let summary = lock(&state.summary).clone();
         tokio::task::spawn_blocking(move || {
             execute_run(&state, &scenario, driver, &capabilities);
@@ -1330,13 +1354,13 @@ impl RunController {
         &self,
         request: StartEvaluationRequest,
     ) -> Result<EvaluationSummary, RunError> {
-        let (source_files, source_assembly) = self.validate_evaluation_request(&request)?;
+        let (source_snapshot, source_assembly) = self.validate_evaluation_request(&request)?;
 
         let id = format!("evaluation-{}", run_id());
         let bundle_dir = confined_child(&self.inner.evaluations_dir, &id)?;
         fs::create_dir(&bundle_dir)?;
         let snapshot = bundle_dir.join("source");
-        write_snapshot_tree(&snapshot, &source_files)?;
+        write_captured_tree(&snapshot, &source_snapshot)?;
         let source_revision = format!("revision-{}", run_id());
         write_json_atomic(
             &bundle_dir.join("source.json"),
@@ -1402,7 +1426,7 @@ impl RunController {
     fn validate_evaluation_request(
         &self,
         request: &StartEvaluationRequest,
-    ) -> Result<(BTreeMap<String, Vec<u8>>, AssemblySnapshot), RunError> {
+    ) -> Result<(CapturedTree, AssemblySnapshot), RunError> {
         if request.harness_ids.len() != 2 {
             return Err(RunError::InvalidRequest(
                 "an evaluation requires exactly two harness ids".to_owned(),
@@ -1442,7 +1466,7 @@ impl RunController {
         // Validate and capture the full source before creating a bundle. Writing this exact
         // in-memory snapshot also prevents Explore edits from racing the evaluation copy.
         Ok((
-            snapshot_tree(&source.workspace)?,
+            capture_tree(&source.workspace)?,
             lock(&source.assembly).clone(),
         ))
     }
@@ -1461,13 +1485,29 @@ impl RunController {
                 set_evaluation_arm(&state, index, None, "cancelled")?;
                 continue;
             }
-            let prepared = self
+            let prepared = match self
                 .prepare_snapshot_run(
                     &summary.scenario_id,
                     &state.snapshot,
                     &summary.source_revision,
                 )
-                .await?;
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    set_evaluation_arm(&state, index, None, "failed")?;
+                    record_evaluation_event(
+                        &state,
+                        "evaluation.arm.finished",
+                        json!({
+                            "harnessId": harness_id,
+                            "status": "failed",
+                            "error": error.to_string(),
+                        }),
+                    )?;
+                    continue;
+                }
+            };
             set_evaluation_arm(&state, index, Some(prepared.id.clone()), "starting")?;
             record_evaluation_event(
                 &state,
@@ -1477,14 +1517,36 @@ impl RunController {
                     "runId": prepared.id,
                 }),
             )?;
-            self.start_prepared(
+            if let Err(error) = self.start_prepared(
                 &prepared.id,
                 &StartPreparedRunRequest {
                     model_id: None,
                     harness_id: Some(harness_id.clone()),
                     model_profile_id: Some(summary.model_profile_id.clone()),
                 },
-            )?;
+            ) {
+                let message = error.to_string();
+                if let Ok(run_state) = self.state(&prepared.id) {
+                    let _ = finish_run(
+                        &run_state,
+                        RunStatus::Failed,
+                        Some(&message),
+                        &json!({ "passed": false, "startError": message.clone() }),
+                    );
+                }
+                set_evaluation_arm(&state, index, Some(prepared.id.clone()), "failed")?;
+                record_evaluation_event(
+                    &state,
+                    "evaluation.arm.finished",
+                    json!({
+                        "harnessId": harness_id,
+                        "runId": prepared.id,
+                        "status": "failed",
+                        "error": message,
+                    }),
+                )?;
+                continue;
+            }
             let mut projected_steps = 0;
             let mut projected_events = 0;
             loop {
@@ -1698,7 +1760,7 @@ impl RunController {
                     Some(harness_id.clone()),
                     Some(profile_id.clone()),
                     concrete_model.clone(),
-                    self.resolve_harness_driver(harness)?,
+                    harness.launch.clone(),
                 ))
             }
             (None, None) => {
@@ -1792,6 +1854,7 @@ fn rollback_prepared_start(
     state: &RunState,
     previous_summary: RunSummary,
     previous_assembly: AssemblySnapshot,
+    reason: &str,
 ) {
     *lock(&state.summary) = previous_summary;
     *lock(&state.assembly) = previous_assembly;
@@ -1800,7 +1863,7 @@ fn rollback_prepared_start(
     let _ = record_event(
         state,
         "run.status",
-        json!({ "status": RunStatus::Exploring, "reason": "start persistence failed" }),
+        json!({ "status": RunStatus::Exploring, "reason": reason }),
     );
 }
 
@@ -4255,18 +4318,36 @@ fn persist_initial_snapshot(
     Ok(())
 }
 
-fn write_snapshot_tree(
-    destination: &Path,
-    snapshot: &BTreeMap<String, Vec<u8>>,
-) -> Result<(), RunError> {
+#[derive(Debug)]
+struct CapturedFile {
+    contents: Vec<u8>,
+    permissions: fs::Permissions,
+}
+
+#[derive(Debug)]
+struct CapturedTree {
+    root_permissions: fs::Permissions,
+    directories: BTreeMap<String, fs::Permissions>,
+    files: BTreeMap<String, CapturedFile>,
+}
+
+fn write_captured_tree(destination: &Path, snapshot: &CapturedTree) -> Result<(), RunError> {
     fs::create_dir(destination)?;
-    for (relative, contents) in snapshot {
+    for relative in snapshot.directories.keys() {
+        fs::create_dir_all(confined_child(destination, relative)?)?;
+    }
+    for (relative, file) in &snapshot.files {
         let path = confined_child(destination, relative)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, contents)?;
+        fs::write(&path, &file.contents)?;
+        fs::set_permissions(path, file.permissions.clone())?;
     }
+    for (relative, permissions) in snapshot.directories.iter().rev() {
+        fs::set_permissions(confined_child(destination, relative)?, permissions.clone())?;
+    }
+    fs::set_permissions(destination, snapshot.root_permissions.clone())?;
     Ok(())
 }
 
@@ -4334,10 +4415,19 @@ fn redact_evidence_bytes(bytes: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, RunError> {
+    Ok(capture_tree(root)?
+        .files
+        .into_iter()
+        .map(|(path, file)| (path, file.contents))
+        .collect())
+}
+
+fn capture_tree(root: &Path) -> Result<CapturedTree, RunError> {
     fn visit(
         root: &Path,
         directory: &Path,
-        files: &mut BTreeMap<String, Vec<u8>>,
+        directories: &mut BTreeMap<String, fs::Permissions>,
+        files: &mut BTreeMap<String, CapturedFile>,
         retained_bytes: &mut u64,
     ) -> Result<(), RunError> {
         for entry in fs::read_dir(directory)? {
@@ -4347,16 +4437,22 @@ fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, RunError> {
                 return Err(RunError::PathEscape(entry.path()));
             }
             if file_type.is_dir() {
-                visit(root, &entry.path(), files, retained_bytes)?;
+                let entry_path = entry.path();
+                let relative = relative_evidence_path(root, &entry_path)?;
+                directories.insert(relative, entry.metadata()?.permissions());
+                visit(root, &entry_path, directories, files, retained_bytes)?;
             } else if file_type.is_file() {
                 let entry_path = entry.path();
-                let relative = entry_path
-                    .strip_prefix(root)
-                    .map_err(|_| RunError::PathEscape(entry_path.clone()))?
-                    .to_str()
-                    .ok_or_else(|| RunError::UnsupportedWorkspaceEntry(entry_path.clone()))?
-                    .to_owned();
-                files.insert(relative, read_evidence_file(&entry.path(), retained_bytes)?);
+                let relative = relative_evidence_path(root, &entry_path)?;
+                let permissions = entry.metadata()?.permissions();
+                let contents = read_evidence_file(&entry_path, retained_bytes)?;
+                files.insert(
+                    relative,
+                    CapturedFile {
+                        contents,
+                        permissions,
+                    },
+                );
             } else {
                 return Err(RunError::UnsupportedWorkspaceEntry(entry.path()));
             }
@@ -4364,9 +4460,26 @@ fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, RunError> {
         Ok(())
     }
 
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(RunError::PathEscape(root.to_path_buf()));
+    }
+    let mut directories = BTreeMap::new();
     let mut files = BTreeMap::new();
-    visit(root, root, &mut files, &mut 0)?;
-    Ok(files)
+    visit(root, root, &mut directories, &mut files, &mut 0)?;
+    Ok(CapturedTree {
+        root_permissions: metadata.permissions(),
+        directories,
+        files,
+    })
+}
+
+fn relative_evidence_path(root: &Path, path: &Path) -> Result<String, RunError> {
+    path.strip_prefix(root)
+        .map_err(|_| RunError::PathEscape(path.to_path_buf()))?
+        .to_str()
+        .ok_or_else(|| RunError::UnsupportedWorkspaceEntry(path.to_path_buf()))
+        .map(str::to_owned)
 }
 
 fn validate_evidence_tree(root: &Path) -> Result<(), RunError> {
@@ -4465,6 +4578,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), RunError> {
             return Err(RunError::UnsupportedWorkspaceEntry(entry.path()));
         }
     }
+    fs::set_permissions(destination, metadata.permissions())?;
     Ok(())
 }
 
@@ -6452,6 +6566,90 @@ fi
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_prepared_runs_do_not_resolve_launch_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("model-access-invalid-run");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let mode_log = root.join("resolver-modes.log");
+        let resolver_path = root.join("resolver.sh");
+        fs::write(
+            &resolver_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\nprintf '%s\\n' '{{\"status\":\"ready\",\"source\":\"test\",\"environment\":{{\"TOKEN\":\"secret\"}}}}'\n",
+                mode_log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&resolver_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let harness = HarnessProfile {
+            id: "v0".to_owned(),
+            display_name: "v0".to_owned(),
+            launch: DriverLaunch::new("/bin/false"),
+            models: BTreeMap::from([("haiku".to_owned(), "v0/haiku".to_owned())]),
+        };
+        let controller = RunController::new_with_harnesses_and_model_access(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![harness],
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+            vec![ModelAccessProvider {
+                id: "gateway".to_owned(),
+                display_name: "Gateway".to_owned(),
+                resolver: Some(DriverLaunch::new(resolver_path)),
+                environment_names: vec!["TOKEN".to_owned()],
+                setup_hint: "Connect the gateway".to_owned(),
+            }],
+            BTreeMap::from([("v0".to_owned(), "gateway".to_owned())]),
+        )
+        .unwrap();
+
+        let error = controller
+            .start_prepared(
+                "missing-run",
+                &StartPreparedRunRequest {
+                    model_id: None,
+                    harness_id: Some("v0".to_owned()),
+                    model_profile_id: Some("haiku".to_owned()),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, RunError::UnknownRun(_)));
+        assert!(!mode_log.exists());
+
+        let prepared = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        controller.cancel(&prepared.id).unwrap();
+        let error = controller
+            .start_prepared(
+                &prepared.id,
+                &StartPreparedRunRequest {
+                    model_id: None,
+                    harness_id: Some("v0".to_owned()),
+                    model_profile_id: Some("haiku".to_owned()),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, RunError::RunUnavailable(_)));
+        assert!(!mode_log.exists());
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn model_access_resolvers_are_bounded_by_a_timeout() {
         use std::os::unix::fs::PermissionsExt;
@@ -6569,6 +6767,95 @@ fi
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evaluation_runs_later_arms_after_a_launch_credential_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("evaluation-start-failure");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let resolver_path = root.join("resolver.sh");
+        fs::write(
+            &resolver_path,
+            r#"#!/bin/sh
+if [ "$1" = "probe" ]; then
+  printf '%s\n' '{"status":"ready","source":"test"}'
+else
+  printf '%s\n' '{"status":"needs-setup","message":"launch credential unavailable"}'
+fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&resolver_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let harness = |id: &str| HarnessProfile {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            launch: DriverLaunch::new("/bin/false"),
+            models: BTreeMap::from([("haiku".to_owned(), format!("{id}/haiku"))]),
+        };
+        let controller = RunController::new_with_harnesses_and_model_access(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![harness("v0"), harness("eve")],
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+            vec![ModelAccessProvider {
+                id: "gateway".to_owned(),
+                display_name: "Gateway".to_owned(),
+                resolver: Some(DriverLaunch::new(resolver_path)),
+                environment_names: vec!["TOKEN".to_owned()],
+                setup_hint: "Connect the gateway".to_owned(),
+            }],
+            BTreeMap::from([("v0".to_owned(), "gateway".to_owned())]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let evaluation = controller
+            .start_evaluation(StartEvaluationRequest {
+                scenario_id: "catalog".to_owned(),
+                model_profile_id: "haiku".to_owned(),
+                source_workspace_id: explore.id,
+                harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
+            })
+            .unwrap();
+
+        let detail = loop {
+            let detail = controller.get_evaluation(&evaluation.id).unwrap();
+            if detail.summary.status.is_finished() {
+                break detail;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(detail.summary.status, EvaluationStatus::Failed);
+        assert_eq!(detail.summary.arms[0].status, "failed");
+        assert_eq!(detail.summary.arms[1].status, "failed");
+        for arm in &detail.summary.arms {
+            let run_id = arm.run_id.as_deref().unwrap();
+            assert!(controller.get(run_id).unwrap().summary.status.is_finished());
+        }
+        assert!(detail.events.iter().any(|event| {
+            event.kind == "evaluation.arm.finished"
+                && event.payload["harnessId"] == "v0"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("launch credential unavailable"))
+        }));
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn evaluation_rejects_oversized_sources_before_creating_a_bundle() {
         let root = temporary_root("oversized-evaluation-source");
@@ -6625,6 +6912,106 @@ fi
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evaluation_snapshots_preserve_executable_files_and_empty_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("evaluation-snapshot-metadata");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let harness = |id: &str| HarnessProfile {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            launch: DriverLaunch::new("/bin/false"),
+            models: BTreeMap::from([("haiku".to_owned(), format!("{id}/haiku"))]),
+        };
+        let controller = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data.clone(),
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![harness("v0"), harness("eve")],
+            BTreeMap::from([("haiku".to_owned(), "Haiku".to_owned())]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let workspace = controller.workspace(&explore.id).unwrap();
+        let empty = workspace.join("empty");
+        fs::create_dir(&empty).unwrap();
+        fs::set_permissions(&empty, fs::Permissions::from_mode(0o750)).unwrap();
+        let helper = workspace.join("helper.sh");
+        fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o751)).unwrap();
+        let evaluation = controller
+            .start_evaluation(StartEvaluationRequest {
+                scenario_id: "catalog".to_owned(),
+                model_profile_id: "haiku".to_owned(),
+                source_workspace_id: explore.id,
+                harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
+            })
+            .unwrap();
+        let captured = data.join("evaluations").join(&evaluation.id).join("source");
+        assert!(captured.join("empty").is_dir());
+        assert_eq!(
+            fs::metadata(captured.join("empty"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(captured.join("helper.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        let detail = loop {
+            let detail = controller.get_evaluation(&evaluation.id).unwrap();
+            if detail.summary.status.is_finished() {
+                break detail;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        for arm in detail.summary.arms {
+            let arm_workspace = controller
+                .workspace(arm.run_id.as_deref().unwrap())
+                .unwrap();
+            assert!(arm_workspace.join("empty").is_dir());
+            assert_eq!(
+                fs::metadata(arm_workspace.join("empty"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o750
+            );
+            assert_eq!(
+                fs::metadata(arm_workspace.join("helper.sh"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o751
+            );
+        }
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn evaluation_storage_is_isolated_by_the_selected_data_root() {
         let root = temporary_root("evaluation-data-root-isolation");
@@ -6660,7 +7047,7 @@ fi
             })
             .await
             .unwrap();
-        first
+        let evaluation = first
             .start_evaluation(StartEvaluationRequest {
                 scenario_id: "catalog".to_owned(),
                 model_profile_id: "haiku".to_owned(),
@@ -6675,10 +7062,21 @@ fi
         assert!(first_data.join("evaluations").is_dir());
         assert!(second_data.join("evaluations").is_dir());
         assert!(!root.join("evaluations").exists());
+        loop {
+            if first
+                .get_evaluation(&evaluation.id)
+                .unwrap()
+                .summary
+                .status
+                .is_finished()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         drop(first);
         drop(second);
-        tokio::time::sleep(Duration::from_millis(50)).await;
         fs::remove_dir_all(root).unwrap();
     }
 

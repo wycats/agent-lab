@@ -56,11 +56,104 @@ export interface RunSummary {
   scenarioId: string;
   scenarioTitle: string;
   modelId: string;
+  harnessId?: string;
+  modelProfileId?: string;
   status: RunStatus;
   startedAtMs: number;
   finishedAtMs?: number;
   eventCount: number;
   error?: string;
+}
+
+export interface HarnessMetadata {
+  id: string;
+  displayName: string;
+  modelProfileIds: string[];
+}
+
+export interface ModelProfileMetadata {
+  id: string;
+  displayName: string;
+  harnessIds: string[];
+}
+
+export interface WorkbenchSelection {
+  harnessId?: string;
+  modelProfileId?: string;
+  comparisonHarnessIds: string[];
+}
+
+export interface ModelAccessSnapshot {
+  id: string;
+  displayName: string;
+  harnessIds: string[];
+  status: 'ready' | 'needs-setup';
+  source?: string;
+  expiresAtMs?: number;
+  message?: string;
+  setupHint: string;
+}
+
+export interface WorkbenchSnapshot {
+  workspaceId: string;
+  assembly: AssemblySnapshot;
+  selection: WorkbenchSelection;
+  harnesses: HarnessMetadata[];
+  modelProfiles: ModelProfileMetadata[];
+  modelAccess: ModelAccessSnapshot[];
+  latestEvaluation?: EvaluationSummary;
+}
+
+export type EvaluationStatus = 'queued' | 'running' | 'passed' | 'failed' | 'cancelled';
+
+export interface EvaluationSummary {
+  id: string;
+  scenarioId: string;
+  modelProfileId: string;
+  sourceWorkspaceId: string;
+  sourceRevision: string;
+  harnessIds: string[];
+  arms: Array<{ harnessId: string; runId?: string; status: string }>;
+  status: EvaluationStatus;
+  startedAtMs: number;
+  finishedAtMs?: number;
+}
+
+export interface EvaluationDetail {
+  summary: EvaluationSummary;
+  events: RunEvent[];
+  comparison?: {
+    version: number;
+    sourceRevision: string;
+    modelProfileId: string;
+    arms: EvaluationComparisonArm[];
+    outputsMatch: boolean;
+    artifactComparison?: 'same' | 'different' | 'missing';
+    outputDiff?: unknown;
+  };
+}
+
+export interface EvaluationComparisonArm {
+  harnessId: string;
+  runId?: string;
+  status: string;
+  score?: Record<string, unknown>;
+  metrics?: {
+    modelTurns: number;
+    capabilityCalls: number;
+    nativeActions: number;
+    workspaceChanges: number;
+    durationMs: number | null;
+  };
+  output?: unknown;
+  firstUsefulAction?: {
+    title: string;
+    detail?: string | null;
+    kind: string;
+  };
+  evidenceComplete: boolean;
+  usage: 'not reported' | { inputTokens: number; outputTokens: number };
+  cache: 'not reported' | { readTokens: number; writeTokens: number };
 }
 
 export interface RunEvent {
@@ -80,16 +173,18 @@ export interface RunReview {
     workspaceChanges: number;
     durationMs: number | null;
   };
-  steps: Array<{
-    ordinal: number;
-    kind: string;
-    title: string;
-    detail: string | null;
-    status: string;
-    eventSequences: number[];
-    source: string | null;
-    path: string | null;
-  }>;
+  steps: RunReviewStep[];
+}
+
+export interface RunReviewStep {
+  ordinal: number;
+  kind: string;
+  title: string;
+  detail: string | null;
+  status: string;
+  eventSequences: number[];
+  source: string | null;
+  path: string | null;
 }
 
 export interface RunDetail {
@@ -104,14 +199,36 @@ export interface RunDetail {
 
 export interface RunClient {
   models(): Promise<string[]>;
+  harnesses(): Promise<HarnessMetadata[]>;
+  modelProfiles(): Promise<ModelProfileMetadata[]>;
   scenarios(): Promise<ScenarioManifest[]>;
   runs(): Promise<RunSummary[]>;
   prepare(scenarioId: string): Promise<RunSummary>;
   start(scenarioId: string, modelId: string): Promise<RunSummary>;
   startPrepared(id: string, modelId: string): Promise<RunSummary>;
+  startPreparedHarness(id: string, harnessId: string, modelProfileId: string): Promise<RunSummary>;
   detail(id: string): Promise<RunDetail>;
   cancel(id: string): Promise<void>;
   events(id: string, onEvent: (event: RunEvent) => void): AbortController;
+  evaluations(): Promise<EvaluationSummary[]>;
+  startEvaluation(input: {
+    scenarioId: string;
+    modelProfileId: string;
+    sourceWorkspaceId: string;
+    harnessIds: string[];
+  }): Promise<EvaluationSummary>;
+  evaluation(id: string): Promise<EvaluationDetail>;
+  cancelEvaluation(id: string): Promise<void>;
+  evaluationEvents(id: string, onEvent: (event: RunEvent) => void): AbortController;
+  workbench(id: string): Promise<WorkbenchSnapshot>;
+  updateWorkbenchSelection(
+    id: string,
+    input: Partial<WorkbenchSelection>
+  ): Promise<WorkbenchSelection>;
+  compareWorkbench(
+    id: string,
+    input?: { modelProfileId?: string; harnessIds?: string[] }
+  ): Promise<EvaluationSummary>;
 }
 
 async function processToken(): Promise<string> {
@@ -145,12 +262,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 async function streamEvents(
-  id: string,
+  path: string,
   signal: AbortSignal,
   onEvent: (event: RunEvent) => void
 ): Promise<void> {
   const token = await processToken();
-  const response = await fetch(`/api/runs/${encodeURIComponent(id)}/events`, {
+  const response = await fetch(path, {
     headers: { Authorization: `Bearer ${token}` },
     cache: 'no-store',
     signal
@@ -182,6 +299,8 @@ async function streamEvents(
 export function createRunClient(): RunClient {
   return {
     models: () => request('/api/models'),
+    harnesses: () => request('/api/harnesses'),
+    modelProfiles: () => request('/api/model-profiles'),
     scenarios: () => request('/api/scenarios'),
     runs: () => request('/api/runs'),
     prepare: (scenarioId) =>
@@ -199,14 +318,47 @@ export function createRunClient(): RunClient {
         method: 'POST',
         body: JSON.stringify({ modelId })
       }),
+    startPreparedHarness: (id, harnessId, modelProfileId) =>
+      request(`/api/runs/${encodeURIComponent(id)}/start`, {
+        method: 'POST',
+        body: JSON.stringify({ harnessId, modelProfileId })
+      }),
     detail: (id) => request(`/api/runs/${encodeURIComponent(id)}`),
     cancel: (id) => request(`/api/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
     events(id, onEvent) {
       const controller = new AbortController();
-      void streamEvents(id, controller.signal, onEvent).catch((error) => {
+      void streamEvents(`/api/runs/${encodeURIComponent(id)}/events`, controller.signal, onEvent).catch((error) => {
         if (!controller.signal.aborted) console.error(error);
       });
       return controller;
-    }
+    },
+    evaluations: () => request('/api/evaluations'),
+    startEvaluation: (input) =>
+      request('/api/evaluations', { method: 'POST', body: JSON.stringify(input) }),
+    evaluation: (id) => request(`/api/evaluations/${encodeURIComponent(id)}`),
+    cancelEvaluation: (id) =>
+      request(`/api/evaluations/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
+    evaluationEvents(id, onEvent) {
+      const controller = new AbortController();
+      void streamEvents(
+        `/api/evaluations/${encodeURIComponent(id)}/events`,
+        controller.signal,
+        onEvent
+      ).catch((error) => {
+        if (!controller.signal.aborted) console.error(error);
+      });
+      return controller;
+    },
+    workbench: (id) => request(`/api/workbench/${encodeURIComponent(id)}`),
+    updateWorkbenchSelection: (id, input) =>
+      request(`/api/workbench/${encodeURIComponent(id)}/selection`, {
+        method: 'PATCH',
+        body: JSON.stringify(input)
+      }),
+    compareWorkbench: (id, input = {}) =>
+      request(`/api/workbench/${encodeURIComponent(id)}/compare`, {
+        method: 'POST',
+        body: JSON.stringify(input)
+      })
   };
 }

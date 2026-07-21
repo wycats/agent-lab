@@ -25,3 +25,7 @@ path = "src/bin/fixture.rs"
 [[bin]]
 name = "agent-lab-driver-probe"
 path = "src/bin/probe.rs"
+
+[[bin]]
+name = "agent-lab-model-access-fixture"
+path = "src/bin/model_access_fixture.rs"

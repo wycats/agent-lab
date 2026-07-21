@@ -31,6 +31,10 @@ fn command(message_id: &str, body: CommandBody) -> ControllerCommand {
 }
 
 fn open_session(driver: &mut DriverProcess) -> u32 {
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::StartupEvent { ref phase, .. } if phase == "adapter-load"
+    ));
     let ready = driver.receive(TIMEOUT).expect("driver should become ready");
     assert!(ready.raw.ends_with(b"\n"));
     assert!(matches!(ready.parsed.body, DriverBody::Ready { .. }));
@@ -164,7 +168,7 @@ fn one_process_streams_two_turns_and_cancels_the_second() {
     assert_eq!(driver.sent_records().len(), 5);
     let transcript = driver.transcript();
     assert_eq!(transcript.controller_records.len(), 5);
-    assert_eq!(transcript.driver_records.len(), 9);
+    assert_eq!(transcript.driver_records.len(), 10);
     assert!(
         transcript
             .driver_records
@@ -269,6 +273,10 @@ fn fast_driver_exit_preserves_its_final_valid_message() {
         let mut driver = DriverProcess::spawn_with(launch).unwrap();
         assert!(matches!(
             driver.receive(TIMEOUT).unwrap().parsed.body,
+            DriverBody::StartupEvent { .. }
+        ));
+        assert!(matches!(
+            driver.receive(TIMEOUT).unwrap().parsed.body,
             DriverBody::Ready { .. }
         ));
         assert!(matches!(
@@ -286,6 +294,10 @@ fn fast_driver_exit_preserves_output_order_before_a_later_error() {
             .env
             .push(("AGENT_LAB_FIXTURE_MALFORMED_AFTER_READY".into(), "1".into()));
         let mut driver = DriverProcess::spawn_with(launch).unwrap();
+        assert!(matches!(
+            driver.receive(TIMEOUT).unwrap().parsed.body,
+            DriverBody::StartupEvent { .. }
+        ));
         assert!(matches!(
             driver.receive(TIMEOUT).unwrap().parsed.body,
             DriverBody::Ready { .. }
@@ -477,8 +489,8 @@ fn protocol_version_and_sequence_violations_are_distinct() {
     assert!(matches!(
         sequence.receive(TIMEOUT),
         Err(ProcessError::UnexpectedSequence {
-            expected: 3,
-            actual: 2
+            expected: 4,
+            actual: 3
         })
     ));
 }
@@ -711,13 +723,13 @@ fn evidence_rejects_a_session_closed_with_an_unfinished_turn() {
     );
     let mut closed: DriverMessage =
         serde_json::from_slice(unfinished.driver_records.last().unwrap()).unwrap();
-    closed.sequence = 4;
-    unfinished.driver_records[2] = driver_record(&closed);
+    closed.sequence = 5;
+    *unfinished.driver_records.last_mut().unwrap() = driver_record(&closed);
     unfinished.driver_records.insert(
-        2,
+        unfinished.driver_records.len() - 1,
         driver_record(&DriverMessage {
             protocol_version: PROTOCOL_VERSION,
-            sequence: 3,
+            sequence: 4,
             caused_by: Some("unfinished-turn".to_owned()),
             body: DriverBody::TurnEvent {
                 session_id: "evidence-session".to_owned(),
@@ -833,9 +845,9 @@ fn evidence_rejects_invalid_failure_and_causal_identities() {
 
     let mut unknown_cause = bundle.transcript.clone();
     let mut opened: DriverMessage =
-        serde_json::from_slice(&unknown_cause.driver_records[1]).unwrap();
+        serde_json::from_slice(&unknown_cause.driver_records[2]).unwrap();
     opened.caused_by = Some("unknown-command".to_owned());
-    unknown_cause.driver_records[1] = driver_record(&opened);
+    unknown_cause.driver_records[2] = driver_record(&opened);
     assert!(
         DriverEvidenceBundle::new(
             bundle.controller_revision.clone(),
@@ -849,9 +861,9 @@ fn evidence_rejects_invalid_failure_and_causal_identities() {
 
     let mut mismatched_cause = bundle.transcript.clone();
     let mut opened: DriverMessage =
-        serde_json::from_slice(&mismatched_cause.driver_records[1]).unwrap();
+        serde_json::from_slice(&mismatched_cause.driver_records[2]).unwrap();
     opened.caused_by = Some("close-evidence".to_owned());
-    mismatched_cause.driver_records[1] = driver_record(&opened);
+    mismatched_cause.driver_records[2] = driver_record(&opened);
     assert!(
         DriverEvidenceBundle::new(
             bundle.controller_revision.clone(),
@@ -884,9 +896,9 @@ fn evidence_rejects_invalid_failure_and_causal_identities() {
 fn turn_failure_is_terminal_in_evidence() {
     let bundle = completed_fixture_bundle_with_turn();
     let mut failed = bundle.transcript.clone();
-    failed.driver_records[3] = driver_record(&DriverMessage {
+    failed.driver_records[4] = driver_record(&DriverMessage {
         protocol_version: PROTOCOL_VERSION,
-        sequence: 4,
+        sequence: 5,
         caused_by: Some("turn-evidence".to_owned()),
         body: DriverBody::Failed {
             scope: DriverFailureScope::Turn,
@@ -909,13 +921,13 @@ fn turn_failure_is_terminal_in_evidence() {
 
     let mut closed: DriverMessage =
         serde_json::from_slice(failed.driver_records.last().unwrap()).unwrap();
-    closed.sequence = 6;
+    closed.sequence = 7;
     *failed.driver_records.last_mut().unwrap() = driver_record(&closed);
     failed.driver_records.insert(
-        4,
+        5,
         driver_record(&DriverMessage {
             protocol_version: PROTOCOL_VERSION,
-            sequence: 5,
+            sequence: 6,
             caused_by: Some("turn-evidence".to_owned()),
             body: DriverBody::TurnFinished {
                 session_id: "evidence-session".to_owned(),
@@ -945,6 +957,7 @@ fn probe_can_finalize_fixture_evidence_for_direct_inspection() {
         .arg(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"))
         .env("AGENT_LAB_EVIDENCE_DIR", &evidence)
         .env("AGENT_LAB_CONTROLLER_REVISION", "test-controller")
+        .env("AGENT_LAB_DRIVER_TASK_JSON", r#"{"mode":"startup-event"}"#)
         .env(
             "AGENT_LAB_CANONICAL_POLICY_JSON",
             r#"{"name":"fixture-v1","removedObjectKeys":["processId"]}"#,
@@ -1075,7 +1088,7 @@ fn clean_exit_drains_queued_stdout_before_transcript_capture() {
     ));
 
     let transcript = process.transcript();
-    assert_eq!(transcript.driver_records.len(), 67);
+    assert_eq!(transcript.driver_records.len(), 68);
     let trailing: DriverMessage =
         serde_json::from_slice(transcript.driver_records.last().unwrap()).unwrap();
     assert!(matches!(
@@ -1227,6 +1240,10 @@ fn temporary_root(label: &str) -> PathBuf {
 
 fn completed_fixture_bundle() -> DriverEvidenceBundle {
     let mut process = fixture();
+    assert!(matches!(
+        process.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::StartupEvent { .. }
+    ));
     let ready = process.receive(TIMEOUT).unwrap();
     let DriverBody::Ready { driver } = ready.parsed.body else {
         panic!("expected driver.ready")
@@ -1287,13 +1304,13 @@ fn completed_fixture_bundle_with_turn() -> DriverEvidenceBundle {
     );
     let mut closed: DriverMessage =
         serde_json::from_slice(transcript.driver_records.last().unwrap()).unwrap();
-    closed.sequence = 5;
+    closed.sequence = 6;
     *transcript.driver_records.last_mut().unwrap() = driver_record(&closed);
     transcript.driver_records.insert(
-        2,
+        3,
         driver_record(&DriverMessage {
             protocol_version: PROTOCOL_VERSION,
-            sequence: 3,
+            sequence: 4,
             caused_by: Some("turn-evidence".to_owned()),
             body: DriverBody::TurnEvent {
                 session_id: "evidence-session".to_owned(),
@@ -1304,10 +1321,10 @@ fn completed_fixture_bundle_with_turn() -> DriverEvidenceBundle {
         }),
     );
     transcript.driver_records.insert(
-        3,
+        4,
         driver_record(&DriverMessage {
             protocol_version: PROTOCOL_VERSION,
-            sequence: 4,
+            sequence: 5,
             caused_by: Some("turn-evidence".to_owned()),
             body: DriverBody::TurnFinished {
                 session_id: "evidence-session".to_owned(),

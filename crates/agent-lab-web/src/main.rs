@@ -10,8 +10,10 @@ use std::{
 
 use agent_lab_driver_protocol::DriverLaunch;
 use agent_lab_web::{
-    RunController, RunControllerConfig, RunSessionProvider, ServerConfig, app_with_runs,
+    HarnessProfile, ModelAccessProvider, RunController, RunControllerConfig, RunSessionProvider,
+    ServerConfig, app_with_runs,
 };
+use serde::Deserialize;
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -58,12 +60,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     driver.env.extend(driver_env);
-    let runs = RunController::new(RunControllerConfig {
+    let controller_config = RunControllerConfig {
         scenarios_dir: options.scenarios,
         data_dir: options.data,
         driver,
-    })?;
-    let provider = Arc::new(RunSessionProvider::new(options.shell, runs.clone()));
+    };
+    let runs = if let Some(path) = options.harness_config {
+        let (harnesses, model_profiles, model_access, harness_model_access) =
+            load_harness_config(&path, options.driver_env_file.as_deref())?;
+        RunController::new_with_harnesses_and_model_access(
+            controller_config,
+            harnesses,
+            model_profiles,
+            model_access,
+            harness_model_access,
+        )?
+    } else {
+        RunController::new(controller_config)?
+    };
+    let provider = Arc::new(RunSessionProvider::new(
+        options.shell,
+        runs.clone(),
+        origin.clone(),
+    ));
 
     println!("Agent Lab web surface: {origin}");
     println!("Local Nushell and scenario runs; press Ctrl-C to stop.");
@@ -87,6 +106,7 @@ struct Options {
     driver_env: Vec<String>,
     driver_env_file: Option<PathBuf>,
     models: Vec<String>,
+    harness_config: Option<PathBuf>,
 }
 
 impl Options {
@@ -102,6 +122,7 @@ impl Options {
         let mut driver_env = Vec::new();
         let mut driver_env_file = None;
         let mut models = Vec::new();
+        let mut harness_config = None;
         let mut args = args;
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -123,6 +144,7 @@ impl Options {
                     driver_env_file = Some(args.next().ok_or_else(usage)?.into());
                 }
                 "--model" => models.push(args.next().ok_or_else(usage)?),
+                "--harness-config" => harness_config = Some(args.next().ok_or_else(usage)?.into()),
                 _ => return Err(usage()),
             }
         }
@@ -141,6 +163,7 @@ impl Options {
             driver_env,
             driver_env_file,
             models,
+            harness_config,
         })
     }
 }
@@ -162,7 +185,211 @@ fn default_shell_path() -> Result<PathBuf, String> {
 }
 
 fn usage() -> String {
-    "usage: agent-lab-web [--port PORT] [--assets DIRECTORY] [--scenarios DIRECTORY] [--data DIRECTORY] [--driver EXECUTABLE] [--driver-arg ARG]... [--driver-cwd DIRECTORY] [--driver-env NAME]... [--driver-env-file FILE] [--model MODEL]...".to_owned()
+    "usage: agent-lab-web [--port PORT] [--assets DIRECTORY] [--scenarios DIRECTORY] [--data DIRECTORY] [--driver EXECUTABLE] [--driver-arg ARG]... [--driver-cwd DIRECTORY] [--driver-env NAME]... [--driver-env-file FILE] [--model MODEL]... [--harness-config FILE]".to_owned()
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalHarnessConfig {
+    #[serde(default)]
+    model_profiles: BTreeMap<String, LocalModelProfile>,
+    #[serde(default)]
+    model_access: BTreeMap<String, LocalModelAccess>,
+    harnesses: Vec<LocalHarness>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalModelProfile {
+    display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalModelAccess {
+    display_name: String,
+    command: PathBuf,
+    #[serde(default)]
+    arguments: Vec<String>,
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    environment_allowlist: Vec<String>,
+    setup_hint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalHarness {
+    id: String,
+    display_name: String,
+    command: PathBuf,
+    #[serde(default)]
+    arguments: Vec<String>,
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    environment_allowlist: Vec<String>,
+    model_access: Option<String>,
+    models: BTreeMap<String, String>,
+}
+
+type LoadedHarnessConfig = (
+    Vec<HarnessProfile>,
+    BTreeMap<String, String>,
+    Vec<ModelAccessProvider>,
+    BTreeMap<String, String>,
+);
+
+fn load_harness_config(
+    path: &Path,
+    environment_file: Option<&Path>,
+) -> Result<LoadedHarnessConfig, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("could not read harness config {}: {error}", path.display()))?;
+    let parsed: LocalHarnessConfig = toml::from_str(&contents)
+        .map_err(|error| format!("invalid harness config {}: {error}", path.display()))?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut access_profiles = Vec::new();
+    for (id, access) in parsed.model_access {
+        validate_environment_names(&access.environment_allowlist, &format!("model access {id}"))?;
+        let command = resolve_config_path(base, &access.command);
+        validate_launch_paths(
+            &command,
+            access.cwd.as_deref(),
+            base,
+            &format!("model access {id}"),
+        )?;
+        let mut resolver = DriverLaunch::new(command);
+        resolver.args = access.arguments.into_iter().map(OsString::from).collect();
+        resolver.cwd = access
+            .cwd
+            .as_ref()
+            .map(|cwd| resolve_config_path(base, cwd));
+        resolver.clear_env = true;
+        for name in ["PATH", "HOME", "TMPDIR", "SHELL"]
+            .into_iter()
+            .chain(access.environment_allowlist.iter().map(String::as_str))
+        {
+            if let Some(value) = env::var_os(name) {
+                resolver.env.push((OsString::from(name), value));
+            }
+        }
+        if let Some(environment_file) = environment_file {
+            resolver.env.extend(load_driver_env_file(
+                environment_file,
+                &access.environment_allowlist,
+            )?);
+        }
+        access_profiles.push(ModelAccessProvider {
+            id,
+            display_name: access.display_name,
+            resolver: Some(resolver),
+            environment_names: access.environment_allowlist,
+            setup_hint: access.setup_hint,
+        });
+    }
+    let mut profiles = Vec::new();
+    let mut harness_model_access = BTreeMap::new();
+    for harness in parsed.harnesses {
+        validate_environment_names(
+            &harness.environment_allowlist,
+            &format!("harness {}", harness.id),
+        )?;
+        if let Some(provider_id) = &harness.model_access {
+            harness_model_access.insert(harness.id.clone(), provider_id.clone());
+        }
+        let command = resolve_config_path(base, &harness.command);
+        validate_launch_paths(
+            &command,
+            harness.cwd.as_deref(),
+            base,
+            &format!("harness {}", harness.id),
+        )?;
+        let mut launch = DriverLaunch::new(command);
+        launch.args = harness.arguments.into_iter().map(OsString::from).collect();
+        launch.cwd = harness
+            .cwd
+            .as_ref()
+            .map(|cwd| resolve_config_path(base, cwd));
+        launch.clear_env = true;
+        for name in ["PATH", "HOME", "TMPDIR", "SHELL"]
+            .into_iter()
+            .chain(harness.environment_allowlist.iter().map(String::as_str))
+        {
+            if let Some(value) = env::var_os(name) {
+                launch.env.push((OsString::from(name), value));
+            }
+        }
+        if let Some(environment_file) = environment_file {
+            launch.env.extend(load_driver_env_file(
+                environment_file,
+                &harness.environment_allowlist,
+            )?);
+        }
+        profiles.push(HarnessProfile {
+            id: harness.id,
+            display_name: harness.display_name,
+            launch,
+            models: harness.models,
+        });
+    }
+    Ok((
+        profiles,
+        parsed
+            .model_profiles
+            .into_iter()
+            .map(|(id, profile)| (id, profile.display_name))
+            .collect(),
+        access_profiles,
+        harness_model_access,
+    ))
+}
+
+fn resolve_config_path(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_owned()
+    } else {
+        base.join(path)
+    }
+}
+
+fn validate_environment_names(names: &[String], owner: &str) -> Result<(), String> {
+    let mut unique = HashSet::new();
+    for name in names {
+        let mut bytes = name.bytes();
+        let valid = bytes
+            .next()
+            .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+            && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric());
+        if !valid {
+            return Err(format!(
+                "{owner} contains an unsafe environment name: {name}"
+            ));
+        }
+        if !unique.insert(name) {
+            return Err(format!("{owner} repeats environment name: {name}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_launch_paths(
+    command: &Path,
+    cwd: Option<&Path>,
+    base: &Path,
+    owner: &str,
+) -> Result<(), String> {
+    if !command.is_file() {
+        return Err(format!(
+            "{owner} executable does not exist or is not a file: {}",
+            command.display()
+        ));
+    }
+    if let Some(cwd) = cwd {
+        let cwd = resolve_config_path(base, cwd);
+        if !cwd.is_dir() {
+            return Err(format!(
+                "{owner} working directory does not exist or is not a directory: {}",
+                cwd.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn load_driver_env_file(
@@ -190,11 +417,7 @@ fn load_driver_env_file(
         if !allowlist.contains(name) {
             continue;
         }
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
-        {
+        if validate_environment_names(&[name.to_owned()], "driver environment file").is_err() {
             return Err(format!(
                 "invalid allowlisted name on line {} of {}",
                 index + 1,
@@ -253,7 +476,7 @@ async fn shutdown_signal(config: ServerConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_driver_env_file, parse_env_value};
+    use super::{load_driver_env_file, load_harness_config, parse_env_value};
     use std::{ffi::OsString, fs};
 
     #[test]
@@ -290,5 +513,58 @@ mod tests {
             parse_env_value("\"sensitive\\q\""),
             Err("unsupported escape")
         );
+    }
+
+    #[test]
+    fn harness_config_rejects_unsafe_environment_names_and_missing_executables() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-lab-harness-config-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let config = root.join("harnesses.toml");
+        fs::write(
+            &config,
+            format!(
+                r#"
+[model_profiles.fixture]
+display_name = "Fixture"
+
+[[harnesses]]
+id = "fixture"
+display_name = "Fixture"
+command = {executable:?}
+environment_allowlist = ["TOKEN-NAME"]
+
+[harnesses.models]
+fixture = "fixture/model"
+"#
+            ),
+        )
+        .unwrap();
+        let error = load_harness_config(&config, None).unwrap_err();
+        assert!(error.contains("unsafe environment name"));
+
+        fs::write(
+            &config,
+            r#"
+[model_profiles.fixture]
+display_name = "Fixture"
+
+[[harnesses]]
+id = "fixture"
+display_name = "Fixture"
+command = "missing-driver"
+
+[harnesses.models]
+fixture = "fixture/model"
+"#,
+        )
+        .unwrap();
+        let error = load_harness_config(&config, None).unwrap_err();
+        assert!(error.contains("executable does not exist"));
+        fs::remove_dir_all(root).unwrap();
     }
 }

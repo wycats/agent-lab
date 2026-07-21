@@ -88,9 +88,18 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn open_probe_session(
     driver: &mut DriverProcess,
 ) -> Result<(DriverDescriptor, u32), Box<dyn Error>> {
-    let ready = driver.receive(TIMEOUT)?;
-    let DriverBody::Ready { driver: descriptor } = ready.parsed.body else {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected driver.ready").into());
+    let descriptor = loop {
+        match driver.receive(TIMEOUT)?.parsed.body {
+            DriverBody::StartupEvent { .. } => {}
+            DriverBody::Ready { driver } => break driver,
+            body => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected startup.event or driver.ready, received {body:?}"),
+                )
+                .into());
+            }
+        }
     };
 
     driver.send(&command(
@@ -101,13 +110,21 @@ fn open_probe_session(
             limits: json_env("AGENT_LAB_DRIVER_LIMITS_JSON", json!({}))?,
         },
     ))?;
-    let opened = driver.receive(TIMEOUT)?;
-    let DriverBody::SessionOpened {
-        session_id,
-        process_id,
-    } = opened.parsed.body
-    else {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected session.opened").into());
+    let (session_id, process_id) = loop {
+        match driver.receive(TIMEOUT)?.parsed.body {
+            DriverBody::StartupEvent { .. } => {}
+            DriverBody::SessionOpened {
+                session_id,
+                process_id,
+            } => break (session_id, process_id),
+            body => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected startup.event or session.opened, received {body:?}"),
+                )
+                .into());
+            }
+        }
     };
     if session_id != PROBE_SESSION_ID {
         return Err(io::Error::new(
@@ -143,6 +160,7 @@ fn run_probe_turn(
     let (outcome, evidence) = loop {
         let message = driver.receive(TIMEOUT)?;
         match message.parsed.body {
+            DriverBody::StartupEvent { .. } => {}
             DriverBody::TurnEvent {
                 session_id,
                 turn_id,

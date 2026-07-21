@@ -51,6 +51,12 @@ pub struct DriverMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum DriverBody {
+    #[serde(rename = "startup.event", rename_all = "camelCase")]
+    StartupEvent {
+        phase: String,
+        status: String,
+        detail: Option<String>,
+    },
     #[serde(rename = "driver.ready")]
     Ready { driver: DriverDescriptor },
     #[serde(rename = "session.opened", rename_all = "camelCase")]

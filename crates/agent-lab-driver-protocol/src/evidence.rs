@@ -328,6 +328,7 @@ impl CommandIdentity {
 
 fn command_causes_driver_body(command: &CommandIdentity, body: &DriverBody) -> bool {
     match body {
+        DriverBody::StartupEvent { .. } => true,
         DriverBody::Ready { .. } => false,
         DriverBody::SessionOpened { session_id, .. } => matches!(
             command,
@@ -537,12 +538,24 @@ impl DriverLifecycleState {
         record_number: usize,
         body: &DriverBody,
     ) -> Result<(), EvidenceError> {
-        if record_number == 1 && !matches!(body, DriverBody::Ready { .. }) {
-            return Err(EvidenceError::InvalidBundle(
-                "first driver record is not driver.ready".to_owned(),
-            ));
+        if !self.saw_ready
+            && !matches!(
+                body,
+                DriverBody::StartupEvent { .. } | DriverBody::Ready { .. }
+            )
+        {
+            return Err(EvidenceError::InvalidBundle(format!(
+                "driver record {record_number} occurs before driver.ready"
+            )));
         }
         match body {
+            DriverBody::StartupEvent { phase, status, .. } => {
+                if phase.trim().is_empty() || status.trim().is_empty() {
+                    return Err(EvidenceError::InvalidBundle(format!(
+                        "driver record {record_number} has an empty startup phase or status"
+                    )));
+                }
+            }
             DriverBody::Ready { driver } => {
                 if self.saw_ready {
                     return Err(EvidenceError::InvalidBundle(format!(

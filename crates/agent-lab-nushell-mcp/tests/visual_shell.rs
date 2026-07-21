@@ -12,9 +12,7 @@ fn pty_session_preserves_visible_nushell_and_mcp_behavior() {
     let mut shell = Session::spawn(command).expect("visual shell should start in a PTY");
     shell.set_expect_timeout(Some(Duration::from_secs(10)));
 
-    shell
-        .expect("Agent Lab visual shell")
-        .expect("banner should be visible");
+    shell.expect("Agent Lab").expect("banner should be visible");
     shell
         .expect("MCP namespaces: fixture")
         .expect("attached source should be visible");

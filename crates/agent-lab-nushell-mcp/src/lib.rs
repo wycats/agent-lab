@@ -12,6 +12,8 @@
 mod bridge;
 mod host;
 mod value;
+mod workbench;
 
 pub use bridge::{BridgeError, LifecycleEvent, McpBridge};
 pub use host::{HostError, NushellHost};
+pub use workbench::{WorkbenchBridge, WorkbenchError};

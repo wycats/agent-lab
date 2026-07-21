@@ -409,28 +409,46 @@ Existing steel threads have demonstrated:
 - a real-model run against an authenticated capability source and physical
   workspace;
 - durable evidence that can reopen after the live driver and capability source
-  are gone.
+  are gone;
+- controller-owned harness and model selection shared by Nushell and the
+  browser;
+- shell- and browser-initiated paired evaluations from one immutable Explore
+  snapshot;
+- real v0 and Eve runs using the same model profile, prompt, capability
+  revisions, workspace seed, and limits;
+- behavioral comparison that preserves native timelines, unavailable metrics,
+  workspace effects, and independently replayable arm evidence.
 
-This evidence supports the architectural pieces, but it does not yet prove the
-complete product loop described by this RFC. In particular, the product has
-not yet demonstrated that a builder can begin with a legible question, explore
-the assembly, run more than one real harness, and promote a discovery into an
-evaluation through one coherent workbench.
+The two-harness catalog evaluation is the first coherent run-and-review product
+loop. A builder can inspect the active assembly, explore its capabilities,
+start the same evaluation from Nushell or the browser, compare two real
+harnesses, and reopen the result from stored evidence.
+
+It does not yet demonstrate the complete improvement loop. The catalog question
+is checked in rather than authored from an exploratory discovery, the product
+cannot promote observations into an editable evaluation, the real-model result
+is a single trial, and no harness change has yet been followed by a controlled
+rerun of the preserved evaluation.
 
 ## Next validation boundary
 
-Build the smallest "two harnesses, one workbench" experience using v0 and Eve.
-Each harness should be independently inspectable, attach to the same kind of
-resettable seeded environment, run through its native loop, stream its native
-activity, produce attributable workspace effects, and receive a simple
-evaluation outcome.
+Complete the missing transition from exploration to durable improvement. A
+builder should be able to start and continue a harness-native agent session
+from Nushell, pass structured exploration results into a turn, preserve more
+than one session, and propose an editable evaluation from a meaningful turn
+span. The proposal must capture its starting state, capabilities, task,
+assertions, measurements, limits, and provenance without baking the source
+harness or model into the portable definition.
 
-The workbench should give a person a clear starting question and enough
-structured operations to understand what is assembled and explore the active
-workspace. Both a person and an implementation agent should validate the slice
-through the visible product. Full ordinary Nushell workspace mode, broad
-cross-harness scoring, and translation of Eve's native evaluation system are
-outside this boundary.
+The builder then reviews the same draft through Nushell and the browser,
+replays it from the captured state, keeps failed drafts as editable evidence,
+and explicitly saves a passing revision into the local evaluation library. A
+passing replay means reproduced once, not a general behavioral claim.
+
+After this product-flow boundary exists, live code-server diagnostics remain
+the first richer capability experiment. They should use the completed
+promotion loop to test whether settled semantic diagnostics improve repair
+behavior while preserving correctness.
 
 ## Open questions
 

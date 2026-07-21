@@ -1,0 +1,27 @@
+[model_profiles.fixture]
+display_name = "Fixture model"
+
+[model_access.fixture]
+display_name = "Fixture model access"
+command = "../../../../target/debug/agent-lab-model-access-fixture"
+environment_allowlist = ["AGENT_LAB_FIXTURE_MODEL_TOKEN"]
+setup_hint = "Start the deterministic model fixture."
+
+[[harnesses]]
+id = "v0"
+display_name = "v0"
+command = "../../../../target/debug/agent-lab-driver-fixture"
+environment_allowlist = []
+model_access = "fixture"
+
+[harnesses.models]
+fixture = "fixture/model"
+[[harnesses]]
+id = "eve"
+display_name = "Eve"
+command = "../../../../target/debug/agent-lab-driver-fixture"
+environment_allowlist = []
+model_access = "fixture"
+
+[harnesses.models]
+fixture = "fixture/model"

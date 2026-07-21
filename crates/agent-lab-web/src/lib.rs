@@ -17,7 +17,7 @@ use axum::{
     },
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response, Sse, sse::Event},
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
@@ -31,9 +31,12 @@ use tower_http::{
 };
 
 pub use runs::{
-    PrepareRunRequest, RunController, RunControllerConfig, RunDetail, RunError, RunEvent,
-    RunStatus, RunSummary, ScenarioManifest, StartPreparedRunRequest, StartRunRequest,
-    TerminalBinding, TerminalCapabilityBinding,
+    CompareWorkbenchRequest, EvaluationDetail, EvaluationStatus, EvaluationSummary,
+    HarnessMetadata, HarnessProfile, ModelAccessProvider, ModelAccessSnapshot, ModelAccessStatus,
+    ModelProfileMetadata, PrepareRunRequest, RunController, RunControllerConfig, RunDetail,
+    RunError, RunEvent, RunStatus, RunSummary, ScenarioManifest, StartEvaluationRequest,
+    StartPreparedRunRequest, StartRunRequest, TerminalBinding, TerminalCapabilityBinding,
+    UpdateWorkbenchSelectionRequest, WorkbenchOrigin, WorkbenchSelection, WorkbenchSnapshot,
 };
 
 const DEFAULT_COLS: u16 = 100;
@@ -127,14 +130,16 @@ impl SessionProvider for FixtureSessionProvider {
 pub struct RunSessionProvider {
     shell: PathBuf,
     runs: RunController,
+    origin: String,
 }
 
 impl RunSessionProvider {
     #[must_use]
-    pub fn new(shell: impl Into<PathBuf>, runs: RunController) -> Self {
+    pub fn new(shell: impl Into<PathBuf>, runs: RunController, origin: String) -> Self {
         Self {
             shell: shell.into(),
             runs,
+            origin,
         }
     }
 }
@@ -163,13 +168,63 @@ impl SessionProvider for RunSessionProvider {
             ]);
             environment.push((token_env, source.token));
         }
-        Ok(Box::new(PtyTerminalSession::spawn(
+        let control_env = "AGENT_LAB_WORKBENCH_TOKEN".to_owned();
+        args.extend([
+            "--workbench".to_owned(),
+            self.origin.clone(),
+            run_id.to_owned(),
+            control_env.clone(),
+        ]);
+        environment.push((control_env, binding.control_token.clone()));
+        let session = match PtyTerminalSession::spawn(
             &self.shell,
             &binding.workspace,
             size,
             &args,
             &environment,
-        )?))
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                self.runs.revoke_workbench_grant(&binding.control_token);
+                return Err(error);
+            }
+        };
+        Ok(Box::new(GrantedTerminalSession {
+            inner: session,
+            runs: self.runs.clone(),
+            token: binding.control_token,
+        }))
+    }
+}
+
+struct GrantedTerminalSession {
+    inner: PtyTerminalSession,
+    runs: RunController,
+    token: String,
+}
+
+impl BrowserSession for GrantedTerminalSession {
+    fn take_reader(&self) -> Result<Box<dyn Read + Send>, GatewayError> {
+        self.inner.take_reader()
+    }
+
+    fn write(&self, bytes: &[u8]) -> Result<(), GatewayError> {
+        self.inner.write(bytes)
+    }
+
+    fn resize(&self, size: TerminalSize) -> Result<(), GatewayError> {
+        self.inner.resize(size)
+    }
+
+    fn terminate(&self) {
+        self.inner.terminate();
+        self.runs.revoke_workbench_grant(&self.token);
+    }
+}
+
+impl Drop for GrantedTerminalSession {
+    fn drop(&mut self) {
+        self.runs.revoke_workbench_grant(&self.token);
     }
 }
 
@@ -366,6 +421,8 @@ pub fn app_with_runs(
         .route("/api/session-token", get(session_token))
         .route("/api/terminal", get(upgrade_terminal))
         .route("/api/models", get(list_models))
+        .route("/api/harnesses", get(list_harnesses))
+        .route("/api/model-profiles", get(list_model_profiles))
         .route("/api/scenarios", get(list_scenarios))
         .route("/api/explore", post(prepare_run))
         .route("/api/runs", get(list_runs).post(start_run))
@@ -373,6 +430,31 @@ pub fn app_with_runs(
         .route("/api/runs/{id}/start", post(start_prepared_run))
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/runs/{id}/events", get(run_events))
+        .route("/api/workbench/{id}", get(get_workbench))
+        .route(
+            "/api/workbench/{id}/selection",
+            patch(update_workbench_selection),
+        )
+        .route("/api/workbench/{id}/compare", post(compare_workbench))
+        .route(
+            "/api/workbench/{workspace_id}/evaluations/{evaluation_id}",
+            get(get_workbench_evaluation),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluations/{evaluation_id}/events",
+            get(workbench_evaluation_events),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluations/{evaluation_id}/cancel",
+            post(cancel_workbench_evaluation),
+        )
+        .route(
+            "/api/evaluations",
+            get(list_evaluations).post(start_evaluation),
+        )
+        .route("/api/evaluations/{id}", get(get_evaluation))
+        .route("/api/evaluations/{id}/cancel", post(cancel_evaluation))
+        .route("/api/evaluations/{id}/events", get(evaluation_events))
         .fallback_service(assets)
         .layer(SetResponseHeaderLayer::if_not_present(
             header::X_FRAME_OPTIONS,
@@ -390,6 +472,32 @@ async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Respo
         return StatusCode::FORBIDDEN.into_response();
     }
     Json(state.config.models.clone()).into_response()
+}
+
+async fn list_harnesses(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !run_request_is_authorized(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    Json(
+        state
+            .runs
+            .as_ref()
+            .map_or_else(Vec::new, RunController::harnesses),
+    )
+    .into_response()
+}
+
+async fn list_model_profiles(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !run_request_is_authorized(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    Json(
+        state
+            .runs
+            .as_ref()
+            .map_or_else(Vec::new, RunController::model_profiles),
+    )
+    .into_response()
 }
 
 async fn list_scenarios(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -426,8 +534,12 @@ async fn start_run(
     let Some(runs) = authorized_runs(&state, &headers) else {
         return StatusCode::FORBIDDEN.into_response();
     };
-    if !model_is_available(&state.config, &request.model_id) {
-        return unavailable_model_response(&request.model_id);
+    if request
+        .model_id
+        .as_deref()
+        .is_some_and(|model| !model_is_available(&state.config, model))
+    {
+        return unavailable_model_response(request.model_id.as_deref().unwrap_or_default());
     }
     match runs.start(request).await {
         Ok(summary) => (StatusCode::CREATED, Json(summary)).into_response(),
@@ -458,10 +570,14 @@ async fn start_prepared_run(
     let Some(runs) = authorized_runs(&state, &headers) else {
         return StatusCode::FORBIDDEN.into_response();
     };
-    if !model_is_available(&state.config, &request.model_id) {
-        return unavailable_model_response(&request.model_id);
+    if request
+        .model_id
+        .as_deref()
+        .is_some_and(|model| !model_is_available(&state.config, model))
+    {
+        return unavailable_model_response(request.model_id.as_deref().unwrap_or_default());
     }
-    match runs.start_prepared(&id, request) {
+    match runs.start_prepared(&id, &request) {
         Ok(summary) => Json(summary).into_response(),
         Err(error) => run_error_response(error),
     }
@@ -567,6 +683,246 @@ fn run_event_stream(
 
 fn event_is_after_history(event: &RunEvent, live_after_sequence: u64) -> bool {
     event.sequence > live_after_sequence
+}
+
+async fn list_evaluations(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !run_request_is_authorized(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    Json(
+        state
+            .runs
+            .as_ref()
+            .map_or_else(Vec::new, RunController::list_evaluations),
+    )
+    .into_response()
+}
+
+async fn get_workbench(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.workbench(&id) {
+        Ok(workbench) => Json(workbench).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn update_workbench_selection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<UpdateWorkbenchSelectionRequest>,
+) -> Response {
+    let Some((runs, origin)) = authorized_workbench(&state, &headers, &id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.update_workbench_selection(&id, request, origin) {
+        Ok(selection) => Json(selection).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn compare_workbench(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<CompareWorkbenchRequest>,
+) -> Response {
+    let Some((runs, origin)) = authorized_workbench(&state, &headers, &id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.compare_workbench(&id, request, origin) {
+        Ok(evaluation) => (StatusCode::CREATED, Json(evaluation)).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn get_workbench_evaluation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, evaluation_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let evaluation_id = (evaluation_id != "latest").then_some(evaluation_id.as_str());
+    match runs.workbench_evaluation(&workspace_id, evaluation_id) {
+        Ok(evaluation) => Json(evaluation).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn workbench_evaluation_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, evaluation_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Ok(detail) = runs.workbench_evaluation(&workspace_id, Some(&evaluation_id)) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok((history, receiver)) = runs.subscribe_evaluation(&detail.summary.id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    evaluation_event_response(
+        runs,
+        detail.summary.id,
+        history,
+        receiver,
+        state.config.shutdown,
+    )
+}
+
+async fn cancel_workbench_evaluation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, evaluation_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if runs
+        .workbench_evaluation(&workspace_id, Some(&evaluation_id))
+        .is_err()
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match runs.cancel_evaluation(&evaluation_id) {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn start_evaluation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<StartEvaluationRequest>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.start_evaluation(request) {
+        Ok(summary) => (StatusCode::CREATED, Json(summary)).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn get_evaluation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.get_evaluation(&id) {
+        Ok(evaluation) => Json(evaluation).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn cancel_evaluation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.cancel_evaluation(&id) {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn evaluation_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Ok((history, receiver)) = runs.subscribe_evaluation(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    evaluation_event_response(runs, id, history, receiver, state.config.shutdown)
+}
+
+fn evaluation_event_response(
+    runs: RunController,
+    id: String,
+    history: Vec<RunEvent>,
+    receiver: tokio::sync::broadcast::Receiver<RunEvent>,
+    shutdown: CancellationToken,
+) -> Response {
+    let stream = evaluation_event_stream(runs, id, history, receiver)
+        .map(|event| {
+            Event::default()
+                .id(event.sequence.to_string())
+                .event(&event.kind)
+                .json_data(event)
+        })
+        .take_until(shutdown.cancelled_owned());
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
+fn evaluation_event_stream(
+    runs: RunController,
+    id: String,
+    history: Vec<RunEvent>,
+    receiver: tokio::sync::broadcast::Receiver<RunEvent>,
+) -> impl futures_util::Stream<Item = RunEvent> {
+    futures_util::stream::unfold(
+        (VecDeque::from(history), receiver, runs, id, 0_u64),
+        |(mut pending, mut receiver, runs, id, mut last_sequence)| async move {
+            loop {
+                if let Some(event) = pending.pop_front() {
+                    if event_is_after_history(&event, last_sequence) {
+                        last_sequence = event.sequence;
+                        return Some((event, (pending, receiver, runs, id, last_sequence)));
+                    }
+                    continue;
+                }
+                match receiver.recv().await {
+                    Ok(event) => pending.push_back(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let Ok(events) = runs.evaluation_events_after(&id, last_sequence) else {
+                            return None;
+                        };
+                        pending.extend(events);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
+}
+
+fn authorized_workbench(
+    state: &AppState,
+    headers: &HeaderMap,
+    workspace_id: &str,
+) -> Option<(RunController, WorkbenchOrigin)> {
+    if let Some(runs) = authorized_runs(state, headers) {
+        return Some((runs, WorkbenchOrigin::Browser));
+    }
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))?;
+    let runs = state.runs.clone()?;
+    runs.workbench_grant_allows(bearer, workspace_id)
+        .then_some((runs, WorkbenchOrigin::Nushell))
 }
 
 fn authorized_runs(state: &AppState, headers: &HeaderMap) -> Option<RunController> {
@@ -1086,7 +1442,25 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(
-            list_runs(State(state), headers).await.status(),
+            list_runs(State(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            list_harnesses(State(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            list_model_profiles(State(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            list_evaluations(State(state), headers).await.status(),
             StatusCode::OK
         );
     }

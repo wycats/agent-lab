@@ -957,6 +957,7 @@ fn probe_can_finalize_fixture_evidence_for_direct_inspection() {
         .arg(env!("CARGO_BIN_EXE_agent-lab-driver-fixture"))
         .env("AGENT_LAB_EVIDENCE_DIR", &evidence)
         .env("AGENT_LAB_CONTROLLER_REVISION", "test-controller")
+        .env("AGENT_LAB_DRIVER_TASK_JSON", r#"{"mode":"startup-event"}"#)
         .env(
             "AGENT_LAB_CANONICAL_POLICY_JSON",
             r#"{"name":"fixture-v1","removedObjectKeys":["processId"]}"#,

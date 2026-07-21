@@ -486,6 +486,7 @@ struct RunState {
     initial_snapshot: Option<BTreeMap<String, Vec<u8>>>,
     capabilities: Mutex<Vec<CapabilityEndpoint>>,
     secret_values: Mutex<Vec<Vec<u8>>>,
+    reusable_explore: bool,
     replay_failed: bool,
 }
 
@@ -1092,7 +1093,9 @@ impl RunController {
             .values()
             .find(|state| {
                 let summary = lock(&state.summary);
-                summary.scenario_id == scenario.id && summary.status == RunStatus::Exploring
+                state.reusable_explore
+                    && summary.scenario_id == scenario.id
+                    && summary.status == RunStatus::Exploring
             })
             .cloned();
         if let Some(state) = existing {
@@ -1148,6 +1151,7 @@ impl RunController {
             initial_snapshot: Some(initial_snapshot),
             capabilities: Mutex::new(Vec::new()),
             secret_values: Mutex::new(driver_secret_values(&self.inner.driver)),
+            reusable_explore: true,
             replay_failed: false,
         });
         lock(&self.inner.runs).insert(id, state.clone());
@@ -1669,6 +1673,7 @@ impl RunController {
             initial_snapshot: Some(initial_snapshot),
             capabilities: Mutex::new(Vec::new()),
             secret_values: Mutex::new(driver_secret_values(&self.inner.driver)),
+            reusable_explore: false,
             replay_failed: false,
         });
         lock(&self.inner.runs).insert(id, state.clone());
@@ -1681,6 +1686,7 @@ impl RunController {
             json!({
                 "scenario": scenario.id,
                 "sourceRevision": source_revision,
+                "evaluationArm": true,
             }),
         )?;
         let capabilities = start_capability_sources(state.clone()).await?;
@@ -1958,7 +1964,7 @@ fn resolve_model_access_with_timeout(
         .map(String::as_str)
         .collect::<HashSet<_>>();
     let Some(resolver) = &provider.resolver else {
-        let environment = resolver_environment(&DriverLaunch::new(""), &allowed);
+        let environment = allowed_environment(None, &allowed);
         return Ok(ModelAccessResolution {
             status: if environment.is_empty() {
                 ModelAccessStatus::NeedsSetup
@@ -1986,6 +1992,19 @@ fn resolve_model_access_with_timeout(
     resolution
         .environment
         .retain(|name, value| allowed.contains(name.as_str()) && !value.is_empty());
+    let mut secrets = allowed_environment(Some(resolver), &allowed)
+        .into_values()
+        .map(String::into_bytes)
+        .collect::<Vec<_>>();
+    secrets.extend(
+        resolution
+            .environment
+            .values()
+            .map(|value| value.as_bytes().to_vec()),
+    );
+    resolution.message = resolution
+        .message
+        .map(|message| redact_string(&message, &secrets));
     if !include_environment {
         resolution.environment.clear();
     } else if resolution.status == ModelAccessStatus::Ready && resolution.environment.is_empty() {
@@ -2099,20 +2118,32 @@ fn terminate_resolver_process(child: &mut dyn ChildWrapper) {
     let _ = child.wait();
 }
 
-fn resolver_environment(
-    resolver: &DriverLaunch,
+fn allowed_environment(
+    launch: Option<&DriverLaunch>,
     allowed: &HashSet<&str>,
 ) -> BTreeMap<String, String> {
-    resolver
-        .env
-        .iter()
-        .filter_map(|(name, value)| {
+    let mut environment = if launch.is_none_or(|launch| !launch.clear_env) {
+        allowed
+            .iter()
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| ((*name).to_owned(), value))
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    if let Some(launch) = launch {
+        environment.extend(launch.env.iter().filter_map(|(name, value)| {
             let name = name.to_str()?;
             let value = value.to_str()?;
             (allowed.contains(name) && !value.is_empty())
                 .then(|| (name.to_owned(), value.to_owned()))
-        })
-        .collect()
+        }));
+    }
+    environment
 }
 
 async fn start_capability_sources(
@@ -2291,7 +2322,14 @@ fn receive_with_cancellation(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<Option<RawDriverMessage>, ProcessError> {
-    let deadline = Instant::now() + timeout;
+    receive_until_deadline(driver, Instant::now() + timeout, cancel)
+}
+
+fn receive_until_deadline(
+    driver: &mut DriverProcess,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<Option<RawDriverMessage>, ProcessError> {
     loop {
         if cancel.is_cancelled() {
             return Ok(None);
@@ -2345,14 +2383,6 @@ fn run_driver(
     driver_launch: DriverLaunch,
     capabilities: &[CapabilityEndpoint],
 ) -> Result<(), RunError> {
-    update_status(state, RunStatus::Running)?;
-    record_event(state, "driver.starting", JsonValue::Null)?;
-    record_startup_event(
-        state,
-        "driver-process",
-        "started",
-        Some("Launching the external driver process"),
-    )?;
     let mut secret_values = driver_secret_values(&driver_launch);
     secret_values.extend(
         capabilities
@@ -2361,6 +2391,14 @@ fn run_driver(
             .map(|token| token.as_bytes().to_vec()),
     );
     lock(&state.secret_values).clone_from(&secret_values);
+    update_status(state, RunStatus::Running)?;
+    record_event(state, "driver.starting", JsonValue::Null)?;
+    record_startup_event(
+        state,
+        "driver-process",
+        "started",
+        Some("Launching the external driver process"),
+    )?;
     let mut driver = DriverProcess::spawn_with(driver_launch)?;
     record_startup_event(
         state,
@@ -2375,9 +2413,9 @@ fn run_driver(
         Some("Loading the adapter and its module graph"),
     )?;
     let result = (|| -> Result<RunCompletion, RunError> {
+        let ready_deadline = Instant::now() + DRIVER_READY_TIMEOUT;
         let descriptor = loop {
-            let Some(message) =
-                receive_with_cancellation(&mut driver, DRIVER_READY_TIMEOUT, &state.cancel)?
+            let Some(message) = receive_until_deadline(&mut driver, ready_deadline, &state.cancel)?
             else {
                 return Ok(cancelled_completion());
             };
@@ -2437,9 +2475,10 @@ fn run_driver(
                 limits: serde_json::to_value(&scenario.limits)?,
             },
         ))?;
+        let session_deadline = Instant::now() + DRIVER_RESPONSE_TIMEOUT;
         loop {
             let Some(message) =
-                receive_with_cancellation(&mut driver, DRIVER_RESPONSE_TIMEOUT, &state.cancel)?
+                receive_until_deadline(&mut driver, session_deadline, &state.cancel)?
             else {
                 return Ok(cancelled_completion());
             };
@@ -2747,13 +2786,14 @@ fn record_startup_event(
     status: &str,
     detail: Option<&str>,
 ) -> Result<(), RunError> {
+    let secrets = lock(&state.secret_values).clone();
     record_event(
         state,
         "startup.event",
         json!({
-            "phase": phase,
-            "status": status,
-            "detail": detail,
+            "phase": redact_string(phase, &secrets),
+            "status": redact_string(status, &secrets),
+            "detail": detail.map(|detail| redact_string(detail, &secrets)),
         }),
     )
 }
@@ -3983,6 +4023,11 @@ fn load_run_bundle(
     let initial_snapshot = (summary.status == RunStatus::Exploring)
         .then(|| snapshot_tree(&bundle_dir.join("initial")).ok())
         .flatten();
+    let reusable_explore = !events.iter().any(|event| {
+        event.kind == "run.prepared"
+            && (event.payload["evaluationArm"].as_bool() == Some(true)
+                || event.payload.get("sourceRevision").is_some())
+    });
     let mut selection = if bundle_dir.join("workbench.json").is_file() {
         serde_json::from_slice(&fs::read(bundle_dir.join("workbench.json"))?)?
     } else {
@@ -4004,6 +4049,7 @@ fn load_run_bundle(
         initial_snapshot,
         capabilities: Mutex::new(Vec::new()),
         secret_values: Mutex::new(Vec::new()),
+        reusable_explore,
         replay_failed,
     });
     persist_selection(&state)?;
@@ -5117,6 +5163,7 @@ totalScore = 11
             initial_snapshot,
             capabilities: Mutex::new(Vec::new()),
             secret_values: Mutex::new(Vec::new()),
+            reusable_explore: false,
             replay_failed: false,
         }
     }
@@ -5176,6 +5223,40 @@ totalScore = 11
         canceller.join().unwrap();
         assert!(message.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_progress_does_not_extend_the_original_deadline() {
+        let script = r#"
+i=1
+while [ "$i" -le 20 ]; do
+  printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"startup.event","phase":"adapter","status":"running","detail":null}\n' "$i"
+  i=$((i + 1))
+  sleep 0.02
+done
+sleep 30
+"#;
+        let mut driver = DriverProcess::spawn("/bin/sh", ["-c", script]).unwrap();
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(80);
+        let mut progress = 0;
+        loop {
+            match receive_until_deadline(&mut driver, deadline, &cancel) {
+                Ok(Some(message)) => {
+                    assert!(matches!(
+                        message.parsed.body,
+                        DriverBody::StartupEvent { .. }
+                    ));
+                    progress += 1;
+                }
+                Err(ProcessError::Timeout) => break,
+                other => panic!("unexpected startup receive result: {other:?}"),
+            }
+        }
+        assert!(progress > 0);
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[cfg(unix)]
@@ -6426,6 +6507,59 @@ totalScore = 11
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn resolverless_model_access_reads_allowlisted_ambient_environment() {
+        let provider = ModelAccessProvider {
+            id: "ambient".to_owned(),
+            display_name: "Ambient".to_owned(),
+            resolver: None,
+            environment_names: vec!["PATH".to_owned()],
+            setup_hint: "Provide PATH".to_owned(),
+        };
+
+        let resolution = resolve_model_access(&provider, true).unwrap();
+        assert_eq!(resolution.status, ModelAccessStatus::Ready);
+        assert!(
+            resolution
+                .environment
+                .get("PATH")
+                .is_some_and(|path| !path.is_empty())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_access_messages_are_redacted_against_resolver_environment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("model-access-message-redaction");
+        let resolver_path = root.join("resolver.sh");
+        fs::write(
+            &resolver_path,
+            "#!/bin/sh\nprintf '{\"status\":\"needs-setup\",\"message\":\"credential %s rejected\"}\\n' \"$TOKEN\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&resolver_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut resolver = DriverLaunch::new(resolver_path);
+        resolver.clear_env = true;
+        resolver
+            .env
+            .push(("TOKEN".into(), "secret-model-token".into()));
+        let provider = ModelAccessProvider {
+            id: "gateway".to_owned(),
+            display_name: "Gateway".to_owned(),
+            resolver: Some(resolver),
+            environment_names: vec!["TOKEN".to_owned()],
+            setup_hint: "Connect the gateway".to_owned(),
+        };
+
+        let resolution = resolve_model_access(&provider, false).unwrap();
+        let message = resolution.message.unwrap();
+        assert!(!message.contains("secret-model-token"));
+        assert!(message.contains("[REDACTED]"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn model_access_secrets_are_injected_only_into_the_resolved_launch() {
@@ -6853,6 +6987,46 @@ fi
         }));
 
         drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn evaluation_arms_are_not_reused_as_explore_workspaces_after_restart() {
+        let root = temporary_root("evaluation-arm-explore-isolation");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/bin/false"),
+        };
+        let controller = RunController::new(config()).unwrap();
+        let arm = controller
+            .prepare_snapshot_run(
+                "catalog",
+                &scenarios.join("catalog/workspace"),
+                "revision-test",
+            )
+            .await
+            .unwrap();
+        assert_eq!(arm.status, RunStatus::Exploring);
+        drop(controller);
+
+        let reopened = RunController::new(config()).unwrap();
+        let explore = reopened
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_ne!(explore.id, arm.id);
+        assert!(reopened.state(&explore.id).unwrap().reusable_explore);
+        assert!(!reopened.state(&arm.id).unwrap().reusable_explore);
+
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7684,6 +7858,7 @@ fi
                 cancel: capability_cancel.clone(),
             }]),
             secret_values: Mutex::new(vec![b"environment-secret".to_vec()]),
+            reusable_explore: false,
             replay_failed: false,
         };
         finalize_workspace(&state).unwrap();
@@ -7746,6 +7921,27 @@ fi
             );
         }
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_events_are_redacted_before_recording() {
+        let root = temporary_root("startup-event-redaction");
+        fs::create_dir(root.join("initial")).unwrap();
+        let state = test_run_state(&root);
+        lock(&state.secret_values).push(b"provider-secret".to_vec());
+
+        record_startup_event(
+            &state,
+            "phase-provider-secret",
+            "status-provider-secret",
+            Some("detail provider-secret"),
+        )
+        .unwrap();
+
+        let serialized = serde_json::to_string(&lock(&state.events).clone()).unwrap();
+        assert!(!serialized.contains("provider-secret"));
+        assert!(serialized.contains("[REDACTED]"));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -160,6 +160,7 @@ fn run_probe_turn(
     let (outcome, evidence) = loop {
         let message = driver.receive(TIMEOUT)?;
         match message.parsed.body {
+            DriverBody::StartupEvent { .. } => {}
             DriverBody::TurnEvent {
                 session_id,
                 turn_id,

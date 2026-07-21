@@ -230,6 +230,17 @@ impl Fixture {
                     },
                 )
             }
+            Some("startup-event") => {
+                self.emit(
+                    output,
+                    DriverBody::StartupEvent {
+                        phase: "turn-runtime".to_owned(),
+                        status: "completed".to_owned(),
+                        detail: Some("Turn runtime ready".to_owned()),
+                    },
+                )?;
+                self.complete_turn(output, session_id, turn_id, task, capability_sources)
+            }
             _ => self.complete_turn(output, session_id, turn_id, task, capability_sources),
         }
     }

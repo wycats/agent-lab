@@ -79,7 +79,12 @@
     .map((id) => harnesses.find((harness) => harness.id === id)?.displayName ?? id)
     .join(' with ')}`;
   $: activeModelAccess = modelAccess.find((access) => access.status !== 'ready') ?? modelAccess[0];
-  $: modelAccessReady = modelAccess.every((access) => access.status === 'ready');
+  $: runModelAccessReady = modelAccess
+    .filter((access) => access.harnessIds.includes(harnessId))
+    .every((access) => access.status === 'ready');
+  $: comparisonModelAccessReady = modelAccess
+    .filter((access) => access.harnessIds.some((id) => comparisonHarnessIds.includes(id)))
+    .every((access) => access.status === 'ready');
 
   async function startTerminal(run?: RunSummary): Promise<void> {
     startupError = '';
@@ -190,7 +195,7 @@
 
   async function beginRun(): Promise<void> {
     const hasSelection = harnesses.length ? Boolean(harnessId && modelProfileId) : Boolean(modelId.trim());
-    if (!exploreRun || exploreRun.summary.status !== 'exploring' || !hasSelection || !modelAccessReady || starting) return;
+    if (!exploreRun || exploreRun.summary.status !== 'exploring' || !hasSelection || !runModelAccessReady || starting) return;
     starting = true;
     actionError = '';
     activeTab = 'agent';
@@ -220,7 +225,7 @@
   }
 
   async function beginEvaluation(): Promise<void> {
-    if (!exploreRun || exploreRun.summary.status !== 'exploring' || !modelProfileId || !modelAccessReady || comparing) return;
+    if (!exploreRun || exploreRun.summary.status !== 'exploring' || !modelProfileId || !comparisonModelAccessReady || comparing) return;
     if (
       comparisonHarnessIds.length !== 2 ||
       comparisonHarnessIds.some((id) => !harnesses.some((harness) => harness.id === id))
@@ -726,12 +731,12 @@
           {preparing ? 'Preparing…' : 'New workspace'}
         </button>
       {:else}
-        <button class="primary" disabled={activeExplore?.status !== 'exploring' || !(harnesses.length ? harnessId && modelProfileId : modelId.trim()) || !modelAccessReady || preparing || starting || running} on:click={() => void beginRun()}>
+        <button class="primary" disabled={activeExplore?.status !== 'exploring' || !(harnesses.length ? harnessId && modelProfileId : modelId.trim()) || !runModelAccessReady || preparing || starting || running} on:click={() => void beginRun()}>
           {starting ? 'Starting…' : 'Run harness'}
         </button>
       {/if}
       {#if comparisonHarnessIds.length === 2}
-        <button class="quiet compare" disabled={activeExplore?.status !== 'exploring' || !modelProfileId || !modelAccessReady || preparing || comparing || running || evaluationRunning} on:click={() => void beginEvaluation()}>
+        <button class="quiet compare" disabled={activeExplore?.status !== 'exploring' || !modelProfileId || !comparisonModelAccessReady || preparing || comparing || running || evaluationRunning} on:click={() => void beginEvaluation()}>
           {comparing ? 'Starting…' : comparisonLabel}
         </button>
       {/if}

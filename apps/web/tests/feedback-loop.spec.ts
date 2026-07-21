@@ -43,8 +43,10 @@ test('model access surfaces the provider blocking the shared selection', async (
   const access = page.locator('.model-access-pill');
   await expect(access).toContainText('Connect');
   await expect(access).toHaveAttribute('title', 'Connect the second provider.');
-  await expect(page.getByRole('button', { name: 'Run harness', exact: true })).toBeDisabled();
+  await page.getByLabel('Harness').selectOption('v0');
+  await expect(page.getByRole('button', { name: 'Run harness', exact: true })).toBeEnabled();
   await expect(page.getByRole('button', { name: 'Compare v0 with Eve' })).toBeDisabled();
+  await page.unrouteAll({ behavior: 'wait' });
 });
 
 test('a catalog run remains explorable and reopens from durable evidence', async ({ page }) => {

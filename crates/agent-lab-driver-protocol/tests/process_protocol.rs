@@ -9,6 +9,7 @@ use agent_lab_driver_protocol::{
     CanonicalizationPolicy, CommandBody, ControllerCommand, DriverBody, DriverEvidenceBundle,
     DriverFailureScope, DriverLaunch, DriverMessage, DriverProcess, MAX_DRIVER_RECORD_BYTES,
     MAX_DRIVER_STDERR_BYTES, MAX_DRIVER_TRANSCRIPT_BYTES, PROTOCOL_VERSION, ProcessError,
+    TURN_OBSERVATIONS_FEATURE, TurnObservation,
 };
 use serde_json::json;
 
@@ -175,6 +176,154 @@ fn one_process_streams_two_turns_and_cancels_the_second() {
             .iter()
             .all(|raw| raw.ends_with(b"\n"))
     );
+}
+
+#[test]
+fn interactive_fixture_answers_and_preserves_its_prior_conclusion() {
+    const CONCLUSION: &str = r#"# Catalog answer
+
+**Alpha** and **gamma** are active.
+
+| Item | Score |
+| --- | ---: |
+| `gamma` | **8** |
+| `alpha` | 3 |
+
+> Gamma matters most because its score is 8, compared with alpha's 3.
+
+- Evidence
+  - [Catalog reference](https://example.com/catalog)
+  - Structured excerpt:
+
+    ```json
+    {"name":"gamma","score":8}
+    ```"#;
+
+    let mut driver = fixture();
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::StartupEvent { .. }
+    ));
+    let ready = driver.receive(TIMEOUT).unwrap();
+    let DriverBody::Ready { driver: descriptor } = ready.parsed.body else {
+        panic!("expected driver.ready")
+    };
+    assert!(
+        descriptor
+            .features
+            .iter()
+            .any(|feature| feature == TURN_OBSERVATIONS_FEATURE)
+    );
+    driver
+        .send(&command(
+            "open-interactive",
+            CommandBody::OpenSession {
+                session_id: "interactive-session".to_owned(),
+                config: json!({}),
+                limits: json!({}),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::SessionOpened { .. }
+    ));
+
+    driver
+        .send(&command(
+            "interactive-1",
+            CommandBody::StartTurn {
+                session_id: "interactive-session".to_owned(),
+                turn_id: "interactive-turn-1".to_owned(),
+                task: json!({
+                    "mode": "interactive",
+                    "prompt": "Explain which catalog items matter.",
+                    "input": [
+                        { "name": "alpha", "active": true, "score": 3 },
+                        { "name": "gamma", "active": true, "score": 8 }
+                    ]
+                }),
+                capability_sources: json!([]),
+            },
+        ))
+        .unwrap();
+    assert_eq!(receive_fixture_answer(&mut driver), CONCLUSION);
+
+    driver
+        .send(&command(
+            "interactive-2",
+            CommandBody::StartTurn {
+                session_id: "interactive-session".to_owned(),
+                turn_id: "interactive-turn-2".to_owned(),
+                task: json!({
+                    "mode": "interactive",
+                    "prompt": "What was your prior conclusion?"
+                }),
+                capability_sources: json!([]),
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        receive_fixture_answer(&mut driver),
+        format!("## Prior conclusion\n\n{CONCLUSION}")
+    );
+
+    driver
+        .send(&command(
+            "close-interactive",
+            CommandBody::CloseSession {
+                session_id: "interactive-session".to_owned(),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        driver.receive(TIMEOUT).unwrap().parsed.body,
+        DriverBody::SessionClosed { .. }
+    ));
+    assert_eq!(driver.wait_for_exit(TIMEOUT).unwrap(), Some(0));
+}
+
+fn receive_fixture_answer(driver: &mut DriverProcess) -> String {
+    let mut deltas = Vec::new();
+    let mut completed = None;
+    let mut progress = Vec::new();
+    let mut saw_usage = false;
+    loop {
+        match driver.receive(TIMEOUT).unwrap().parsed.body {
+            DriverBody::TurnEvent {
+                event_type,
+                payload,
+                ..
+            } => match TurnObservation::parse(&event_type, &payload).unwrap() {
+                Some(TurnObservation::AssistantDelta(delta)) => deltas.push(delta.text),
+                Some(TurnObservation::AssistantCompleted(message)) => {
+                    completed = Some(message.text);
+                }
+                Some(TurnObservation::Progress(observation)) => {
+                    progress.push(observation.phase);
+                }
+                Some(TurnObservation::Usage(_)) => saw_usage = true,
+                Some(TurnObservation::NativeAction(_)) | None => {}
+            },
+            DriverBody::TurnFinished { outcome, .. } => {
+                assert_eq!(outcome, "completed");
+                break;
+            }
+            body => panic!("unexpected fixture response: {body:?}"),
+        }
+    }
+    assert_eq!(deltas.len(), 2);
+    assert_eq!(
+        progress,
+        [
+            agent_lab_driver_protocol::ProgressPhase::Reasoning,
+            agent_lab_driver_protocol::ProgressPhase::Responding,
+        ]
+    );
+    let completed = completed.expect("fixture should emit authoritative assistant text");
+    assert_eq!(deltas.concat(), completed);
+    assert!(saw_usage);
+    completed
 }
 
 #[test]

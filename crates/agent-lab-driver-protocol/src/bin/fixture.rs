@@ -5,8 +5,10 @@ use std::{
 };
 
 use agent_lab_driver_protocol::{
-    CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverFailureScope,
-    DriverMessage, MAX_DRIVER_RECORD_BYTES, MAX_DRIVER_STDERR_BYTES, PROTOCOL_VERSION,
+    AssistantCompletedObservation, AssistantDeltaObservation, CommandBody, ControllerCommand,
+    DriverBody, DriverDescriptor, DriverFailureScope, DriverMessage, MAX_DRIVER_RECORD_BYTES,
+    MAX_DRIVER_STDERR_BYTES, PROTOCOL_VERSION, ProgressObservation, ProgressPhase,
+    TURN_OBSERVATIONS_FEATURE, TurnObservation, UsageObservation,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -28,7 +30,27 @@ struct Fixture {
     session_id: Option<String>,
     active_turn: Option<String>,
     workspace_root: Option<PathBuf>,
+    prior_conclusion: Option<String>,
 }
+
+const CATALOG_CONCLUSION: &str = r#"# Catalog answer
+
+**Alpha** and **gamma** are active.
+
+| Item | Score |
+| --- | ---: |
+| `gamma` | **8** |
+| `alpha` | 3 |
+
+> Gamma matters most because its score is 8, compared with alpha's 3.
+
+- Evidence
+  - [Catalog reference](https://example.com/catalog)
+  - Structured excerpt:
+
+    ```json
+    {"name":"gamma","score":8}
+    ```"#;
 
 impl Fixture {
     fn new() -> Self {
@@ -38,6 +60,7 @@ impl Fixture {
             session_id: None,
             active_turn: None,
             workspace_root: None,
+            prior_conclusion: None,
         }
     }
 
@@ -253,7 +276,7 @@ impl Fixture {
         task: &JsonValue,
         capability_sources: &JsonValue,
     ) -> io::Result<()> {
-        let scenario_mode = task.get("mode").and_then(JsonValue::as_str) == Some("real");
+        let mode = task.get("mode").and_then(JsonValue::as_str);
         self.emit(
             output,
             DriverBody::TurnEvent {
@@ -272,8 +295,16 @@ impl Fixture {
                 payload: (*capability_sources).clone(),
             },
         )?;
-        if scenario_mode {
+        if mode == Some("real") {
             self.complete_catalog_scenario(output, &session_id, &turn_id, capability_sources)?;
+        } else if mode == Some("interactive") {
+            self.complete_interactive_turn(
+                output,
+                &session_id,
+                &turn_id,
+                task,
+                capability_sources,
+            )?;
         }
         self.emit(
             output,
@@ -311,6 +342,95 @@ impl Fixture {
             )?;
         }
         Ok(())
+    }
+
+    fn complete_interactive_turn(
+        &mut self,
+        output: &mut impl Write,
+        session_id: &str,
+        turn_id: &str,
+        task: &JsonValue,
+        capability_sources: &JsonValue,
+    ) -> io::Result<()> {
+        let prompt = task
+            .get("prompt")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default();
+        let asks_for_prior = asks_for_prior_conclusion(prompt);
+        let answer = if asks_for_prior {
+            self.prior_conclusion.as_ref().map_or_else(
+                || "There is no prior conclusion in this session.".to_owned(),
+                |conclusion| format!("## Prior conclusion\n\n{conclusion}"),
+            )
+        } else if can_call_catalog_capabilities(capability_sources) {
+            self.complete_catalog_scenario(output, session_id, turn_id, capability_sources)?;
+            CATALOG_CONCLUSION.to_owned()
+        } else if task.get("input").is_some_and(|input| !input.is_null()) {
+            CATALOG_CONCLUSION.to_owned()
+        } else {
+            format!("Fixture agent answered: {prompt}")
+        };
+        if !asks_for_prior {
+            self.prior_conclusion = Some(answer.clone());
+        }
+
+        let message_id = format!("fixture-message-{turn_id}");
+        let (first, second) = split_answer(&answer);
+        self.emit(
+            output,
+            TurnObservation::Progress(ProgressObservation {
+                phase: ProgressPhase::Reasoning,
+                detail: Some("Inspecting the workspace".to_owned()),
+                source: Some("fixture".to_owned()),
+            })
+            .into_driver_body(session_id, turn_id),
+        )?;
+        self.emit(
+            output,
+            TurnObservation::Progress(ProgressObservation {
+                phase: ProgressPhase::Responding,
+                detail: Some("Composing the answer".to_owned()),
+                source: Some("fixture".to_owned()),
+            })
+            .into_driver_body(session_id, turn_id),
+        )?;
+        self.emit(
+            output,
+            TurnObservation::AssistantDelta(AssistantDeltaObservation {
+                message_id: message_id.clone(),
+                text: first.to_owned(),
+            })
+            .into_driver_body(session_id, turn_id),
+        )?;
+        self.emit(
+            output,
+            TurnObservation::AssistantDelta(AssistantDeltaObservation {
+                message_id: message_id.clone(),
+                text: second.to_owned(),
+            })
+            .into_driver_body(session_id, turn_id),
+        )?;
+        self.emit(
+            output,
+            TurnObservation::AssistantCompleted(AssistantCompletedObservation {
+                message_id,
+                text: answer.clone(),
+            })
+            .into_driver_body(session_id, turn_id),
+        )?;
+        let input_tokens = prompt.split_whitespace().count() as u64;
+        let output_tokens = answer.split_whitespace().count() as u64;
+        self.emit(
+            output,
+            TurnObservation::Usage(UsageObservation {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+                total_tokens: Some(input_tokens + output_tokens),
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            })
+            .into_driver_body(session_id, turn_id),
+        )
     }
 
     fn abort_turn(
@@ -409,6 +529,44 @@ impl Fixture {
         }
         Ok(true)
     }
+}
+
+fn can_call_catalog_capabilities(capability_sources: &JsonValue) -> bool {
+    ["catalog", "analysis"].iter().all(|source_id| {
+        capability_sources.as_array().is_some_and(|sources| {
+            sources.iter().any(|source| {
+                source.get("id").and_then(JsonValue::as_str) == Some(source_id)
+                    && source
+                        .pointer("/transport/type")
+                        .and_then(JsonValue::as_str)
+                        == Some("http")
+                    && source
+                        .pointer("/transport/url")
+                        .and_then(JsonValue::as_str)
+                        .is_some()
+                    && source
+                        .pointer("/transport/headers/Authorization")
+                        .and_then(JsonValue::as_str)
+                        .is_some_and(|value| value.starts_with("Bearer "))
+            })
+        })
+    })
+}
+
+fn asks_for_prior_conclusion(prompt: &str) -> bool {
+    let prompt = prompt.to_ascii_lowercase();
+    prompt.contains("prior conclusion")
+        || prompt.contains("earlier conclusion")
+        || prompt.contains("what did you conclude")
+}
+
+fn split_answer(answer: &str) -> (&str, &str) {
+    let midpoint = answer.chars().count() / 2;
+    let split = answer
+        .char_indices()
+        .nth(midpoint)
+        .map_or(answer.len(), |(index, _)| index);
+    answer.split_at(split)
 }
 
 fn call_catalog_capabilities(capability_sources: &JsonValue) -> io::Result<JsonValue> {
@@ -511,6 +669,7 @@ fn start_fixture(output: &mut impl Write, fixture: &mut Fixture) -> io::Result<b
                     "streaming".to_owned(),
                     "cancellation".to_owned(),
                     "raw-evidence".to_owned(),
+                    TURN_OBSERVATIONS_FEATURE.to_owned(),
                 ],
             },
         },

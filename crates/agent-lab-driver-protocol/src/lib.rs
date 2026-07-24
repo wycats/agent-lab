@@ -16,6 +16,10 @@ pub use process::{
     MAX_DRIVER_STDERR_BYTES, MAX_DRIVER_TRANSCRIPT_BYTES, ProcessError, RawDriverMessage,
 };
 pub use protocol::{
-    CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverFailureScope,
-    DriverMessage, PROTOCOL_VERSION,
+    ASSISTANT_COMPLETED_EVENT, ASSISTANT_DELTA_EVENT, AssistantCompletedObservation,
+    AssistantDeltaObservation, CommandBody, ControllerCommand, DriverBody, DriverDescriptor,
+    DriverFailureScope, DriverMessage, NATIVE_ACTION_EVENT, NativeActionObservation,
+    NativeActionStatus, PROGRESS_EVENT, PROTOCOL_VERSION, ProgressObservation, ProgressPhase,
+    TURN_OBSERVATIONS_FEATURE, TurnObservation, TurnObservationError, USAGE_EVENT,
+    UsageObservation,
 };

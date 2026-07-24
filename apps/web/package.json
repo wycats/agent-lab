@@ -12,6 +12,7 @@
   "dependencies": {
     "@fontsource-variable/geist": "5.2.9",
     "@fontsource-variable/geist-mono": "5.2.8",
+    "@humanspeak/svelte-markdown": "1.6.1",
     "ghostty-web": "0.4.0"
   },
   "devDependencies": {

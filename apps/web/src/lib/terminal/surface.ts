@@ -12,6 +12,7 @@ export interface TerminalSurface {
   write(data: string | Uint8Array, afterWrite?: () => void): void;
   readText(): string;
   onData(listener: (data: string) => void): Disposable;
+  onUserInput(listener: () => void): Disposable;
   onResize(listener: (dimensions: TerminalDimensions) => void): Disposable;
   onScroll(listener: () => void): Disposable;
   focus(): void;

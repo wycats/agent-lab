@@ -102,6 +102,85 @@ export interface WorkbenchSnapshot {
   modelProfiles: ModelProfileMetadata[];
   modelAccess: ModelAccessSnapshot[];
   latestEvaluation?: EvaluationSummary;
+  activeAgentSession?: AgentSessionSummary;
+  replayAgentSession?: AgentSessionSummary;
+  agentSessions: AgentSessionSummary[];
+}
+
+export type AgentSessionStatus = 'starting' | 'ready' | 'running' | 'closing' | 'failed' | 'closed' | 'interrupted';
+export type AgentTurnStatus = 'queued' | 'running' | 'completed' | 'intervened' | 'failed' | 'cancelled';
+
+export interface AgentSessionSummary {
+  id: string;
+  workspaceId: string;
+  harnessId: string;
+  modelProfileId: string;
+  modelId: string;
+  status: AgentSessionStatus;
+  active: boolean;
+  createdAtMs: number;
+  updatedAtMs: number;
+  turnCount: number;
+  error?: string;
+}
+
+export interface AgentTurnSummary {
+  id: string;
+  sessionId: string;
+  prompt: string;
+  input?: unknown | null;
+  sourceRevision: string;
+  capabilityRevisions: Record<string, string>;
+  status: AgentTurnStatus;
+  startedAtMs: number;
+  finishedAtMs?: number;
+  outcome?: string;
+  error?: string;
+  humanInterventionAtMs?: number;
+  presentation?: AgentTurnPresentation;
+}
+
+export interface AgentTurnMessagePresentation {
+  id: string;
+  text: string;
+  complete: boolean;
+  sourceEventSequences: number[];
+}
+
+export interface AgentTurnActivityPresentation {
+  kind: string;
+  title: string;
+  detail: string | null;
+  status: string;
+  source: string | null;
+  path: string | null;
+  sourceEventSequences: number[];
+}
+
+export interface AgentTurnPresentationCompleteness {
+  assistantOutput: 'complete' | 'partial' | 'unavailable';
+  capabilityActivity: 'complete' | 'partial' | 'unavailable';
+  nativeActivity: 'complete' | 'partial' | 'unavailable';
+  workspaceEffects: 'complete' | 'partial' | 'unavailable';
+  usage: 'complete' | 'partial' | 'unavailable';
+}
+
+export interface AgentTurnPresentation {
+  schemaVersion: 1;
+  response: string | null;
+  messages: AgentTurnMessagePresentation[];
+  activity: AgentTurnActivityPresentation[];
+  usage: Record<string, unknown> | null;
+  completeness: AgentTurnPresentationCompleteness;
+  sourceEventSequences: number[];
+  sourceDigest: string;
+}
+
+export interface AgentSessionDetail {
+  projectionVersion: number;
+  summary: AgentSessionSummary;
+  turns: AgentTurnSummary[];
+  events: RunEvent[];
 }
 
 export type EvaluationStatus = 'queued' | 'running' | 'passed' | 'failed' | 'cancelled';
@@ -156,11 +235,29 @@ export interface EvaluationComparisonArm {
   cache: 'not reported' | { readTokens: number; writeTokens: number };
 }
 
+export type RunProgressPhase =
+  | 'starting'
+  | 'preparing'
+  | 'reasoning'
+  | 'responding'
+  | 'acting'
+  | 'waiting'
+  | 'finalizing';
+
+export interface RunEventProgress {
+  phase: RunProgressPhase;
+  detail?: string | null;
+  source?: string | null;
+  sourceEventSequence?: number | null;
+  sourceEventType?: string | null;
+}
+
 export interface RunEvent {
   sequence: number;
   atMs: number;
   type: string;
   payload: unknown;
+  progress?: RunEventProgress;
 }
 
 export interface RunReview {
@@ -229,6 +326,13 @@ export interface RunClient {
     id: string,
     input?: { modelProfileId?: string; harnessIds?: string[] }
   ): Promise<EvaluationSummary>;
+  agentSession(workspaceId: string, sessionId: string): Promise<AgentSessionDetail>;
+  cancelAgentTurn(workspaceId: string, sessionId: string): Promise<void>;
+  agentSessionEvents(
+    workspaceId: string,
+    sessionId: string,
+    onEvent: (event: RunEvent) => void
+  ): AbortController;
 }
 
 async function processToken(): Promise<string> {
@@ -359,6 +463,24 @@ export function createRunClient(): RunClient {
       request(`/api/workbench/${encodeURIComponent(id)}/compare`, {
         method: 'POST',
         body: JSON.stringify(input)
-      })
+      }),
+    agentSession: (workspaceId, sessionId) =>
+      request(`/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}`),
+    cancelAgentTurn: (workspaceId, sessionId) =>
+      request(
+        `/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}/cancel`,
+        { method: 'POST' }
+      ),
+    agentSessionEvents(workspaceId, sessionId, onEvent) {
+      const controller = new AbortController();
+      void streamEvents(
+        `/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}/events`,
+        controller.signal,
+        onEvent
+      ).catch((error) => {
+        if (!controller.signal.aborted) console.error(error);
+      });
+      return controller;
+    }
   };
 }

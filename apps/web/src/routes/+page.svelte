@@ -2,14 +2,24 @@
   import '@fontsource-variable/geist';
   import '@fontsource-variable/geist-mono';
   import { onMount } from 'svelte';
-  import { createRunClient, type EvaluationComparisonArm, type EvaluationDetail, type EvaluationSummary, type HarnessMetadata, type ModelAccessSnapshot, type ModelProfileMetadata, type RunDetail, type RunEvent, type RunReviewStep, type RunSummary, type ScenarioManifest, type WorkbenchSelection } from '$lib/runs';
+  import AgentSessionLiveStatus from '$lib/AgentSessionLiveStatus.svelte';
+  import AssistantMarkdown from '$lib/AssistantMarkdown.svelte';
+  import { projectAgentSessionLiveStatus } from '$lib/agent-live-status';
+  import { createRunClient, type AgentSessionDetail, type AgentTurnActivityPresentation, type AgentTurnMessagePresentation, type AgentTurnSummary, type EvaluationComparisonArm, type EvaluationDetail, type EvaluationSummary, type HarnessMetadata, type ModelAccessSnapshot, type ModelProfileMetadata, type RunDetail, type RunEvent, type RunReviewStep, type RunSummary, type ScenarioManifest, type WorkbenchSelection } from '$lib/runs';
   import { createGhosttySurface } from '$lib/terminal/ghostty';
   import { connectSession } from '$lib/terminal/session';
   import type { BrowserSession, ConnectionState, SessionEvent } from '$lib/terminal/session';
   import type { TerminalSurface } from '$lib/terminal/surface';
 
   type Tab = 'agent' | 'workspace' | 'editor' | 'evidence' | 'evaluation';
+  type AgentInspectionMode = 'session' | 'run';
+  type AgentSessionReconcileTarget = {
+    workspaceId: string;
+    sessionId: string;
+    openVersion: number;
+  };
   type AgentView = 'review' | 'raw';
+  type AgentAnswerView = 'rendered' | 'source';
   type BehaviorSegment = {
     key: string;
     label: string;
@@ -25,6 +35,10 @@
     segments: Record<string, BehaviorSegment | undefined>;
   };
 
+  function agentSessionIsHistorical(summary: AgentSessionDetail['summary']): boolean {
+    return summary.status === 'failed' || summary.status === 'closed' || summary.status === 'interrupted';
+  }
+
   const runClient = createRunClient();
   let terminalHost: HTMLDivElement;
   let surface: TerminalSurface | undefined;
@@ -33,6 +47,13 @@
   let exploreEventStream: AbortController | undefined;
   let inspectionEventStream: AbortController | undefined;
   let evaluationRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let agentSessionEventStream: AbortController | undefined;
+  let agentSessionEventFlushTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingAgentSessionEvents: RunEvent[] = [];
+  let knownAgentSessionEventSequences = new Set<number>();
+  let agentSessionReconcileInFlight: Promise<void> | undefined;
+  let agentSessionReconcileTarget: AgentSessionReconcileTarget | undefined;
+  let agentSessionOpenVersion = 0;
   let connectionState: ConnectionState = 'starting';
   let sessionEvents: SessionEvent[] = [];
   let screenText = '';
@@ -50,23 +71,48 @@
   let runs: RunSummary[] = [];
   let evaluations: EvaluationSummary[] = [];
   let selectedEvaluation: EvaluationDetail | undefined;
+  let activeAgentSession: AgentSessionDetail | undefined;
   let evaluationRuns: Record<string, RunDetail> = {};
   let exploreRun: RunDetail | undefined;
   let selectedRun: RunDetail | undefined;
   let terminalRun: RunSummary | undefined;
   let runEvents: RunEvent[] = [];
   let activeTab: Tab = 'agent';
+  let agentInspectionMode: AgentInspectionMode = 'session';
   let agentView: AgentView = 'review';
+  let agentAnswerView: AgentAnswerView = 'rendered';
   let actionError = '';
   let preparing = false;
   let starting = false;
   let fixtureOnly = false;
   let comparing = false;
+  let agentTurnCancelling = false;
 
   $: activeExplore = exploreRun?.summary;
   $: inspectedRun = selectedRun?.summary;
   $: running = activeExplore?.status === 'starting' || activeExplore?.status === 'running';
   $: finished = activeExplore?.status === 'passed' || activeExplore?.status === 'failed' || activeExplore?.status === 'cancelled';
+  $: historicalAgentSession = Boolean(activeAgentSession && agentSessionIsHistorical(activeAgentSession.summary));
+  $: showingAgentSession = Boolean(activeAgentSession && agentInspectionMode === 'session');
+  $: sessionAssembly = exploreRun?.assembly;
+  $: agentLiveStatus = projectAgentSessionLiveStatus(activeAgentSession, agentTurnCancelling);
+  $: if (!activeAgentSession?.turns.some((turn) => turn.status === 'queued' || turn.status === 'running')) {
+    agentTurnCancelling = false;
+  }
+  $: agentSessionHeading = activeAgentSession?.summary.status === 'interrupted'
+    ? 'Session replay'
+    : historicalAgentSession
+      ? 'Session history'
+      : activeAgentSession?.summary.active
+        ? 'Active session'
+        : 'Agent session';
+  $: agentSessionIntro = activeAgentSession?.summary.status === 'interrupted'
+    ? 'Reopened from durable evidence. Start a new agent session to continue.'
+    : historicalAgentSession
+      ? 'Retained as durable evidence. Start a new agent session to continue.'
+      : activeAgentSession?.summary.active
+        ? 'Ask the harness in Explore. Its response, actions, and effects stay together here.'
+        : 'This session is getting ready. Its response, actions, and effects will stay together here.';
   $: evaluationRunning = selectedEvaluation?.summary.status === 'queued' || selectedEvaluation?.summary.status === 'running';
   $: behaviorRows = buildBehaviorRows(selectedEvaluation, evaluationRuns);
   $: comparisonClockMs = maxComparisonDuration(selectedEvaluation, evaluationRuns);
@@ -163,6 +209,277 @@
     const workbench = await runClient.workbench(id);
     applyWorkbenchSelection(workbench.selection);
     modelAccess = workbench.modelAccess;
+    const session = workbench.activeAgentSession?.active
+      ? workbench.activeAgentSession
+      : workbench.replayAgentSession;
+    if (session && !starting && exploreRun?.summary.status === 'exploring') {
+      try {
+        await openAgentSession(id, session.id, false);
+      } catch {
+        clearAgentSessionView();
+      }
+    } else {
+      clearAgentSessionView();
+    }
+  }
+
+  async function openAgentSession(
+    workspaceId: string,
+    sessionId: string,
+    reveal = true,
+    refresh = true
+  ): Promise<void> {
+    if (!refresh && activeAgentSession?.summary.id === sessionId) {
+      if (reveal) {
+        activeTab = 'agent';
+        agentInspectionMode = 'session';
+      }
+      return;
+    }
+    const openVersion = ++agentSessionOpenVersion;
+    const detail = await runClient.agentSession(workspaceId, sessionId);
+    if (
+      openVersion !== agentSessionOpenVersion ||
+      starting ||
+      exploreRun?.summary.status !== 'exploring'
+    ) return;
+    if (activeAgentSession?.summary.id !== detail.summary.id) {
+      agentAnswerView = 'rendered';
+      agentTurnCancelling = false;
+    }
+    activeAgentSession = detail;
+    knownAgentSessionEventSequences = new Set(detail.events.map((event) => event.sequence));
+    pendingAgentSessionEvents = [];
+    if (agentSessionEventFlushTimer !== undefined) clearTimeout(agentSessionEventFlushTimer);
+    agentSessionEventFlushTimer = undefined;
+    if (reveal) {
+      activeTab = 'agent';
+      agentInspectionMode = 'session';
+    }
+    agentSessionEventStream?.abort();
+    agentSessionEventStream = undefined;
+    if (!agentSessionIsHistorical(detail.summary)) {
+      agentSessionEventStream = runClient.agentSessionEvents(workspaceId, sessionId, (event) => {
+        queueAgentSessionEvent(workspaceId, sessionId, openVersion, event);
+      });
+    }
+  }
+
+  function clearAgentSessionView(): void {
+    agentSessionOpenVersion += 1;
+    agentSessionEventStream?.abort();
+    agentSessionEventStream = undefined;
+    if (agentSessionEventFlushTimer !== undefined) clearTimeout(agentSessionEventFlushTimer);
+    agentSessionEventFlushTimer = undefined;
+    pendingAgentSessionEvents = [];
+    knownAgentSessionEventSequences = new Set();
+    agentSessionReconcileTarget = undefined;
+    activeAgentSession = undefined;
+    agentAnswerView = 'rendered';
+    agentTurnCancelling = false;
+  }
+
+  function queueAgentSessionEvent(
+    workspaceId: string,
+    sessionId: string,
+    openVersion: number,
+    event: RunEvent
+  ): void {
+    if (
+      openVersion !== agentSessionOpenVersion ||
+      activeAgentSession?.summary.id !== sessionId ||
+      knownAgentSessionEventSequences.has(event.sequence)
+    ) return;
+    knownAgentSessionEventSequences.add(event.sequence);
+    pendingAgentSessionEvents.push(event);
+    if (agentSessionEventFlushTimer !== undefined) return;
+    agentSessionEventFlushTimer = setTimeout(() => {
+      agentSessionEventFlushTimer = undefined;
+      if (
+        openVersion !== agentSessionOpenVersion ||
+        activeAgentSession?.summary.id !== sessionId
+      ) {
+        pendingAgentSessionEvents = [];
+        return;
+      }
+      const events = pendingAgentSessionEvents.sort((left, right) => left.sequence - right.sequence);
+      pendingAgentSessionEvents = [];
+      activeAgentSession = applyAgentSessionEvents(activeAgentSession, events);
+      if (events.some(requiresAgentSessionReconciliation)) {
+        requestAgentSessionReconciliation(workspaceId, sessionId, openVersion);
+      }
+    }, 50);
+  }
+
+  function applyAgentSessionEvents(
+    detail: AgentSessionDetail,
+    events: RunEvent[]
+  ): AgentSessionDetail {
+    const turns = detail.turns.map((turn) => ({
+      ...turn,
+      presentation: turn.presentation
+        ? {
+            ...turn.presentation,
+            messages: turn.presentation.messages.map((entry) => ({
+              ...entry,
+              sourceEventSequences: [...entry.sourceEventSequences]
+            })),
+            sourceEventSequences: [...turn.presentation.sourceEventSequences]
+          }
+        : undefined
+    }));
+    const turnIndexes = new Map(turns.map((turn, index) => [turn.id, index]));
+    let summary = { ...detail.summary };
+
+    for (const event of events) {
+      const payload = eventRecord(event.payload);
+      const body = eventRecord(payload.event ?? payload);
+      const turnId = typeof payload.turnId === 'string' ? payload.turnId : undefined;
+      const turnIndex = turnId === undefined ? undefined : turnIndexes.get(turnId);
+      const turn = turnIndex === undefined ? undefined : turns[turnIndex];
+
+      if (event.type === 'agent.session.starting') summary.status = 'starting';
+      if (event.type === 'agent.session.ready') summary.status = 'ready';
+      if (event.type === 'agent.session.failed') {
+        summary = {
+          ...summary,
+          active: false,
+          status: 'failed',
+          error: typeof payload.message === 'string' ? payload.message : summary.error
+        };
+      }
+      if (event.type === 'agent.session.closed' || event.type === 'agent.session.interrupted') {
+        summary = {
+          ...summary,
+          active: false,
+          status: event.type === 'agent.session.closed' ? 'closed' : 'interrupted'
+        };
+      }
+      if (event.type === 'agent.turn.started') {
+        summary.status = 'running';
+        if (turn) turn.status = 'running';
+      }
+      if (event.type === 'agent.turn.finished') {
+        summary.status = 'ready';
+        if (turn) {
+          const outcome = typeof payload.outcome === 'string' ? payload.outcome : 'failed';
+          turn.outcome = outcome;
+          turn.status = outcome === 'completed'
+            ? 'completed'
+            : outcome === 'intervened'
+              ? 'intervened'
+              : outcome === 'aborted' || outcome === 'cancelled'
+                ? 'cancelled'
+                : 'failed';
+          turn.finishedAtMs = event.atMs;
+        }
+      }
+
+      if (
+        turn?.presentation &&
+        (event.type === 'observation.assistant.delta' ||
+          event.type === 'observation.assistant.completed')
+      ) {
+        const messageId = typeof body.messageId === 'string' ? body.messageId : undefined;
+        const text = typeof body.text === 'string' ? body.text : undefined;
+        if (messageId && text !== undefined) {
+          let responseMessage = turn.presentation.messages.find((entry) => entry.id === messageId);
+          if (!responseMessage) {
+            responseMessage = {
+              id: messageId,
+              text: '',
+              complete: false,
+              sourceEventSequences: []
+            };
+            turn.presentation.messages.push(responseMessage);
+          }
+          if (event.type === 'observation.assistant.completed') {
+            responseMessage.text = text;
+            responseMessage.complete = true;
+          } else if (!responseMessage.complete) {
+            responseMessage.text += text;
+          }
+          responseMessage.sourceEventSequences.push(event.sequence);
+          turn.presentation.sourceEventSequences.push(event.sequence);
+          turn.presentation.response = turn.presentation.messages.map((entry) => entry.text).join('\n\n');
+          turn.presentation.completeness = {
+            ...turn.presentation.completeness,
+            assistantOutput: turn.presentation.messages.every((entry) => entry.complete)
+              ? 'complete'
+              : 'partial'
+          };
+        }
+      }
+      summary.updatedAtMs = Math.max(summary.updatedAtMs, event.atMs);
+    }
+
+    return {
+      ...detail,
+      summary,
+      turns,
+      events: [...detail.events, ...events]
+    };
+  }
+
+  function eventRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+  }
+
+  function requiresAgentSessionReconciliation(event: RunEvent): boolean {
+    return event.type === 'agent.turn.started' ||
+      event.type === 'agent.turn.finished' ||
+      event.type === 'agent.session.failed' ||
+      event.type === 'agent.session.closed' ||
+      event.type === 'agent.session.interrupted';
+  }
+
+  function requestAgentSessionReconciliation(
+    workspaceId: string,
+    sessionId: string,
+    openVersion: number
+  ): void {
+    agentSessionReconcileTarget = { workspaceId, sessionId, openVersion };
+    if (agentSessionReconcileInFlight) return;
+    const reconciliation = (async () => {
+      while (agentSessionReconcileTarget) {
+        const target: AgentSessionReconcileTarget = agentSessionReconcileTarget;
+        agentSessionReconcileTarget = undefined;
+        const latest = await runClient.agentSession(target.workspaceId, target.sessionId);
+        const current = activeAgentSession;
+        if (
+          target.openVersion !== agentSessionOpenVersion ||
+          current?.summary.id !== target.sessionId
+        ) continue;
+        const currentSequence = current.events.at(-1)?.sequence ?? 0;
+        const latestSequence = latest.events.at(-1)?.sequence ?? 0;
+        if (latestSequence < currentSequence) {
+          agentSessionReconcileTarget = target;
+          continue;
+        }
+        activeAgentSession = latest;
+        const reconciledSequences = new Set(latest.events.map((event) => event.sequence));
+        pendingAgentSessionEvents = pendingAgentSessionEvents.filter(
+          (event) => !reconciledSequences.has(event.sequence)
+        );
+        knownAgentSessionEventSequences = new Set([
+          ...knownAgentSessionEventSequences,
+          ...reconciledSequences
+        ]);
+        if (agentSessionIsHistorical(latest.summary)) {
+          agentSessionEventStream?.abort();
+          agentSessionEventStream = undefined;
+        }
+      }
+    })().catch((error) => {
+      if (openVersion === agentSessionOpenVersion) actionError = message(error);
+    }).finally(() => {
+      if (agentSessionReconcileInFlight === reconciliation) {
+        agentSessionReconcileInFlight = undefined;
+      }
+    });
+    agentSessionReconcileInFlight = reconciliation;
   }
 
   function applyWorkbenchSelection(selection: WorkbenchSelection): void {
@@ -199,11 +516,13 @@
     starting = true;
     actionError = '';
     activeTab = 'agent';
+    agentInspectionMode = 'run';
     inspectionEventStream?.abort();
     try {
       const summary = harnesses.length
         ? await runClient.startPreparedHarness(exploreRun.summary.id, harnessId, modelProfileId)
         : await runClient.startPrepared(exploreRun.summary.id, modelId.trim());
+      clearAgentSessionView();
       const detail = {
         summary,
         assembly: exploreRun.assembly,
@@ -354,6 +673,31 @@
         const evaluationId = (event.payload as { evaluationId: string }).evaluationId;
         void openEvaluation(evaluationId);
       }
+      if (
+        event.sequence > liveAfterSequence &&
+        !starting &&
+        exploreRun?.summary.status === 'exploring' &&
+        (
+          event.type === 'workbench.agent.session.started' ||
+          event.type === 'workbench.agent.session.activated' ||
+          event.type === 'workbench.agent.turn.started'
+        ) &&
+        event.payload &&
+        typeof event.payload === 'object' &&
+        typeof (event.payload as { sessionId?: unknown }).sessionId === 'string'
+      ) {
+        const sessionId = (event.payload as { sessionId: string }).sessionId;
+        void openAgentSession(
+          id,
+          sessionId,
+          (event.payload as { origin?: unknown }).origin === 'nushell',
+          event.type === 'workbench.agent.turn.started' ||
+            activeAgentSession?.summary.id !== sessionId
+        )
+          .catch((error) => {
+            actionError = `Agent session evidence is unavailable: ${message(error)}`;
+          });
+      }
     });
   }
 
@@ -427,6 +771,7 @@
       selectedRun = detail;
       runEvents = detail.events;
       activeTab = 'agent';
+      agentInspectionMode = 'run';
       agentView = 'review';
       if (
         id !== exploreRun?.summary.id &&
@@ -448,6 +793,25 @@
     }
   }
 
+  async function cancelActiveAgentTurn(): Promise<void> {
+    const workspaceId = exploreRun?.summary.id;
+    const sessionId = activeAgentSession?.summary.id;
+    if (
+      !workspaceId ||
+      !sessionId ||
+      !agentLiveStatus?.cancellable ||
+      agentTurnCancelling
+    ) return;
+    agentTurnCancelling = true;
+    actionError = '';
+    try {
+      await runClient.cancelAgentTurn(workspaceId, sessionId);
+    } catch (error) {
+      agentTurnCancelling = false;
+      actionError = message(error);
+    }
+  }
+
   async function cancelEvaluation(): Promise<void> {
     if (!selectedEvaluation || !evaluationRunning) return;
     try {
@@ -464,6 +828,44 @@
 
   function pretty(value: unknown): string {
     return value === undefined || value === null ? 'Not available yet.' : JSON.stringify(value, null, 2);
+  }
+
+  function turnMessages(turn: AgentTurnSummary): AgentTurnMessagePresentation[] {
+    if (turn.presentation?.messages?.length) return turn.presentation.messages ?? [];
+    if (!turn.presentation?.response) return [];
+    return [{
+      id: `legacy-${turn.id}`,
+      text: turn.presentation.response,
+      complete: turn.status !== 'queued' && turn.status !== 'running',
+      sourceEventSequences: turn.presentation.sourceEventSequences ?? []
+    }];
+  }
+
+  function turnDuration(turn: AgentTurnSummary): number | null {
+    return turn.finishedAtMs === undefined ? null : Math.max(0, turn.finishedAtMs - turn.startedAtMs);
+  }
+
+  function turnEvents(turn: AgentTurnSummary): RunEvent[] {
+    if (!activeAgentSession) return [];
+    const sequences = new Set(turn.presentation?.sourceEventSequences ?? []);
+    return activeAgentSession.events.filter((event) => {
+      if (sequences.has(event.sequence)) return true;
+      if (!event.payload || typeof event.payload !== 'object') return false;
+      return (event.payload as { turnId?: unknown }).turnId === turn.id;
+    });
+  }
+
+  function activityLabel(activity: AgentTurnActivityPresentation): string {
+    return activity.kind.replaceAll('.', ' ').replaceAll('-', ' ');
+  }
+
+  function turnCompleteness(turn: AgentTurnSummary): string {
+    const completeness = turn.presentation?.completeness;
+    if (!completeness) return 'legacy evidence';
+    const values = Object.values(completeness);
+    if (values.every((value) => value === 'complete')) return 'complete projection';
+    if (values.every((value) => value === 'unavailable')) return 'native evidence only';
+    return 'partial projection';
   }
 
   function shortId(id: string): string {
@@ -660,8 +1062,10 @@
     return () => {
       if (reviewRefreshTimer !== undefined) clearTimeout(reviewRefreshTimer);
       if (evaluationRefreshTimer) clearTimeout(evaluationRefreshTimer);
+      if (agentSessionEventFlushTimer !== undefined) clearTimeout(agentSessionEventFlushTimer);
       exploreEventStream?.abort();
       inspectionEventStream?.abort();
+      agentSessionEventStream?.abort();
       session?.dispose();
       surface?.dispose();
     };
@@ -695,16 +1099,16 @@
       </label>
       {#if harnesses.length}
         <label>
-          <span>Harness</span>
-          <select bind:value={harnessId} aria-label="Harness" disabled={preparing || running} on:change={() => void changeWorkbenchSelection({ harnessId })}>
+          <span>Default harness</span>
+          <select bind:value={harnessId} aria-label="Default harness" disabled={preparing || running} on:change={() => void changeWorkbenchSelection({ harnessId })}>
             {#each harnesses as harness}
               <option value={harness.id}>{harness.displayName}</option>
             {/each}
           </select>
         </label>
         <label class="model-field">
-          <span>Model</span>
-          <select bind:value={modelProfileId} aria-label="Model" disabled={preparing || running} on:change={() => void changeWorkbenchSelection({ modelProfileId })}>
+          <span>Default model</span>
+          <select bind:value={modelProfileId} aria-label="Default model" disabled={preparing || running} on:change={() => void changeWorkbenchSelection({ modelProfileId })}>
             <option value="" disabled>Choose a model</option>
             {#each selectableModelProfiles as profile}
               <option value={profile.id}>{profile.displayName}</option>
@@ -780,7 +1184,22 @@
 
     <aside class="run-panel">
       <nav class="tabs" aria-label="Run views">
-        <button class:active={activeTab === 'agent'} on:click={() => (activeTab = 'agent')}>Agent Run</button>
+        {#if activeAgentSession}
+          <button
+            class:active={activeTab === 'agent' && agentInspectionMode === 'session'}
+            on:click={() => {
+              activeTab = 'agent';
+              agentInspectionMode = 'session';
+            }}
+          >Session</button>
+        {/if}
+        <button
+          class:active={activeTab === 'agent' && (agentInspectionMode === 'run' || !activeAgentSession)}
+          on:click={() => {
+            activeTab = 'agent';
+            agentInspectionMode = 'run';
+          }}
+        >Agent Run</button>
         <button class:active={activeTab === 'workspace'} on:click={() => (activeTab = 'workspace')}>Workspace</button>
         <button class:active={activeTab === 'editor'} on:click={() => (activeTab = 'editor')}>Editor</button>
         <button class:active={activeTab === 'evidence'} on:click={() => (activeTab = 'evidence')}>Evidence</button>
@@ -788,7 +1207,13 @@
       </nav>
 
       <div class="run-heading">
-        {#if inspectedRun}
+        {#if activeTab === 'agent' && showingAgentSession && activeAgentSession}
+          <div>
+            <span class="label">{agentSessionHeading}</span>
+            <strong>{activeAgentSession.summary.harnessId} · {activeAgentSession.summary.modelProfileId}</strong>
+          </div>
+          <span class="run-status" data-status={activeAgentSession.summary.status}>{activeAgentSession.summary.status}</span>
+        {:else if inspectedRun}
           <div>
             <span class="label">{inspectedRun.scenarioTitle}</span>
             <strong>{inspectedRun.status === 'exploring' ? 'Ready for exploration' : inspectedRun.modelId}</strong>
@@ -804,127 +1229,290 @@
 
       <div class="tab-content">
         {#if activeTab === 'agent'}
-          {#if selectedRun?.assembly}
-            <section class="assembly" data-testid="assembly">
-              <div class="question">
-                <span class="label">Question</span>
-                <p>{selectedRun.assembly.question}</p>
+          {#if showingAgentSession && activeAgentSession}
+            <section class="session-view" data-testid="interactive-agent-session">
+              <div class="session-intro">
+                <div>
+                  <span class="label">Conversation</span>
+                  <p>{agentSessionIntro}</p>
+                </div>
+                <div class="answer-view-toggle" role="group" aria-label="Agent answer presentation">
+                  <button
+                    class:active={agentAnswerView === 'rendered'}
+                    aria-pressed={agentAnswerView === 'rendered'}
+                    on:click={() => (agentAnswerView = 'rendered')}
+                  >Rendered</button>
+                  <button
+                    class:active={agentAnswerView === 'source'}
+                    aria-pressed={agentAnswerView === 'source'}
+                    on:click={() => (agentAnswerView = 'source')}
+                  >Source</button>
+                </div>
               </div>
-              <dl class="assembly-grid">
-                <div>
-                  <dt>Harness</dt>
-                  <dd>{selectedRun.assembly.harness.driver?.name ?? 'External driver'}</dd>
-                  <small>{selectedRun.assembly.harness.driver ? `v${selectedRun.assembly.harness.driver.version}` : 'waiting for run'}</small>
-                </div>
-                <div>
-                  <dt>Model</dt>
-                  <dd>{selectedRun.assembly.harness.modelId ?? modelProfiles.find((profile) => profile.id === modelProfileId)?.displayName ?? (modelId.trim() || 'Choose a model')}</dd>
-                  <small>{selectedRun.assembly.harness.adapter}</small>
-                </div>
-                {#if activeModelAccess}
-                  <div class="model-access-cell" data-status={activeModelAccess.status}>
-                    <dt>Model access</dt>
-                    <dd>{activeModelAccess.status === 'ready' ? 'Ready' : 'Connect to run'}</dd>
-                    <small>{activeModelAccess.source ?? activeModelAccess.displayName}</small>
-                  </div>
-                {/if}
-                <div>
-                  <dt>Workspace</dt>
-                  <dd>{shortId(selectedRun.assembly.workspace.id.replace('/workspace', ''))}</dd>
-                  <small>{selectedRun.assembly.workspace.attachment.replaceAll('-', ' ')}</small>
-                </div>
-                <div>
-                  <dt>Seed revision</dt>
-                  <dd>{selectedRun.assembly.workspace.seedRevision}</dd>
-                  <small>{selectedRun.assembly.workspace.changeTracking.replaceAll('-', ' ')}</small>
-                </div>
-              </dl>
-              {#if activeModelAccess?.status === 'needs-setup'}
-                <div class="model-access-setup" role="status">
-                  <strong>Connect {activeModelAccess.displayName}</strong>
-                  {#if activeModelAccess.message}<p>{activeModelAccess.message}</p>{/if}
-                  <p>{activeModelAccess.setupHint}</p>
-                </div>
+              {#if agentLiveStatus}
+                <AgentSessionLiveStatus
+                  status={agentLiveStatus}
+                  cancelling={agentTurnCancelling}
+                  onCancel={() => void cancelActiveAgentTurn()}
+                />
               {/if}
-              <div class="capabilities">
-                <span class="label">Capability sources</span>
-                <ul>
-                  {#each selectedRun.assembly.capabilitySources as source}
-                    <li>
-                      <span><strong>{source.id}</strong><small>{source.revision}</small></span>
-                      <em>{source.projections.join(' + ')}</em>
-                    </li>
-                  {:else}
-                    <li class="waiting">Preparing capability sources…</li>
-                  {/each}
-                </ul>
-              </div>
-            </section>
-            <div class="activity-heading">
-              <span class="label">{agentView === 'review' ? 'Run review' : 'Raw trace'}</span>
-              <div class="agent-view-toggle" aria-label="Agent run detail">
-                <button class:active={agentView === 'review'} on:click={() => (agentView = 'review')}>Review</button>
-                <button class:active={agentView === 'raw'} on:click={() => (agentView = 'raw')}>Raw trace</button>
-              </div>
-            </div>
-          {/if}
-          {#if agentView === 'review'}
-            <section class="review" data-testid="run-review">
-              {#if selectedRun?.review.steps.length}
-                <dl class="review-metrics">
-                  <div><dt>Turns</dt><dd>{selectedRun.review.metrics.modelTurns}</dd></div>
-                  <div><dt>Capabilities</dt><dd>{selectedRun.review.metrics.capabilityCalls}</dd></div>
-                  <div><dt>Native actions</dt><dd>{selectedRun.review.metrics.nativeActions}</dd></div>
-                  <div><dt>Effects</dt><dd>{selectedRun.review.metrics.workspaceChanges}</dd></div>
-                  <div><dt>Duration</dt><dd>{duration(selectedRun.review.metrics.durationMs)}</dd></div>
-                </dl>
-                <ol class="review-steps" aria-label="Causal run review">
-                  {#each selectedRun.review.steps as step}
-                    <li data-kind={step.kind} data-status={step.status}>
-                      <span class="review-marker">{String(step.ordinal).padStart(2, '0')}</span>
+              <div class="session-turns">
+                {#each activeAgentSession.turns as turn, index}
+                  <article class="session-turn" data-testid="session-turn" data-status={turn.status}>
+                    <header>
+                      <h2>Turn {index + 1}</h2>
                       <div>
-                        <div class="review-step-heading">
-                          <strong>{step.title}</strong>
-                          <span>{step.kind.replaceAll('-', ' ')}</span>
-                        </div>
-                        {#if step.detail}<p>{step.detail}</p>{/if}
-                        <small>
-                          {step.source ? `source ${step.source} · ` : ''}{step.path ? `${step.path} · ` : ''}events {step.eventSequences.join(', ')}
-                        </small>
+                        {#if turnDuration(turn) !== null}<time>{duration(turnDuration(turn))}</time>{/if}
+                        <em data-status={turn.status}>{turn.status}</em>
                       </div>
-                    </li>
-                  {/each}
-                </ol>
-              {:else}
-                <div class="review-empty">
-                  <strong>Start with the environment</strong>
-                  <p>Answer the scenario question yourself, then compare how the real harnesses approach the same state.</p>
-                  <ol class="starting-points">
-                    <li><code>catalog list | where active</code></li>
-                    <li><code>catalog list | where active | analysis summarize</code></li>
-                    <li><code>lab assembly</code></li>
-                    <li><code>lab compare</code></li>
-                  </ol>
-                  <button on:click={() => (agentView = 'raw')}>Inspect preparation events</button>
-                </div>
+                    </header>
+                    <div class="turn-prompt">
+                      <span>You</span>
+                      <p>{turn.prompt}</p>
+                    </div>
+                    {#if turn.input !== undefined && turn.input !== null}
+                      <details class="provided-context">
+                        <summary>Provided context</summary>
+                        <pre>{pretty(turn.input)}</pre>
+                      </details>
+                    {/if}
+                    <div class="turn-response" data-testid="agent-response" data-state={turn.status}>
+                      <span>Agent</span>
+                      {#if turnMessages(turn).length}
+                        <div class="assistant-messages">
+                          {#each turnMessages(turn) as responseMessage (responseMessage.id)}
+                            <article class="assistant-message" data-message-id={responseMessage.id} data-complete={responseMessage.complete}>
+                              {#if agentAnswerView === 'rendered'}
+                                <AssistantMarkdown source={responseMessage.text} streaming={!responseMessage.complete} />
+                              {:else}
+                                <!-- svelte-ignore a11y_no_noninteractive_tabindex (keyboard access for overflow content) -->
+                                <pre class="response-source" tabindex="0" aria-label="Markdown source for agent response">{responseMessage.text}</pre>
+                              {/if}
+                            </article>
+                          {/each}
+                        </div>
+                      {:else if turn.status === 'queued' || turn.status === 'running'}
+                        <p class="response-pending">Waiting for the first response…</p>
+                      {:else}
+                        <p class="response-unavailable">This harness did not report an assistant response.</p>
+                      {/if}
+                    </div>
+                    {#if turn.presentation?.activity.length}
+                      <section class="turn-activity" aria-label="Turn activity">
+                        <span class="label">What the harness did</span>
+                        <ol>
+                          {#each turn.presentation.activity as activity}
+                            <li data-kind={activity.kind} data-status={activity.status}>
+                              <span class="activity-marker"></span>
+                              <div>
+                                <div class="activity-title">
+                                  <strong>{activity.title}</strong>
+                                  <em>{activityLabel(activity)}</em>
+                                </div>
+                                {#if activity.detail}<p>{activity.detail}</p>{/if}
+                                {#if activity.source || activity.path}
+                                  <small>{activity.source ?? ''}{activity.source && activity.path ? ' · ' : ''}{activity.path ?? ''}</small>
+                                {/if}
+                              </div>
+                            </li>
+                          {/each}
+                        </ol>
+                      </section>
+                    {/if}
+                    <footer class="turn-summary">
+                      <span>{turnCompleteness(turn)}</span>
+                      {#if turn.presentation?.usage}<span>Usage reported</span>{/if}
+                      {#if turn.humanInterventionAtMs}
+                        <span>Human input observed; effects are not agent-only</span>
+                      {/if}
+                      {#if turn.error}<span class="turn-error">{turn.error}</span>{/if}
+                    </footer>
+                    <details class="turn-evidence">
+                      <summary>Evidence</summary>
+                      <dl>
+                        <div><dt>Workspace revision</dt><dd>{turn.sourceRevision}</dd></div>
+                        <div><dt>Projection</dt><dd>{turn.presentation ? `v${turn.presentation.schemaVersion}` : 'legacy'}</dd></div>
+                        {#if turn.presentation?.sourceDigest}
+                          <div><dt>Source digest</dt><dd>{turn.presentation.sourceDigest}</dd></div>
+                        {/if}
+                      </dl>
+                      <div class="turn-capability-revisions">
+                        <span class="label">Capability revisions</span>
+                        <ul>
+                          {#each Object.entries(turn.capabilityRevisions) as [source, revision]}
+                            <li><strong>{source}</strong><span>{revision}</span></li>
+                          {/each}
+                        </ul>
+                      </div>
+                      {#if turn.presentation?.usage}
+                        <div class="turn-usage">
+                          <span class="label">Usage</span>
+                          <pre>{pretty(turn.presentation.usage)}</pre>
+                        </div>
+                      {/if}
+                      <details class="turn-raw-events">
+                        <summary>Raw events</summary>
+                        <ol class="run-events" aria-label={`Raw events for turn ${index + 1}`}>
+                          {#each turnEvents(turn) as event}
+                            <li>
+                              <span class="sequence">{String(event.sequence).padStart(2, '0')}</span>
+                              <div>
+                                <strong>{eventLabel(event.type)}</strong>
+                                {#if event.payload !== null}<pre>{pretty(event.payload)}</pre>{/if}
+                              </div>
+                            </li>
+                          {:else}
+                            <li class="empty">No raw events were retained for this turn.</li>
+                          {/each}
+                        </ol>
+                      </details>
+                    </details>
+                  </article>
+                {:else}
+                  <div class="session-empty">
+                    <strong>Ask the harness about this workspace</strong>
+                    <p>The harness can discover the same catalog and analysis capabilities you can use in Explore.</p>
+                    <code>agent "Find the active catalog items and explain what matters"</code>
+                  </div>
+                {/each}
+              </div>
+              {#if sessionAssembly}
+                <details class="session-environment">
+                  <summary>
+                    <span>Session environment</span>
+                    <small>{shortId(sessionAssembly.workspace.id.replace('/workspace', ''))} · {sessionAssembly.capabilitySources.length} capabilities</small>
+                  </summary>
+                  <dl>
+                    <div><dt>Seed revision</dt><dd>{sessionAssembly.workspace.seedRevision}</dd></div>
+                    <div><dt>Model</dt><dd>{activeAgentSession.summary.modelId}</dd></div>
+                  </dl>
+                  <ul>
+                    {#each sessionAssembly.capabilitySources as source}
+                      <li><strong>{source.id}</strong><span>{source.revision}</span><em>{source.projections.join(' + ')}</em></li>
+                    {/each}
+                  </ul>
+                </details>
               {/if}
             </section>
           {:else}
-            <ol class="run-events" aria-label="Agent run events">
-              {#each runEvents as event}
-                <li>
-                  <span class="sequence">{String(event.sequence).padStart(2, '0')}</span>
+            {#if selectedRun?.assembly}
+              <section class="assembly" data-testid="assembly">
+                <div class="question">
+                  <span class="label">Question</span>
+                  <p>{selectedRun.assembly.question}</p>
+                </div>
+                <dl class="assembly-grid">
                   <div>
-                    <strong>{eventLabel(event.type)}</strong>
-                    {#if event.payload !== null}
-                      <pre>{pretty(event.payload)}</pre>
-                    {/if}
+                    <dt>Harness</dt>
+                    <dd>{selectedRun.assembly.harness.driver?.name ?? 'External driver'}</dd>
+                    <small>{selectedRun.assembly.harness.driver ? `v${selectedRun.assembly.harness.driver.version}` : 'waiting for run'}</small>
                   </div>
-                </li>
-              {:else}
-                <li class="empty">Model, tool, and workspace activity will stream here.</li>
-              {/each}
-            </ol>
+                  <div>
+                    <dt>Model</dt>
+                    <dd>{selectedRun.assembly.harness.modelId ?? modelProfiles.find((profile) => profile.id === modelProfileId)?.displayName ?? (modelId.trim() || 'Choose a model')}</dd>
+                    <small>{selectedRun.assembly.harness.adapter}</small>
+                  </div>
+                  {#if activeModelAccess}
+                    <div class="model-access-cell" data-status={activeModelAccess.status}>
+                      <dt>Model access</dt>
+                      <dd>{activeModelAccess.status === 'ready' ? 'Ready' : 'Connect to run'}</dd>
+                      <small>{activeModelAccess.source ?? activeModelAccess.displayName}</small>
+                    </div>
+                  {/if}
+                  <div>
+                    <dt>Workspace</dt>
+                    <dd>{shortId(selectedRun.assembly.workspace.id.replace('/workspace', ''))}</dd>
+                    <small>{selectedRun.assembly.workspace.attachment.replaceAll('-', ' ')}</small>
+                  </div>
+                  <div>
+                    <dt>Seed revision</dt>
+                    <dd>{selectedRun.assembly.workspace.seedRevision}</dd>
+                    <small>{selectedRun.assembly.workspace.changeTracking.replaceAll('-', ' ')}</small>
+                  </div>
+                </dl>
+                {#if activeModelAccess?.status === 'needs-setup'}
+                  <div class="model-access-setup" role="status">
+                    <strong>Connect {activeModelAccess.displayName}</strong>
+                    {#if activeModelAccess.message}<p>{activeModelAccess.message}</p>{/if}
+                    <p>{activeModelAccess.setupHint}</p>
+                  </div>
+                {/if}
+                <div class="capabilities">
+                  <span class="label">Capability sources</span>
+                  <ul>
+                    {#each selectedRun.assembly.capabilitySources as source}
+                      <li>
+                        <span><strong>{source.id}</strong><small>{source.revision}</small></span>
+                        <em>{source.projections.join(' + ')}</em>
+                      </li>
+                    {:else}
+                      <li class="waiting">Preparing capability sources…</li>
+                    {/each}
+                  </ul>
+                </div>
+              </section>
+              <div class="activity-heading">
+                <span class="label">{agentView === 'review' ? 'Run review' : 'Raw trace'}</span>
+                <div class="agent-view-toggle" aria-label="Agent run detail">
+                  <button class:active={agentView === 'review'} on:click={() => (agentView = 'review')}>Review</button>
+                  <button class:active={agentView === 'raw'} on:click={() => (agentView = 'raw')}>Raw trace</button>
+                </div>
+              </div>
+            {/if}
+            {#if agentView === 'review'}
+              <section class="review" data-testid="run-review">
+                {#if selectedRun?.review.steps.length}
+                  <dl class="review-metrics">
+                    <div><dt>Turns</dt><dd>{selectedRun.review.metrics.modelTurns}</dd></div>
+                    <div><dt>Capabilities</dt><dd>{selectedRun.review.metrics.capabilityCalls}</dd></div>
+                    <div><dt>Native actions</dt><dd>{selectedRun.review.metrics.nativeActions}</dd></div>
+                    <div><dt>Effects</dt><dd>{selectedRun.review.metrics.workspaceChanges}</dd></div>
+                    <div><dt>Duration</dt><dd>{duration(selectedRun.review.metrics.durationMs)}</dd></div>
+                  </dl>
+                  <ol class="review-steps" aria-label="Causal run review">
+                    {#each selectedRun.review.steps as step}
+                      <li data-kind={step.kind} data-status={step.status}>
+                        <span class="review-marker">{String(step.ordinal).padStart(2, '0')}</span>
+                        <div>
+                          <div class="review-step-heading">
+                            <strong>{step.title}</strong>
+                            <span>{step.kind.replaceAll('-', ' ')}</span>
+                          </div>
+                          {#if step.detail}<p>{step.detail}</p>{/if}
+                          <small>{step.source ? `source ${step.source} · ` : ''}{step.path ? `${step.path} · ` : ''}events {step.eventSequences.join(', ')}</small>
+                        </div>
+                      </li>
+                    {/each}
+                  </ol>
+                {:else}
+                  <div class="review-empty">
+                    <strong>Start with the environment</strong>
+                    <p>Explore the workspace yourself, then ask the selected harness to investigate it.</p>
+                    <ol class="starting-points">
+                      <li><code>catalog list | where active</code></li>
+                      <li><code>agent "Find the active catalog items and explain what matters"</code></li>
+                      <li><code>lab assembly</code></li>
+                      <li><code>lab compare</code></li>
+                    </ol>
+                    <button on:click={() => (agentView = 'raw')}>Inspect preparation events</button>
+                  </div>
+                {/if}
+              </section>
+            {:else}
+              <ol class="run-events" aria-label="Agent run events">
+                {#each runEvents as event}
+                  <li>
+                    <span class="sequence">{String(event.sequence).padStart(2, '0')}</span>
+                    <div>
+                      <strong>{eventLabel(event.type)}</strong>
+                      {#if event.payload !== null}<pre>{pretty(event.payload)}</pre>{/if}
+                    </div>
+                  </li>
+                {:else}
+                  <li class="empty">Model, tool, and workspace activity will stream here.</li>
+                {/each}
+              </ol>
+            {/if}
           {/if}
         {:else if activeTab === 'workspace'}
           <section class="artifact">
@@ -1158,15 +1746,15 @@
   .mark { display: grid; place-items: center; width: 30px; height: 30px; border: 1px solid #345348; border-radius: 7px; color: #9bc47c; font-weight: 650; }
   h1 { margin: 0; color: #f1f4f2; font-size: 1rem; font-weight: 610; letter-spacing: -0.02em; }
   .identity p { margin: 3px 0 0; color: #718078; font-size: 0.73rem; }
-  .run-controls { display: flex; justify-content: flex-end; align-items: end; gap: 8px; }
-  label { display: grid; gap: 5px; }
+  .run-controls { display: flex; flex-wrap: nowrap; justify-content: flex-end; align-items: end; gap: 6px; min-width: 0; }
+  label { display: grid; gap: 4px; }
+  .run-controls label { flex: 1 1 130px; min-width: 0; max-width: 180px; }
   label > span, .label, .transport { color: #73847b; font-size: 0.62rem; font-weight: 680; letter-spacing: 0.12em; text-transform: uppercase; }
-  select { min-height: 34px; border: 1px solid #293730; border-radius: 6px; padding: 0 10px; color: #cbd5cf; background: #111715; outline: none; }
+  select { width: 100%; min-width: 0; min-height: 30px; border: 1px solid #293730; border-radius: 6px; padding: 0 8px; color: #cbd5cf; background: #111715; font-size: 0.7rem; line-height: 1; outline: none; }
   select:focus { border-color: #4b6d5e; }
-  select { min-width: 165px; }
-  .model-field { min-width: 250px; }
-  .run-controls button { height: 34px; margin: 0; padding: 0 15px; }
-  .model-access-pill { display: grid; align-content: center; gap: 1px; min-height: 32px; padding: 0 10px; border: 1px solid #34443c; border-radius: 6px; background: #111715; }
+  .run-controls .model-field { flex-basis: 190px; max-width: 230px; }
+  .run-controls button { flex: none; height: 30px; margin: 0; padding: 0 11px; font-size: 0.7rem; line-height: 1; white-space: nowrap; }
+  .model-access-pill { display: grid; flex: none; align-content: center; gap: 1px; min-height: 30px; padding: 0 8px; border: 1px solid #34443c; border-radius: 6px; background: #111715; }
   .model-access-pill span { color: #6d7c74; font-size: 0.5rem; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; }
   .model-access-pill strong { color: #a8c994; font-size: 0.61rem; font-weight: 540; white-space: nowrap; }
   .model-access-pill[data-status="needs-setup"] { border-color: #695532; background: #211c12; }
@@ -1196,8 +1784,19 @@
   .terminal-footer { display: flex; align-items: center; gap: 18px; padding: 0 17px; border-top: 1px solid #202c27; color: #58665f; font-family: var(--font-mono); font-size: 0.63rem; }
   .terminal-footer span:last-child { margin-left: auto; }
   .run-panel { display: grid; grid-template-rows: 44px 58px minmax(0, 1fr) auto; min-width: 0; min-height: 0; border-left: 1px solid #27342f; background: #0d1311; }
-  .tabs { display: flex; gap: 2px; padding: 5px 7px 0; border-bottom: 1px solid #27342f; }
-  .tabs button { position: relative; padding: 0 10px; color: #6f7d76; font-size: 0.7rem; }
+  .tabs {
+    display: flex;
+    min-inline-size: 0;
+    gap: 2px;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    padding: 5px 7px 0;
+    border-bottom: 1px solid #27342f;
+    scrollbar-width: none;
+    scroll-padding-inline: 7px;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tabs button { position: relative; flex: 0 0 auto; padding: 0 10px; color: #6f7d76; font-size: 0.7rem; white-space: nowrap; }
   .tabs button.active { color: #d2dad6; }
   .tabs button.active::after { position: absolute; right: 8px; bottom: -1px; left: 8px; height: 2px; background: #91b976; content: ''; }
   .run-status { padding: 4px 8px; border: 1px solid #34443c; border-radius: 999px; color: #a9b6af; font-family: var(--font-mono); font-size: 0.63rem; }
@@ -1226,6 +1825,78 @@
   .capabilities small, .capabilities em { color: #5f6f66; font-family: var(--font-mono); font-size: 0.56rem; font-style: normal; }
   .capabilities em { margin-left: auto; color: #78966c; }
   .capabilities .waiting { color: #617068; font-size: 0.65rem; }
+  .session-view { background: #0b1210; }
+  .session-intro { display: flex; align-items: start; justify-content: space-between; gap: 14px; padding: 13px 17px; border-bottom: 1px solid #1d2924; }
+  .session-intro > div:first-child { min-width: 0; }
+  .session-intro p { margin: 5px 0 0; color: #8c9a92; font-size: 0.7rem; line-height: 1.45; }
+  .answer-view-toggle { display: flex; flex: none; gap: 2px; padding: 2px; border: 1px solid #293730; border-radius: 5px; background: #0a100e; }
+  .answer-view-toggle button { border-radius: 3px; padding: 4px 7px; color: #718078; font-size: 0.56rem; }
+  .answer-view-toggle button.active { color: #cbd5cf; background: #1a2520; }
+  .answer-view-toggle button:focus-visible { outline: 2px solid #789d6b; outline-offset: 2px; }
+  .session-turns { display: grid; }
+  .session-turn { min-width: 0; padding: 15px 17px 13px; border-bottom: 1px solid #27342f; }
+  .session-turn > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; color: #718078; font-family: var(--font-mono); font-size: 0.59rem; }
+  .session-turn > header h2 { margin: 0; color: inherit; font: inherit; }
+  .session-turn > header > div { display: flex; align-items: center; gap: 9px; }
+  .session-turn > header time { color: #65746c; }
+  .session-turn > header em { color: #7d8c84; font-style: normal; }
+  .session-turn > header em[data-status="completed"] { color: #a8c994; }
+  .session-turn > header em[data-status="failed"], .session-turn > header em[data-status="cancelled"] { color: #d98d92; }
+  .turn-prompt, .turn-response { display: grid; grid-template-columns: 46px minmax(0, 1fr); gap: 10px; }
+  .turn-prompt > span, .turn-response > span { padding-top: 2px; color: #6e7d75; font-size: 0.6rem; font-weight: 680; letter-spacing: 0.08em; text-transform: uppercase; }
+  .turn-prompt p { margin: 0; color: #c9d2cd; font-size: 0.76rem; line-height: 1.48; }
+  .turn-response { margin-top: 12px; }
+  .turn-response > p { margin: 0; color: #d9e0dc; font-size: 0.78rem; line-height: 1.56; white-space: pre-wrap; }
+  .assistant-messages { display: grid; min-width: 0; gap: 10px; }
+  .assistant-message { min-width: 0; }
+  .assistant-message + .assistant-message { padding-top: 10px; border-top: 1px solid #202d27; }
+  .response-source { max-width: 100%; max-height: 280px; margin: 0; overflow: auto; padding: 9px 10px; border: 1px solid #28372f; border-radius: 6px; color: #aab8b1; background: #09100d; scrollbar-color: #405048 transparent; }
+  .response-source:focus-visible { outline: 2px solid #789d6b; outline-offset: 2px; }
+  .turn-response .response-pending { color: #8fa099; }
+  .turn-response .response-unavailable { color: #78867f; font-style: italic; }
+  .provided-context { margin: 9px 0 0 56px; border: 1px solid #26342e; border-radius: 6px; background: #0a100e; }
+  .provided-context summary, .turn-evidence > summary, .turn-raw-events > summary, .session-environment > summary { cursor: pointer; }
+  .provided-context summary { padding: 7px 9px; color: #84938b; font-size: 0.62rem; }
+  .provided-context pre { max-height: 150px; margin: 0; padding: 0 9px 9px; }
+  .turn-activity { margin: 14px 0 0 56px; }
+  .turn-activity > ol { display: grid; gap: 1px; margin: 7px 0 0; padding: 0; overflow: hidden; border: 1px solid #24312c; border-radius: 6px; background: #24312c; list-style: none; }
+  .turn-activity li { display: grid; grid-template-columns: 8px minmax(0, 1fr); gap: 9px; padding: 8px 9px; background: #0d1411; }
+  .activity-marker { align-self: start; width: 6px; height: 6px; margin-top: 5px; border: 1px solid #688275; border-radius: 50%; background: #18231e; }
+  .turn-activity li[data-kind*="workspace"] .activity-marker { border-color: #89aa74; background: #31462a; }
+  .turn-activity li[data-status="failed"] .activity-marker { border-color: #b16067; background: #3b2023; }
+  .activity-title { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .activity-title strong { color: #bfc9c4; font-size: 0.69rem; font-weight: 540; }
+  .activity-title em { color: #718078; font-size: 0.52rem; font-style: normal; text-transform: capitalize; }
+  .turn-activity p { margin: 2px 0 0; color: #899990; font-size: 0.63rem; line-height: 1.4; }
+  .turn-activity small { display: block; margin-top: 3px; color: #687870; font-family: var(--font-mono); font-size: 0.54rem; }
+  .turn-summary { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 12px 0 0 56px; color: #6f7e76; font-family: var(--font-mono); font-size: 0.54rem; }
+  .turn-summary .turn-error { color: #d98d92; }
+  .turn-evidence { margin: 10px 0 0 56px; border-top: 1px solid #1f2b26; }
+  .turn-evidence > summary { padding: 8px 0 0; color: #718078; font-size: 0.59rem; }
+  .turn-evidence > dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 12px; margin: 10px 0; }
+  .turn-evidence > dl > div { min-width: 0; }
+  .turn-evidence dt { color: #65746c; font-size: 0.52rem; letter-spacing: 0.06em; text-transform: uppercase; }
+  .turn-evidence dd { overflow-wrap: anywhere; margin: 2px 0 0; color: #92a099; font-family: var(--font-mono); font-size: 0.55rem; }
+  .turn-capability-revisions ul, .session-environment ul { display: grid; gap: 4px; margin: 7px 0 0; padding: 0; list-style: none; }
+  .turn-capability-revisions li, .session-environment li { display: flex; align-items: baseline; gap: 8px; color: #718078; font-family: var(--font-mono); font-size: 0.55rem; }
+  .turn-capability-revisions strong, .session-environment strong { color: #95a39b; font-weight: 540; }
+  .turn-usage { margin-top: 10px; }
+  .turn-usage pre { margin-top: 5px; }
+  .turn-raw-events { margin-top: 10px; }
+  .turn-raw-events > summary { color: #718078; font-size: 0.59rem; }
+  .turn-raw-events .run-events { padding: 4px 0 0; }
+  .turn-raw-events .run-events li { padding: 8px 0; }
+  .session-empty { margin: 16px 17px; padding: 18px; border: 1px dashed #304039; border-radius: 7px; }
+  .session-empty strong { color: #c3cdc8; font-size: 0.76rem; font-weight: 560; }
+  .session-empty p { margin: 5px 0 11px; color: #87958e; font-size: 0.68rem; line-height: 1.45; }
+  .session-empty code { display: block; overflow-wrap: anywhere; padding: 8px 9px; border: 1px solid #293832; border-radius: 5px; color: #a8c994; background: #0a100e; font-family: var(--font-mono); font-size: 0.59rem; }
+  .session-environment { margin: 0; padding: 0 17px 14px; border-bottom: 1px solid #27342f; }
+  .session-environment > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 0; color: #89978f; font-size: 0.64rem; }
+  .session-environment > summary small { color: #617068; font-family: var(--font-mono); font-size: 0.54rem; }
+  .session-environment > dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin: 0 0 10px; }
+  .session-environment dt { color: #65746c; font-size: 0.52rem; text-transform: uppercase; }
+  .session-environment dd { overflow-wrap: anywhere; margin: 2px 0 0; color: #98a69f; font-family: var(--font-mono); font-size: 0.57rem; }
+  .session-environment li em { margin-left: auto; color: #78966c; font-style: normal; }
   .activity-heading { display: flex; align-items: center; justify-content: space-between; padding: 10px 17px 8px; color: #596760; font-size: 0.6rem; }
   .agent-view-toggle { display: flex; gap: 2px; padding: 2px; border: 1px solid #26342e; border-radius: 6px; background: #0a100e; }
   .agent-view-toggle button { padding: 4px 8px; border-radius: 4px; color: #65746c; font-size: 0.59rem; }
@@ -1342,9 +2013,11 @@
   .history-list strong { overflow: hidden; color: #aeb9b3; font-size: 0.68rem; font-weight: 520; text-overflow: ellipsis; white-space: nowrap; }
   .history-list small, .history-list em { overflow: hidden; color: #5e6c65; font-family: var(--font-mono); font-size: 0.58rem; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
   .history-list p { margin: 8px 9px; color: #56635c; font-size: 0.68rem; }
-  @media (max-width: 1050px) {
+  @media (max-width: 1280px) {
     header { grid-template-columns: 1fr auto; }
     .run-controls { grid-row: 2; grid-column: 1 / -1; justify-content: flex-start; }
+  }
+  @media (max-width: 1050px) {
     .bench { grid-template-columns: 1fr; height: auto; min-height: 720px; }
     .terminal-panel { height: clamp(430px, calc(100dvh - 175px), 682px); }
     .run-panel { block-size: 100dvb; min-block-size: 0; border-top: 1px solid #27342f; border-left: 0; }
@@ -1352,8 +2025,7 @@
   @media (max-width: 620px) {
     main { width: calc(100% - 20px); padding-top: 14px; }
     .run-controls { display: grid; grid-template-columns: 1fr 1fr; }
-    .run-controls label { min-width: 0; }
-    select { width: 100%; min-width: 0; }
+    .run-controls > *, .run-controls label, .run-controls .model-field { width: 100%; min-width: 0; max-width: none; }
     .bench { min-height: 600px; }
     .terminal-panel { height: clamp(400px, calc(100dvh - 167px), 620px); }
     .review-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }

@@ -31,12 +31,16 @@ use tower_http::{
 };
 
 pub use runs::{
+    AgentAssistantMessage, AgentPresentationCompleteness, AgentPresentationCompletenessSummary,
+    AgentSessionDetail, AgentSessionStatus, AgentSessionSummary, AgentTurnActivity,
+    AgentTurnDetail, AgentTurnPresentation, AgentTurnStatus, AgentTurnSummary,
     CompareWorkbenchRequest, EvaluationDetail, EvaluationStatus, EvaluationSummary,
     HarnessMetadata, HarnessProfile, ModelAccessProvider, ModelAccessSnapshot, ModelAccessStatus,
     ModelProfileMetadata, PrepareRunRequest, RunController, RunControllerConfig, RunDetail,
-    RunError, RunEvent, RunStatus, RunSummary, ScenarioManifest, StartEvaluationRequest,
-    StartPreparedRunRequest, StartRunRequest, TerminalBinding, TerminalCapabilityBinding,
-    UpdateWorkbenchSelectionRequest, WorkbenchOrigin, WorkbenchSelection, WorkbenchSnapshot,
+    RunError, RunEvent, RunStatus, RunSummary, ScenarioManifest, StartAgentSessionRequest,
+    StartAgentTurnRequest, StartEvaluationRequest, StartPreparedRunRequest, StartRunRequest,
+    TerminalBinding, TerminalCapabilityBinding, UpdateWorkbenchSelectionRequest, WorkbenchOrigin,
+    WorkbenchSelection, WorkbenchSnapshot,
 };
 
 const DEFAULT_COLS: u16 = 100;
@@ -75,6 +79,16 @@ pub trait BrowserSession: Send + Sync + 'static {
     ///
     /// Returns an error when the session can no longer accept input.
     fn write(&self, bytes: &[u8]) -> Result<(), GatewayError>;
+
+    /// Record browser-observed human input separately from terminal protocol
+    /// replies carried over the same PTY byte stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session cannot persist the attribution.
+    fn note_human_input(&self) -> Result<(), GatewayError> {
+        Ok(())
+    }
 
     /// Resize the session's terminal viewport.
     ///
@@ -192,6 +206,7 @@ impl SessionProvider for RunSessionProvider {
         Ok(Box::new(GrantedTerminalSession {
             inner: session,
             runs: self.runs.clone(),
+            workspace_id: run_id.to_owned(),
             token: binding.control_token,
         }))
     }
@@ -200,6 +215,7 @@ impl SessionProvider for RunSessionProvider {
 struct GrantedTerminalSession {
     inner: PtyTerminalSession,
     runs: RunController,
+    workspace_id: String,
     token: String,
 }
 
@@ -210,6 +226,11 @@ impl BrowserSession for GrantedTerminalSession {
 
     fn write(&self, bytes: &[u8]) -> Result<(), GatewayError> {
         self.inner.write(bytes)
+    }
+
+    fn note_human_input(&self) -> Result<(), GatewayError> {
+        self.runs.note_terminal_input(&self.workspace_id)?;
+        Ok(())
     }
 
     fn resize(&self, size: TerminalSize) -> Result<(), GatewayError> {
@@ -436,6 +457,34 @@ pub fn app_with_runs(
             patch(update_workbench_selection),
         )
         .route("/api/workbench/{id}/compare", post(compare_workbench))
+        .route(
+            "/api/workbench/{workspace_id}/agent-sessions",
+            get(list_agent_sessions).post(start_agent_session),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/agent-sessions/{session_id}",
+            get(get_agent_session),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/agent-sessions/{session_id}/activate",
+            post(activate_agent_session),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/agent-sessions/{session_id}/turns",
+            post(start_agent_turn),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/agent-sessions/{session_id}/cancel",
+            post(cancel_agent_turn),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/agent-sessions/{session_id}/close",
+            post(close_agent_session),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/agent-sessions/{session_id}/events",
+            get(agent_session_events),
+        )
         .route(
             "/api/workbench/{workspace_id}/evaluations/{evaluation_id}",
             get(get_workbench_evaluation),
@@ -740,6 +789,180 @@ async fn compare_workbench(
         Ok(evaluation) => (StatusCode::CREATED, Json(evaluation)).into_response(),
         Err(error) => run_error_response(error),
     }
+}
+
+async fn list_agent_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if let Err(error) = runs.ensure_exploring_workspace(&workspace_id) {
+        return run_error_response(error);
+    }
+    Json(runs.list_agent_sessions(&workspace_id)).into_response()
+}
+
+async fn start_agent_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<StartAgentSessionRequest>,
+) -> Response {
+    let Some((runs, origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match tokio::task::spawn_blocking(move || {
+        runs.start_agent_session(&workspace_id, request, origin)
+    })
+    .await
+    {
+        Ok(Ok(session)) => (StatusCode::CREATED, Json(session)).into_response(),
+        Ok(Err(error)) => run_error_response(error),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("agent session task failed: {error}") })),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_agent_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, session_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.agent_session(&workspace_id, &session_id) {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn activate_agent_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, session_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.activate_agent_session(&workspace_id, &session_id, origin) {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn start_agent_turn(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, session_id)): AxumPath<(String, String)>,
+    Json(request): Json<StartAgentTurnRequest>,
+) -> Response {
+    let Some((runs, origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match tokio::task::spawn_blocking(move || {
+        runs.start_agent_turn(&workspace_id, &session_id, request, origin)
+    })
+    .await
+    {
+        Ok(Ok(turn)) => (StatusCode::ACCEPTED, Json(turn)).into_response(),
+        Ok(Err(error)) => run_error_response(error),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("agent turn task failed: {error}") })),
+        )
+            .into_response(),
+    }
+}
+
+async fn cancel_agent_turn(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, session_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.cancel_agent_turn(&workspace_id, &session_id) {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn close_agent_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, session_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.close_agent_session(&workspace_id, &session_id) {
+        Ok(session) => (StatusCode::ACCEPTED, Json(session)).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn agent_session_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, session_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Ok((history, receiver)) = runs.subscribe_agent_session(&workspace_id, &session_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let stream = agent_session_event_stream(runs, session_id, history, receiver)
+        .map(|event| {
+            Event::default()
+                .id(event.sequence.to_string())
+                .event(&event.kind)
+                .json_data(event)
+        })
+        .take_until(state.config.shutdown.cancelled_owned());
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
+fn agent_session_event_stream(
+    runs: RunController,
+    id: String,
+    history: Vec<RunEvent>,
+    receiver: tokio::sync::broadcast::Receiver<RunEvent>,
+) -> impl futures_util::Stream<Item = RunEvent> {
+    futures_util::stream::unfold(
+        (VecDeque::from(history), receiver, runs, id, 0_u64),
+        |(mut pending, mut receiver, runs, id, mut last_sequence)| async move {
+            loop {
+                if let Some(event) = pending.pop_front() {
+                    if event_is_after_history(&event, last_sequence) {
+                        last_sequence = event.sequence;
+                        return Some((event, (pending, receiver, runs, id, last_sequence)));
+                    }
+                    continue;
+                }
+                match receiver.recv().await {
+                    Ok(event) => pending.push_back(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let Ok(events) = runs.agent_session_events_after(&id, last_sequence) else {
+                            return None;
+                        };
+                        pending.extend(events);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
 }
 
 async fn get_workbench_evaluation(
@@ -1095,6 +1318,7 @@ fn origin_reaches_bound_listener(request_origin: &str, expected: &str) -> bool {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientControl {
     Resize { cols: u16, rows: u16 },
+    HumanInput,
 }
 
 /// Structured lifecycle evidence carried separately from binary PTY frames.
@@ -1197,6 +1421,7 @@ async fn open_session(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn serve_terminal(
     socket: WebSocket,
     provider: Arc<dyn SessionProvider>,
@@ -1272,21 +1497,30 @@ async fn serve_terminal(
                     }
                 }
                 Some(Ok(Message::Text(text))) => {
-                    let Ok(ClientControl::Resize { cols, rows }) = serde_json::from_str(&text) else {
+                    let Ok(control) = serde_json::from_str(&text) else {
                         continue;
                     };
-                    let Ok(size) = (TerminalSize { cols, rows }).validated() else {
-                        continue;
-                    };
-                    if session.resize(size).is_err() {
-                        break;
-                    }
-                    let resized = session_event_message(&SessionEvent::Resized {
-                        cols: size.cols,
-                        rows: size.rows,
-                    });
-                    if socket_tx.send(resized).await.is_err() {
-                        break;
+                    match control {
+                        ClientControl::Resize { cols, rows } => {
+                            let Ok(size) = (TerminalSize { cols, rows }).validated() else {
+                                continue;
+                            };
+                            if session.resize(size).is_err() {
+                                break;
+                            }
+                            let resized = session_event_message(&SessionEvent::Resized {
+                                cols: size.cols,
+                                rows: size.rows,
+                            });
+                            if socket_tx.send(resized).await.is_err() {
+                                break;
+                            }
+                        }
+                        ClientControl::HumanInput => {
+                            if session.note_human_input().is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
                 Some(Ok(Message::Close(_)) | Err(_)) | None => break,
@@ -1387,18 +1621,27 @@ mod tests {
     }
 
     #[test]
+    fn human_input_uses_a_control_frame_distinct_from_pty_bytes() {
+        let control = serde_json::from_str::<ClientControl>(r#"{"type":"human_input"}"#)
+            .expect("human input control should parse");
+        assert!(matches!(control, ClientControl::HumanInput));
+    }
+
+    #[test]
     fn live_run_events_skip_sequences_already_present_in_history() {
         let duplicate = RunEvent {
             sequence: 7,
             at_ms: 1,
             kind: "duplicate".to_owned(),
             payload: serde_json::Value::Null,
+            progress: None,
         };
         let next = RunEvent {
             sequence: 8,
             at_ms: 2,
             kind: "next".to_owned(),
             payload: serde_json::Value::Null,
+            progress: None,
         };
         assert!(!event_is_after_history(&duplicate, 7));
         assert!(event_is_after_history(&next, 7));

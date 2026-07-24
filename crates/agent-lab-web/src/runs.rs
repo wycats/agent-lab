@@ -6,14 +6,17 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, Weak, mpsc},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agent_lab_catalog_source::{AnalysisSource, CatalogSource, SourceObserver};
 use agent_lab_driver_protocol::{
-    CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverLaunch, DriverProcess,
-    DriverTranscript, PROTOCOL_VERSION, ProcessError, RawDriverMessage,
+    CommandBody, ControllerCommand, DriverBody, DriverDescriptor, DriverFailureScope, DriverLaunch,
+    DriverProcess, DriverTranscript, MAX_DRIVER_RECORD_BYTES, PROTOCOL_VERSION, ProcessError,
+    ProgressObservation, ProgressPhase, RawDriverMessage, TURN_OBSERVATIONS_FEATURE,
+    TurnObservation,
 };
 use axum::{
     Router,
@@ -33,6 +36,7 @@ use rmcp::transport::streamable_http_server::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
+use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, sync::broadcast};
 use tokio_util::sync::CancellationToken;
 
@@ -45,6 +49,7 @@ const DRIVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MODEL_ACCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EVIDENCE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_EVIDENCE_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_AGENT_TURN_INPUT_BYTES: usize = 1024 * 1024;
 const CATALOG_REQUIRED_SOURCES: &[&str] = &["catalog", "analysis"];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -215,6 +220,165 @@ pub struct CompareWorkbenchRequest {
     pub harness_ids: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartAgentSessionRequest {
+    #[serde(default)]
+    pub harness_id: Option<String>,
+    #[serde(default)]
+    pub model_profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartAgentTurnRequest {
+    pub prompt: String,
+    #[serde(default)]
+    pub input: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentSessionStatus {
+    Starting,
+    Ready,
+    Running,
+    Closing,
+    Failed,
+    Closed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentTurnStatus {
+    Queued,
+    Running,
+    Completed,
+    Intervened,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionSummary {
+    pub id: String,
+    pub workspace_id: String,
+    pub harness_id: String,
+    pub model_profile_id: String,
+    pub model_id: String,
+    pub status: AgentSessionStatus,
+    pub active: bool,
+    pub created_at_ms: u128,
+    pub updated_at_ms: u128,
+    pub turn_count: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTurnSummary {
+    pub id: String,
+    pub session_id: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<JsonValue>,
+    #[serde(default)]
+    pub source_revision: String,
+    #[serde(default)]
+    pub capability_revisions: BTreeMap<String, String>,
+    pub status: AgentTurnStatus,
+    pub started_at_ms: u128,
+    pub finished_at_ms: Option<u128>,
+    pub outcome: Option<String>,
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_intervention_at_ms: Option<u128>,
+}
+
+const AGENT_TURN_PRESENTATION_VERSION: u32 = 1;
+const AGENT_SESSION_MANIFEST_LEGACY_VERSION: u32 = 1;
+const AGENT_SESSION_MANIFEST_VERSION: u32 = 2;
+const AGENT_SESSION_PRESENTATION_REQUIRED_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPresentationCompleteness {
+    Complete,
+    Partial,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPresentationCompletenessSummary {
+    pub assistant_output: AgentPresentationCompleteness,
+    pub capability_activity: AgentPresentationCompleteness,
+    pub native_activity: AgentPresentationCompleteness,
+    pub workspace_effects: AgentPresentationCompleteness,
+    pub usage: AgentPresentationCompleteness,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAssistantMessage {
+    pub id: String,
+    pub text: String,
+    pub complete: bool,
+    pub source_event_sequences: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTurnActivity {
+    pub kind: String,
+    pub title: String,
+    pub detail: Option<String>,
+    pub status: String,
+    pub source: Option<String>,
+    pub path: Option<String>,
+    pub source_event_sequences: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTurnPresentation {
+    pub schema_version: u32,
+    pub response: Option<String>,
+    pub messages: Vec<AgentAssistantMessage>,
+    pub activity: Vec<AgentTurnActivity>,
+    pub usage: Option<JsonValue>,
+    pub completeness: AgentPresentationCompletenessSummary,
+    pub source_event_sequences: Vec<u64>,
+    pub source_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTurnDetail {
+    #[serde(flatten)]
+    pub summary: AgentTurnSummary,
+    pub presentation: AgentTurnPresentation,
+}
+
+impl std::ops::Deref for AgentTurnDetail {
+    type Target = AgentTurnSummary;
+
+    fn deref(&self) -> &Self::Target {
+        &self.summary
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionDetail {
+    pub projection_version: u32,
+    pub summary: AgentSessionSummary,
+    pub turns: Vec<AgentTurnDetail>,
+    pub events: Vec<RunEvent>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkbenchOrigin {
@@ -306,6 +470,18 @@ pub struct RunSummary {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProgressProjection {
+    pub phase: ProgressPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub source_event_sequence: u64,
+    pub source_event_type: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunEvent {
@@ -314,6 +490,8 @@ pub struct RunEvent {
     #[serde(rename = "type")]
     pub kind: String,
     pub payload: JsonValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<AgentProgressProjection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,6 +597,9 @@ pub struct WorkbenchSnapshot {
     pub model_profiles: Vec<ModelProfileMetadata>,
     pub model_access: Vec<ModelAccessSnapshot>,
     pub latest_evaluation: Option<EvaluationSummary>,
+    pub active_agent_session: Option<AgentSessionSummary>,
+    pub replay_agent_session: Option<AgentSessionSummary>,
+    pub agent_sessions: Vec<AgentSessionSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -447,6 +628,7 @@ struct ControllerInner {
     evaluations_dir: PathBuf,
     evaluations: Mutex<HashMap<String, Arc<EvaluationState>>>,
     workbench_grants: Mutex<HashMap<String, String>>,
+    agent_sessions: Mutex<HashMap<String, Arc<AgentSessionState>>>,
 }
 
 impl Drop for ControllerInner {
@@ -470,6 +652,19 @@ impl Drop for ControllerInner {
         for state in evaluations.values() {
             state.cancel.cancel();
         }
+        let sessions = self
+            .agent_sessions
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for state in sessions.values() {
+            state.lifecycle_cancel.cancel();
+            if let Some(cancel) = lock(&state.turn_cancel).take() {
+                cancel.cancel();
+            }
+            if let Some(commands) = lock(&state.commands).take() {
+                let _ = commands.send(AgentSessionCommand::Shutdown);
+            }
+        }
     }
 }
 
@@ -486,6 +681,10 @@ struct RunState {
     initial_snapshot: Option<BTreeMap<String, Vec<u8>>>,
     capabilities: Mutex<Vec<CapabilityEndpoint>>,
     secret_values: Mutex<Vec<Vec<u8>>>,
+    agent_sessions: Mutex<HashMap<String, Weak<AgentSessionState>>>,
+    active_agent_session_id: Mutex<Option<String>>,
+    active_agent_turn: Mutex<Option<AgentTurnAttribution>>,
+    capability_attributions: Mutex<HashMap<String, AgentTurnAttribution>>,
     reusable_explore: bool,
     replay_failed: bool,
 }
@@ -494,6 +693,12 @@ struct RunCompletion {
     status: RunStatus,
     error: Option<String>,
     score: JsonValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentTurnTermination {
+    Cancelled,
+    TimedOut,
 }
 
 enum ExitWait {
@@ -509,6 +714,125 @@ struct EvaluationState {
     bundle_dir: PathBuf,
     snapshot: PathBuf,
     replay_failed: bool,
+}
+
+struct AgentSessionState {
+    summary: Mutex<AgentSessionSummary>,
+    turns: Mutex<Vec<AgentTurnSummary>>,
+    events: Mutex<Vec<RunEvent>>,
+    sender: broadcast::Sender<RunEvent>,
+    commands: Mutex<Option<mpsc::Sender<AgentSessionCommand>>>,
+    lifecycle_cancel: CancellationToken,
+    turn_cancel: Mutex<Option<CancellationToken>>,
+    evidence_error: Mutex<Option<String>>,
+    bundle_dir: PathBuf,
+    secret_values: Mutex<Vec<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentTurnAttribution {
+    session_id: String,
+    turn_id: String,
+}
+
+struct ActiveAgentTurnGuard<'a> {
+    workspace: &'a RunState,
+    attribution: AgentTurnAttribution,
+}
+
+impl<'a> ActiveAgentTurnGuard<'a> {
+    fn new(workspace: &'a RunState, session_id: &str, turn_id: &str) -> Result<Self, RunError> {
+        let attribution = AgentTurnAttribution {
+            session_id: session_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+        };
+        if lock(&workspace.active_agent_turn).as_ref() != Some(&attribution) {
+            return Err(RunError::Protocol(format!(
+                "agent turn {turn_id} did not own the workspace turn reservation"
+            )));
+        }
+        Ok(Self {
+            workspace,
+            attribution,
+        })
+    }
+
+    fn finish(
+        &mut self,
+        persist_terminal_state: impl FnOnce() -> Result<(), RunError>,
+    ) -> Result<(), RunError> {
+        let mut active = lock(&self.workspace.active_agent_turn);
+        if active.as_ref() != Some(&self.attribution) {
+            return Err(RunError::Protocol(format!(
+                "agent turn {} lost the workspace turn reservation",
+                self.attribution.turn_id
+            )));
+        }
+        persist_terminal_state()?;
+        *active = None;
+        Ok(())
+    }
+}
+
+impl Drop for ActiveAgentTurnGuard<'_> {
+    fn drop(&mut self) {
+        let mut active = lock(&self.workspace.active_agent_turn);
+        if active.as_ref() == Some(&self.attribution) {
+            *active = None;
+        }
+    }
+}
+
+fn release_agent_turn_reservation(workspace: &RunState, attribution: &AgentTurnAttribution) {
+    let mut active = lock(&workspace.active_agent_turn);
+    if active.as_ref() == Some(attribution) {
+        *active = None;
+    }
+}
+
+fn rollback_agent_turn_start(
+    state: &AgentSessionState,
+    workspace: &RunState,
+    attribution: &AgentTurnAttribution,
+    turn_dir: &Path,
+) {
+    lock(&state.turns).retain(|turn| turn.id != attribution.turn_id);
+    *lock(&state.turn_cancel) = None;
+    let _ = persist_agent_session(state);
+    let _ = remove_evidence_entry(turn_dir);
+    release_agent_turn_reservation(workspace, attribution);
+}
+
+fn agent_turn_was_intervened(state: &AgentSessionState, turn_id: &str) -> bool {
+    lock(&state.turns)
+        .iter()
+        .find(|turn| turn.id == turn_id)
+        .is_some_and(|turn| turn.human_intervention_at_ms.is_some())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSessionManifest {
+    #[serde(default = "legacy_agent_session_manifest_version")]
+    version: u32,
+    summary: AgentSessionSummary,
+    turns: Vec<AgentTurnSummary>,
+}
+
+const fn legacy_agent_session_manifest_version() -> u32 {
+    AGENT_SESSION_MANIFEST_LEGACY_VERSION
+}
+
+enum AgentSessionCommand {
+    StartTurn {
+        turn_id: String,
+        prompt: String,
+        input: Option<JsonValue>,
+        capabilities: Vec<CapabilityEndpoint>,
+        cancel: CancellationToken,
+    },
+    Close,
+    Shutdown,
 }
 
 impl Drop for RunState {
@@ -644,6 +968,17 @@ impl RunController {
         }
         let runs = load_runs(&data_dir, &scenarios, &harness_registry, &model_profiles)?;
         let evaluations = load_evaluations(&evaluations_dir)?;
+        let agent_sessions = load_agent_sessions(&runs)?;
+        for session in agent_sessions.values() {
+            let workspace_id = lock(&session.summary).workspace_id.clone();
+            if let Some(workspace) = runs.get(&workspace_id) {
+                lock(&workspace.agent_sessions)
+                    .insert(lock(&session.summary).id.clone(), Arc::downgrade(session));
+            }
+        }
+        for workspace in runs.values() {
+            persist_active_agent_session(workspace, None)?;
+        }
         Ok(Self {
             inner: Arc::new(ControllerInner {
                 scenarios,
@@ -659,6 +994,7 @@ impl RunController {
                 evaluations_dir,
                 evaluations: Mutex::new(evaluations),
                 workbench_grants: Mutex::new(HashMap::new()),
+                agent_sessions: Mutex::new(agent_sessions),
             }),
         })
     }
@@ -756,6 +1092,39 @@ impl RunController {
             .find(|evaluation| evaluation.source_workspace_id == id);
         let selection = lock(&state.selection).clone();
         let model_access = self.model_access(&selection);
+        let agent_sessions = self.list_agent_sessions(id);
+        let active_agent_session = agent_sessions
+            .iter()
+            .find(|session| {
+                session.active
+                    && matches!(
+                        session.status,
+                        AgentSessionStatus::Starting
+                            | AgentSessionStatus::Ready
+                            | AgentSessionStatus::Running
+                            | AgentSessionStatus::Closing
+                    )
+            })
+            .cloned();
+        let replay_agent_session = active_agent_session
+            .is_none()
+            .then(|| {
+                let replay_session_id = lock(&state.events)
+                    .iter()
+                    .rev()
+                    .find(|event| event.kind == "workbench.agent.session.activated")
+                    .and_then(|event| event.payload.get("sessionId"))
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned)?;
+                agent_sessions
+                    .iter()
+                    .find(|session| {
+                        session.id == replay_session_id
+                            && session.status == AgentSessionStatus::Interrupted
+                    })
+                    .cloned()
+            })
+            .flatten();
         Ok(WorkbenchSnapshot {
             workspace_id: id.to_owned(),
             assembly: lock(&state.assembly).clone(),
@@ -764,6 +1133,9 @@ impl RunController {
             model_profiles: self.model_profiles(),
             model_access,
             latest_evaluation,
+            active_agent_session,
+            replay_agent_session,
+            agent_sessions,
         })
     }
 
@@ -906,6 +1278,542 @@ impl RunController {
     }
 
     #[must_use]
+    pub fn list_agent_sessions(&self, workspace_id: &str) -> Vec<AgentSessionSummary> {
+        let active_id = self
+            .state(workspace_id)
+            .ok()
+            .and_then(|workspace| lock(&workspace.active_agent_session_id).clone());
+        let mut sessions = lock(&self.inner.agent_sessions)
+            .values()
+            .map(|state| lock(&state.summary).clone())
+            .filter(|summary| summary.workspace_id == workspace_id)
+            .map(|mut summary| {
+                summary.active = active_id.as_deref() == Some(&summary.id);
+                summary
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|summary| std::cmp::Reverse(summary.created_at_ms));
+        sessions
+    }
+
+    pub(crate) fn ensure_exploring_workspace(&self, workspace_id: &str) -> Result<(), RunError> {
+        let workspace = self.state(workspace_id)?;
+        if lock(&workspace.summary).status != RunStatus::Exploring {
+            return Err(RunError::RunUnavailable(workspace_id.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Read one interactive agent session owned by an Explore workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace or session is unknown, or when the
+    /// session belongs to a different workspace.
+    pub fn agent_session(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<AgentSessionDetail, RunError> {
+        let workspace = self.state(workspace_id)?;
+        let state = self.agent_session_state(session_id)?;
+        let mut summary = lock(&state.summary).clone();
+        if summary.workspace_id != workspace_id {
+            return Err(RunError::UnknownAgentSession(session_id.to_owned()));
+        }
+        summary.active = lock(&workspace.active_agent_session_id).as_deref() == Some(session_id);
+        let turns = lock(&state.turns)
+            .clone()
+            .into_iter()
+            .map(|summary| {
+                let presentation =
+                    load_or_build_agent_turn_presentation(&state, &workspace, &summary)?;
+                Ok(AgentTurnDetail {
+                    summary,
+                    presentation,
+                })
+            })
+            .collect::<Result<Vec<_>, RunError>>()?;
+        Ok(AgentSessionDetail {
+            projection_version: AGENT_TURN_PRESENTATION_VERSION,
+            summary,
+            turns,
+            events: lock(&state.events).clone(),
+        })
+    }
+
+    /// Start one persistent harness-native session for an Explore workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shared selection is invalid or the durable
+    /// starting session cannot be created. Model-access and driver-startup
+    /// failures are persisted asynchronously on the returned session.
+    #[allow(clippy::too_many_lines)]
+    pub fn start_agent_session(
+        &self,
+        workspace_id: &str,
+        request: StartAgentSessionRequest,
+        origin: WorkbenchOrigin,
+    ) -> Result<AgentSessionSummary, RunError> {
+        let workspace = self.state(workspace_id)?;
+        let active_turn = lock(&workspace.active_agent_turn);
+        let source = lock(&workspace.summary).clone();
+        if source.status != RunStatus::Exploring {
+            return Err(RunError::RunUnavailable(workspace_id.to_owned()));
+        }
+        if active_turn.is_some() {
+            return Err(RunError::InvalidRequest(
+                "finish or cancel the active turn before starting another session".to_owned(),
+            ));
+        }
+        let selection = lock(&workspace.selection).clone();
+        let harness_id = request
+            .harness_id
+            .or(selection.harness_id)
+            .ok_or_else(|| RunError::InvalidRequest("choose a harness first".to_owned()))?;
+        let model_profile_id = request
+            .model_profile_id
+            .or(selection.model_profile_id)
+            .ok_or_else(|| RunError::InvalidRequest("choose a model profile first".to_owned()))?;
+        let harness = self
+            .inner
+            .harnesses
+            .get(&harness_id)
+            .ok_or_else(|| RunError::InvalidRequest(format!("unknown harness: {harness_id}")))?
+            .clone();
+        let model_id = harness
+            .models
+            .get(&model_profile_id)
+            .cloned()
+            .ok_or_else(|| {
+                RunError::InvalidRequest(format!(
+                    "model profile {model_profile_id} is unavailable for harness {harness_id}"
+                ))
+            })?;
+        let capabilities = lock(&workspace.capabilities).clone();
+        if capabilities.is_empty() {
+            return Err(RunError::RunUnavailable(workspace_id.to_owned()));
+        }
+        let scenario = self
+            .inner
+            .scenarios
+            .get(&source.scenario_id)
+            .cloned()
+            .ok_or_else(|| RunError::UnknownScenario(source.scenario_id.clone()))?;
+        let id = format!("agent-session-{}-{}", now_ms(), random_suffix());
+        let bundle_dir = workspace.bundle_dir.join("agent-sessions").join(&id);
+        fs::create_dir_all(bundle_dir.join("turns"))?;
+        let (sender, _) = broadcast::channel(256);
+        let summary = AgentSessionSummary {
+            id: id.clone(),
+            workspace_id: workspace_id.to_owned(),
+            harness_id,
+            model_profile_id,
+            model_id,
+            status: AgentSessionStatus::Starting,
+            active: false,
+            created_at_ms: now_ms(),
+            updated_at_ms: now_ms(),
+            turn_count: 0,
+            error: None,
+        };
+        let secret_values = capabilities
+            .iter()
+            .map(|capability| capability.agent_token.as_bytes().to_vec())
+            .collect();
+        let state = Arc::new(AgentSessionState {
+            summary: Mutex::new(summary),
+            turns: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
+            sender,
+            commands: Mutex::new(None),
+            lifecycle_cancel: CancellationToken::new(),
+            turn_cancel: Mutex::new(None),
+            evidence_error: Mutex::new(None),
+            bundle_dir,
+            secret_values: Mutex::new(secret_values),
+        });
+        lock(&workspace.agent_sessions).insert(id.clone(), Arc::downgrade(&state));
+        persist_agent_session(&state)?;
+        lock(&self.inner.agent_sessions).insert(id.clone(), state.clone());
+        record_event(
+            &workspace,
+            "workbench.agent.session.started",
+            json!({ "origin": origin, "sessionId": id }),
+        )?;
+        let (commands, receiver) = mpsc::channel();
+        *lock(&state.commands) = Some(commands);
+        let actor_state = state.clone();
+        let actor_workspace = workspace.clone();
+        let actor_controller = Arc::downgrade(&self.inner);
+        let workspace_path = workspace.workspace.clone();
+        let spawn = thread::Builder::new()
+            .name(format!("agent-lab-session-{id}"))
+            .spawn(move || {
+                run_agent_session_actor(
+                    &actor_controller,
+                    &actor_state,
+                    &actor_workspace,
+                    &harness,
+                    &workspace_path,
+                    &scenario.limits,
+                    &capabilities,
+                    &receiver,
+                    origin,
+                );
+            });
+        if let Err(error) = spawn {
+            update_agent_session_status(
+                &state,
+                AgentSessionStatus::Failed,
+                Some("agent session actor could not start"),
+            )?;
+            return Err(RunError::Process(ProcessError::Spawn(error.to_string())));
+        }
+        Ok(lock(&state.summary).clone())
+    }
+
+    /// Select one starting or ready session as the active workspace session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is unknown, belongs to another
+    /// workspace, is not ready, or selection persistence fails.
+    pub fn activate_agent_session(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        origin: WorkbenchOrigin,
+    ) -> Result<AgentSessionSummary, RunError> {
+        let target = self.agent_session_state(session_id)?;
+        let target_summary = lock(&target.summary).clone();
+        if target_summary.workspace_id != workspace_id
+            || target_summary.status != AgentSessionStatus::Ready
+        {
+            return Err(RunError::RunUnavailable(session_id.to_owned()));
+        }
+        let workspace = self.state(workspace_id)?;
+        let active_turn = lock(&workspace.active_agent_turn);
+        if active_turn.is_some() {
+            return Err(RunError::InvalidRequest(
+                "finish or cancel the active turn before switching sessions".to_owned(),
+            ));
+        }
+        persist_active_agent_session(&workspace, Some(session_id))?;
+        *lock(&workspace.active_agent_session_id) = Some(session_id.to_owned());
+        record_event(
+            &workspace,
+            "workbench.agent.session.activated",
+            json!({ "origin": origin, "sessionId": session_id }),
+        )?;
+        drop(active_turn);
+        let mut summary = lock(&target.summary).clone();
+        summary.active = true;
+        Ok(summary)
+    }
+
+    /// Queue one attributable turn on a starting or ready interactive session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prompt or session is invalid, another turn is
+    /// active, the workspace snapshot fails, or the actor is unavailable.
+    #[allow(clippy::too_many_lines)]
+    pub fn start_agent_turn(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        request: StartAgentTurnRequest,
+        origin: WorkbenchOrigin,
+    ) -> Result<AgentTurnSummary, RunError> {
+        if request.prompt.trim().is_empty() {
+            return Err(RunError::InvalidRequest(
+                "agent prompt must not be empty".to_owned(),
+            ));
+        }
+        if request.input.as_ref().is_some_and(|input| {
+            serde_json::to_vec(input).is_ok_and(|bytes| bytes.len() > MAX_AGENT_TURN_INPUT_BYTES)
+        }) {
+            return Err(RunError::InvalidRequest(format!(
+                "agent turn input exceeds the {MAX_AGENT_TURN_INPUT_BYTES} byte limit"
+            )));
+        }
+        let workspace = self.state(workspace_id)?;
+        if lock(&workspace.summary).status != RunStatus::Exploring {
+            return Err(RunError::RunUnavailable(workspace_id.to_owned()));
+        }
+        let state = self.agent_session_state(session_id)?;
+        {
+            let summary = lock(&state.summary);
+            if summary.workspace_id != workspace_id
+                || lock(&workspace.active_agent_session_id).as_deref() != Some(session_id)
+                || summary.status != AgentSessionStatus::Ready
+            {
+                return Err(RunError::RunUnavailable(session_id.to_owned()));
+            }
+        }
+        let commands = lock(&state.commands).clone().ok_or_else(|| {
+            RunError::RunUnavailable(format!("agent session {session_id} is not live"))
+        })?;
+        let id = format!("agent-turn-{}-{}", now_ms(), random_suffix());
+        let capabilities = lock(&workspace.capabilities).clone();
+        validate_agent_turn_command_size(
+            session_id,
+            &id,
+            &request.prompt,
+            request.input.as_ref(),
+            &capabilities,
+        )?;
+        let attribution = AgentTurnAttribution {
+            session_id: session_id.to_owned(),
+            turn_id: id.clone(),
+        };
+        {
+            let mut active = lock(&workspace.active_agent_turn);
+            if active.is_some() {
+                return Err(RunError::InvalidRequest(
+                    "this workspace already has an active agent turn".to_owned(),
+                ));
+            }
+            if lock(&workspace.summary).status != RunStatus::Exploring {
+                return Err(RunError::RunUnavailable(workspace_id.to_owned()));
+            }
+            let summary = lock(&state.summary);
+            if lock(&workspace.active_agent_session_id).as_deref() != Some(session_id)
+                || summary.status != AgentSessionStatus::Ready
+            {
+                return Err(RunError::RunUnavailable(session_id.to_owned()));
+            }
+            *active = Some(attribution.clone());
+        }
+        let turn_dir = state.bundle_dir.join("turns").join(&id);
+        let prepared = (|| -> Result<(AgentTurnSummary, CancellationToken, Vec<CapabilityEndpoint>), RunError> {
+            fs::create_dir_all(&turn_dir)?;
+            let mut snapshot = capture_tree(&workspace.workspace)?;
+            redact_captured_tree(&mut snapshot, &lock(&state.secret_values));
+            let source_revision = captured_tree_digest(&snapshot);
+            write_captured_tree(&turn_dir.join("initial"), &snapshot)?;
+            let secrets = lock(&state.secret_values).clone();
+            let turn = AgentTurnSummary {
+                id: id.clone(),
+                session_id: session_id.to_owned(),
+                prompt: redact_string(&request.prompt, &secrets),
+                input: request
+                    .input
+                    .clone()
+                    .map(|value| redact_value(value, &secrets)),
+                source_revision,
+                capability_revisions: capabilities
+                    .iter()
+                    .map(|capability| (capability.id.clone(), capability.revision.clone()))
+                    .collect(),
+                status: AgentTurnStatus::Queued,
+                started_at_ms: now_ms(),
+                finished_at_ms: None,
+            outcome: None,
+            error: None,
+            human_intervention_at_ms: None,
+        };
+            lock(&state.turns).push(turn.clone());
+            let cancel = CancellationToken::new();
+            *lock(&state.turn_cancel) = Some(cancel.clone());
+            persist_agent_session(&state)?;
+            record_event(
+                &workspace,
+                "workbench.agent.turn.started",
+                json!({
+                    "origin": origin,
+                    "sessionId": session_id,
+                    "turnId": turn.id,
+                    "sourceRevision": turn.source_revision,
+                    "capabilityRevisions": turn.capability_revisions,
+                }),
+            )?;
+            Ok((turn, cancel, capabilities))
+        })();
+        let (turn, cancel, capabilities) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                rollback_agent_turn_start(&state, &workspace, &attribution, &turn_dir);
+                return Err(error);
+            }
+        };
+        if commands
+            .send(AgentSessionCommand::StartTurn {
+                turn_id: id,
+                prompt: request.prompt,
+                input: request.input,
+                capabilities,
+                cancel,
+            })
+            .is_err()
+        {
+            rollback_agent_turn_start(&state, &workspace, &attribution, &turn_dir);
+            let _ = record_event(
+                &workspace,
+                "workbench.agent.turn.start-failed",
+                json!({ "origin": origin, "sessionId": session_id, "turnId": turn.id }),
+            );
+            return Err(RunError::RunUnavailable(session_id.to_owned()));
+        }
+        Ok(turn)
+    }
+
+    /// Cancel the active turn in one workspace-owned session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is unknown, belongs to another
+    /// workspace, or has no active turn.
+    pub fn cancel_agent_turn(&self, workspace_id: &str, session_id: &str) -> Result<(), RunError> {
+        let state = self.agent_session_state(session_id)?;
+        if lock(&state.summary).workspace_id != workspace_id {
+            return Err(RunError::UnknownAgentSession(session_id.to_owned()));
+        }
+        lock(&state.turn_cancel)
+            .as_ref()
+            .ok_or_else(|| RunError::InvalidRequest("this session has no active turn".to_owned()))?
+            .cancel();
+        Ok(())
+    }
+
+    /// Conservatively mark terminal input observed while an agent turn owns
+    /// the shared workspace. The marker prevents later evaluation promotion
+    /// from silently attributing a potentially human-authored effect to the
+    /// harness alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace or active turn cannot be found, or
+    /// when the intervention marker cannot be persisted.
+    pub fn note_terminal_input(&self, workspace_id: &str) -> Result<(), RunError> {
+        let workspace = self.state(workspace_id)?;
+        let Some(attribution) = lock(&workspace.active_agent_turn).clone() else {
+            return Ok(());
+        };
+        let session = self.agent_session_state(&attribution.session_id)?;
+        let marked_at_ms = {
+            let mut turns = lock(&session.turns);
+            let turn = turns
+                .iter_mut()
+                .find(|turn| turn.id == attribution.turn_id)
+                .ok_or_else(|| {
+                    RunError::InvalidRequest(format!("unknown agent turn: {}", attribution.turn_id))
+                })?;
+            if turn.human_intervention_at_ms.is_some() {
+                return Ok(());
+            }
+            let marked_at_ms = now_ms();
+            turn.human_intervention_at_ms = Some(marked_at_ms);
+            marked_at_ms
+        };
+        persist_agent_session(&session)?;
+        record_agent_event(
+            &session,
+            "agent.turn.human-intervention",
+            json!({
+                "sessionId": attribution.session_id,
+                "turnId": attribution.turn_id,
+                "atMs": marked_at_ms,
+                "source": "terminal-input",
+            }),
+        )
+    }
+
+    /// Request an orderly close of one ready session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is unavailable, belongs to another
+    /// workspace, or still has a running turn.
+    pub fn close_agent_session(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<AgentSessionSummary, RunError> {
+        let state = self.agent_session_state(session_id)?;
+        if lock(&state.summary).workspace_id != workspace_id {
+            return Err(RunError::UnknownAgentSession(session_id.to_owned()));
+        }
+        let workspace = self.state(workspace_id)?;
+        let commands = lock(&state.commands).clone().ok_or_else(|| {
+            RunError::RunUnavailable(format!("agent session {session_id} is not live"))
+        })?;
+        {
+            let active = lock(&workspace.active_agent_turn);
+            if active.is_some() {
+                return Err(RunError::InvalidRequest(
+                    "cancel or finish the active turn before closing this session".to_owned(),
+                ));
+            }
+            let mut summary = lock(&state.summary);
+            let was_starting = summary.status == AgentSessionStatus::Starting;
+            if !matches!(
+                summary.status,
+                AgentSessionStatus::Starting | AgentSessionStatus::Ready
+            ) {
+                return Err(RunError::RunUnavailable(session_id.to_owned()));
+            }
+            summary.status = AgentSessionStatus::Closing;
+            summary.updated_at_ms = now_ms();
+            drop(summary);
+            persist_agent_session(&state)?;
+            if was_starting {
+                state.lifecycle_cancel.cancel();
+            }
+        }
+        clear_active_agent_session(&workspace, &state)?;
+        if commands.send(AgentSessionCommand::Close).is_err() {
+            update_agent_session_status(
+                &state,
+                AgentSessionStatus::Failed,
+                Some("agent session actor stopped before close"),
+            )?;
+            return Err(RunError::RunUnavailable(session_id.to_owned()));
+        }
+        Ok(lock(&state.summary).clone())
+    }
+
+    /// Subscribe to durable and live events for a workspace-owned session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is unknown or belongs to another
+    /// workspace.
+    pub fn subscribe_agent_session(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<(Vec<RunEvent>, broadcast::Receiver<RunEvent>), RunError> {
+        let state = self.agent_session_state(session_id)?;
+        if lock(&state.summary).workspace_id != workspace_id {
+            return Err(RunError::UnknownAgentSession(session_id.to_owned()));
+        }
+        let receiver = state.sender.subscribe();
+        let history = lock(&state.events).clone();
+        Ok((history, receiver))
+    }
+
+    /// Read the durable event suffix after a sequence number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is unknown.
+    pub fn agent_session_events_after(
+        &self,
+        session_id: &str,
+        sequence: u64,
+    ) -> Result<Vec<RunEvent>, RunError> {
+        let state = self.agent_session_state(session_id)?;
+        Ok(lock(&state.events)
+            .iter()
+            .filter(|event| event.sequence > sequence)
+            .cloned()
+            .collect())
+    }
+
+    #[must_use]
     pub fn scenarios(&self) -> Vec<ScenarioManifest> {
         self.inner.scenarios.values().cloned().collect()
     }
@@ -1002,6 +1910,12 @@ impl RunController {
     /// Returns an error when the run is unknown.
     pub fn cancel(&self, id: &str) -> Result<(), RunError> {
         let state = self.state(id)?;
+        let active_turn = lock(&state.active_agent_turn);
+        if active_turn.is_some() {
+            return Err(RunError::InvalidRequest(
+                "cancel the active agent turn before closing this workspace".to_owned(),
+            ));
+        }
         let cancel_prepared = {
             let mut summary = lock(&state.summary);
             if summary.status == RunStatus::Exploring {
@@ -1013,7 +1927,15 @@ impl RunController {
                 false
             }
         };
+        drop(active_turn);
         if cancel_prepared {
+            for session in lock(&self.inner.agent_sessions).values() {
+                if lock(&session.summary).workspace_id == id
+                    && let Some(commands) = lock(&session.commands).clone()
+                {
+                    let _ = commands.send(AgentSessionCommand::Shutdown);
+                }
+            }
             return finish_run(
                 &state,
                 RunStatus::Cancelled,
@@ -1151,6 +2073,10 @@ impl RunController {
             initial_snapshot: Some(initial_snapshot),
             capabilities: Mutex::new(Vec::new()),
             secret_values: Mutex::new(driver_secret_values(&self.inner.driver)),
+            agent_sessions: Mutex::new(HashMap::new()),
+            active_agent_session_id: Mutex::new(None),
+            active_agent_turn: Mutex::new(None),
+            capability_attributions: Mutex::new(HashMap::new()),
             reusable_explore: true,
             replay_failed: false,
         });
@@ -1180,6 +2106,26 @@ impl RunController {
             self.resolve_harness_selection(request)?;
         validate_model_id(&model_id)?;
         let state = self.state(id)?;
+        let active_turn = lock(&state.active_agent_turn);
+        if active_turn.is_some() {
+            return Err(RunError::InvalidRequest(
+                "finish or cancel the active agent turn before running the harness".to_owned(),
+            ));
+        }
+        if lock(&self.inner.agent_sessions).values().any(|session| {
+            lock(&session.summary).workspace_id == id
+                && matches!(
+                    lock(&session.summary).status,
+                    AgentSessionStatus::Starting
+                        | AgentSessionStatus::Ready
+                        | AgentSessionStatus::Running
+                        | AgentSessionStatus::Closing
+                )
+        }) {
+            return Err(RunError::InvalidRequest(
+                "close interactive agent sessions before running the harness".to_owned(),
+            ));
+        }
         let capabilities = lock(&state.capabilities).clone();
         if capabilities.is_empty() {
             return Err(RunError::RunUnavailable(id.to_owned()));
@@ -1202,6 +2148,7 @@ impl RunController {
             summary.status = RunStatus::Starting;
             (scenario, previous_summary)
         };
+        drop(active_turn);
         let previous_assembly = {
             let mut assembly = lock(&state.assembly);
             let previous = assembly.clone();
@@ -1467,6 +2414,13 @@ impl RunController {
             ));
         }
 
+        let active_turn = lock(&source.active_agent_turn);
+        if active_turn.is_some() {
+            return Err(RunError::InvalidRequest(
+                "finish or cancel the active agent turn before capturing an evaluation".to_owned(),
+            ));
+        }
+
         // Validate and capture the full source before creating a bundle. Writing this exact
         // in-memory snapshot also prevents Explore edits from racing the evaluation copy.
         Ok((
@@ -1673,6 +2627,10 @@ impl RunController {
             initial_snapshot: Some(initial_snapshot),
             capabilities: Mutex::new(Vec::new()),
             secret_values: Mutex::new(driver_secret_values(&self.inner.driver)),
+            agent_sessions: Mutex::new(HashMap::new()),
+            active_agent_session_id: Mutex::new(None),
+            active_agent_turn: Mutex::new(None),
+            capability_attributions: Mutex::new(HashMap::new()),
             reusable_explore: false,
             replay_failed: false,
         });
@@ -1784,6 +2742,14 @@ impl RunController {
     }
 
     fn resolve_harness_driver(&self, harness: &HarnessProfile) -> Result<DriverLaunch, RunError> {
+        self.resolve_harness_driver_with_cancellation(harness, &CancellationToken::new())
+    }
+
+    fn resolve_harness_driver_with_cancellation(
+        &self,
+        harness: &HarnessProfile,
+        cancel: &CancellationToken,
+    ) -> Result<DriverLaunch, RunError> {
         let Some(provider_id) = self.inner.harness_model_access.get(&harness.id) else {
             return Ok(harness.launch.clone());
         };
@@ -1797,7 +2763,12 @@ impl RunController {
                     harness.id
                 ))
             })?;
-        let resolution = resolve_model_access(provider, true)?;
+        let resolution = resolve_model_access_with_cancellation(
+            provider,
+            true,
+            MODEL_ACCESS_TIMEOUT,
+            Some(cancel),
+        )?;
         if resolution.status != ModelAccessStatus::Ready {
             return Err(RunError::ModelAccessUnavailable(
                 resolution
@@ -1853,6 +2824,13 @@ impl RunController {
             .get(id)
             .cloned()
             .ok_or_else(|| RunError::InvalidRequest(format!("unknown evaluation: {id}")))
+    }
+
+    fn agent_session_state(&self, id: &str) -> Result<Arc<AgentSessionState>, RunError> {
+        lock(&self.inner.agent_sessions)
+            .get(id)
+            .cloned()
+            .ok_or_else(|| RunError::UnknownAgentSession(id.to_owned()))
     }
 }
 
@@ -1958,6 +2936,20 @@ fn resolve_model_access_with_timeout(
     include_environment: bool,
     timeout: Duration,
 ) -> Result<ModelAccessResolution, RunError> {
+    resolve_model_access_with_cancellation(provider, include_environment, timeout, None)
+}
+
+fn resolve_model_access_with_cancellation(
+    provider: &ModelAccessProvider,
+    include_environment: bool,
+    timeout: Duration,
+    cancel: Option<&CancellationToken>,
+) -> Result<ModelAccessResolution, RunError> {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err(RunError::RunUnavailable(
+            "model-access resolution was cancelled".to_owned(),
+        ));
+    }
     let allowed = provider
         .environment_names
         .iter()
@@ -1982,7 +2974,8 @@ fn resolve_model_access_with_timeout(
         });
     };
 
-    let output = run_model_access_resolver(provider, resolver, include_environment, timeout)?;
+    let output =
+        run_model_access_resolver(provider, resolver, include_environment, timeout, cancel)?;
     let mut resolution: ModelAccessResolution = serde_json::from_slice(&output).map_err(|_| {
         RunError::ModelAccessUnavailable(format!(
             "{} returned an invalid readiness response",
@@ -2016,11 +3009,13 @@ fn resolve_model_access_with_timeout(
     Ok(resolution)
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_model_access_resolver(
     provider: &ModelAccessProvider,
     resolver: &DriverLaunch,
     include_environment: bool,
     timeout: Duration,
+    cancel: Option<&CancellationToken>,
 ) -> Result<Vec<u8>, RunError> {
     let mut command = Command::new(&resolver.executable);
     command.args(&resolver.args).arg(if include_environment {
@@ -2064,6 +3059,12 @@ fn run_model_access_resolver(
     });
     let deadline = Instant::now() + timeout;
     let status = loop {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            terminate_resolver_process(child.as_mut());
+            return Err(RunError::RunUnavailable(
+                "model-access resolution was cancelled".to_owned(),
+            ));
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
@@ -2080,19 +3081,35 @@ fn run_model_access_resolver(
             }
         }
     };
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let output = match output_receiver.recv_timeout(remaining) {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
+    let output = loop {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
             terminate_resolver_process(child.as_mut());
-            return Err(RunError::ModelAccessUnavailable(format!(
-                "could not read {} readiness: {error}",
-                provider.display_name
-            )));
+            return Err(RunError::RunUnavailable(
+                "model-access resolution was cancelled".to_owned(),
+            ));
         }
-        Err(_) => {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             terminate_resolver_process(child.as_mut());
             return Err(model_access_timeout(provider, timeout));
+        }
+        match output_receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(output)) => break output,
+            Ok(Err(error)) => {
+                terminate_resolver_process(child.as_mut());
+                return Err(RunError::ModelAccessUnavailable(format!(
+                    "could not read {} readiness: {error}",
+                    provider.display_name
+                )));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                terminate_resolver_process(child.as_mut());
+                return Err(RunError::ModelAccessUnavailable(format!(
+                    "could not read {} readiness",
+                    provider.display_name
+                )));
+            }
         }
     };
     if !status.success() || output.len() > 64 * 1024 {
@@ -2181,14 +3198,63 @@ fn source_observer(
     actor: &'static str,
 ) -> SourceObserver {
     Arc::new(move |kind, mut payload| {
+        let attribution = (actor == "agent")
+            .then(|| capability_event_attribution(&state, source, kind, &payload))
+            .flatten();
         if let Some(payload) = payload.as_object_mut() {
             payload.insert("source".to_owned(), JsonValue::String(source.to_owned()));
             payload.insert("actor".to_owned(), JsonValue::String(actor.to_owned()));
+            if let Some(attribution) = &attribution {
+                payload.insert(
+                    "sessionId".to_owned(),
+                    JsonValue::String(attribution.session_id.clone()),
+                );
+                payload.insert(
+                    "turnId".to_owned(),
+                    JsonValue::String(attribution.turn_id.clone()),
+                );
+            }
         }
         let secrets = lock(&state.secret_values).clone();
         payload = redact_value(payload, &secrets);
-        let _ = record_event(&state, kind, payload);
+        let workspace_error = record_event(&state, kind, payload.clone()).err();
+        if let Some(attribution) = attribution {
+            let session = lock(&state.agent_sessions)
+                .get(&attribution.session_id)
+                .and_then(Weak::upgrade);
+            if let Some(session) = session {
+                let session_error = record_agent_event(&session, kind, payload).err();
+                if let Some(error) = workspace_error.or(session_error) {
+                    *lock(&session.evidence_error) = Some(format!(
+                        "capability evidence could not be persisted: {error}"
+                    ));
+                }
+            }
+        }
     })
+}
+
+fn capability_event_attribution(
+    state: &RunState,
+    source: &str,
+    kind: &str,
+    payload: &JsonValue,
+) -> Option<AgentTurnAttribution> {
+    let call_id = payload.get("callId").and_then(JsonValue::as_str);
+    let key = call_id.map(|call_id| format!("{source}:{call_id}"));
+    if kind == "mcp.tool.started" {
+        let attribution = lock(&state.active_agent_turn).clone();
+        if let (Some(key), Some(attribution)) = (key, attribution.clone()) {
+            lock(&state.capability_attributions).insert(key, attribution);
+        }
+        return attribution;
+    }
+    if kind == "mcp.tool.completed" {
+        return key
+            .and_then(|key| lock(&state.capability_attributions).remove(&key))
+            .or_else(|| lock(&state.active_agent_turn).clone());
+    }
+    lock(&state.active_agent_turn).clone()
 }
 
 async fn start_mcp_source<S>(
@@ -2699,7 +3765,7 @@ fn run_driver(
                 score: json!({ "passed": false, "limitExceeded": true }),
             });
         }
-        if abort_sent || outcome.as_deref() == Some("aborted") {
+        if state.cancel.is_cancelled() || abort_sent || outcome.as_deref() == Some("aborted") {
             return Ok(RunCompletion {
                 status: RunStatus::Cancelled,
                 error: None,
@@ -2741,6 +3807,1455 @@ fn run_driver(
     )
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_agent_session_actor(
+    controller: &Weak<ControllerInner>,
+    state: &AgentSessionState,
+    workspace_state: &RunState,
+    harness: &HarnessProfile,
+    workspace: &Path,
+    limits: &ScenarioLimits,
+    capabilities: &[CapabilityEndpoint],
+    commands: &mpsc::Receiver<AgentSessionCommand>,
+    origin: WorkbenchOrigin,
+) {
+    let result = (|| -> Result<(), RunError> {
+        let activation = controller.upgrade().ok_or_else(|| {
+            RunError::RunUnavailable("controller stopped during agent session startup".to_owned())
+        })?;
+        let driver_launch = (RunController {
+            inner: Arc::clone(&activation),
+        })
+        .resolve_harness_driver_with_cancellation(harness, &state.lifecycle_cancel)?;
+        if state.lifecycle_cancel.is_cancelled() {
+            return Err(RunError::RunUnavailable(
+                "agent session startup was cancelled".to_owned(),
+            ));
+        }
+        let mut secrets = lock(&state.secret_values).clone();
+        secrets.extend(driver_secret_values(&driver_launch));
+        lock(&state.secret_values).clone_from(&secrets);
+        record_agent_event(
+            state,
+            "agent.session.starting",
+            json!({ "sessionId": lock(&state.summary).id }),
+        )?;
+        let mut driver = DriverProcess::spawn_with(driver_launch)?;
+        let ready_deadline = Instant::now() + DRIVER_READY_TIMEOUT;
+        let descriptor = loop {
+            let message =
+                receive_until_deadline(&mut driver, ready_deadline, &state.lifecycle_cancel)?
+                    .ok_or_else(|| {
+                        RunError::Protocol("interactive driver readiness was cancelled".to_owned())
+                    })?;
+            match message.parsed.body {
+                DriverBody::StartupEvent {
+                    phase,
+                    status,
+                    detail,
+                } => record_agent_event(
+                    state,
+                    "startup.event",
+                    redact_value(
+                        json!({ "phase": phase, "status": status, "detail": detail }),
+                        &secrets,
+                    ),
+                )?,
+                DriverBody::Ready { driver } => break redact_driver_descriptor(driver, &secrets),
+                _ => {
+                    return Err(RunError::Protocol(
+                        "expected startup.event or driver.ready for interactive session".to_owned(),
+                    ));
+                }
+            }
+        };
+        let session_id = lock(&state.summary).id.clone();
+        let capability_sources = agent_capability_sources(capabilities);
+        driver.send(&command(
+            "agent-open",
+            CommandBody::OpenSession {
+                session_id: session_id.clone(),
+                config: json!({
+                    "files": {},
+                    "modelId": lock(&state.summary).model_id,
+                    "workspaceRoot": workspace,
+                    "capabilitySources": capability_sources,
+                }),
+                limits: serde_json::to_value(limits)?,
+            },
+        ))?;
+        let deadline = Instant::now() + DRIVER_RESPONSE_TIMEOUT;
+        loop {
+            let message = receive_until_deadline(&mut driver, deadline, &state.lifecycle_cancel)?
+                .ok_or_else(|| {
+                RunError::Protocol("interactive session opening was cancelled".to_owned())
+            })?;
+            match message.parsed.body {
+                DriverBody::StartupEvent {
+                    phase,
+                    status,
+                    detail,
+                } => record_agent_event(
+                    state,
+                    "startup.event",
+                    redact_value(
+                        json!({ "phase": phase, "status": status, "detail": detail }),
+                        &secrets,
+                    ),
+                )?,
+                DriverBody::SessionOpened {
+                    session_id: opened,
+                    process_id,
+                } if opened == session_id => {
+                    record_agent_event(
+                        state,
+                        "agent.session.ready",
+                        json!({ "sessionId": session_id, "processId": process_id, "driver": descriptor }),
+                    )?;
+                    break;
+                }
+                DriverBody::Failed { code, message, .. } => {
+                    return Err(RunError::Protocol(format!(
+                        "driver failed while opening interactive session: {code}: {message}"
+                    )));
+                }
+                _ => {
+                    return Err(RunError::Protocol(
+                        "expected startup.event or session.opened for interactive session"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        update_agent_session_status(state, AgentSessionStatus::Ready, None)?;
+        let workspace_id = lock(&state.summary).workspace_id.clone();
+        if let Err(error) = (RunController { inner: activation }).activate_agent_session(
+            &workspace_id,
+            &session_id,
+            origin,
+        ) {
+            record_agent_event(
+                state,
+                "agent.session.activation-deferred",
+                json!({ "sessionId": session_id, "reason": error.to_string() }),
+            )?;
+        }
+        let supports_turn_observations = descriptor
+            .features
+            .iter()
+            .any(|feature| feature == TURN_OBSERVATIONS_FEATURE);
+
+        while let Ok(command) = commands.recv() {
+            match command {
+                AgentSessionCommand::StartTurn {
+                    turn_id,
+                    prompt,
+                    input,
+                    capabilities,
+                    cancel,
+                } => run_agent_turn(
+                    state,
+                    workspace_state,
+                    &mut driver,
+                    &session_id,
+                    &turn_id,
+                    workspace,
+                    &prompt,
+                    input.as_ref(),
+                    &capabilities,
+                    limits,
+                    &cancel,
+                    &secrets,
+                    supports_turn_observations,
+                )?,
+                AgentSessionCommand::Close => {
+                    close_agent_driver(state, &mut driver, &session_id, false)?;
+                    return Ok(());
+                }
+                AgentSessionCommand::Shutdown => {
+                    close_agent_driver(state, &mut driver, &session_id, true)?;
+                    return Ok(());
+                }
+            }
+        }
+        close_agent_driver(state, &mut driver, &session_id, true)
+    })();
+
+    if let Err(error) = result {
+        if state.lifecycle_cancel.is_cancelled()
+            && lock(&state.summary).status == AgentSessionStatus::Closing
+        {
+            let session_id = lock(&state.summary).id.clone();
+            let _ = update_agent_session_status(state, AgentSessionStatus::Closed, None);
+            let _ = record_agent_event(
+                state,
+                "agent.session.closed",
+                json!({ "sessionId": session_id, "during": "startup" }),
+            );
+            let _ = clear_active_agent_session(workspace_state, state);
+            return;
+        }
+        let secrets = lock(&state.secret_values).clone();
+        let message = redact_string(&error.to_string(), &secrets);
+        let terminal_turn = lock(&state.turn_cancel)
+            .as_ref()
+            .and_then(|_| lock(&state.turns).last().map(|turn| turn.id.clone()));
+        if let Some(turn_id) = terminal_turn {
+            let retained_terminal = lock(&state.events)
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.kind == "agent.turn.finished"
+                        && event.payload.get("turnId").and_then(JsonValue::as_str) == Some(&turn_id)
+                })
+                .cloned();
+            let terminal_event = if let Some(event) = retained_terminal {
+                let events = lock(&state.events).clone();
+                let _ = repair_agent_turns_from_events(&mut lock(&state.turns), &events);
+                if let Some(turn) = lock(&state.turns)
+                    .iter()
+                    .find(|turn| turn.id == turn_id)
+                    .cloned()
+                {
+                    let _ = load_or_build_agent_turn_presentation(state, workspace_state, &turn);
+                }
+                let _ = remove_evidence_entry(
+                    &state
+                        .bundle_dir
+                        .join("turns")
+                        .join(&turn_id)
+                        .join("presentation.pending.json"),
+                );
+                let _ = persist_agent_session(state);
+                Ok(event)
+            } else {
+                let _ = remove_evidence_entry(
+                    &state
+                        .bundle_dir
+                        .join("turns")
+                        .join(&turn_id)
+                        .join("presentation.pending.json"),
+                );
+                let workspace_diff =
+                    finalize_agent_turn_workspace(state, &turn_id, workspace, &secrets)
+                        .unwrap_or_else(|_| json!({ "changes": [] }));
+                let turn_started_at_ms = lock(&state.turns)
+                    .iter()
+                    .find(|turn| turn.id == turn_id)
+                    .map_or_else(now_ms, |turn| turn.started_at_ms);
+                let termination = if lock(&state.turn_cancel)
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    Some(AgentTurnTermination::Cancelled)
+                } else if now_ms().saturating_sub(turn_started_at_ms)
+                    >= u128::from(limits.max_duration_ms)
+                {
+                    Some(AgentTurnTermination::TimedOut)
+                } else {
+                    None
+                };
+                let (status, outcome, terminal_error) = match termination {
+                    Some(AgentTurnTermination::Cancelled) => {
+                        (AgentTurnStatus::Cancelled, "cancelled", None)
+                    }
+                    Some(AgentTurnTermination::TimedOut) => (
+                        AgentTurnStatus::Failed,
+                        "timed-out",
+                        Some("interactive turn duration limit exceeded"),
+                    ),
+                    None => (AgentTurnStatus::Failed, "failed", Some(message.as_str())),
+                };
+                let event = record_finished_agent_turn_event(
+                    state,
+                    workspace_state,
+                    &turn_id,
+                    status,
+                    json!({
+                        "sessionId": lock(&state.summary).id,
+                        "turnId": turn_id,
+                        "outcome": outcome,
+                        "error": terminal_error,
+                        "workspaceDiff": workspace_diff,
+                    }),
+                );
+                let _ = update_agent_turn_status(
+                    state,
+                    &turn_id,
+                    status,
+                    Some(outcome),
+                    terminal_error,
+                );
+                event
+            };
+            release_agent_turn_reservation(
+                workspace_state,
+                &AgentTurnAttribution {
+                    session_id: lock(&state.summary).id.clone(),
+                    turn_id,
+                },
+            );
+            *lock(&state.turn_cancel) = None;
+            if let Ok(event) = terminal_event {
+                let _ = state.sender.send(event);
+            }
+        }
+        let _ = update_agent_session_status(state, AgentSessionStatus::Failed, Some(&message));
+        let _ = record_agent_event(state, "agent.session.failed", json!({ "message": message }));
+    }
+    let _ = clear_active_agent_session(workspace_state, state);
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_agent_turn(
+    state: &AgentSessionState,
+    workspace_state: &RunState,
+    driver: &mut DriverProcess,
+    session_id: &str,
+    turn_id: &str,
+    workspace: &Path,
+    prompt: &str,
+    input: Option<&JsonValue>,
+    capabilities: &[CapabilityEndpoint],
+    limits: &ScenarioLimits,
+    cancel: &CancellationToken,
+    secrets: &[Vec<u8>],
+    supports_turn_observations: bool,
+) -> Result<(), RunError> {
+    let mut attribution = ActiveAgentTurnGuard::new(workspace_state, session_id, turn_id)?;
+    let mut assistant_redactor = AssistantObservationRedactor::new(secrets);
+    *lock(&state.evidence_error) = None;
+    update_agent_turn_status(state, turn_id, AgentTurnStatus::Running, None, None)?;
+    update_agent_session_status(state, AgentSessionStatus::Running, None)?;
+    let capability_sources = agent_capability_sources(capabilities);
+    let mut task = json!({
+        "mode": "interactive",
+        "prompt": prompt,
+    });
+    if let Some(input) = input {
+        task.as_object_mut()
+            .expect("interactive task is an object")
+            .insert("input".to_owned(), input.clone());
+    }
+    driver.send(&command(
+        &format!("{turn_id}-start"),
+        CommandBody::StartTurn {
+            session_id: session_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            task,
+            capability_sources: capability_sources.clone(),
+        },
+    ))?;
+    record_agent_event(
+        state,
+        "agent.turn.started",
+        redact_value(
+            json!({ "sessionId": session_id, "turnId": turn_id, "prompt": prompt, "input": input }),
+            secrets,
+        ),
+    )?;
+    let started = Instant::now();
+    let mut termination = None;
+    let mut abort_sent_at = None;
+    let result = (|| -> Result<(), RunError> {
+        loop {
+            if termination.is_none() {
+                termination = if cancel.is_cancelled() {
+                    Some(AgentTurnTermination::Cancelled)
+                } else if started.elapsed() >= Duration::from_millis(limits.max_duration_ms) {
+                    Some(AgentTurnTermination::TimedOut)
+                } else {
+                    None
+                };
+            }
+            if let Some(cause) = termination.filter(|_| abort_sent_at.is_none()) {
+                driver.send(&command(
+                    &format!("{turn_id}-abort"),
+                    CommandBody::AbortTurn {
+                        session_id: session_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        reason: Some(match cause {
+                            AgentTurnTermination::Cancelled => {
+                                "cancelled from Agent Lab".to_owned()
+                            }
+                            AgentTurnTermination::TimedOut => {
+                                "interactive turn duration limit exceeded".to_owned()
+                            }
+                        }),
+                    },
+                ))?;
+                abort_sent_at = Some(Instant::now());
+            }
+            if abort_sent_at.is_some_and(|sent| sent.elapsed() >= Duration::from_secs(10)) {
+                return Err(RunError::Protocol(
+                    "driver did not finish within 10 seconds of interactive turn abort".to_owned(),
+                ));
+            }
+            match driver.receive(DRIVER_POLL) {
+                Ok(message) => match message.parsed.body {
+                    DriverBody::StartupEvent {
+                        phase,
+                        status,
+                        detail,
+                    } => record_agent_event(
+                        state,
+                        "startup.event",
+                        redact_value(
+                            json!({ "phase": phase, "status": status, "detail": detail }),
+                            secrets,
+                        ),
+                    )?,
+                    DriverBody::TurnEvent {
+                        session_id: observed_session,
+                        turn_id: observed_turn,
+                        event_type,
+                        payload,
+                    } => {
+                        validate_turn_identity(
+                            &observed_session,
+                            &observed_turn,
+                            session_id,
+                            turn_id,
+                            "turn.event",
+                        )?;
+                        let observation = TurnObservation::parse(&event_type, &payload)
+                            .map_err(|error| RunError::Protocol(error.to_string()))?;
+                        if event_type.starts_with("observation.") {
+                            if !supports_turn_observations {
+                                return Err(RunError::Protocol(format!(
+                                    "driver emitted {event_type} without advertising {TURN_OBSERVATIONS_FEATURE}"
+                                )));
+                            }
+                            if observation.is_none() {
+                                return Err(RunError::Protocol(format!(
+                                    "unknown reserved turn observation: {event_type}"
+                                )));
+                            }
+                        }
+                        if let Some(observation) = observation {
+                            for observation in assistant_redactor.redact(observation)? {
+                                record_agent_event(
+                                    state,
+                                    observation.event_type(),
+                                    json!({
+                                        "sessionId": session_id,
+                                        "turnId": turn_id,
+                                        "event": observation.payload(),
+                                    }),
+                                )?;
+                            }
+                        } else {
+                            record_agent_event(
+                                state,
+                                &driver_event_kind(&event_type),
+                                redact_value(
+                                    json!({
+                                        "sessionId": session_id,
+                                        "turnId": turn_id,
+                                        "event": payload,
+                                    }),
+                                    secrets,
+                                ),
+                            )?;
+                        }
+                    }
+                    DriverBody::TurnFinished {
+                        session_id: observed_session,
+                        turn_id: observed_turn,
+                        outcome,
+                        evidence,
+                    } => {
+                        if let Some(error) = lock(&state.evidence_error).take() {
+                            return Err(RunError::EvidencePersistence(error));
+                        }
+                        validate_turn_identity(
+                            &observed_session,
+                            &observed_turn,
+                            session_id,
+                            turn_id,
+                            "turn.finished",
+                        )?;
+                        if termination.is_none() {
+                            termination = if cancel.is_cancelled() {
+                                Some(AgentTurnTermination::Cancelled)
+                            } else if started.elapsed()
+                                >= Duration::from_millis(limits.max_duration_ms)
+                            {
+                                Some(AgentTurnTermination::TimedOut)
+                            } else {
+                                None
+                            };
+                        }
+                        flush_pending_assistant_deltas(
+                            state,
+                            session_id,
+                            turn_id,
+                            &mut assistant_redactor,
+                        )?;
+                        if termination.is_none() {
+                            termination = if cancel.is_cancelled() {
+                                Some(AgentTurnTermination::Cancelled)
+                            } else if started.elapsed()
+                                >= Duration::from_millis(limits.max_duration_ms)
+                            {
+                                Some(AgentTurnTermination::TimedOut)
+                            } else {
+                                None
+                            };
+                        }
+                        if outcome == "completed"
+                            && termination.is_none()
+                            && supports_turn_observations
+                        {
+                            require_agent_turn_response(state, turn_id)?;
+                        }
+                        let workspace_diff =
+                            finalize_agent_turn_workspace(state, turn_id, workspace, secrets)?;
+                        write_json_atomic(
+                            &state.bundle_dir.join("transcript.json"),
+                            &serde_json::to_value(redact_transcript(driver.transcript(), secrets))?,
+                        )?;
+                        let mut turn_cancel = lock(&state.turn_cancel);
+                        if termination.is_none() {
+                            termination = if cancel.is_cancelled() {
+                                Some(AgentTurnTermination::Cancelled)
+                            } else if started.elapsed()
+                                >= Duration::from_millis(limits.max_duration_ms)
+                            {
+                                Some(AgentTurnTermination::TimedOut)
+                            } else {
+                                None
+                            };
+                        }
+                        let (status, recorded_outcome, terminal_error) = match termination {
+                            Some(AgentTurnTermination::Cancelled) => {
+                                (AgentTurnStatus::Cancelled, "cancelled".to_owned(), None)
+                            }
+                            Some(AgentTurnTermination::TimedOut) => (
+                                AgentTurnStatus::Failed,
+                                "timed-out".to_owned(),
+                                Some("interactive turn duration limit exceeded".to_owned()),
+                            ),
+                            None if outcome == "aborted" => {
+                                (AgentTurnStatus::Cancelled, "aborted".to_owned(), None)
+                            }
+                            None if outcome == "completed" => {
+                                if agent_turn_was_intervened(state, turn_id) {
+                                    (AgentTurnStatus::Intervened, "intervened".to_owned(), None)
+                                } else {
+                                    (AgentTurnStatus::Completed, "completed".to_owned(), None)
+                                }
+                            }
+                            None => (AgentTurnStatus::Failed, outcome.clone(), None),
+                        };
+                        let terminal_event = record_finished_agent_turn_event(
+                            state,
+                            workspace_state,
+                            turn_id,
+                            status,
+                            redact_value(
+                                json!({
+                                    "sessionId": session_id,
+                                    "turnId": turn_id,
+                                    "outcome": recorded_outcome,
+                                    "driverOutcome": outcome,
+                                    "evidence": evidence,
+                                    "error": terminal_error,
+                                    "workspaceDiff": workspace_diff,
+                                }),
+                                secrets,
+                            ),
+                        )?;
+                        attribution.finish(|| {
+                            persist_agent_turn_terminal_state(
+                                state,
+                                turn_id,
+                                status,
+                                Some(&recorded_outcome),
+                                terminal_error.as_deref(),
+                            )?;
+                            Ok(())
+                        })?;
+                        *turn_cancel = None;
+                        let _ = state.sender.send(terminal_event);
+                        return Ok(());
+                    }
+                    DriverBody::Failed {
+                        scope,
+                        session_id: failed_session,
+                        turn_id: failed_turn,
+                        code,
+                        message,
+                    } => {
+                        if scope == DriverFailureScope::Turn
+                            && (failed_session.as_deref() != Some(session_id)
+                                || failed_turn.as_deref() != Some(turn_id))
+                        {
+                            record_agent_event(
+                                state,
+                                "driver.stale-turn-failure",
+                                redact_value(
+                                    json!({
+                                        "sessionId": failed_session,
+                                        "turnId": failed_turn,
+                                        "code": code,
+                                        "message": message,
+                                    }),
+                                    secrets,
+                                ),
+                            )?;
+                            continue;
+                        }
+                        if scope == DriverFailureScope::Session
+                            && failed_session.as_deref() != Some(session_id)
+                        {
+                            return Err(RunError::Protocol(format!(
+                                "driver reported a failure for unexpected session {}",
+                                failed_session.as_deref().unwrap_or("<missing>")
+                            )));
+                        }
+                        let message = redact_string(
+                            &format!("driver failed during interactive turn: {code}: {message}"),
+                            secrets,
+                        );
+                        update_agent_turn_status(
+                            state,
+                            turn_id,
+                            AgentTurnStatus::Failed,
+                            None,
+                            Some(&message),
+                        )?;
+                        return Err(RunError::Protocol(message));
+                    }
+                    _ => {}
+                },
+                Err(ProcessError::Timeout) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    })();
+    if result.is_err() {
+        flush_pending_assistant_deltas(state, session_id, turn_id, &mut assistant_redactor)?;
+    }
+    result
+}
+
+struct AssistantObservationRedactor<'a> {
+    secrets: &'a [Vec<u8>],
+    secret_patterns: Vec<&'a str>,
+    messages: BTreeMap<String, AssistantMessageRedactionState>,
+}
+
+#[derive(Default)]
+struct AssistantMessageRedactionState {
+    original: String,
+    pending: String,
+    redacted: String,
+    saw_delta: bool,
+    complete: bool,
+}
+
+impl<'a> AssistantObservationRedactor<'a> {
+    fn new(secrets: &'a [Vec<u8>]) -> Self {
+        let secret_patterns = secrets
+            .iter()
+            .filter_map(|secret| std::str::from_utf8(secret).ok())
+            .filter(|secret| secret.len() >= 4)
+            .collect();
+        Self {
+            secrets,
+            secret_patterns,
+            messages: BTreeMap::new(),
+        }
+    }
+
+    fn redact(&mut self, observation: TurnObservation) -> Result<Vec<TurnObservation>, RunError> {
+        match observation {
+            TurnObservation::AssistantDelta(delta) => {
+                let state = self.messages.entry(delta.message_id.clone()).or_default();
+                if state.complete {
+                    return Err(RunError::Protocol(format!(
+                        "assistant delta arrived after completion for {}",
+                        delta.message_id
+                    )));
+                }
+                state.saw_delta = true;
+                state.original.push_str(&delta.text);
+                state.pending.push_str(&delta.text);
+                let text = drain_redacted_prefix(&mut state.pending, &self.secret_patterns, false);
+                state.redacted.push_str(&text);
+                Ok(vec![TurnObservation::AssistantDelta(
+                    agent_lab_driver_protocol::AssistantDeltaObservation {
+                        message_id: delta.message_id,
+                        text,
+                    },
+                )])
+            }
+            TurnObservation::AssistantCompleted(completed) => {
+                let state = self
+                    .messages
+                    .entry(completed.message_id.clone())
+                    .or_default();
+                if state.complete {
+                    return Err(RunError::Protocol(format!(
+                        "assistant completion was repeated for {}",
+                        completed.message_id
+                    )));
+                }
+                if state.saw_delta && state.original != completed.text {
+                    return Err(RunError::Protocol(format!(
+                        "assistant completion text disagrees with streamed deltas for {}",
+                        completed.message_id
+                    )));
+                }
+                let mut output = Vec::new();
+                let suffix = drain_redacted_prefix(&mut state.pending, &self.secret_patterns, true);
+                if !suffix.is_empty() {
+                    state.redacted.push_str(&suffix);
+                    output.push(TurnObservation::AssistantDelta(
+                        agent_lab_driver_protocol::AssistantDeltaObservation {
+                            message_id: completed.message_id.clone(),
+                            text: suffix,
+                        },
+                    ));
+                }
+                let completed_text = redact_string(&completed.text, self.secrets);
+                if state.saw_delta && state.redacted != completed_text {
+                    return Err(RunError::Protocol(format!(
+                        "redacted assistant completion disagrees with streamed deltas for {}",
+                        completed.message_id
+                    )));
+                }
+                state.complete = true;
+                output.push(TurnObservation::AssistantCompleted(
+                    agent_lab_driver_protocol::AssistantCompletedObservation {
+                        message_id: completed.message_id,
+                        text: completed_text,
+                    },
+                ));
+                Ok(output)
+            }
+            observation => Ok(vec![observation]),
+        }
+    }
+
+    fn flush_incomplete(&mut self) -> Vec<TurnObservation> {
+        let mut output = Vec::new();
+        for (message_id, state) in &mut self.messages {
+            if state.complete {
+                continue;
+            }
+            let suffix = drain_redacted_prefix(&mut state.pending, &self.secret_patterns, true);
+            if suffix.is_empty() {
+                continue;
+            }
+            state.redacted.push_str(&suffix);
+            output.push(TurnObservation::AssistantDelta(
+                agent_lab_driver_protocol::AssistantDeltaObservation {
+                    message_id: message_id.clone(),
+                    text: suffix,
+                },
+            ));
+        }
+        output
+    }
+}
+
+fn flush_pending_assistant_deltas(
+    state: &AgentSessionState,
+    session_id: &str,
+    turn_id: &str,
+    redactor: &mut AssistantObservationRedactor<'_>,
+) -> Result<(), RunError> {
+    for observation in redactor.flush_incomplete() {
+        record_agent_event(
+            state,
+            observation.event_type(),
+            json!({
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "event": observation.payload(),
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn drain_redacted_prefix(pending: &mut String, secrets: &[&str], finish: bool) -> String {
+    let mut output = String::new();
+    while !pending.is_empty() {
+        if let Some(secret) = secrets
+            .iter()
+            .copied()
+            .find(|secret| pending.starts_with(secret))
+        {
+            pending.drain(..secret.len());
+            output.push_str("[REDACTED]");
+            continue;
+        }
+        if !finish
+            && secrets
+                .iter()
+                .any(|secret| secret.starts_with(pending.as_str()))
+        {
+            break;
+        }
+        let first_len = pending
+            .chars()
+            .next()
+            .expect("non-empty string has a first character")
+            .len_utf8();
+        output.push_str(&pending[..first_len]);
+        pending.drain(..first_len);
+    }
+    output
+}
+
+fn require_agent_turn_response(state: &AgentSessionState, turn_id: &str) -> Result<(), RunError> {
+    let turn = lock(&state.turns)
+        .iter()
+        .find(|turn| turn.id == turn_id)
+        .cloned()
+        .ok_or_else(|| RunError::InvalidRequest(format!("unknown agent turn: {turn_id}")))?;
+    let presentation = build_agent_turn_presentation(state, &turn)?;
+    if presentation.messages.is_empty()
+        || presentation
+            .messages
+            .iter()
+            .any(|message| !message.complete)
+    {
+        return Err(RunError::Protocol(format!(
+            "interactive turn {turn_id} completed without an authoritative assistant response"
+        )));
+    }
+    Ok(())
+}
+
+fn finalize_agent_turn_workspace(
+    state: &AgentSessionState,
+    turn_id: &str,
+    workspace: &Path,
+    secrets: &[Vec<u8>],
+) -> Result<JsonValue, RunError> {
+    validate_evidence_tree(workspace)?;
+    let turn_dir = state.bundle_dir.join("turns").join(turn_id);
+    let final_dir = turn_dir.join("final");
+    let staging_dir = turn_dir.join("final.tmp");
+    remove_evidence_entry(&staging_dir)?;
+    let mut final_snapshot = capture_tree(workspace)?;
+    redact_captured_tree(&mut final_snapshot, secrets);
+    write_captured_tree(&staging_dir, &final_snapshot)?;
+    let initial_snapshot = capture_tree(&turn_dir.join("initial"))?;
+    let changes = captured_tree_changes(&initial_snapshot, &final_snapshot, secrets);
+    let event_changes = changes
+        .iter()
+        .map(|change| {
+            json!({
+                "path": change["path"],
+                "entryType": change["entryType"],
+                "kind": change["kind"],
+                "beforeMode": change["beforeMode"],
+                "afterMode": change["afterMode"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let diff = json!({ "changes": changes });
+    write_json_atomic(&turn_dir.join("diff.json"), &diff)?;
+    remove_evidence_entry(&final_dir)?;
+    fs::rename(&staging_dir, &final_dir)?;
+    Ok(json!({ "changes": event_changes }))
+}
+
+fn load_or_build_agent_turn_presentation(
+    state: &AgentSessionState,
+    _workspace: &RunState,
+    turn: &AgentTurnSummary,
+) -> Result<AgentTurnPresentation, RunError> {
+    let events = lock(&state.events);
+    let expected =
+        build_agent_turn_presentation_from_events(&events, turn, &lock(&state.secret_values))?;
+    let terminal_evidence_finalized = events.iter().any(|event| {
+        event.kind == "agent.turn.finished"
+            && event.payload.get("turnId").and_then(JsonValue::as_str) == Some(&turn.id)
+    });
+    let path = state
+        .bundle_dir
+        .join("turns")
+        .join(&turn.id)
+        .join("presentation.json");
+    let stored = read_agent_turn_presentation(&path)?;
+    if !terminal_evidence_finalized {
+        return match stored {
+            None => Ok(expected),
+            Some(stored) if stored == expected => Ok(stored),
+            Some(_) => Err(RunError::Protocol(format!(
+                "agent turn presentation does not match retained evidence: {}",
+                turn.id
+            ))),
+        };
+    }
+    validate_agent_turn_presentation(turn, &expected, &events)?;
+    if stored.as_ref() != Some(&expected) {
+        write_json_atomic(&path, &serde_json::to_value(&expected)?)?;
+    }
+    Ok(expected)
+}
+
+fn repair_terminal_agent_turn_presentations(
+    bundle_dir: &Path,
+    turns: &[AgentTurnSummary],
+    events: &[RunEvent],
+) -> Result<bool, RunError> {
+    let mut repaired = false;
+    for turn in turns {
+        let turn_dir = bundle_dir.join("turns").join(&turn.id);
+        let pending_path = turn_dir.join("presentation.pending.json");
+        if pending_path.exists() {
+            remove_evidence_entry(&pending_path)?;
+            repaired = true;
+        }
+        let terminal_evidence_finalized = events.iter().any(|event| {
+            event.kind == "agent.turn.finished"
+                && event.payload.get("turnId").and_then(JsonValue::as_str) == Some(&turn.id)
+        });
+        if !terminal_evidence_finalized {
+            continue;
+        }
+
+        let expected = build_agent_turn_presentation_from_events(events, turn, &[])?;
+        validate_agent_turn_presentation(turn, &expected, events)?;
+        let path = turn_dir.join("presentation.json");
+        if read_agent_turn_presentation(&path)?.as_ref() != Some(&expected) {
+            write_json_atomic(&path, &serde_json::to_value(expected)?)?;
+            repaired = true;
+        }
+    }
+    Ok(repaired)
+}
+
+fn read_agent_turn_presentation(path: &Path) -> Result<Option<AgentTurnPresentation>, RunError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn record_finished_agent_turn_event(
+    state: &AgentSessionState,
+    _workspace: &RunState,
+    turn_id: &str,
+    terminal_status: AgentTurnStatus,
+    payload: JsonValue,
+) -> Result<RunEvent, RunError> {
+    let mut turn = lock(&state.turns)
+        .iter()
+        .find(|turn| turn.id == turn_id)
+        .cloned()
+        .ok_or_else(|| RunError::InvalidRequest(format!("unknown agent turn: {turn_id}")))?;
+    turn.status = terminal_status;
+    let payload = redact_value(payload, &lock(&state.secret_values));
+    let event = {
+        // Hold the history lock across the projection and event commit.
+        // Readers and subscribers can therefore observe the terminal event
+        // only after its presentation is durable.
+        let mut events = lock(&state.events);
+        if let Some(existing) = events.iter().find(|event| {
+            event.kind == "agent.turn.finished"
+                && event.payload.get("turnId").and_then(JsonValue::as_str) == Some(turn_id)
+        }) {
+            return Ok(existing.clone());
+        }
+        let event = RunEvent {
+            sequence: events.len() as u64 + 1,
+            at_ms: now_ms(),
+            kind: "agent.turn.finished".to_owned(),
+            payload,
+            progress: None,
+        };
+        let mut prospective_events = events.clone();
+        prospective_events.push(event.clone());
+        let presentation = build_agent_turn_presentation_from_events(
+            &prospective_events,
+            &turn,
+            &lock(&state.secret_values),
+        )?;
+        validate_agent_turn_presentation(&turn, &presentation, &prospective_events)?;
+        #[cfg(test)]
+        maybe_inject_agent_presentation_write_failure(state, turn_id)?;
+        let turn_dir = state.bundle_dir.join("turns").join(turn_id);
+        let pending_path = turn_dir.join("presentation.pending.json");
+        write_json_atomic(&pending_path, &serde_json::to_value(presentation)?)?;
+        #[cfg(test)]
+        maybe_inject_agent_terminal_event_append_failure(state, turn_id)?;
+        append_agent_event_record_locked(state, &mut events, event.clone())?;
+        fs::rename(pending_path, turn_dir.join("presentation.json"))?;
+        event
+    };
+    Ok(event)
+}
+
+#[cfg(test)]
+fn maybe_inject_agent_terminal_event_append_failure(
+    state: &AgentSessionState,
+    turn_id: &str,
+) -> Result<(), RunError> {
+    let marker = state
+        .bundle_dir
+        .join("turns")
+        .join(turn_id)
+        .join("fail-terminal-event-append.once");
+    if marker.is_file() {
+        fs::remove_file(marker)?;
+        return Err(RunError::EvidencePersistence(
+            "injected agent terminal event append failure".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_inject_agent_presentation_write_failure(
+    state: &AgentSessionState,
+    turn_id: &str,
+) -> Result<(), RunError> {
+    let marker = state
+        .bundle_dir
+        .join("turns")
+        .join(turn_id)
+        .join("fail-presentation-write.once");
+    if marker.is_file() {
+        fs::remove_file(marker)?;
+        return Err(RunError::EvidencePersistence(
+            "injected agent presentation write failure".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_agent_turn_presentation(
+    turn: &AgentTurnSummary,
+    presentation: &AgentTurnPresentation,
+    events: &[RunEvent],
+) -> Result<(), RunError> {
+    if matches!(
+        turn.status,
+        AgentTurnStatus::Completed | AgentTurnStatus::Intervened
+    ) && agent_session_supports_turn_observations(events)
+        && (presentation.messages.is_empty()
+            || presentation
+                .messages
+                .iter()
+                .any(|message| !message.complete))
+    {
+        return Err(RunError::Protocol(format!(
+            "interactive turn {} completed without an authoritative assistant response",
+            turn.id
+        )));
+    }
+    Ok(())
+}
+
+fn build_agent_turn_presentation(
+    state: &AgentSessionState,
+    turn: &AgentTurnSummary,
+) -> Result<AgentTurnPresentation, RunError> {
+    build_agent_turn_presentation_from_events(
+        &lock(&state.events),
+        turn,
+        &lock(&state.secret_values),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_agent_turn_presentation_from_events(
+    events: &[RunEvent],
+    turn: &AgentTurnSummary,
+    secrets: &[Vec<u8>],
+) -> Result<AgentTurnPresentation, RunError> {
+    let relevant = events
+        .iter()
+        .filter(|event| event.payload.get("turnId").and_then(JsonValue::as_str) == Some(&turn.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let observations_supported = agent_session_supports_turn_observations(events);
+    let terminal_outcome = relevant
+        .iter()
+        .rev()
+        .find(|event| event.kind == "agent.turn.finished")
+        .and_then(|event| event.payload.get("outcome"))
+        .and_then(JsonValue::as_str);
+    let turn_evidence_finalized = terminal_outcome.is_some();
+    let turn_successful = matches!(terminal_outcome, Some("completed" | "intervened"));
+    let mut messages = Vec::<AgentAssistantMessage>::new();
+    let mut message_indexes = HashMap::<String, usize>::new();
+    let mut activity = Vec::<AgentTurnActivity>::new();
+    let mut capability_indexes = HashMap::<(String, String), usize>::new();
+    let mut native_action_indexes = HashMap::<String, usize>::new();
+    let mut usage = None;
+
+    for event in &relevant {
+        let body = event.payload.get("event").unwrap_or(&event.payload);
+        match event.kind.as_str() {
+            "observation.assistant.delta" => {
+                let message_id = required_json_string(body, "messageId", &event.kind)?;
+                let text = required_json_string(body, "text", &event.kind)?;
+                let index = *message_indexes
+                    .entry(message_id.to_owned())
+                    .or_insert_with(|| {
+                        messages.push(AgentAssistantMessage {
+                            id: message_id.to_owned(),
+                            text: String::new(),
+                            complete: false,
+                            source_event_sequences: Vec::new(),
+                        });
+                        messages.len() - 1
+                    });
+                if messages[index].complete {
+                    return Err(RunError::Protocol(format!(
+                        "assistant delta arrived after completion for {message_id}"
+                    )));
+                }
+                messages[index].text.push_str(text);
+                messages[index].source_event_sequences.push(event.sequence);
+            }
+            "observation.assistant.completed" => {
+                let message_id = required_json_string(body, "messageId", &event.kind)?;
+                let completed_text = required_json_string(body, "text", &event.kind)?;
+                let index = *message_indexes
+                    .entry(message_id.to_owned())
+                    .or_insert_with(|| {
+                        messages.push(AgentAssistantMessage {
+                            id: message_id.to_owned(),
+                            text: completed_text.to_owned(),
+                            complete: false,
+                            source_event_sequences: Vec::new(),
+                        });
+                        messages.len() - 1
+                    });
+                if messages[index].complete {
+                    return Err(RunError::Protocol(format!(
+                        "assistant completion was repeated for {message_id}"
+                    )));
+                }
+                if !messages[index].text.is_empty() && messages[index].text != completed_text {
+                    return Err(RunError::Protocol(format!(
+                        "assistant completion text disagrees with streamed deltas for {message_id}"
+                    )));
+                }
+                completed_text.clone_into(&mut messages[index].text);
+                messages[index].complete = true;
+                messages[index].source_event_sequences.push(event.sequence);
+            }
+            "mcp.tool.started" => {
+                let source = body
+                    .get("source")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("capability");
+                let name = body
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("call");
+                let call_id = body
+                    .get("callId")
+                    .and_then(JsonValue::as_str)
+                    .map_or_else(|| format!("{}:{}", source, event.sequence), str::to_owned);
+                let index = activity.len();
+                capability_indexes.insert((source.to_owned(), call_id), index);
+                activity.push(AgentTurnActivity {
+                    kind: "capability-call".to_owned(),
+                    title: format!("{source} · {name}"),
+                    detail: body.get("arguments").map(compact_json_detail),
+                    status: "running".to_owned(),
+                    source: Some(source.to_owned()),
+                    path: None,
+                    source_event_sequences: vec![event.sequence],
+                });
+            }
+            "mcp.tool.completed" => {
+                let source = body
+                    .get("source")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("capability");
+                let name = body
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("call");
+                let call_id = body
+                    .get("callId")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned);
+                let index = call_id
+                    .as_ref()
+                    .and_then(|call_id| {
+                        capability_indexes
+                            .get(&(source.to_owned(), call_id.to_owned()))
+                            .copied()
+                    })
+                    .unwrap_or_else(|| {
+                        activity.push(AgentTurnActivity {
+                            kind: "capability-call".to_owned(),
+                            title: format!("{source} · {name}"),
+                            detail: None,
+                            status: "running".to_owned(),
+                            source: Some(source.to_owned()),
+                            path: None,
+                            source_event_sequences: Vec::new(),
+                        });
+                        activity.len() - 1
+                    });
+                activity[index].status =
+                    if body.get("isError").and_then(JsonValue::as_bool) == Some(true) {
+                        "failed".to_owned()
+                    } else {
+                        "completed".to_owned()
+                    };
+                activity[index].detail = body.get("result").map(compact_json_detail);
+                activity[index].source_event_sequences.push(event.sequence);
+            }
+            "observation.native-action" => {
+                let action_id = required_json_string(body, "actionId", &event.kind)?;
+                let name = body
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("Native action");
+                let index = *native_action_indexes
+                    .entry(action_id.to_owned())
+                    .or_insert_with(|| {
+                        activity.push(AgentTurnActivity {
+                            kind: "native-action".to_owned(),
+                            title: name.to_owned(),
+                            detail: None,
+                            status: "started".to_owned(),
+                            source: None,
+                            path: None,
+                            source_event_sequences: Vec::new(),
+                        });
+                        activity.len() - 1
+                    });
+                name.clone_into(&mut activity[index].title);
+                if let Some(summary) = body.get("summary").and_then(JsonValue::as_str) {
+                    activity[index].detail = Some(summary.to_owned());
+                }
+                body.get("status")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("completed")
+                    .clone_into(&mut activity[index].status);
+                activity[index].source_event_sequences.push(event.sequence);
+            }
+            "observation.usage" => usage = Some(body.clone()),
+            "agent.turn.finished" => {
+                if let Some(changes) = body
+                    .get("workspaceDiff")
+                    .and_then(|diff| diff.get("changes"))
+                    .and_then(JsonValue::as_array)
+                {
+                    for change in changes {
+                        let path = change
+                            .get("path")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("workspace");
+                        let kind = change
+                            .get("kind")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("changed");
+                        let mode_detail = match (
+                            change.get("beforeMode").and_then(JsonValue::as_str),
+                            change.get("afterMode").and_then(JsonValue::as_str),
+                        ) {
+                            (Some(before), Some(after)) if before != after => {
+                                Some(format!("mode {before} -> {after}"))
+                            }
+                            _ => None,
+                        };
+                        activity.push(AgentTurnActivity {
+                            kind: "workspace-effect".to_owned(),
+                            title: format!("{} {path}", title_case(kind)),
+                            detail: mode_detail,
+                            status: "completed".to_owned(),
+                            source: None,
+                            path: Some(path.to_owned()),
+                            source_event_sequences: vec![event.sequence],
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for message in &mut messages {
+        message.text = redact_string(&message.text, secrets);
+    }
+    let response = (!messages.is_empty()).then(|| {
+        messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    });
+    let source_event_sequences = relevant
+        .iter()
+        .map(|event| event.sequence)
+        .collect::<Vec<_>>();
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(&relevant)?);
+    let source_digest = format!("sha256:{:x}", hasher.finalize());
+    let assistant_output =
+        if !messages.is_empty() && messages.iter().all(|message| message.complete) {
+            AgentPresentationCompleteness::Complete
+        } else if messages.is_empty() {
+            AgentPresentationCompleteness::Unavailable
+        } else {
+            AgentPresentationCompleteness::Partial
+        };
+    let capability_activity = if turn_evidence_finalized && turn_successful {
+        AgentPresentationCompleteness::Complete
+    } else {
+        AgentPresentationCompleteness::Partial
+    };
+    let native_activity = if turn_evidence_finalized
+        && turn_successful
+        && (activity
+            .iter()
+            .any(|activity| activity.kind == "native-action")
+            || observations_supported)
+    {
+        AgentPresentationCompleteness::Complete
+    } else if observations_supported {
+        AgentPresentationCompleteness::Partial
+    } else {
+        AgentPresentationCompleteness::Unavailable
+    };
+    let workspace_effects = if turn_evidence_finalized && turn_successful {
+        AgentPresentationCompleteness::Complete
+    } else {
+        AgentPresentationCompleteness::Partial
+    };
+    let usage_completeness = if usage.is_some() {
+        AgentPresentationCompleteness::Complete
+    } else {
+        AgentPresentationCompleteness::Unavailable
+    };
+    Ok(AgentTurnPresentation {
+        schema_version: AGENT_TURN_PRESENTATION_VERSION,
+        response,
+        messages,
+        activity,
+        usage,
+        completeness: AgentPresentationCompletenessSummary {
+            assistant_output,
+            capability_activity,
+            native_activity,
+            workspace_effects,
+            usage: usage_completeness,
+        },
+        source_event_sequences,
+        source_digest,
+    })
+}
+
+fn agent_session_supports_turn_observations(events: &[RunEvent]) -> bool {
+    events.iter().any(|event| {
+        event.kind == "agent.session.ready"
+            && event.payload["driver"]["features"]
+                .as_array()
+                .is_some_and(|features| {
+                    features
+                        .iter()
+                        .any(|feature| feature.as_str() == Some(TURN_OBSERVATIONS_FEATURE))
+                })
+    })
+}
+
+fn required_json_string<'a>(
+    value: &'a JsonValue,
+    key: &str,
+    event_kind: &str,
+) -> Result<&'a str, RunError> {
+    value
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| RunError::Protocol(format!("{event_kind} requires a string {key}")))
+}
+
+fn compact_json_detail(value: &JsonValue) -> String {
+    value
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(500)
+        .collect()
+}
+
+fn title_case(value: &str) -> String {
+    let mut chars = value.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().collect::<String>() + chars.as_str()
+    })
+}
+
+fn close_agent_driver(
+    state: &AgentSessionState,
+    driver: &mut DriverProcess,
+    session_id: &str,
+    interrupted: bool,
+) -> Result<(), RunError> {
+    driver.send(&command(
+        "agent-close",
+        CommandBody::CloseSession {
+            session_id: session_id.to_owned(),
+        },
+    ))?;
+    let closed = driver.receive(DRIVER_RESPONSE_TIMEOUT)?;
+    if !matches!(closed.parsed.body, DriverBody::SessionClosed { session_id: ref closed } if closed == session_id)
+    {
+        return Err(RunError::Protocol(
+            "expected session.closed for interactive session".to_owned(),
+        ));
+    }
+    let exit = driver.wait_for_exit(DRIVER_RESPONSE_TIMEOUT)?;
+    require_successful_driver_exit(exit)?;
+    let status = if interrupted {
+        AgentSessionStatus::Interrupted
+    } else {
+        AgentSessionStatus::Closed
+    };
+    update_agent_session_status(state, status, None)?;
+    record_agent_event(
+        state,
+        if interrupted {
+            "agent.session.interrupted"
+        } else {
+            "agent.session.closed"
+        },
+        json!({ "sessionId": session_id }),
+    )?;
+    Ok(())
+}
+
+fn agent_capability_sources(capabilities: &[CapabilityEndpoint]) -> JsonValue {
+    JsonValue::Array(
+        capabilities
+            .iter()
+            .map(|capability| {
+                json!({
+                    "type": "mcp",
+                    "id": capability.id,
+                    "revision": capability.revision,
+                    "transport": {
+                        "type": "http",
+                        "url": capability.agent_url,
+                        "headers": { "Authorization": format!("Bearer {}", capability.agent_token) }
+                    }
+                })
+            })
+            .collect(),
+    )
+}
+
 fn require_successful_driver_exit(exit_code: Option<i32>) -> Result<(), RunError> {
     if exit_code == Some(0) {
         Ok(())
@@ -2752,7 +5267,14 @@ fn require_successful_driver_exit(exit_code: Option<i32>) -> Result<(), RunError
 }
 
 fn driver_event_kind(event_type: &str) -> String {
-    const CONTROLLER_PREFIXES: &[&str] = &["controller.", "driver.", "mcp.", "run.", "workspace."];
+    const CONTROLLER_PREFIXES: &[&str] = &[
+        "agent.",
+        "controller.",
+        "driver.",
+        "mcp.",
+        "run.",
+        "workspace.",
+    ];
     if CONTROLLER_PREFIXES
         .iter()
         .any(|prefix| event_type.starts_with(prefix))
@@ -3066,6 +5588,7 @@ fn record_event(state: &RunState, kind: &str, payload: JsonValue) -> Result<(), 
             at_ms: now_ms(),
             kind: kind.to_owned(),
             payload,
+            progress: None,
         };
         let mut line = serde_json::to_vec(&event)?;
         line.push(b'\n');
@@ -3096,6 +5619,7 @@ fn record_evaluation_event(
             at_ms: now_ms(),
             kind: kind.to_owned(),
             payload,
+            progress: None,
         };
         let mut line = serde_json::to_vec(&event)?;
         line.push(b'\n');
@@ -3116,6 +5640,350 @@ fn persist_evaluation(state: &EvaluationState) -> Result<(), RunError> {
         &state.bundle_dir.join("manifest.json"),
         &serde_json::to_value(lock(&state.summary).clone())?,
     )
+}
+
+fn persist_agent_session(state: &AgentSessionState) -> Result<(), RunError> {
+    let manifest = AgentSessionManifest {
+        version: AGENT_SESSION_MANIFEST_VERSION,
+        summary: lock(&state.summary).clone(),
+        turns: lock(&state.turns).clone(),
+    };
+    let secrets = lock(&state.secret_values).clone();
+    let value = redact_value(serde_json::to_value(manifest)?, &secrets);
+    write_json_atomic(&state.bundle_dir.join("manifest.json"), &value)
+}
+
+fn record_agent_event(
+    state: &AgentSessionState,
+    kind: &str,
+    payload: JsonValue,
+) -> Result<(), RunError> {
+    let payload = redact_value(payload, &lock(&state.secret_values));
+    let event = {
+        let mut events = lock(&state.events);
+        append_agent_event_locked(state, &mut events, kind, payload)?
+    };
+    let _ = state.sender.send(event);
+    Ok(())
+}
+
+fn append_agent_event_locked(
+    state: &AgentSessionState,
+    events: &mut Vec<RunEvent>,
+    kind: &str,
+    payload: JsonValue,
+) -> Result<RunEvent, RunError> {
+    let mut event = RunEvent {
+        sequence: events.len() as u64 + 1,
+        at_ms: now_ms(),
+        kind: kind.to_owned(),
+        payload,
+        progress: None,
+    };
+    event.progress = if recent_driver_progress_supersedes_fallback(events, &event) {
+        None
+    } else {
+        project_agent_progress(&event)
+    };
+    if event.progress.as_ref().is_some_and(|progress| {
+        events
+            .iter()
+            .rev()
+            .find(|previous| {
+                same_agent_progress_context(previous, &event) && previous.progress.is_some()
+            })
+            .and_then(|previous| previous.progress.as_ref())
+            .is_some_and(|previous| {
+                previous.phase == progress.phase
+                    && previous.detail == progress.detail
+                    && previous.source == progress.source
+            })
+    }) {
+        event.progress = None;
+    }
+    append_agent_event_record_locked(state, events, event.clone())?;
+    Ok(event)
+}
+
+fn same_agent_progress_context(previous: &RunEvent, current: &RunEvent) -> bool {
+    previous.payload.get("turnId").and_then(JsonValue::as_str)
+        == current.payload.get("turnId").and_then(JsonValue::as_str)
+}
+
+fn recent_driver_progress_supersedes_fallback(events: &[RunEvent], event: &RunEvent) -> bool {
+    if !matches!(
+        event.kind.as_str(),
+        "observation.assistant.delta"
+            | "observation.assistant.completed"
+            | "observation.native-action"
+            | "v0.turn-start"
+            | "v0.task-thinking-v1"
+            | "v0.mdx"
+            | "v0.agent-finalizing"
+            | "v0.task-waiting-v1"
+            | "v0.turn-finish"
+            | "model.step.started"
+            | "model.message.delta"
+            | "model.step.completed"
+            | "model.session.waiting"
+    ) {
+        return false;
+    }
+    events.iter().rev().any(|previous| {
+        previous.kind == "observation.progress"
+            && same_agent_progress_context(previous, event)
+            && event.sequence.saturating_sub(previous.sequence) <= 3
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn project_agent_progress(event: &RunEvent) -> Option<AgentProgressProjection> {
+    let body = event.payload.get("event").unwrap_or(&event.payload);
+    let progress = match event.kind.as_str() {
+        "agent.session.starting" => progress(
+            ProgressPhase::Starting,
+            Some("Starting agent session"),
+            Some("controller"),
+        ),
+        "startup.event" => progress(
+            ProgressPhase::Starting,
+            body.get("detail")
+                .and_then(JsonValue::as_str)
+                .or_else(|| body.get("phase").and_then(JsonValue::as_str)),
+            Some("harness"),
+        ),
+        "agent.turn.started" => progress(
+            ProgressPhase::Preparing,
+            Some("Preparing turn"),
+            Some("controller"),
+        ),
+        "observation.progress" => {
+            let Ok(Some(TurnObservation::Progress(observation))) =
+                TurnObservation::parse("observation.progress", body)
+            else {
+                return None;
+            };
+            progress(
+                observation.phase,
+                observation.detail.as_deref(),
+                observation.source.as_deref().or(Some("harness")),
+            )
+        }
+        "mcp.tool.started" => {
+            let detail = capability_progress_detail(body, false);
+            progress(ProgressPhase::Acting, Some(&detail), Some("mcp"))
+        }
+        "mcp.tool.completed" => {
+            let detail = capability_progress_detail(body, true);
+            progress(ProgressPhase::Waiting, Some(&detail), Some("mcp"))
+        }
+        "observation.native-action" => {
+            let status = body
+                .get("status")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("started");
+            let phase = if status == "started" {
+                ProgressPhase::Acting
+            } else {
+                ProgressPhase::Waiting
+            };
+            progress(
+                phase,
+                body.get("summary")
+                    .and_then(JsonValue::as_str)
+                    .or_else(|| body.get("name").and_then(JsonValue::as_str)),
+                Some("harness"),
+            )
+        }
+        "observation.assistant.delta" | "observation.assistant.completed" => progress(
+            ProgressPhase::Responding,
+            Some("Writing response"),
+            Some("model"),
+        ),
+        "v0.turn-start" | "model.step.started" | "model.turn.started" => progress(
+            ProgressPhase::Reasoning,
+            Some("Model step in progress"),
+            Some("harness"),
+        ),
+        "v0.task-thinking-v1" => progress(
+            ProgressPhase::Reasoning,
+            Some("Model is reasoning"),
+            Some("v0"),
+        ),
+        "v0.mdx" | "model.message.delta" => progress(
+            ProgressPhase::Responding,
+            Some("Writing response"),
+            Some("harness"),
+        ),
+        "v0.agent-finalizing" => progress(
+            ProgressPhase::Finalizing,
+            Some("Finalizing answer"),
+            Some("v0"),
+        ),
+        "v0.task-waiting-v1"
+        | "v0.turn-finish"
+        | "model.step.completed"
+        | "model.session.waiting" => progress(
+            ProgressPhase::Waiting,
+            Some("Waiting for the next step"),
+            Some("harness"),
+        ),
+        _ => return None,
+    };
+    Some(AgentProgressProjection {
+        phase: progress.phase,
+        detail: progress.detail,
+        source: progress.source,
+        source_event_sequence: event.sequence,
+        source_event_type: event.kind.clone(),
+    })
+}
+
+fn progress(
+    phase: ProgressPhase,
+    detail: Option<&str>,
+    source: Option<&str>,
+) -> ProgressObservation {
+    ProgressObservation {
+        phase,
+        detail: detail.and_then(compact_progress_text),
+        source: source.and_then(compact_progress_text),
+    }
+}
+
+fn compact_progress_text(value: &str) -> Option<String> {
+    let value = value
+        .chars()
+        .filter(|character| !character.is_control() || character.is_whitespace())
+        .collect::<String>();
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let value = value.chars().take(160).collect::<String>();
+    (!value.is_empty()).then_some(value)
+}
+
+fn capability_progress_detail(body: &JsonValue, completed: bool) -> String {
+    let source = body
+        .get("source")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("capability");
+    let name = body
+        .get("name")
+        .or_else(|| body.get("tool"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("tool");
+    if completed {
+        format!("{source} · {name} returned")
+    } else {
+        format!("{source} · {name}")
+    }
+}
+
+fn append_agent_event_record_locked(
+    state: &AgentSessionState,
+    events: &mut Vec<RunEvent>,
+    event: RunEvent,
+) -> Result<(), RunError> {
+    if event.sequence != events.len() as u64 + 1 {
+        return Err(RunError::Protocol(format!(
+            "agent event sequence {} did not follow retained sequence {}",
+            event.sequence,
+            events.len()
+        )));
+    }
+    let mut line = serde_json::to_vec(&event)?;
+    line.push(b'\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state.bundle_dir.join("events.jsonl"))?;
+    file.write_all(&line)?;
+    events.push(event);
+    Ok(())
+}
+
+fn update_agent_session_status(
+    state: &AgentSessionState,
+    status: AgentSessionStatus,
+    error: Option<&str>,
+) -> Result<(), RunError> {
+    {
+        let mut summary = lock(&state.summary);
+        summary.status = status;
+        summary.updated_at_ms = now_ms();
+        summary.error = error.map(str::to_owned);
+        if matches!(
+            status,
+            AgentSessionStatus::Closed
+                | AgentSessionStatus::Failed
+                | AgentSessionStatus::Interrupted
+        ) {
+            summary.active = false;
+        }
+    }
+    persist_agent_session(state)
+}
+
+fn update_agent_turn_status(
+    state: &AgentSessionState,
+    turn_id: &str,
+    status: AgentTurnStatus,
+    outcome: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), RunError> {
+    let finished = matches!(
+        status,
+        AgentTurnStatus::Completed
+            | AgentTurnStatus::Intervened
+            | AgentTurnStatus::Failed
+            | AgentTurnStatus::Cancelled
+    );
+    {
+        let mut turns = lock(&state.turns);
+        let turn = turns
+            .iter_mut()
+            .find(|turn| turn.id == turn_id)
+            .ok_or_else(|| RunError::InvalidRequest(format!("unknown agent turn: {turn_id}")))?;
+        turn.status = status;
+        turn.outcome = outcome.map(str::to_owned);
+        turn.error = error.map(str::to_owned);
+        if finished {
+            turn.finished_at_ms = Some(now_ms());
+        }
+    }
+    {
+        let mut summary = lock(&state.summary);
+        summary.turn_count = lock(&state.turns).len() as u64;
+        summary.updated_at_ms = now_ms();
+    }
+    persist_agent_session(state)
+}
+
+fn persist_agent_turn_terminal_state(
+    state: &AgentSessionState,
+    turn_id: &str,
+    status: AgentTurnStatus,
+    outcome: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), RunError> {
+    {
+        let mut turns = lock(&state.turns);
+        let turn = turns
+            .iter_mut()
+            .find(|turn| turn.id == turn_id)
+            .ok_or_else(|| RunError::InvalidRequest(format!("unknown agent turn: {turn_id}")))?;
+        turn.status = status;
+        turn.outcome = outcome.map(str::to_owned);
+        turn.error = error.map(str::to_owned);
+        turn.finished_at_ms = Some(now_ms());
+    }
+    {
+        let mut summary = lock(&state.summary);
+        summary.status = AgentSessionStatus::Ready;
+        summary.turn_count = lock(&state.turns).len() as u64;
+        summary.updated_at_ms = now_ms();
+        summary.error = None;
+    }
+    persist_agent_session(state)
 }
 
 fn set_evaluation_arm(
@@ -3168,6 +6036,37 @@ fn persist_selection(state: &RunState) -> Result<(), RunError> {
         &state.bundle_dir.join("workbench.json"),
         &serde_json::to_value(lock(&state.selection).clone())?,
     )
+}
+
+fn persist_active_agent_session(
+    state: &RunState,
+    session_id: Option<&str>,
+) -> Result<(), RunError> {
+    write_json_atomic(
+        &state.bundle_dir.join("active-agent-session.json"),
+        &json!({ "sessionId": session_id }),
+    )
+}
+
+fn clear_active_agent_session(
+    workspace: &RunState,
+    session: &AgentSessionState,
+) -> Result<(), RunError> {
+    let _operation = lock(&workspace.active_agent_turn);
+    let session_id = lock(&session.summary).id.clone();
+    let mut active_id = lock(&workspace.active_agent_session_id);
+    if active_id.as_deref() == Some(&session_id) {
+        persist_active_agent_session(workspace, None)?;
+        *active_id = None;
+    }
+    let mut summary = lock(&session.summary);
+    if summary.active {
+        summary.active = false;
+        summary.updated_at_ms = now_ms();
+        drop(summary);
+        persist_agent_session(session)?;
+    }
+    Ok(())
 }
 
 fn persist_review(state: &RunState) -> Result<(), RunError> {
@@ -3752,6 +6651,37 @@ fn command(message_id: &str, body: CommandBody) -> ControllerCommand {
     }
 }
 
+fn validate_agent_turn_command_size(
+    session_id: &str,
+    turn_id: &str,
+    prompt: &str,
+    input: Option<&JsonValue>,
+    capabilities: &[CapabilityEndpoint],
+) -> Result<(), RunError> {
+    let mut task = json!({ "mode": "interactive", "prompt": prompt });
+    if let Some(input) = input {
+        task.as_object_mut()
+            .expect("interactive task is an object")
+            .insert("input".to_owned(), input.clone());
+    }
+    let record = command(
+        &format!("{turn_id}-start"),
+        CommandBody::StartTurn {
+            session_id: session_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            task,
+            capability_sources: agent_capability_sources(capabilities),
+        },
+    );
+    let encoded = serde_json::to_vec(&record)?;
+    if encoded.len().saturating_add(1) > MAX_DRIVER_RECORD_BYTES {
+        return Err(RunError::InvalidRequest(format!(
+            "agent prompt and structured input exceed the {MAX_DRIVER_RECORD_BYTES}-byte driver record limit"
+        )));
+    }
+    Ok(())
+}
+
 fn workspace_relative_path(path: &Path) -> Result<PathBuf, RunError> {
     let workspace_root = Path::new("/agent-lab-workspace");
     let normalized = confined_child(workspace_root, path)?;
@@ -3956,6 +6886,142 @@ fn load_runs(
     Ok(runs)
 }
 
+#[allow(clippy::too_many_lines)]
+fn load_agent_sessions(
+    runs: &HashMap<String, Arc<RunState>>,
+) -> Result<HashMap<String, Arc<AgentSessionState>>, RunError> {
+    let mut sessions = HashMap::new();
+    for run in runs.values() {
+        let sessions_dir = run.bundle_dir.join("agent-sessions");
+        let entries = match fs::read_dir(&sessions_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(%error, "skipping unreadable agent session entry");
+                    continue;
+                }
+            };
+            let bundle_dir = entry.path();
+            let loaded = (|| -> Result<Arc<AgentSessionState>, RunError> {
+                if !entry.file_type()?.is_dir() {
+                    return Err(RunError::InvalidRequest(
+                        "agent session bundle is not a directory".to_owned(),
+                    ));
+                }
+                let manifest_path = bundle_dir.join("manifest.json");
+                let mut manifest: AgentSessionManifest =
+                    serde_json::from_slice(&fs::read(manifest_path)?)?;
+                if !(AGENT_SESSION_MANIFEST_LEGACY_VERSION..=AGENT_SESSION_MANIFEST_VERSION)
+                    .contains(&manifest.version)
+                {
+                    return Err(RunError::InvalidRequest(format!(
+                        "unsupported agent session manifest version: {}",
+                        manifest.version
+                    )));
+                }
+                let migrate_legacy_presentations =
+                    manifest.version < AGENT_SESSION_PRESENTATION_REQUIRED_VERSION;
+                if manifest.summary.id != entry.file_name().to_string_lossy()
+                    || manifest.summary.workspace_id != lock(&run.summary).id
+                {
+                    return Err(RunError::InvalidRequest(
+                        "agent session bundle identity does not match its owner".to_owned(),
+                    ));
+                }
+                let was_live = matches!(
+                    manifest.summary.status,
+                    AgentSessionStatus::Starting
+                        | AgentSessionStatus::Ready
+                        | AgentSessionStatus::Running
+                        | AgentSessionStatus::Closing
+                );
+                let repaired_inactive = manifest.summary.active
+                    && matches!(
+                        manifest.summary.status,
+                        AgentSessionStatus::Closed
+                            | AgentSessionStatus::Failed
+                            | AgentSessionStatus::Interrupted
+                    );
+                if repaired_inactive {
+                    manifest.summary.active = false;
+                }
+                if was_live {
+                    manifest.summary.status = AgentSessionStatus::Interrupted;
+                    manifest.summary.active = false;
+                    manifest.summary.updated_at_ms = now_ms();
+                    manifest.summary.error = Some(
+                        "the server restarted; start a new agent session to continue".to_owned(),
+                    );
+                    for turn in &mut manifest.turns {
+                        if matches!(
+                            turn.status,
+                            AgentTurnStatus::Queued | AgentTurnStatus::Running
+                        ) {
+                            turn.status = AgentTurnStatus::Failed;
+                            turn.finished_at_ms = Some(now_ms());
+                            turn.error = Some("the server restarted during this turn".to_owned());
+                        }
+                    }
+                }
+                let events = read_agent_events_recovering(&bundle_dir)?;
+                let repaired_terminal =
+                    repair_agent_turns_from_events(&mut manifest.turns, &events);
+                let repaired_presentations = repair_terminal_agent_turn_presentations(
+                    &bundle_dir,
+                    &manifest.turns,
+                    &events,
+                )?;
+                let (sender, _) = broadcast::channel(256);
+                let state = Arc::new(AgentSessionState {
+                    summary: Mutex::new(manifest.summary),
+                    turns: Mutex::new(manifest.turns),
+                    events: Mutex::new(events),
+                    sender,
+                    commands: Mutex::new(None),
+                    lifecycle_cancel: CancellationToken::new(),
+                    turn_cancel: Mutex::new(None),
+                    evidence_error: Mutex::new(None),
+                    bundle_dir: bundle_dir.clone(),
+                    secret_values: Mutex::new(Vec::new()),
+                });
+                if was_live
+                    || repaired_inactive
+                    || repaired_terminal
+                    || repaired_presentations
+                    || migrate_legacy_presentations
+                {
+                    persist_agent_session(&state)?;
+                }
+                if was_live {
+                    record_agent_event(
+                        &state,
+                        "agent.session.interrupted",
+                        json!({ "reason": "server-restarted" }),
+                    )?;
+                }
+                Ok(state)
+            })();
+            match loaded {
+                Ok(state) => {
+                    let id = lock(&state.summary).id.clone();
+                    if sessions.insert(id.clone(), state).is_some() {
+                        tracing::warn!(%id, "skipping duplicate agent session identity");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(bundle = %bundle_dir.display(), %error, "skipping malformed agent session bundle");
+                }
+            }
+        }
+    }
+    Ok(sessions)
+}
+
 fn load_run_bundle(
     bundle_dir: &Path,
     bundle_name: &OsStr,
@@ -3997,6 +7063,7 @@ fn load_run_bundle(
                                 "error": message,
                                 "recovered": true,
                             }),
+                            progress: None,
                         }],
                         true,
                         true,
@@ -4049,6 +7116,10 @@ fn load_run_bundle(
         initial_snapshot,
         capabilities: Mutex::new(Vec::new()),
         secret_values: Mutex::new(Vec::new()),
+        agent_sessions: Mutex::new(HashMap::new()),
+        active_agent_session_id: Mutex::new(None),
+        active_agent_turn: Mutex::new(None),
+        capability_attributions: Mutex::new(HashMap::new()),
         reusable_explore,
         replay_failed,
     });
@@ -4228,6 +7299,7 @@ fn load_evaluation_bundle(
                         "error": message,
                         "recovered": true,
                     }),
+                    progress: None,
                 }],
                 true,
             )
@@ -4279,6 +7351,94 @@ fn read_events(path: &Path) -> Result<Vec<RunEvent>, RunError> {
             Ok(event)
         })
         .collect()
+}
+
+fn read_agent_events_recovering(bundle_dir: &Path) -> Result<Vec<RunEvent>, RunError> {
+    let path = bundle_dir.join("events.jsonl");
+    let source = fs::read(&path)?;
+    let mut events = Vec::new();
+    let mut valid_bytes = 0_usize;
+    for line in source.split_inclusive(|byte| *byte == b'\n') {
+        let content = line.strip_suffix(b"\n").unwrap_or(line);
+        if content.iter().all(u8::is_ascii_whitespace) {
+            valid_bytes += line.len();
+            continue;
+        }
+        let Ok(mut event) = serde_json::from_slice::<RunEvent>(content) else {
+            break;
+        };
+        if event.sequence != events.len() as u64 + 1 {
+            break;
+        }
+        redact_json(&mut event.payload);
+        events.push(event);
+        valid_bytes += line.len();
+    }
+    if valid_bytes == source.len() {
+        return Ok(events);
+    }
+
+    write_bytes_atomic(&bundle_dir.join("events.corrupt.jsonl"), &source)?;
+    let marker = RunEvent {
+        sequence: events.len() as u64 + 1,
+        at_ms: now_ms(),
+        kind: "agent.session.replay-incomplete".to_owned(),
+        payload: json!({
+            "reason": "a corrupt event-log suffix was quarantined",
+            "validBytes": valid_bytes,
+            "totalBytes": source.len(),
+        }),
+        progress: None,
+    };
+    events.push(marker);
+    let mut repaired = Vec::new();
+    for event in &events {
+        repaired.extend(serde_json::to_vec(event)?);
+        repaired.push(b'\n');
+    }
+    write_bytes_atomic(&path, &repaired)?;
+    Ok(events)
+}
+
+fn repair_agent_turns_from_events(turns: &mut [AgentTurnSummary], events: &[RunEvent]) -> bool {
+    let mut repaired = false;
+    for event in events {
+        if event.kind != "agent.turn.finished" {
+            continue;
+        }
+        let Some(turn_id) = event.payload.get("turnId").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some(turn) = turns.iter_mut().find(|turn| turn.id == turn_id) else {
+            continue;
+        };
+        let outcome = event
+            .payload
+            .get("outcome")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("failed");
+        let status = match outcome {
+            "completed" => AgentTurnStatus::Completed,
+            "intervened" => AgentTurnStatus::Intervened,
+            "aborted" | "cancelled" => AgentTurnStatus::Cancelled,
+            _ => AgentTurnStatus::Failed,
+        };
+        if turn.status != status
+            || turn.outcome.as_deref() != Some(outcome)
+            || turn.finished_at_ms != Some(event.at_ms)
+        {
+            turn.status = status;
+            turn.outcome = Some(outcome.to_owned());
+            turn.finished_at_ms = Some(event.at_ms);
+            turn.error = event
+                .payload
+                .get("error")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned);
+            repaired = true;
+        }
+    }
+    repaired
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -4375,6 +7535,146 @@ struct CapturedTree {
     root_permissions: fs::Permissions,
     directories: BTreeMap<String, fs::Permissions>,
     files: BTreeMap<String, CapturedFile>,
+}
+
+fn redact_captured_tree(snapshot: &mut CapturedTree, secrets: &[Vec<u8>]) {
+    for file in snapshot.files.values_mut() {
+        file.contents = redact_evidence_bytes(&file.contents, secrets);
+    }
+}
+
+fn captured_files_equal(before: Option<&CapturedFile>, after: Option<&CapturedFile>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            before.contents == after.contents
+                && permission_label(&before.permissions) == permission_label(&after.permissions)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn captured_tree_changes(
+    initial: &CapturedTree,
+    final_snapshot: &CapturedTree,
+    secrets: &[Vec<u8>],
+) -> Vec<JsonValue> {
+    let mut changes = Vec::new();
+    if permission_label(&initial.root_permissions)
+        != permission_label(&final_snapshot.root_permissions)
+    {
+        changes.push(json!({
+            "path": ".",
+            "entryType": "directory",
+            "kind": "mode-changed",
+            "before": JsonValue::Null,
+            "after": JsonValue::Null,
+            "beforeMode": permission_label(&initial.root_permissions),
+            "afterMode": permission_label(&final_snapshot.root_permissions),
+        }));
+    }
+
+    let directory_paths = initial
+        .directories
+        .keys()
+        .chain(final_snapshot.directories.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in directory_paths {
+        let before = initial.directories.get(&path);
+        let after = final_snapshot.directories.get(&path);
+        if before.map(permission_label) == after.map(permission_label) {
+            continue;
+        }
+        changes.push(json!({
+            "path": path,
+            "entryType": "directory",
+            "kind": match (before, after) {
+                (None, Some(_)) => "created",
+                (Some(_), None) => "deleted",
+                (Some(_), Some(_)) => "mode-changed",
+                (None, None) => unreachable!("a union path has an entry"),
+            },
+            "before": JsonValue::Null,
+            "after": JsonValue::Null,
+            "beforeMode": before.map(permission_label),
+            "afterMode": after.map(permission_label),
+        }));
+    }
+
+    let file_paths = initial
+        .files
+        .keys()
+        .chain(final_snapshot.files.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in file_paths {
+        let before = initial.files.get(&path);
+        let after = final_snapshot.files.get(&path);
+        if captured_files_equal(before, after) {
+            continue;
+        }
+        changes.push(json!({
+            "path": path,
+            "entryType": "file",
+            "kind": match (before, after) {
+                (None, Some(_)) => "created",
+                (Some(_), None) => "deleted",
+                (Some(before), Some(after)) if before.contents == after.contents => "mode-changed",
+                _ => "modified",
+            },
+            "before": before.and_then(|file| redacted_evidence_text(&file.contents, secrets)),
+            "after": after.and_then(|file| redacted_evidence_text(&file.contents, secrets)),
+            "beforeMode": before.map(|file| permission_label(&file.permissions)),
+            "afterMode": after.map(|file| permission_label(&file.permissions)),
+        }));
+    }
+    changes
+}
+
+fn permission_label(permissions: &fs::Permissions) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        format!("{:04o}", permissions.mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        if permissions.readonly() {
+            "readonly".to_owned()
+        } else {
+            "writable".to_owned()
+        }
+    }
+}
+
+fn captured_tree_digest(snapshot: &CapturedTree) -> String {
+    let mut hasher = Sha256::new();
+    hash_permissions(&mut hasher, &snapshot.root_permissions);
+    for (path, permissions) in &snapshot.directories {
+        hasher.update(b"directory\0");
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        hash_permissions(&mut hasher, permissions);
+    }
+    for (path, file) in &snapshot.files {
+        hasher.update(b"file\0");
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        hash_permissions(&mut hasher, &file.permissions);
+        hasher.update((file.contents.len() as u64).to_le_bytes());
+        hasher.update(&file.contents);
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn hash_permissions(hasher: &mut Sha256, permissions: &fs::Permissions) {
+    hasher.update([u8::from(permissions.readonly())]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        hasher.update(permissions.mode().to_le_bytes());
+    }
 }
 
 fn write_captured_tree(destination: &Path, snapshot: &CapturedTree) -> Result<(), RunError> {
@@ -4699,6 +7999,13 @@ fn write_json_atomic(path: &Path, value: &JsonValue) -> Result<(), RunError> {
     Ok(())
 }
 
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), RunError> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, bytes)?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
 fn read_optional_json(path: &Path) -> Result<Option<JsonValue>, RunError> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
@@ -4828,6 +8135,7 @@ fn require_race_free_confined_reads(supported: bool) -> Result<(), RunError> {
 }
 
 fn redact_transcript(mut transcript: DriverTranscript, secrets: &[Vec<u8>]) -> DriverTranscript {
+    redact_assistant_transcript_records(&mut transcript.driver_records, secrets);
     for record in transcript
         .controller_records
         .iter_mut()
@@ -4846,6 +8154,81 @@ fn redact_transcript(mut transcript: DriverTranscript, secrets: &[Vec<u8>]) -> D
     }
     replace_secrets(&mut transcript.driver_stderr, secrets);
     transcript
+}
+
+fn redact_assistant_transcript_records(records: &mut [Vec<u8>], secrets: &[Vec<u8>]) {
+    let mut redactors = HashMap::<(String, String), AssistantObservationRedactor<'_>>::new();
+    for record in records {
+        let Ok(mut value) = serde_json::from_slice::<JsonValue>(record) else {
+            continue;
+        };
+        let event_type = value
+            .get("eventType")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned);
+        if matches!(
+            event_type.as_deref(),
+            Some(
+                agent_lab_driver_protocol::ASSISTANT_DELTA_EVENT
+                    | agent_lab_driver_protocol::ASSISTANT_COMPLETED_EVENT
+            )
+        ) {
+            let key = value
+                .get("sessionId")
+                .and_then(JsonValue::as_str)
+                .zip(value.get("turnId").and_then(JsonValue::as_str))
+                .map(|(session_id, turn_id)| (session_id.to_owned(), turn_id.to_owned()));
+            let sanitized = key.and_then(|key| {
+                let observation = TurnObservation::parse(
+                    event_type
+                        .as_deref()
+                        .expect("assistant event type is present"),
+                    value.get("payload").unwrap_or(&JsonValue::Null),
+                )
+                .ok()
+                .flatten()?;
+                redactors
+                    .entry(key)
+                    .or_insert_with(|| AssistantObservationRedactor::new(secrets))
+                    .redact(observation)
+                    .ok()?
+                    .into_iter()
+                    .rev()
+                    .find(|observation| observation.event_type() == event_type.as_deref().unwrap())
+            });
+            if let Some(payload) = value.get_mut("payload") {
+                *payload = sanitized.map_or_else(
+                    || {
+                        let mut payload = payload.clone();
+                        match &mut payload {
+                            JsonValue::Object(payload) => {
+                                payload.insert(
+                                    "text".to_owned(),
+                                    JsonValue::String("[REDACTED]".to_owned()),
+                                );
+                            }
+                            _ => payload = json!({ "text": "[REDACTED]" }),
+                        }
+                        payload
+                    },
+                    |observation| observation.payload(),
+                );
+            }
+        }
+        if value.get("type").and_then(JsonValue::as_str) == Some("turn.finished")
+            && let Some(key) = value
+                .get("sessionId")
+                .and_then(JsonValue::as_str)
+                .zip(value.get("turnId").and_then(JsonValue::as_str))
+                .map(|(session_id, turn_id)| (session_id.to_owned(), turn_id.to_owned()))
+        {
+            redactors.remove(&key);
+        }
+        if let Ok(mut sanitized) = serde_json::to_vec(&value) {
+            sanitized.push(b'\n');
+            *record = sanitized;
+        }
+    }
 }
 
 fn redact_value(mut value: JsonValue, secrets: &[Vec<u8>]) -> JsonValue {
@@ -4967,6 +8350,8 @@ pub enum RunError {
     UnknownScenario(String),
     #[error("unknown run: {0}")]
     UnknownRun(String),
+    #[error("unknown agent session: {0}")]
+    UnknownAgentSession(String),
     #[error("run is not ready for an attached terminal: {0}")]
     RunUnavailable(String),
     #[error("model access is not ready: {0}")]
@@ -5004,7 +8389,9 @@ pub enum RunError {
 impl From<RunError> for (StatusCode, String) {
     fn from(error: RunError) -> Self {
         let status = match error {
-            RunError::UnknownRun(_) | RunError::UnknownScenario(_) => StatusCode::NOT_FOUND,
+            RunError::UnknownRun(_)
+            | RunError::UnknownScenario(_)
+            | RunError::UnknownAgentSession(_) => StatusCode::NOT_FOUND,
             RunError::RunUnavailable(_) => StatusCode::CONFLICT,
             RunError::ModelAccessUnavailable(_) => StatusCode::PRECONDITION_FAILED,
             RunError::InvalidRequest(_)
@@ -5036,6 +8423,7 @@ mod tests {
             at_ms: u128::from(sequence),
             kind: kind.to_owned(),
             payload,
+            progress: None,
         }
     }
 
@@ -5047,6 +8435,1464 @@ mod tests {
         ));
         fs::create_dir(&root).expect("temporary root should be created");
         root
+    }
+
+    fn test_agent_turn(status: AgentTurnStatus) -> AgentTurnSummary {
+        AgentTurnSummary {
+            id: "turn-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            prompt: "test prompt".to_owned(),
+            input: None,
+            source_revision: "sha256:test".to_owned(),
+            capability_revisions: BTreeMap::new(),
+            status,
+            started_at_ms: 1,
+            finished_at_ms: None,
+            outcome: None,
+            error: None,
+            human_intervention_at_ms: None,
+        }
+    }
+
+    fn test_agent_session_state(bundle_dir: PathBuf) -> AgentSessionState {
+        let (sender, _) = broadcast::channel(8);
+        AgentSessionState {
+            summary: Mutex::new(AgentSessionSummary {
+                id: "session-1".to_owned(),
+                workspace_id: "workspace-1".to_owned(),
+                harness_id: "fixture".to_owned(),
+                model_profile_id: "test".to_owned(),
+                model_id: "fixture/test".to_owned(),
+                status: AgentSessionStatus::Running,
+                active: true,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                turn_count: 1,
+                error: None,
+            }),
+            turns: Mutex::new(vec![test_agent_turn(AgentTurnStatus::Running)]),
+            events: Mutex::new(Vec::new()),
+            sender,
+            commands: Mutex::new(None),
+            lifecycle_cancel: CancellationToken::new(),
+            turn_cancel: Mutex::new(None),
+            evidence_error: Mutex::new(None),
+            bundle_dir,
+            secret_values: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn observation_ready_event(sequence: u64) -> RunEvent {
+        event(
+            sequence,
+            "agent.session.ready",
+            json!({ "driver": { "features": [TURN_OBSERVATIONS_FEATURE] } }),
+        )
+    }
+
+    #[test]
+    fn agent_progress_projects_portable_and_controller_events_with_provenance() {
+        let portable = event(
+            7,
+            "observation.progress",
+            json!({
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "event": {
+                    "phase": "reasoning",
+                    "detail": "  Inspecting\n the catalog  ",
+                    "source": "fixture"
+                }
+            }),
+        );
+        assert_eq!(
+            project_agent_progress(&portable),
+            Some(AgentProgressProjection {
+                phase: ProgressPhase::Reasoning,
+                detail: Some("Inspecting the catalog".to_owned()),
+                source: Some("fixture".to_owned()),
+                source_event_sequence: 7,
+                source_event_type: "observation.progress".to_owned(),
+            })
+        );
+
+        let capability = event(
+            8,
+            "mcp.tool.started",
+            json!({
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "source": "catalog",
+                "name": "list"
+            }),
+        );
+        assert_eq!(
+            project_agent_progress(&capability),
+            Some(AgentProgressProjection {
+                phase: ProgressPhase::Acting,
+                detail: Some("catalog · list".to_owned()),
+                source: Some("mcp".to_owned()),
+                source_event_sequence: 8,
+                source_event_type: "mcp.tool.started".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn opaque_v0_thoughts_remain_raw_evidence_not_progress_detail() {
+        let event = event(
+            9,
+            "v0.task-thinking-v1",
+            json!({
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "thought": "private\u{001b}]52;c;clipboard payload\u{0007} details"
+            }),
+        );
+        let projection = project_agent_progress(&event).unwrap();
+        assert_eq!(projection.phase, ProgressPhase::Reasoning);
+        assert_eq!(projection.detail.as_deref(), Some("Model is reasoning"));
+        assert!(!projection.detail.unwrap().contains("private"));
+    }
+
+    #[test]
+    fn repeated_agent_progress_is_deduplicated_until_the_phase_changes() {
+        let root = temporary_root("progress-deduplication");
+        let state = test_agent_session_state(root.clone());
+        let payload = || {
+            json!({
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "messageId": "message-1",
+                "text": "delta"
+            })
+        };
+        record_agent_event(&state, "observation.assistant.delta", payload()).unwrap();
+        record_agent_event(&state, "observation.assistant.delta", payload()).unwrap();
+        record_agent_event(
+            &state,
+            "mcp.tool.started",
+            json!({
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "source": "catalog",
+                "name": "list"
+            }),
+        )
+        .unwrap();
+        record_agent_event(&state, "observation.assistant.delta", payload()).unwrap();
+
+        let events = lock(&state.events);
+        assert!(events[0].progress.is_some());
+        assert!(events[1].progress.is_none());
+        assert_eq!(
+            events[2].progress.as_ref().map(|progress| progress.phase),
+            Some(ProgressPhase::Acting)
+        );
+        assert_eq!(
+            events[3].progress.as_ref().map(|progress| progress.phase),
+            Some(ProgressPhase::Responding)
+        );
+        drop(events);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_driver_progress_supersedes_adjacent_generic_fallbacks() {
+        let root = temporary_root("progress-precedence");
+        let state = test_agent_session_state(root.clone());
+        record_agent_event(
+            &state,
+            "observation.progress",
+            json!({
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "event": {
+                    "phase": "responding",
+                    "detail": "Receiving model response",
+                    "source": "fixture"
+                }
+            }),
+        )
+        .unwrap();
+        record_agent_event(
+            &state,
+            "model.message.delta",
+            json!({
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "event": { "messageDelta": "hello" }
+            }),
+        )
+        .unwrap();
+        record_agent_event(
+            &state,
+            "observation.assistant.delta",
+            json!({
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "event": { "messageId": "message-1", "text": "hello" }
+            }),
+        )
+        .unwrap();
+
+        let events = lock(&state.events);
+        assert!(events[0].progress.is_some());
+        assert!(events[1].progress.is_none());
+        assert!(events[2].progress.is_none());
+        drop(events);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_run_events_without_progress_still_replay() {
+        let event: RunEvent = serde_json::from_value(json!({
+            "sequence": 1,
+            "atMs": 2,
+            "type": "agent.turn.started",
+            "payload": { "turnId": "turn-1" }
+        }))
+        .unwrap();
+        assert!(event.progress.is_none());
+    }
+
+    #[test]
+    fn assistant_projection_rejects_events_after_completion_and_incomplete_messages() {
+        let turn = test_agent_turn(AgentTurnStatus::Completed);
+        let delta_after_completion = vec![
+            observation_ready_event(1),
+            event(
+                2,
+                "observation.assistant.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "messageId": "message-1",
+                    "text": "complete",
+                }),
+            ),
+            event(
+                3,
+                "observation.assistant.delta",
+                json!({
+                    "turnId": "turn-1",
+                    "messageId": "message-1",
+                    "text": "late",
+                }),
+            ),
+        ];
+        let error = build_agent_turn_presentation_from_events(&delta_after_completion, &turn, &[])
+            .unwrap_err();
+        assert!(error.to_string().contains("delta arrived after completion"));
+
+        let incomplete_second_message = vec![
+            observation_ready_event(1),
+            event(
+                2,
+                "observation.assistant.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "messageId": "message-1",
+                    "text": "first",
+                }),
+            ),
+            event(
+                3,
+                "observation.assistant.delta",
+                json!({
+                    "turnId": "turn-1",
+                    "messageId": "message-2",
+                    "text": "unfinished",
+                }),
+            ),
+            event(
+                4,
+                "agent.turn.finished",
+                json!({ "turnId": "turn-1", "workspaceDiff": { "changes": [] } }),
+            ),
+        ];
+        let presentation =
+            build_agent_turn_presentation_from_events(&incomplete_second_message, &turn, &[])
+                .unwrap();
+        assert_eq!(presentation.messages.len(), 2);
+        assert!(!presentation.messages[1].complete);
+        let error =
+            validate_agent_turn_presentation(&turn, &presentation, &incomplete_second_message)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without an authoritative assistant response")
+        );
+    }
+
+    #[test]
+    fn malformed_assistant_sequence_is_rejected_before_terminal_event_persistence() {
+        let root = temporary_root("malformed-agent-terminal-prevalidation");
+        let bundle = root.join("agent-session");
+        fs::create_dir_all(bundle.join("turns/turn-1")).unwrap();
+        let session = test_agent_session_state(bundle.clone());
+        record_agent_event(
+            &session,
+            "agent.session.ready",
+            json!({ "driver": { "features": [TURN_OBSERVATIONS_FEATURE] } }),
+        )
+        .unwrap();
+        record_agent_event(
+            &session,
+            "observation.assistant.completed",
+            json!({
+                "turnId": "turn-1",
+                "messageId": "message-1",
+                "text": "complete",
+            }),
+        )
+        .unwrap();
+        record_agent_event(
+            &session,
+            "observation.assistant.delta",
+            json!({
+                "turnId": "turn-1",
+                "messageId": "message-1",
+                "text": "late",
+            }),
+        )
+        .unwrap();
+
+        let workspace = test_run_state(&root.join("run"));
+        let error = record_finished_agent_turn_event(
+            &session,
+            &workspace,
+            "turn-1",
+            AgentTurnStatus::Completed,
+            json!({
+                "turnId": "turn-1",
+                "outcome": "completed",
+                "workspaceDiff": { "changes": [] },
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("delta arrived after completion"));
+        assert!(
+            lock(&session.events)
+                .iter()
+                .all(|event| event.kind != "agent.turn.finished")
+        );
+        assert!(
+            !fs::read_to_string(bundle.join("events.jsonl"))
+                .unwrap()
+                .contains("agent.turn.finished")
+        );
+        assert!(!bundle.join("turns/turn-1/presentation.json").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn split_secret_is_absent_from_live_raw_and_completed_answer_projections() {
+        let secrets = vec![b"credential-token".to_vec()];
+        let mut redactor = AssistantObservationRedactor::new(&secrets);
+        let mut observations = Vec::new();
+        for text in ["safe cred", "ential-", "token tail"] {
+            observations.extend(
+                redactor
+                    .redact(TurnObservation::AssistantDelta(
+                        agent_lab_driver_protocol::AssistantDeltaObservation {
+                            message_id: "message-1".to_owned(),
+                            text: text.to_owned(),
+                        },
+                    ))
+                    .unwrap(),
+            );
+        }
+        observations.extend(
+            redactor
+                .redact(TurnObservation::AssistantCompleted(
+                    agent_lab_driver_protocol::AssistantCompletedObservation {
+                        message_id: "message-1".to_owned(),
+                        text: "safe credential-token tail".to_owned(),
+                    },
+                ))
+                .unwrap(),
+        );
+
+        let mut events = vec![observation_ready_event(1)];
+        for (index, observation) in observations.iter().enumerate() {
+            events.push(event(
+                index as u64 + 2,
+                observation.event_type(),
+                json!({
+                    "turnId": "turn-1",
+                    "event": observation.payload(),
+                }),
+            ));
+        }
+        events.push(event(
+            events.len() as u64 + 1,
+            "agent.turn.finished",
+            json!({
+                "turnId": "turn-1",
+                "outcome": "completed",
+                "workspaceDiff": { "changes": [] },
+            }),
+        ));
+
+        let raw_texts = events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("event")
+                    .and_then(|payload| payload.get("text"))
+                    .and_then(JsonValue::as_str)
+            })
+            .collect::<String>();
+        assert!(!raw_texts.contains("credential-token"));
+        assert!(raw_texts.contains("[REDACTED]"));
+
+        let presentation = build_agent_turn_presentation_from_events(
+            &events,
+            &test_agent_turn(AgentTurnStatus::Completed),
+            &secrets,
+        )
+        .unwrap();
+        assert_eq!(
+            presentation.response.as_deref(),
+            Some("safe [REDACTED] tail")
+        );
+        assert!(
+            presentation
+                .messages
+                .iter()
+                .all(|message| !message.text.contains("credential-token"))
+        );
+    }
+
+    #[test]
+    fn split_secret_is_flushed_safely_into_a_failed_partial_answer() {
+        let root = temporary_root("failed-split-secret-answer");
+        let bundle = root.join("agent-session");
+        fs::create_dir_all(bundle.join("turns/turn-1")).unwrap();
+        let secrets = vec![b"credential-token".to_vec()];
+        let session = test_agent_session_state(bundle.clone());
+        *lock(&session.secret_values) = secrets.clone();
+        let mut live = session.sender.subscribe();
+        record_agent_event(
+            &session,
+            "agent.session.ready",
+            json!({ "driver": { "features": [TURN_OBSERVATIONS_FEATURE] } }),
+        )
+        .unwrap();
+        let mut redactor = AssistantObservationRedactor::new(&secrets);
+        for text in ["before credential-", "token after"] {
+            for observation in redactor
+                .redact(TurnObservation::AssistantDelta(
+                    agent_lab_driver_protocol::AssistantDeltaObservation {
+                        message_id: "message-1".to_owned(),
+                        text: text.to_owned(),
+                    },
+                ))
+                .unwrap()
+            {
+                record_agent_event(
+                    &session,
+                    observation.event_type(),
+                    json!({
+                        "sessionId": "session-1",
+                        "turnId": "turn-1",
+                        "event": observation.payload(),
+                    }),
+                )
+                .unwrap();
+            }
+        }
+        flush_pending_assistant_deltas(&session, "session-1", "turn-1", &mut redactor).unwrap();
+        let workspace = test_run_state(&root.join("run"));
+        record_finished_agent_turn_event(
+            &session,
+            &workspace,
+            "turn-1",
+            AgentTurnStatus::Failed,
+            json!({
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "outcome": "failed",
+                "workspaceDiff": { "changes": [] },
+            }),
+        )
+        .unwrap();
+
+        let events = lock(&session.events).clone();
+        let live_events = std::iter::from_fn(|| live.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            live_events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            events
+                .iter()
+                .filter(|event| event.kind != "agent.turn.finished")
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>()
+        );
+        let raw_texts = events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("event")
+                    .and_then(|payload| payload.get("text"))
+                    .and_then(JsonValue::as_str)
+            })
+            .collect::<String>();
+        assert_eq!(raw_texts, "before [REDACTED] after");
+        assert!(
+            !serde_json::to_string(&live_events)
+                .unwrap()
+                .contains("credential-token")
+        );
+
+        let failed_turn = test_agent_turn(AgentTurnStatus::Failed);
+        let presentation =
+            load_or_build_agent_turn_presentation(&session, &workspace, &failed_turn).unwrap();
+        assert_eq!(
+            presentation.response.as_deref(),
+            Some("before [REDACTED] after")
+        );
+        assert_eq!(
+            presentation.completeness.assistant_output,
+            AgentPresentationCompleteness::Partial
+        );
+        let durable = fs::read_to_string(bundle.join("events.jsonl")).unwrap()
+            + &fs::read_to_string(bundle.join("turns/turn-1/presentation.json")).unwrap();
+        assert!(!durable.contains("credential-token"));
+        assert!(durable.contains("[REDACTED]"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn assembled_answer_is_redacted_again_after_raw_delta_reconstruction() {
+        let secrets = vec![b"credential-token".to_vec()];
+        let events = vec![
+            observation_ready_event(1),
+            event(
+                2,
+                "observation.assistant.delta",
+                json!({
+                    "turnId": "turn-1",
+                    "messageId": "message-1",
+                    "text": "credential-",
+                }),
+            ),
+            event(
+                3,
+                "observation.assistant.delta",
+                json!({
+                    "turnId": "turn-1",
+                    "messageId": "message-1",
+                    "text": "token",
+                }),
+            ),
+            event(
+                4,
+                "agent.turn.finished",
+                json!({
+                    "turnId": "turn-1",
+                    "outcome": "failed",
+                    "workspaceDiff": { "changes": [] },
+                }),
+            ),
+        ];
+        let presentation = build_agent_turn_presentation_from_events(
+            &events,
+            &test_agent_turn(AgentTurnStatus::Failed),
+            &secrets,
+        )
+        .unwrap();
+        assert_eq!(presentation.response.as_deref(), Some("[REDACTED]"));
+        assert_eq!(presentation.messages[0].text, "[REDACTED]");
+    }
+
+    #[test]
+    fn retained_terminal_evidence_stabilizes_projection_before_summary_persistence() {
+        let root = temporary_root("agent-terminal-projection-race");
+        let bundle = root.join("agent-session");
+        let presentation_path = bundle.join("turns/turn-1/presentation.json");
+        fs::create_dir_all(presentation_path.parent().unwrap()).unwrap();
+        let events = vec![
+            observation_ready_event(1),
+            event(
+                2,
+                "observation.assistant.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "messageId": "message-1",
+                    "text": "complete response",
+                }),
+            ),
+            event(
+                3,
+                "agent.turn.finished",
+                json!({
+                    "turnId": "turn-1",
+                    "outcome": "completed",
+                    "workspaceDiff": { "changes": [] },
+                }),
+            ),
+        ];
+
+        let terminal_turn = test_agent_turn(AgentTurnStatus::Completed);
+        let stored =
+            build_agent_turn_presentation_from_events(&events, &terminal_turn, &[]).unwrap();
+        write_json_atomic(&presentation_path, &serde_json::to_value(&stored).unwrap()).unwrap();
+
+        let session = test_agent_session_state(bundle);
+        *lock(&session.events) = events;
+        let not_yet_persisted = test_agent_turn(AgentTurnStatus::Running);
+        *lock(&session.turns) = vec![not_yet_persisted.clone()];
+        let workspace = test_run_state(&root.join("run"));
+        let loaded =
+            load_or_build_agent_turn_presentation(&session, &workspace, &not_yet_persisted)
+                .unwrap();
+
+        assert_eq!(loaded, stored);
+        assert_eq!(
+            loaded.completeness.assistant_output,
+            AgentPresentationCompleteness::Complete
+        );
+        assert_eq!(
+            loaded.completeness.capability_activity,
+            AgentPresentationCompleteness::Complete
+        );
+        assert_eq!(
+            loaded.completeness.native_activity,
+            AgentPresentationCompleteness::Complete
+        );
+        assert_eq!(
+            loaded.completeness.workspace_effects,
+            AgentPresentationCompleteness::Complete
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_partial_projection_repairs_missing_and_invalid_derived_evidence() {
+        let root = temporary_root("failed-partial-agent-projection");
+        let bundle = root.join("agent-session");
+        fs::create_dir_all(bundle.join("turns/turn-1")).unwrap();
+        let session = test_agent_session_state(bundle.clone());
+        record_agent_event(
+            &session,
+            "agent.session.ready",
+            json!({ "driver": { "features": [TURN_OBSERVATIONS_FEATURE] } }),
+        )
+        .unwrap();
+        record_agent_event(
+            &session,
+            "observation.assistant.delta",
+            json!({
+                "turnId": "turn-1",
+                "messageId": "message-1",
+                "text": "# Partial answer\n\n- retained before failure",
+            }),
+        )
+        .unwrap();
+        let workspace = test_run_state(&root.join("run"));
+        record_finished_agent_turn_event(
+            &session,
+            &workspace,
+            "turn-1",
+            AgentTurnStatus::Failed,
+            json!({
+                "turnId": "turn-1",
+                "outcome": "failed",
+                "error": "intentional fixture failure",
+                "workspaceDiff": { "changes": [] },
+            }),
+        )
+        .unwrap();
+
+        let failed_turn = test_agent_turn(AgentTurnStatus::Failed);
+        let loaded =
+            load_or_build_agent_turn_presentation(&session, &workspace, &failed_turn).unwrap();
+        assert_eq!(
+            loaded.response.as_deref(),
+            Some("# Partial answer\n\n- retained before failure")
+        );
+        assert_eq!(loaded.messages.len(), 1);
+        assert!(!loaded.messages[0].complete);
+        assert_eq!(
+            loaded.completeness.assistant_output,
+            AgentPresentationCompleteness::Partial
+        );
+        assert_eq!(
+            loaded.completeness.workspace_effects,
+            AgentPresentationCompleteness::Partial
+        );
+
+        fs::remove_file(bundle.join("turns/turn-1/presentation.json")).unwrap();
+        let rebuilt =
+            load_or_build_agent_turn_presentation(&session, &workspace, &failed_turn).unwrap();
+        assert_eq!(rebuilt, loaded);
+        assert!(bundle.join("turns/turn-1/presentation.json").is_file());
+
+        fs::write(
+            bundle.join("turns/turn-1/presentation.json"),
+            b"{\"schemaVersion\":",
+        )
+        .unwrap();
+        let repaired =
+            load_or_build_agent_turn_presentation(&session, &workspace, &failed_turn).unwrap();
+        assert_eq!(repaired, loaded);
+        let stored: AgentTurnPresentation = serde_json::from_slice(
+            &fs::read(bundle.join("turns/turn-1/presentation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored, loaded);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_agent_session_rebuilds_terminal_projection_before_manifest_upgrade() {
+        let root = temporary_root("legacy-agent-projection-replay");
+        let workspace = Arc::new(test_run_state(&root.join("run")));
+        let bundle = workspace.bundle_dir.join("agent-sessions/session-1");
+        fs::create_dir_all(bundle.join("turns/turn-1")).unwrap();
+
+        let summary = AgentSessionSummary {
+            id: "session-1".to_owned(),
+            workspace_id: "run-events".to_owned(),
+            harness_id: "fixture".to_owned(),
+            model_profile_id: "test".to_owned(),
+            model_id: "fixture/test".to_owned(),
+            status: AgentSessionStatus::Closed,
+            active: false,
+            created_at_ms: 1,
+            updated_at_ms: 3,
+            turn_count: 1,
+            error: None,
+        };
+        let mut turn = test_agent_turn(AgentTurnStatus::Completed);
+        turn.finished_at_ms = Some(3);
+        turn.outcome = Some("completed".to_owned());
+        let legacy_manifest = json!({
+            "summary": summary,
+            "turns": [turn],
+        });
+        write_json_atomic(&bundle.join("manifest.json"), &legacy_manifest).unwrap();
+
+        let events = vec![
+            observation_ready_event(1),
+            event(
+                2,
+                "observation.assistant.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "messageId": "message-1",
+                    "text": "# Replayed legacy answer",
+                }),
+            ),
+            event(
+                3,
+                "agent.turn.finished",
+                json!({
+                    "turnId": "turn-1",
+                    "outcome": "completed",
+                    "workspaceDiff": { "changes": [] },
+                }),
+            ),
+        ];
+        let mut event_log = Vec::new();
+        for event in &events {
+            serde_json::to_writer(&mut event_log, event).unwrap();
+            event_log.push(b'\n');
+        }
+        fs::write(bundle.join("events.jsonl"), event_log).unwrap();
+
+        let runs = HashMap::from([("run-events".to_owned(), Arc::clone(&workspace))]);
+        let sessions = load_agent_sessions(&runs).unwrap();
+        let session = sessions.get("session-1").unwrap();
+        let loaded_turn = lock(&session.turns)[0].clone();
+        let presentation =
+            load_or_build_agent_turn_presentation(session, &workspace, &loaded_turn).unwrap();
+        assert_eq!(
+            presentation.response.as_deref(),
+            Some("# Replayed legacy answer")
+        );
+        assert!(bundle.join("turns/turn-1/presentation.json").is_file());
+
+        let upgraded: AgentSessionManifest =
+            serde_json::from_slice(&fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(upgraded.version, AGENT_SESSION_MANIFEST_VERSION);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_current_session_repairs_terminal_projection_before_a_sequence_gap() {
+        let root = temporary_root("interrupted-agent-projection-repair");
+        let workspace = Arc::new(test_run_state(&root.join("run")));
+        let bundle = workspace.bundle_dir.join("agent-sessions/session-1");
+        fs::create_dir_all(bundle.join("turns/turn-1")).unwrap();
+
+        let summary = AgentSessionSummary {
+            id: "session-1".to_owned(),
+            workspace_id: "run-events".to_owned(),
+            harness_id: "fixture".to_owned(),
+            model_profile_id: "test".to_owned(),
+            model_id: "fixture/test".to_owned(),
+            status: AgentSessionStatus::Running,
+            active: true,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            turn_count: 1,
+            error: None,
+        };
+        let manifest = AgentSessionManifest {
+            version: AGENT_SESSION_MANIFEST_VERSION,
+            summary,
+            turns: vec![test_agent_turn(AgentTurnStatus::Running)],
+        };
+        write_json_atomic(
+            &bundle.join("manifest.json"),
+            &serde_json::to_value(manifest).unwrap(),
+        )
+        .unwrap();
+
+        let events = [
+            observation_ready_event(1),
+            event(
+                2,
+                "observation.assistant.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "messageId": "message-1",
+                    "text": "# Completed before interruption",
+                }),
+            ),
+            event(
+                3,
+                "agent.turn.finished",
+                json!({
+                    "turnId": "turn-1",
+                    "outcome": "completed",
+                    "workspaceDiff": { "changes": [] },
+                }),
+            ),
+            event(
+                5,
+                "agent.session.closed",
+                json!({ "sessionId": "session-1" }),
+            ),
+        ];
+        let mut event_log = Vec::new();
+        for event in &events {
+            serde_json::to_writer(&mut event_log, event).unwrap();
+            event_log.push(b'\n');
+        }
+        fs::write(bundle.join("events.jsonl"), event_log).unwrap();
+
+        let runs = HashMap::from([("run-events".to_owned(), Arc::clone(&workspace))]);
+        let sessions = load_agent_sessions(&runs).unwrap();
+        let session = sessions.get("session-1").unwrap();
+        let turn = lock(&session.turns)[0].clone();
+        assert_eq!(turn.status, AgentTurnStatus::Completed);
+        let presentation =
+            load_or_build_agent_turn_presentation(session, &workspace, &turn).unwrap();
+        assert_eq!(
+            presentation.response.as_deref(),
+            Some("# Completed before interruption")
+        );
+        assert!(bundle.join("turns/turn-1/presentation.json").is_file());
+        assert!(bundle.join("events.corrupt.jsonl").is_file());
+        assert!(
+            lock(&session.events)
+                .iter()
+                .any(|event| event.kind == "agent.session.replay-incomplete")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn terminal_turn_commit_failures_recover_without_contradictory_outcomes() {
+        for marker in [
+            "fail-presentation-write.once",
+            "fail-terminal-event-append.once",
+        ] {
+            let root = temporary_root(marker);
+            let workspace = Arc::new(test_run_state(&root.join("run")));
+            let bundle = workspace.bundle_dir.join("agent-sessions/session-1");
+            let turn_dir = bundle.join("turns/turn-1");
+            fs::create_dir_all(&turn_dir).unwrap();
+            let state = test_agent_session_state(bundle.clone());
+            lock(&state.summary).workspace_id = "run-events".to_owned();
+            persist_agent_session(&state).unwrap();
+            record_agent_event(
+                &state,
+                "agent.session.ready",
+                json!({
+                    "sessionId": "session-1",
+                    "driver": { "features": [TURN_OBSERVATIONS_FEATURE] }
+                }),
+            )
+            .unwrap();
+            record_agent_event(
+                &state,
+                "observation.assistant.completed",
+                json!({
+                    "sessionId": "session-1",
+                    "turnId": "turn-1",
+                    "event": { "messageId": "message-1", "text": "# Answer" }
+                }),
+            )
+            .unwrap();
+            fs::write(turn_dir.join(marker), []).unwrap();
+
+            let error = record_finished_agent_turn_event(
+                &state,
+                &workspace,
+                "turn-1",
+                AgentTurnStatus::Completed,
+                json!({
+                    "sessionId": "session-1",
+                    "turnId": "turn-1",
+                    "outcome": "completed",
+                    "workspaceDiff": { "changes": [] },
+                }),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("injected agent"));
+            assert_eq!(
+                lock(&state.events)
+                    .iter()
+                    .filter(|event| event.kind == "agent.turn.finished")
+                    .count(),
+                0
+            );
+
+            if marker == "fail-terminal-event-append.once" {
+                assert!(turn_dir.join("presentation.pending.json").is_file());
+                assert!(
+                    repair_terminal_agent_turn_presentations(
+                        &bundle,
+                        &lock(&state.turns),
+                        &lock(&state.events),
+                    )
+                    .unwrap()
+                );
+                assert!(!turn_dir.join("presentation.pending.json").exists());
+            }
+            remove_evidence_entry(&turn_dir.join("presentation.pending.json")).unwrap();
+            let terminal = record_finished_agent_turn_event(
+                &state,
+                &workspace,
+                "turn-1",
+                AgentTurnStatus::Failed,
+                json!({
+                    "sessionId": "session-1",
+                    "turnId": "turn-1",
+                    "outcome": "failed",
+                    "error": "terminal projection commit failed",
+                    "workspaceDiff": { "changes": [] },
+                }),
+            )
+            .unwrap();
+            update_agent_turn_status(
+                &state,
+                "turn-1",
+                AgentTurnStatus::Failed,
+                Some("failed"),
+                Some("terminal projection commit failed"),
+            )
+            .unwrap();
+            assert_eq!(terminal.payload["outcome"], "failed");
+            assert_eq!(
+                lock(&state.events)
+                    .iter()
+                    .filter(|event| event.kind == "agent.turn.finished")
+                    .count(),
+                1
+            );
+            let presentation = turn_dir.join("presentation.json");
+            fs::copy(&presentation, turn_dir.join("presentation.pending.json")).unwrap();
+            fs::remove_file(&presentation).unwrap();
+
+            let runs = HashMap::from([("run-events".to_owned(), Arc::clone(&workspace))]);
+            let sessions = load_agent_sessions(&runs).unwrap();
+            let replayed = sessions.get("session-1").unwrap();
+            assert_eq!(
+                lock(&replayed.events)
+                    .iter()
+                    .filter(|event| event.kind == "agent.turn.finished")
+                    .count(),
+                1
+            );
+            assert_eq!(lock(&replayed.turns)[0].status, AgentTurnStatus::Failed);
+            assert!(presentation.is_file());
+            assert!(!turn_dir.join("presentation.pending.json").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn capability_projection_scopes_identical_call_ids_by_source() {
+        let turn = test_agent_turn(AgentTurnStatus::Completed);
+        let events = vec![
+            event(
+                1,
+                "mcp.tool.started",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "catalog",
+                    "callId": "call-1",
+                    "name": "list",
+                    "arguments": {},
+                }),
+            ),
+            event(
+                2,
+                "mcp.tool.started",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "analysis",
+                    "callId": "call-1",
+                    "name": "summarize",
+                    "arguments": {},
+                }),
+            ),
+            event(
+                3,
+                "mcp.tool.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "catalog",
+                    "callId": "call-1",
+                    "name": "list",
+                    "isError": false,
+                    "result": { "items": [] },
+                }),
+            ),
+            event(
+                4,
+                "mcp.tool.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "analysis",
+                    "callId": "call-1",
+                    "name": "summarize",
+                    "isError": false,
+                    "result": { "active": [] },
+                }),
+            ),
+        ];
+
+        let presentation = build_agent_turn_presentation_from_events(&events, &turn, &[]).unwrap();
+        assert_eq!(presentation.activity.len(), 2);
+        assert_eq!(presentation.activity[0].source.as_deref(), Some("catalog"));
+        assert_eq!(presentation.activity[0].source_event_sequences, [1, 3]);
+        assert_eq!(presentation.activity[0].status, "completed");
+        assert_eq!(presentation.activity[1].source.as_deref(), Some("analysis"));
+        assert_eq!(presentation.activity[1].source_event_sequences, [2, 4]);
+        assert_eq!(presentation.activity[1].status, "completed");
+    }
+
+    #[test]
+    fn corrupt_agent_event_suffix_is_quarantined_without_losing_valid_prefix() {
+        let root = temporary_root("agent-event-suffix-recovery");
+        let prefix = [
+            event(
+                1,
+                "agent.session.started",
+                json!({ "sessionId": "session-1" }),
+            ),
+            event(
+                2,
+                "agent.session.ready",
+                json!({ "sessionId": "session-1" }),
+            ),
+        ];
+        let mut source = Vec::new();
+        for event in &prefix {
+            source.extend(serde_json::to_vec(event).unwrap());
+            source.push(b'\n');
+        }
+        source.extend_from_slice(br#"{"sequence":3,"kind":"truncated"#);
+        fs::write(root.join("events.jsonl"), &source).unwrap();
+
+        let recovered = read_agent_events_recovering(&root).unwrap();
+        assert_eq!(recovered.len(), 3);
+        for (recovered, expected) in recovered.iter().zip(&prefix) {
+            assert_eq!(recovered.sequence, expected.sequence);
+            assert_eq!(recovered.at_ms, expected.at_ms);
+            assert_eq!(recovered.kind, expected.kind);
+            assert_eq!(recovered.payload, expected.payload);
+        }
+        assert_eq!(recovered[2].sequence, 3);
+        assert_eq!(recovered[2].kind, "agent.session.replay-incomplete");
+        assert_eq!(
+            recovered[2].payload["reason"],
+            "a corrupt event-log suffix was quarantined"
+        );
+        assert_eq!(fs::read(root.join("events.corrupt.jsonl")).unwrap(), source);
+
+        let repaired = read_events(&root.join("events.jsonl")).unwrap();
+        assert_eq!(
+            serde_json::to_value(&repaired).unwrap(),
+            serde_json::to_value(&recovered).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_start_turn_record_limit_accounts_for_prompt_input_and_envelope() {
+        let oversized_prompt = "p".repeat(MAX_DRIVER_RECORD_BYTES);
+        let error =
+            validate_agent_turn_command_size("session-1", "turn-1", &oversized_prompt, None, &[])
+                .unwrap_err();
+        assert!(error.to_string().contains("driver record limit"));
+
+        let input = json!("i".repeat(MAX_AGENT_TURN_INPUT_BYTES - 128));
+        assert!(serde_json::to_vec(&input).unwrap().len() <= MAX_AGENT_TURN_INPUT_BYTES);
+        let error = validate_agent_turn_command_size("session-1", "turn-1", "p", Some(&input), &[])
+            .unwrap_err();
+        assert!(error.to_string().contains("driver record limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn final_turn_evidence_redacts_read_only_secrets_and_reports_mode_only_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("agent-final-evidence");
+        let bundle = root.join("session");
+        let initial = bundle.join("turns/turn-1/initial");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&initial).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::set_permissions(&initial, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(initial.join("deleted-empty")).unwrap();
+        fs::create_dir(initial.join("mode-directory")).unwrap();
+        fs::set_permissions(
+            initial.join("mode-directory"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::create_dir(workspace.join("created-empty")).unwrap();
+        fs::set_permissions(
+            workspace.join("created-empty"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        fs::create_dir(workspace.join("mode-directory")).unwrap();
+        fs::set_permissions(
+            workspace.join("mode-directory"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(initial.join("mode.txt"), "unchanged").unwrap();
+        fs::set_permissions(initial.join("mode.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(workspace.join("mode.txt"), "unchanged").unwrap();
+        fs::set_permissions(
+            workspace.join("mode.txt"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(workspace.join("secret.txt"), "read-only-secret").unwrap();
+        fs::set_permissions(
+            workspace.join("secret.txt"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        let state = test_agent_session_state(bundle.clone());
+
+        finalize_agent_turn_workspace(
+            &state,
+            "turn-1",
+            &workspace,
+            &[b"read-only-secret".to_vec()],
+        )
+        .unwrap();
+
+        let final_secret = bundle.join("turns/turn-1/final/secret.txt");
+        assert_eq!(fs::read_to_string(&final_secret).unwrap(), "[REDACTED]");
+        assert_eq!(
+            fs::metadata(&final_secret).unwrap().permissions().mode() & 0o7777,
+            0o444
+        );
+        let diff = read_optional_json(&bundle.join("turns/turn-1/diff.json"))
+            .unwrap()
+            .unwrap();
+        let mode_change = diff["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "mode.txt")
+            .unwrap();
+        assert_eq!(mode_change["kind"], "mode-changed");
+        assert_eq!(mode_change["entryType"], "file");
+        assert_eq!(mode_change["beforeMode"], "0644");
+        assert_eq!(mode_change["afterMode"], "0755");
+        let changes = diff["changes"].as_array().unwrap();
+        let change = |path: &str| {
+            changes
+                .iter()
+                .find(|change| change["path"] == path)
+                .unwrap()
+        };
+        assert_eq!(change(".")["kind"], "mode-changed");
+        assert_eq!(change(".")["entryType"], "directory");
+        assert_eq!(change(".")["beforeMode"], "0755");
+        assert_eq!(change(".")["afterMode"], "0700");
+        assert_eq!(change("created-empty")["kind"], "created");
+        assert_eq!(change("created-empty")["entryType"], "directory");
+        assert_eq!(change("created-empty")["afterMode"], "0750");
+        assert_eq!(change("deleted-empty")["kind"], "deleted");
+        assert_eq!(change("deleted-empty")["entryType"], "directory");
+        assert_eq!(change("mode-directory")["kind"], "mode-changed");
+        assert_eq!(change("mode-directory")["entryType"], "directory");
+        assert_eq!(change("mode-directory")["beforeMode"], "0755");
+        assert_eq!(change("mode-directory")["afterMode"], "0700");
+        let final_tree = capture_tree(&bundle.join("turns/turn-1/final")).unwrap();
+        assert_eq!(
+            permission_label(&final_tree.root_permissions),
+            permission_label(&fs::metadata(&workspace).unwrap().permissions())
+        );
+        assert_eq!(
+            final_tree
+                .directories
+                .get("created-empty")
+                .map(permission_label)
+                .as_deref(),
+            Some("0750")
+        );
+        assert!(
+            !serde_json::to_string(&diff)
+                .unwrap()
+                .contains("read-only-secret")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn interactive_fixture_launch() -> DriverLaunch {
+        let script = r#"
+sequence=1
+printf '%s\n' '{"protocolVersion":1,"sequence":1,"causedBy":null,"type":"driver.ready","driver":{"name":"interactive-fixture","version":"1","revision":null,"features":["streaming","turn-observations-v1"]}}'
+while IFS= read -r line; do
+  session=$(printf '%s' "$line" | sed -E 's/.*"sessionId":"([^"]+)".*/\1/')
+  case "$line" in
+    *'"type":"session.open"'*)
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"session.opened","sessionId":"%s","processId":4242}\n' "$sequence" "$session"
+      ;;
+    *'"type":"turn.start"'*)
+      turn=$(printf '%s' "$line" | sed -E 's/.*"turnId":"([^"]+)".*/\1/')
+      abort_outcome=aborted
+      first='# Fixture answer\n\n**Gamma** leads the catalog.\n\n'
+      second='| Item | Score |\n| --- | ---: |\n| `gamma` | **8** |\n| `alpha` | 3 |'
+      complete='# Fixture answer\n\n**Gamma** leads the catalog.\n\n| Item | Score |\n| --- | ---: |\n| `gamma` | **8** |\n| `alpha` | 3 |'
+      case "$line" in
+        *'what did you conclude earlier?'*)
+          first='## Prior conclusion\n\n'
+          second='`gamma` remained highest at **8**.'
+          complete='## Prior conclusion\n\n`gamma` remained highest at **8**.'
+          ;;
+      esac
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.delta","payload":{"messageId":"message-%s","text":"%s"}}\n' "$sequence" "$session" "$turn" "$turn" "$first"
+      case "$line" in
+        *wait-for-abort-hostile-partial*)
+          abort_outcome=completed
+          continue
+          ;;
+        *wait-for-abort-hostile-complete*|*wait-for-timeout-hostile-complete*)
+          abort_outcome=completed
+          ;;
+        *wait-for-abort*)
+          continue
+          ;;
+      esac
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.delta","payload":{"messageId":"message-%s","text":"%s"}}\n' "$sequence" "$session" "$turn" "$turn" "$second"
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.completed","payload":{"messageId":"message-%s","text":"%s"}}\n' "$sequence" "$session" "$turn" "$turn" "$complete"
+      case "$line" in
+        *wait-for-abort-hostile-complete*|*wait-for-timeout-hostile-complete*) continue ;;
+      esac
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.native-action","payload":{"actionId":"inspect-catalog-%s","name":"Inspect catalog","status":"completed","summary":"Compared active item scores."}}\n' "$sequence" "$session" "$turn" "$turn"
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.usage","payload":{"inputTokens":7,"outputTokens":21,"totalTokens":28}}\n' "$sequence" "$session" "$turn"
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.finished","sessionId":"%s","turnId":"%s","outcome":"completed","evidence":{"fixture":true}}\n' "$sequence" "$session" "$turn"
+      ;;
+    *'"type":"turn.abort"'*)
+      turn=$(printf '%s' "$line" | sed -E 's/.*"turnId":"([^"]+)".*/\1/')
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.finished","sessionId":"%s","turnId":"%s","outcome":"%s","evidence":{"fixture":true}}\n' "$sequence" "$session" "$turn" "$abort_outcome"
+      ;;
+    *'"type":"session.close"'*)
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"session.closed","sessionId":"%s"}\n' "$sequence" "$session"
+      exit 0
+      ;;
+  esac
+done
+"#;
+        let mut launch = DriverLaunch::new("/bin/sh");
+        launch.args = vec!["-c".into(), script.into()];
+        launch
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn closing_a_cold_start_cancels_resolver_and_driver_waits() {
+        async fn wait_for_closed(controller: &RunController, workspace_id: &str, session_id: &str) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let detail = controller.agent_session(workspace_id, session_id).unwrap();
+                let closed_events = detail
+                    .events
+                    .iter()
+                    .filter(|event| event.kind == "agent.session.closed")
+                    .count();
+                if detail.summary.status == AgentSessionStatus::Closed && closed_events == 1 {
+                    assert!(detail.events.iter().any(|event| {
+                        event.kind == "agent.session.closed" && event.payload["during"] == "startup"
+                    }));
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cold-start session did not close promptly"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        let root = temporary_root("cold-start-cancellation");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let models = BTreeMap::from([("test".to_owned(), "Test".to_owned())]);
+
+        let mut stalled_driver = DriverLaunch::new("/bin/sh");
+        stalled_driver.args = vec!["-c".into(), "sleep 30".into()];
+        let controller = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios.clone(),
+                data_dir: data.clone(),
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![HarnessProfile {
+                id: "fixture".to_owned(),
+                display_name: "Fixture".to_owned(),
+                launch: stalled_driver,
+                models: BTreeMap::from([("test".to_owned(), "fixture/test".to_owned())]),
+            }],
+            models.clone(),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail
+                .events
+                .iter()
+                .any(|event| event.kind == "agent.session.starting")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "driver startup did not begin");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        controller
+            .close_agent_session(&explore.id, &session.id)
+            .unwrap();
+        wait_for_closed(&controller, &explore.id, &session.id).await;
+        drop(controller);
+
+        let resolver_started = root.join("resolver-started");
+        let mut resolver = DriverLaunch::new("/bin/sh");
+        resolver.args = vec![
+            "-c".into(),
+            "printf started > \"$STARTED\"; sleep 30; printf '%s\\n' '{\"status\":\"ready\",\"source\":\"test\",\"environment\":{\"TOKEN\":\"secret\"}}'"
+                .into(),
+        ];
+        resolver
+            .env
+            .push(("STARTED".into(), resolver_started.clone().into_os_string()));
+        let resolver_data = root.join("resolver-runs");
+        fs::create_dir(&resolver_data).unwrap();
+        let controller = RunController::new_with_harnesses_and_model_access(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: resolver_data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![HarnessProfile {
+                id: "fixture".to_owned(),
+                display_name: "Fixture".to_owned(),
+                launch: DriverLaunch::new("/bin/false"),
+                models: BTreeMap::from([("test".to_owned(), "fixture/test".to_owned())]),
+            }],
+            models,
+            vec![ModelAccessProvider {
+                id: "gateway".to_owned(),
+                display_name: "Gateway".to_owned(),
+                resolver: Some(resolver),
+                environment_names: vec!["TOKEN".to_owned()],
+                setup_hint: "Connect".to_owned(),
+            }],
+            BTreeMap::from([("fixture".to_owned(), "gateway".to_owned())]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !resolver_started.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "model-access resolver did not begin"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        controller
+            .close_agent_session(&explore.id, &session.id)
+            .unwrap();
+        wait_for_closed(&controller, &explore.id, &session.id).await;
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn write_scenario(root: &Path) {
@@ -5163,6 +10009,10 @@ totalScore = 11
             initial_snapshot,
             capabilities: Mutex::new(Vec::new()),
             secret_values: Mutex::new(Vec::new()),
+            agent_sessions: Mutex::new(HashMap::new()),
+            active_agent_session_id: Mutex::new(None),
+            active_agent_turn: Mutex::new(None),
+            capability_attributions: Mutex::new(HashMap::new()),
             reusable_explore: false,
             replay_failed: false,
         }
@@ -5239,9 +10089,16 @@ sleep 30
 "#;
         let mut driver = DriverProcess::spawn("/bin/sh", ["-c", script]).unwrap();
         let cancel = CancellationToken::new();
+        let first = receive_until_deadline(
+            &mut driver,
+            Instant::now() + Duration::from_secs(1),
+            &cancel,
+        )
+        .expect("fixture should emit startup progress")
+        .expect("fixture should not end before startup progress");
+        assert!(matches!(first.parsed.body, DriverBody::StartupEvent { .. }));
         let started = Instant::now();
         let deadline = started + Duration::from_millis(80);
-        let mut progress = 0;
         loop {
             match receive_until_deadline(&mut driver, deadline, &cancel) {
                 Ok(Some(message)) => {
@@ -5249,13 +10106,11 @@ sleep 30
                         message.parsed.body,
                         DriverBody::StartupEvent { .. }
                     ));
-                    progress += 1;
                 }
                 Err(ProcessError::Timeout) => break,
                 other => panic!("unexpected startup receive result: {other:?}"),
             }
         }
-        assert!(progress > 0);
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
@@ -5315,6 +10170,7 @@ sleep 30
     fn driver_events_cannot_claim_controller_owned_kinds() {
         assert_eq!(driver_event_kind("v0.mdx"), "v0.mdx");
         for reserved in [
+            "agent.turn.finished",
             "run.finished",
             "mcp.tool.completed",
             "workspace.finalized",
@@ -5685,6 +10541,80 @@ sleep 30
         );
         drop(events);
         drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn capability_completion_keeps_the_turn_that_started_the_call() {
+        let root = temporary_root("capability-turn-attribution");
+        let workspace = Arc::new(test_run_state(&root));
+        let session_dir = root.join("agent-sessions").join("session-1");
+        fs::create_dir_all(session_dir.join("turns")).unwrap();
+        let (sender, _) = broadcast::channel(8);
+        let session = Arc::new(AgentSessionState {
+            summary: Mutex::new(AgentSessionSummary {
+                id: "session-1".to_owned(),
+                workspace_id: "run-events".to_owned(),
+                harness_id: "fixture".to_owned(),
+                model_profile_id: "test".to_owned(),
+                model_id: "fixture/test".to_owned(),
+                status: AgentSessionStatus::Running,
+                active: true,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                turn_count: 1,
+                error: None,
+            }),
+            turns: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
+            sender,
+            commands: Mutex::new(None),
+            lifecycle_cancel: CancellationToken::new(),
+            turn_cancel: Mutex::new(None),
+            evidence_error: Mutex::new(None),
+            bundle_dir: session_dir,
+            secret_values: Mutex::new(Vec::new()),
+        });
+        lock(&workspace.agent_sessions).insert("session-1".to_owned(), Arc::downgrade(&session));
+        *lock(&workspace.active_agent_turn) = Some(AgentTurnAttribution {
+            session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+        });
+
+        let observe = source_observer(workspace.clone(), "catalog", "agent");
+        observe(
+            "mcp.tool.started",
+            json!({
+                "callId": "catalog-call-1",
+                "name": "list",
+                "arguments": {}
+            }),
+        );
+        *lock(&workspace.active_agent_turn) = None;
+        observe(
+            "mcp.tool.completed",
+            json!({
+                "callId": "catalog-call-1",
+                "name": "list",
+                "isError": false,
+                "result": { "items": [] }
+            }),
+        );
+
+        let workspace_events = lock(&workspace.events).clone();
+        let session_events = lock(&session.events).clone();
+        assert_eq!(workspace_events.len(), 2);
+        assert_eq!(session_events.len(), 2);
+        for event in workspace_events.iter().chain(&session_events) {
+            assert_eq!(event.payload["sessionId"], "session-1");
+            assert_eq!(event.payload["turnId"], "turn-1");
+            assert_eq!(event.payload["callId"], "catalog-call-1");
+        }
+        assert!(lock(&workspace.capability_attributions).is_empty());
+
+        drop(observe);
+        drop(session);
+        drop(workspace);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6419,7 +11349,8 @@ sleep 30
         let bundle_dir = controller.state(&explore.id).unwrap().bundle_dir.clone();
         drop(controller);
 
-        let reopened = RunController::new_with_harnesses(config(), harnesses(), models).unwrap();
+        let reopened =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
         let persisted = reopened.workbench(&explore.id).unwrap().selection;
         assert_eq!(persisted.harness_id.as_deref(), Some("v0"));
         assert_eq!(persisted.comparison_harness_ids, ["v0", "eve"]);
@@ -6445,6 +11376,595 @@ sleep 30
         assert_eq!(repaired.harness_id.as_deref(), Some("eve"));
         assert_eq!(repaired.model_profile_id.as_deref(), Some("haiku"));
         assert_eq!(repaired.comparison_harness_ids, ["v0", "eve"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn interactive_agent_session_reuses_one_native_session_across_turns_and_replays() {
+        const MARKDOWN_ANSWER: &str = "# Fixture answer\n\n**Gamma** leads the catalog.\n\n| Item | Score |\n| --- | ---: |\n| `gamma` | **8** |\n| `alpha` | 3 |";
+        const PRIOR_MARKDOWN_ANSWER: &str =
+            "## Prior conclusion\n\n`gamma` remained highest at **8**.";
+
+        let root = temporary_root("interactive-agent-session");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let mut launch = interactive_fixture_launch();
+        launch
+            .env
+            .push(("AGENT_API_TOKEN".into(), "turn-secret".into()));
+        let harnesses = || {
+            vec![HarnessProfile {
+                id: "fixture".to_owned(),
+                display_name: "Fixture".to_owned(),
+                launch: launch.clone(),
+                models: BTreeMap::from([("test".to_owned(), "fixture/test".to_owned())]),
+            }]
+        };
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/bin/false"),
+        };
+        let models = BTreeMap::from([("test".to_owned(), "Test".to_owned())]);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let starting_session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest {
+                    harness_id: None,
+                    model_profile_id: None,
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        assert!(!starting_session.active);
+        assert_eq!(starting_session.status, AgentSessionStatus::Starting);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let session = loop {
+            let observed = controller
+                .list_agent_sessions(&explore.id)
+                .into_iter()
+                .find(|session| session.id == starting_session.id)
+                .unwrap();
+            if observed.status == AgentSessionStatus::Ready && observed.active {
+                break observed;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent session did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        for (prompt, input) in [
+            ("first turn turn-secret", json!({ "items": [1, 2] })),
+            (
+                "what did you conclude earlier?",
+                json!({ "continue": true }),
+            ),
+        ] {
+            let turn = controller
+                .start_agent_turn(
+                    &explore.id,
+                    &session.id,
+                    StartAgentTurnRequest {
+                        prompt: prompt.to_owned(),
+                        input: Some(input),
+                    },
+                    WorkbenchOrigin::Nushell,
+                )
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+                let observed = detail.turns.iter().find(|item| item.id == turn.id).unwrap();
+                if observed.status == AgentTurnStatus::Completed {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "agent turn did not finish");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        let cancelled = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "wait-for-abort-hostile-partial".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            let observed = detail
+                .turns
+                .iter()
+                .find(|item| item.id == cancelled.id)
+                .unwrap();
+            if observed.status == AgentTurnStatus::Running {
+                break;
+            }
+            assert!(Instant::now() < deadline, "agent turn did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        controller.note_terminal_input(&explore.id).unwrap();
+        let intervened = controller.agent_session(&explore.id, &session.id).unwrap();
+        assert!(
+            intervened
+                .turns
+                .iter()
+                .find(|turn| turn.id == cancelled.id)
+                .unwrap()
+                .human_intervention_at_ms
+                .is_some()
+        );
+        assert!(intervened.events.iter().any(|event| {
+            event.kind == "agent.turn.human-intervention"
+                && event.payload["turnId"] == cancelled.id
+                && event.payload["source"] == "terminal-input"
+        }));
+        controller
+            .cancel_agent_turn(&explore.id, &session.id)
+            .unwrap();
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            let observed = detail
+                .turns
+                .iter()
+                .find(|item| item.id == cancelled.id)
+                .unwrap();
+            if observed.status == AgentTurnStatus::Cancelled {
+                break;
+            }
+            assert!(Instant::now() < deadline, "agent turn was not cancelled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail
+                .events
+                .iter()
+                .filter(|event| event.kind == "agent.turn.finished")
+                .count()
+                == 3
+                && detail.summary.status == AgentSessionStatus::Ready
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled turn evidence did not finalize"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let timed_out = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "wait-for-timeout-hostile-complete".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let timeout_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            let observed = detail
+                .turns
+                .iter()
+                .find(|item| item.id == timed_out.id)
+                .unwrap();
+            if observed.status == AgentTurnStatus::Failed {
+                break;
+            }
+            assert!(
+                Instant::now() < timeout_deadline,
+                "hostile completed turn did not preserve controller timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+        assert_eq!(detail.summary.turn_count, 4);
+        assert_eq!(detail.summary.status, AgentSessionStatus::Ready);
+        assert_eq!(detail.turns[0].prompt, "first turn [REDACTED]");
+        assert_eq!(
+            detail.turns[0].presentation.response.as_deref(),
+            Some(MARKDOWN_ANSWER)
+        );
+        assert_eq!(
+            detail.turns[0].presentation.messages[0].text,
+            MARKDOWN_ANSWER
+        );
+        assert!(detail.turns[0].presentation.messages[0].complete);
+        assert_eq!(
+            detail.turns[0].presentation.usage,
+            Some(json!({
+                "inputTokens": 7,
+                "outputTokens": 21,
+                "totalTokens": 28,
+            }))
+        );
+        assert!(
+            detail.turns[0]
+                .presentation
+                .activity
+                .iter()
+                .any(|activity| {
+                    activity.kind == "native-action"
+                        && activity.title == "Inspect catalog"
+                        && activity.status == "completed"
+                })
+        );
+        assert_eq!(
+            detail.turns[0].presentation.completeness.assistant_output,
+            AgentPresentationCompleteness::Complete
+        );
+        assert_eq!(
+            detail.turns[0].presentation.completeness.usage,
+            AgentPresentationCompleteness::Complete
+        );
+        assert_eq!(
+            detail.turns[1].presentation.response.as_deref(),
+            Some(PRIOR_MARKDOWN_ANSWER)
+        );
+        let cancelled_turn = detail
+            .turns
+            .iter()
+            .find(|turn| turn.id == cancelled.id)
+            .unwrap();
+        assert_eq!(
+            cancelled_turn.presentation.response.as_deref(),
+            Some("# Fixture answer\n\n**Gamma** leads the catalog.\n\n")
+        );
+        assert_eq!(
+            cancelled_turn.presentation.completeness.assistant_output,
+            AgentPresentationCompleteness::Partial
+        );
+        assert_eq!(cancelled_turn.summary.outcome.as_deref(), Some("cancelled"));
+        let timed_out_turn = detail
+            .turns
+            .iter()
+            .find(|turn| turn.id == timed_out.id)
+            .unwrap();
+        assert_eq!(timed_out_turn.summary.outcome.as_deref(), Some("timed-out"));
+        assert_eq!(
+            timed_out_turn.presentation.response.as_deref(),
+            Some(MARKDOWN_ANSWER)
+        );
+        for (turn_id, expected_outcome) in
+            [(&cancelled.id, "cancelled"), (&timed_out.id, "timed-out")]
+        {
+            let terminal = detail
+                .events
+                .iter()
+                .find(|event| {
+                    event.kind == "agent.turn.finished"
+                        && event.payload["turnId"] == turn_id.as_str()
+                })
+                .unwrap();
+            assert_eq!(terminal.payload["outcome"], expected_outcome);
+            assert_eq!(terminal.payload["driverOutcome"], "completed");
+        }
+        assert!(detail.turns[0].source_revision.starts_with("sha256:"));
+        assert_eq!(
+            detail.turns[0].capability_revisions["catalog"],
+            "catalog-v2"
+        );
+        assert_eq!(
+            detail
+                .events
+                .iter()
+                .filter(|event| event.kind == "agent.session.ready")
+                .count(),
+            1
+        );
+        assert_eq!(
+            detail
+                .events
+                .iter()
+                .filter(|event| event.kind == "agent.turn.finished")
+                .count(),
+            4
+        );
+        let bundle = controller
+            .agent_session_state(&session.id)
+            .unwrap()
+            .bundle_dir
+            .clone();
+        let evidence = fs::read_to_string(bundle.join("manifest.json")).unwrap()
+            + &fs::read_to_string(bundle.join("events.jsonl")).unwrap();
+        assert!(!evidence.contains("turn-secret"));
+        for turn in &detail.turns {
+            let turn_dir = bundle.join("turns").join(&turn.id);
+            assert!(turn_dir.join("initial").is_dir());
+            assert!(turn_dir.join("final").is_dir());
+            assert!(turn_dir.join("diff.json").is_file());
+            assert!(turn_dir.join("presentation.json").is_file());
+        }
+        let second = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest {
+                    harness_id: None,
+                    model_profile_id: None,
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let observed = controller
+                .list_agent_sessions(&explore.id)
+                .into_iter()
+                .find(|session| session.id == second.id)
+                .unwrap();
+            if observed.status == AgentSessionStatus::Ready && observed.active {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "second agent session did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(controller.list_agent_sessions(&explore.id).len(), 2);
+        assert!(
+            controller
+                .agent_session(&explore.id, &second.id)
+                .unwrap()
+                .summary
+                .active
+        );
+        controller
+            .activate_agent_session(&explore.id, &session.id, WorkbenchOrigin::Nushell)
+            .unwrap();
+        assert!(
+            controller
+                .agent_session(&explore.id, &session.id)
+                .unwrap()
+                .summary
+                .active
+        );
+        assert_eq!(
+            controller
+                .agent_session(&explore.id, &session.id)
+                .unwrap()
+                .turns
+                .len(),
+            4
+        );
+        controller
+            .close_agent_session(&explore.id, &second.id)
+            .unwrap();
+        controller
+            .close_agent_session(&explore.id, &session.id)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if controller
+                .agent_session(&explore.id, &session.id)
+                .unwrap()
+                .summary
+                .status
+                == AgentSessionStatus::Closed
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "agent session did not close");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        loop {
+            if controller
+                .agent_session(&explore.id, &second.id)
+                .unwrap()
+                .summary
+                .status
+                == AgentSessionStatus::Closed
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "second agent session did not close"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(controller);
+
+        let reopened =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        assert!(
+            reopened
+                .workbench(&explore.id)
+                .unwrap()
+                .replay_agent_session
+                .is_none()
+        );
+        let replayed = reopened.agent_session(&explore.id, &session.id).unwrap();
+        assert_eq!(replayed.summary.status, AgentSessionStatus::Closed);
+        assert_eq!(replayed.turns.len(), 4);
+        assert_eq!(replayed.events.len(), detail.events.len() + 1);
+        assert_eq!(
+            replayed
+                .turns
+                .iter()
+                .map(|turn| &turn.presentation)
+                .collect::<Vec<_>>(),
+            detail
+                .turns
+                .iter()
+                .map(|turn| &turn.presentation)
+                .collect::<Vec<_>>()
+        );
+        drop(reopened);
+        let presentation_path = bundle
+            .join("turns")
+            .join(&detail.turns[0].id)
+            .join("presentation.json");
+        let mut tampered = read_optional_json(&presentation_path).unwrap().unwrap();
+        tampered["response"] = json!("tampered response");
+        fs::write(
+            &presentation_path,
+            serde_json::to_vec_pretty(&tampered).unwrap(),
+        )
+        .unwrap();
+        let reopened = RunController::new_with_harnesses(config(), harnesses(), models).unwrap();
+        assert_eq!(
+            reopened
+                .agent_session(&explore.id, &session.id)
+                .unwrap()
+                .turns[0]
+                .presentation
+                .response
+                .as_deref(),
+            Some(MARKDOWN_ANSWER)
+        );
+        let repaired: AgentTurnPresentation =
+            serde_json::from_slice(&fs::read(&presentation_path).unwrap()).unwrap();
+        assert_eq!(repaired.response.as_deref(), Some(MARKDOWN_ANSWER));
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn interrupted_agent_session_becomes_the_workbench_replay_selection() {
+        let root = temporary_root("interrupted-agent-replay-selection");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let harnesses = || {
+            vec![HarnessProfile {
+                id: "fixture".to_owned(),
+                display_name: "Fixture".to_owned(),
+                launch: interactive_fixture_launch(),
+                models: BTreeMap::from([("test".to_owned(), "fixture/test".to_owned())]),
+            }]
+        };
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/bin/false"),
+        };
+        let models = BTreeMap::from([("test".to_owned(), "Test".to_owned())]);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let observed = controller
+                .list_agent_sessions(&explore.id)
+                .into_iter()
+                .find(|candidate| candidate.id == session.id)
+                .unwrap();
+            if observed.status == AgentSessionStatus::Ready && observed.active {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent session did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "replay this answer".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail.turns.iter().any(|candidate| {
+                candidate.id == turn.id && candidate.status == AgentTurnStatus::Completed
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "agent turn did not finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let expected = controller
+            .agent_session(&explore.id, &session.id)
+            .unwrap()
+            .turns[0]
+            .presentation
+            .clone();
+        let bundle = controller
+            .agent_session_state(&session.id)
+            .unwrap()
+            .bundle_dir
+            .clone();
+        drop(controller);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let manifest: AgentSessionManifest =
+                serde_json::from_slice(&fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+            if manifest.summary.status == AgentSessionStatus::Interrupted {
+                break;
+            }
+            assert!(Instant::now() < deadline, "agent session did not stop");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let reopened = RunController::new_with_harnesses(config(), harnesses(), models).unwrap();
+        let workbench = reopened.workbench(&explore.id).unwrap();
+        assert!(workbench.active_agent_session.is_none());
+        let replay = workbench.replay_agent_session.unwrap();
+        assert_eq!(replay.id, session.id);
+        assert_eq!(replay.status, AgentSessionStatus::Interrupted);
+        assert!(!replay.active);
+        assert_eq!(
+            reopened
+                .agent_session(&explore.id, &session.id)
+                .unwrap()
+                .turns[0]
+                .presentation,
+            expected
+        );
+
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7486,6 +13006,7 @@ fi
                     "version": "1.0.0",
                     "features": ["streaming"]
                 }),
+                progress: None,
             },
             RunEvent {
                 sequence: 2,
@@ -7496,12 +13017,14 @@ fi
                     "revision": "catalog-v2",
                     "transport": "streamable-http"
                 }),
+                progress: None,
             },
             RunEvent {
                 sequence: 3,
                 at_ms: 2,
                 kind: "run.finished".to_owned(),
                 payload: json!({ "status": "passed" }),
+                progress: None,
             },
         ];
         fs::write(
@@ -7858,6 +13381,10 @@ fi
                 cancel: capability_cancel.clone(),
             }]),
             secret_values: Mutex::new(vec![b"environment-secret".to_vec()]),
+            agent_sessions: Mutex::new(HashMap::new()),
+            active_agent_session_id: Mutex::new(None),
+            active_agent_turn: Mutex::new(None),
+            capability_attributions: Mutex::new(HashMap::new()),
             reusable_explore: false,
             replay_failed: false,
         };
@@ -8552,6 +14079,105 @@ fi
             serialized
                 .windows(b"[REDACTED]".len())
                 .any(|value| value == b"[REDACTED]")
+        );
+    }
+
+    #[test]
+    fn transcript_redaction_prevents_split_assistant_secrets_from_reconstruction() {
+        let driver_records = [
+            json!({
+                "protocolVersion": 1,
+                "sequence": 1,
+                "causedBy": null,
+                "type": "turn.event",
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "eventType": "observation.assistant.delta",
+                "payload": {
+                    "messageId": "message-1",
+                    "text": "credential-",
+                },
+            }),
+            json!({
+                "protocolVersion": 1,
+                "sequence": 2,
+                "causedBy": null,
+                "type": "turn.event",
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "eventType": "observation.assistant.delta",
+                "payload": {
+                    "messageId": "message-1",
+                    "text": "token tail",
+                },
+            }),
+            json!({
+                "protocolVersion": 1,
+                "sequence": 3,
+                "causedBy": null,
+                "type": "turn.event",
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "eventType": "observation.assistant.completed",
+                "payload": {
+                    "messageId": "message-1",
+                    "text": "credential-token tail",
+                },
+            }),
+            json!({
+                "protocolVersion": 1,
+                "sequence": 4,
+                "causedBy": null,
+                "type": "turn.finished",
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+                "outcome": "completed",
+                "evidence": {},
+            }),
+        ]
+        .into_iter()
+        .map(|value| serde_json::to_vec(&value).unwrap())
+        .collect();
+        let transcript = DriverTranscript {
+            controller_records: Vec::new(),
+            driver_records,
+            driver_stderr: Vec::new(),
+        };
+
+        let redacted = redact_transcript(transcript, &[b"credential-token".to_vec()]);
+        let records = redacted
+            .driver_records
+            .iter()
+            .map(|record| serde_json::from_slice::<JsonValue>(record).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["sequence"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert!(
+            records
+                .iter()
+                .filter(|record| record["type"] == "turn.event")
+                .all(|record| {
+                    record["sessionId"] == "session-1"
+                        && record["turnId"] == "turn-1"
+                        && record["payload"]["messageId"] == "message-1"
+                })
+        );
+        let assistant_text = records
+            .iter()
+            .filter_map(|record| record["payload"]["text"].as_str())
+            .collect::<String>();
+        assert!(!assistant_text.contains("credential-token"));
+        assert!(assistant_text.contains("[REDACTED]"));
+        let serialized = redacted.driver_records.concat();
+        assert!(
+            !serialized
+                .windows(b"credential-token".len())
+                .any(|window| window == b"credential-token")
         );
     }
 }

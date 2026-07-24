@@ -432,13 +432,17 @@ rerun of the preserved evaluation.
 
 ## Next validation boundary
 
-Complete the missing transition from exploration to durable improvement. A
-builder should be able to start and continue a harness-native agent session
-from Nushell, pass structured exploration results into a turn, preserve more
-than one session, and propose an editable evaluation from a meaningful turn
-span. The proposal must capture its starting state, capabilities, task,
-assertions, measurements, limits, and provenance without baking the source
-harness or model into the portable definition.
+Complete the missing transition from exploration to durable improvement through
+[RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md).
+Interactive harness-native sessions are now a demonstrated substrate: a builder
+can continue a session from Nushell, pass structured exploration results into a
+turn, preserve more than one session, and inspect durable answer, activity,
+progress, and workspace evidence through the browser and shell.
+
+The remaining boundary begins with a meaningful span of those turns and
+produces an editable evaluation. The proposal must capture its starting state,
+capabilities, task, assertions, measurements, limits, and provenance without
+baking the source harness or model into the portable definition.
 
 The builder then reviews the same draft through Nushell and the browser,
 replays it from the captured state, keeps failed drafts as editable evidence,
@@ -454,8 +458,9 @@ behavior while preserving correctness.
 
 - Which harness facts deserve shared structured projections, and which should
   remain native-only?
-- How should a builder promote commands, observations, workspace state, and
-  runs into an editable evaluation without turning exploration into a wizard?
+- Which parts of the provisional promotion contract in
+  [RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md) will
+  survive direct use and deserve to become stable product vocabulary?
 - When can a workspace attachment faithfully provide a normal Nushell session,
   and how should the host advertise that support?
 - How should harness-native evaluations compose with Agent Lab's cross-harness

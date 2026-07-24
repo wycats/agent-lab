@@ -238,7 +238,12 @@ summary.
 - Completion currently covers the workbench harnesses, model profiles, and
   command flags; broader capability-driven completion remains provisional.
 - Capability events do not yet have a first-class public envelope.
-- Promotion from exploration into an editable evaluation is not implemented.
+- Promotion from exploration into an editable evaluation is not implemented;
+  [RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md)
+  proposes the product and evidence contract for that boundary.
+- Interactive sessions do not yet have idle eviction, reported effective
+  session bounds, per-turn model-access refresh, or adapter-acknowledged
+  capability revisions.
 - The catalog comparison is one real-model observation, not a repeated claim.
 - Harness-reported usage and cache metrics are asymmetric.
 - A live VS Code Problems adapter has not yet been attempted.
@@ -260,9 +265,11 @@ inventing separate evaluation machinery.
 
 ## Next architecture-validation boundary
 
-After interactive sessions and evaluation promotion are demonstrated, build
-one real VS Code/code-server diagnostic adapter behind the public diagnostic
-snapshot contract. The extension uses
+Use the demonstrated interactive-session substrate to complete evaluation
+promotion as proposed in
+[RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md). Then
+build one real VS Code/code-server diagnostic adapter behind the public
+diagnostic snapshot contract. The extension uses
 `vscode.languages.getDiagnostics()` and a bounded local transport. It must
 prove workspace binding, pending and settled revisions, cancellation, timeout,
 extension restart, no-listener behavior, and a repair followed by a settled

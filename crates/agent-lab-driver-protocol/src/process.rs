@@ -119,6 +119,7 @@ pub struct DriverProcess {
     stdout_reader: Option<thread::JoinHandle<Result<(), String>>>,
     stderr_reader: Option<thread::JoinHandle<Result<(), String>>>,
     sent: Vec<Vec<u8>>,
+    sent_bytes: usize,
     received: Vec<Vec<u8>>,
     pending_received: VecDeque<Result<RawDriverMessage, ProcessError>>,
     received_bytes: usize,
@@ -232,6 +233,7 @@ impl DriverProcess {
             stdout_reader: Some(stdout_reader),
             stderr_reader: Some(stderr_reader),
             sent: Vec::new(),
+            sent_bytes: 0,
             received: Vec::new(),
             pending_received: VecDeque::new(),
             received_bytes: 0,
@@ -277,6 +279,11 @@ impl DriverProcess {
     pub fn send(&mut self, command: &ControllerCommand) -> Result<(), ProcessError> {
         let mut raw = serde_json::to_vec(command)?;
         raw.push(b'\n');
+        if self.sent_bytes.saturating_add(raw.len()) > MAX_DRIVER_TRANSCRIPT_BYTES {
+            return Err(ProcessError::TranscriptLimitExceeded {
+                limit: MAX_DRIVER_TRANSCRIPT_BYTES,
+            });
+        }
         let stdin = self
             .stdin
             .as_mut()
@@ -285,6 +292,7 @@ impl DriverProcess {
             .write_all(&raw)
             .and_then(|()| stdin.flush())
             .map_err(|error| ProcessError::Write(error.to_string()))?;
+        self.sent_bytes += raw.len();
         self.sent.push(raw);
         Ok(())
     }

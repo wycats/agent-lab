@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -15,12 +18,16 @@ pub type SourceObserver = Arc<dyn Fn(&str, JsonValue) + Send + Sync>;
 #[derive(Clone)]
 pub struct CatalogSource {
     observe: SourceObserver,
+    invocation_sequence: Arc<AtomicU64>,
 }
 
 impl CatalogSource {
     #[must_use]
     pub fn new(observe: SourceObserver) -> Self {
-        Self { observe }
+        Self {
+            observe,
+            invocation_sequence: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     fn record(&self, kind: &str, payload: JsonValue) {
@@ -60,9 +67,13 @@ impl ServerHandler for CatalogSource {
     ) -> Result<CallToolResult, McpError> {
         let arguments = request.arguments.unwrap_or_default();
         let name = request.name.into_owned();
+        let call_id = format!(
+            "catalog-call-{}",
+            self.invocation_sequence.fetch_add(1, Ordering::Relaxed) + 1
+        );
         self.record(
             "mcp.tool.started",
-            json!({ "name": name, "arguments": arguments }),
+            json!({ "callId": call_id, "name": name, "arguments": arguments }),
         );
         let mut structured_result = None;
         let result = match name.as_str() {
@@ -78,7 +89,12 @@ impl ServerHandler for CatalogSource {
         };
         self.record(
             "mcp.tool.completed",
-            json!({ "name": name, "isError": result.is_err(), "result": structured_result }),
+            json!({
+                "callId": call_id,
+                "name": name,
+                "isError": result.is_err(),
+                "result": structured_result
+            }),
         );
         result
     }
@@ -95,12 +111,16 @@ fn catalog_items() -> JsonValue {
 #[derive(Clone)]
 pub struct AnalysisSource {
     observe: SourceObserver,
+    invocation_sequence: Arc<AtomicU64>,
 }
 
 impl AnalysisSource {
     #[must_use]
     pub fn new(observe: SourceObserver) -> Self {
-        Self { observe }
+        Self {
+            observe,
+            invocation_sequence: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     fn record(&self, kind: &str, payload: JsonValue) {
@@ -153,9 +173,13 @@ impl ServerHandler for AnalysisSource {
     ) -> Result<CallToolResult, McpError> {
         let arguments = request.arguments.unwrap_or_default();
         let name = request.name.into_owned();
+        let call_id = format!(
+            "analysis-call-{}",
+            self.invocation_sequence.fetch_add(1, Ordering::Relaxed) + 1
+        );
         self.record(
             "mcp.tool.started",
-            json!({ "name": name, "arguments": arguments }),
+            json!({ "callId": call_id, "name": name, "arguments": arguments }),
         );
         let mut structured_result = None;
         let result = match name.as_str() {
@@ -193,6 +217,7 @@ impl ServerHandler for AnalysisSource {
         self.record(
             "mcp.tool.completed",
             json!({
+                "callId": call_id,
                 "name": name,
                 "arguments": arguments,
                 "isError": result.is_err(),

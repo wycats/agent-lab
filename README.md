@@ -36,11 +36,13 @@ being copied here.
 ## Status
 
 The embedded Nushell/MCP, browser feedback, neutral external-driver, catalog,
-and shared two-harness workbench threads are implemented. The workbench can
-capture one Explore revision, run two configured harnesses sequentially, show
-their behavioral differences, and reopen the paired evidence after restart.
-Names and contracts remain provisional as later steel threads produce
-evidence.
+shared two-harness workbench, and persistent interactive-agent session threads
+are implemented. A builder can continue a real harness-native session from
+Nushell, inspect its attributable turns in the browser, capture one Explore
+revision, run two configured harnesses sequentially, and reopen the paired
+evidence after restart. Names and contracts remain provisional as later steel
+threads produce evidence. Evaluation drafting, validation, saving, and rerunning
+from an exploratory turn remain the proposed next boundary in RFC 0004.
 
 ## Browser workbench
 
@@ -63,26 +65,73 @@ workspace projection needs a controller-mediated, attributable interface rather
 than ambient shell access. Keep the loopback workbench local and run the browser
 acceptance with `pnpm web:test`.
 
+For a managed development service, use the checked-in locald configuration:
+
+```console
+$ locald up
+```
+
+Open `https://workbench.agent-lab.localhost/`. locald supplies a sticky `$PORT`
+to the development launcher while the canonical HTTPS origin remains stable for
+the browser, cookies, and same-origin authorization. The random loopback port is
+the private listener behind that browser surface; it is not a second public
+workbench URL.
+
 ## The opening loop
 
 Agent Lab begins with a real environment rather than a prewritten agent run.
 The browser and Nushell are two projections of the same active workspace,
 capabilities, harness selection, model profile, and evaluation history.
 
-The catalog scenario demonstrates the loop in four commands:
+The catalog scenario demonstrates the loop without requiring the builder to
+assemble context for the agent first:
 
 ```nu
+agent "Which catalog items are active, and which one matters most?"
+agent "What did you conclude earlier?"
+agent turn
 catalog list | where active
-catalog list | where active | analysis summarize
 lab assembly
 lab compare
 ```
 
-The first two commands explore and compose the capabilities available to every
-harness. `lab assembly` makes the controlled inputs explicit. `lab compare`
+`agent` lazily opens the selected harness's native session. The harness receives
+the catalog and analysis capabilities directly, so it can decide what to
+inspect; the second turn demonstrates native conversational continuity.
+`agent turn` exposes the answer, attributable capability activity, usage, and
+workspace effects as structured evidence. The builder can then query the same
+capability state directly and inspect the controlled assembly. `lab compare`
 captures the current workspace revision, runs the selected harness pair, and
 streams structured progress into both Nushell and the browser. `lab evaluation`
 reopens the durable result without rerunning it.
+
+At the prompt, a completed `agent "..."` displays the assistant response as
+rendered Markdown. Its pipeline value remains a structured `agent-answer`
+record, so binding or piping it preserves the response, session and turn
+identities, activity, usage, outcome, and evidence:
+
+```nu
+let answer = (agent "Summarize the workspace")
+$answer.response | from md
+```
+
+Use `--stream` when a consumer wants assistant Markdown as a text stream, or
+`--raw` when it wants attributable session events. These projections are
+mutually exclusive, and each turn remains durable and reopenable with
+`agent turn`.
+
+Structured pipelines remain available when the builder intentionally wants to
+provide context rather than ask the harness to discover it:
+
+```nu
+catalog list | where active | agent "Analyze this exact selection"
+```
+
+Use `agent new`, `agent sessions`, `agent switch`, `agent cancel`, and
+`agent close` to manage workspace-scoped sessions explicitly. Session identity,
+turn input, native activity, cancellation, and workspace effects are retained as
+local evidence; server restart preserves the history and marks any live native
+process as interrupted.
 
 ## Model access
 

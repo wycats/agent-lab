@@ -102,6 +102,165 @@ export interface WorkbenchSnapshot {
   modelProfiles: ModelProfileMetadata[];
   modelAccess: ModelAccessSnapshot[];
   latestEvaluation?: EvaluationSummary;
+  activeAgentSession?: AgentSessionSummary;
+  replayAgentSession?: AgentSessionSummary;
+  agentSessions: AgentSessionSummary[];
+  agentTurnIndex: AgentTurnCompletionIndex;
+}
+
+export type AgentSessionStatus = 'starting' | 'ready' | 'running' | 'closing' | 'failed' | 'closed' | 'interrupted';
+export type AgentTurnStatus = 'queued' | 'running' | 'completed' | 'intervened' | 'failed' | 'cancelled';
+
+export interface AgentSessionSummary {
+  id: string;
+  workspaceId: string;
+  harnessId: string;
+  modelProfileId: string;
+  modelId: string;
+  status: AgentSessionStatus;
+  active: boolean;
+  createdAtMs: number;
+  updatedAtMs: number;
+  turnCount: number;
+  error?: string;
+}
+
+export interface AgentTurnCompletionRef {
+  id: string;
+  sessionId: string;
+  startedAtMs: number;
+}
+
+export interface AgentTurnCompletionIndex {
+  entries: AgentTurnCompletionRef[];
+  total: number;
+  truncated: boolean;
+}
+
+export interface AgentTurnSummary {
+  id: string;
+  sessionId: string;
+  prompt: string;
+  input?: unknown | null;
+  sourceRevision: string;
+  capabilityRevisions: Record<string, string>;
+  status: AgentTurnStatus;
+  startedAtMs: number;
+  finishedAtMs?: number;
+  outcome?: string;
+  error?: string;
+  humanInterventionAtMs?: number;
+  presentation?: AgentTurnPresentation;
+}
+
+export interface AgentTurnMessagePresentation {
+  id: string;
+  text: string;
+  complete: boolean;
+  sourceEventSequences: number[];
+}
+
+export interface AgentTurnActivityPresentation {
+  kind: string;
+  title: string;
+  detail: string | null;
+  status: string;
+  source: string | null;
+  path: string | null;
+  operation?: string | null;
+  callId?: string | null;
+  arguments?: unknown;
+  result?: unknown;
+  actionId?: string | null;
+  changeKind?: string | null;
+  entryType?: string | null;
+  beforeMode?: string | null;
+  afterMode?: string | null;
+  sourceEventSequences: number[];
+}
+
+function countedActivityLabel(count: number, singular: string): string {
+  return `${count} ${singular}${count === 1 ? '' : 's'}`;
+}
+
+function conciseActivityValue(value: string | number | boolean): string {
+  const rendered = typeof value === 'string' ? value : String(value);
+  return rendered.length <= 80 ? rendered : `${rendered.slice(0, 79)}…`;
+}
+
+function agentActivityArgumentsSummary(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (Array.isArray(value)) return `Arguments: ${countedActivityLabel(value.length, 'item')}`;
+  if (typeof value === 'object') {
+    const keys = Object.keys(value);
+    if (keys.length === 0) return null;
+    return keys.length <= 3
+      ? `Arguments: ${keys.join(', ')}`
+      : `Arguments: ${countedActivityLabel(keys.length, 'field')}`;
+  }
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return `Argument: ${conciseActivityValue(value)}`;
+  }
+  return null;
+}
+
+function agentActivityResultSummary(value: unknown, failed: boolean): string | null {
+  if (value === undefined) return null;
+  if (value === null) return failed ? 'Capability failed' : 'Returned no value';
+  if (Array.isArray(value)) {
+    return `${failed ? 'Failed with' : 'Returned'} ${countedActivityLabel(value.length, 'item')}`;
+  }
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const message = record.message ?? record.error;
+    if (failed && typeof message === 'string') return `Failed: ${conciseActivityValue(message)}`;
+    if (Array.isArray(record.items)) {
+      return `${failed ? 'Failed with' : 'Returned'} ${countedActivityLabel(record.items.length, 'item')}`;
+    }
+    const fieldCount = Object.keys(record).length;
+    return `${failed ? 'Failed with' : 'Returned'} ${countedActivityLabel(fieldCount, 'field')}`;
+  }
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return `${failed ? 'Failed' : 'Returned'}: ${conciseActivityValue(value)}`;
+  }
+  return null;
+}
+
+export function agentTurnActivityDetail(activity: AgentTurnActivityPresentation): string | null {
+  if (activity.detail) return activity.detail;
+  if (activity.kind !== 'capability-call') return null;
+
+  const parts = [
+    agentActivityArgumentsSummary(activity.arguments),
+    agentActivityResultSummary(activity.result, activity.status === 'failed')
+  ].filter((part): part is string => part !== null);
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+export interface AgentTurnPresentationCompleteness {
+  assistantOutput: 'complete' | 'partial' | 'unavailable';
+  capabilityActivity: 'complete' | 'partial' | 'unavailable';
+  nativeActivity: 'complete' | 'partial' | 'unavailable';
+  workspaceEffects: 'complete' | 'partial' | 'unavailable';
+  usage: 'complete' | 'partial' | 'unavailable';
+}
+
+export interface AgentTurnPresentation {
+  schemaVersion: 1 | 2;
+  response: string | null;
+  messages: AgentTurnMessagePresentation[];
+  activity: AgentTurnActivityPresentation[];
+  usage: Record<string, unknown> | null;
+  completeness: AgentTurnPresentationCompleteness;
+  sourceEventSequences: number[];
+  sourceDigest: string;
+}
+
+export interface AgentSessionDetail {
+  projectionVersion: number;
+  summary: AgentSessionSummary;
+  turns: AgentTurnSummary[];
+  events: RunEvent[];
 }
 
 export type EvaluationStatus = 'queued' | 'running' | 'passed' | 'failed' | 'cancelled';
@@ -156,11 +315,29 @@ export interface EvaluationComparisonArm {
   cache: 'not reported' | { readTokens: number; writeTokens: number };
 }
 
+export type RunProgressPhase =
+  | 'starting'
+  | 'preparing'
+  | 'reasoning'
+  | 'responding'
+  | 'acting'
+  | 'waiting'
+  | 'finalizing';
+
+export interface RunEventProgress {
+  phase: RunProgressPhase;
+  detail?: string | null;
+  source?: string | null;
+  sourceEventSequence?: number | null;
+  sourceEventType?: string | null;
+}
+
 export interface RunEvent {
   sequence: number;
   atMs: number;
   type: string;
   payload: unknown;
+  progress?: RunEventProgress;
 }
 
 export interface RunReview {
@@ -203,13 +380,17 @@ export interface RunClient {
   modelProfiles(): Promise<ModelProfileMetadata[]>;
   scenarios(): Promise<ScenarioManifest[]>;
   runs(): Promise<RunSummary[]>;
-  prepare(scenarioId: string): Promise<RunSummary>;
+  prepare(scenarioId: string, sourceWorkspaceId?: string): Promise<RunSummary>;
   start(scenarioId: string, modelId: string): Promise<RunSummary>;
   startPrepared(id: string, modelId: string): Promise<RunSummary>;
   startPreparedHarness(id: string, harnessId: string, modelProfileId: string): Promise<RunSummary>;
   detail(id: string): Promise<RunDetail>;
   cancel(id: string): Promise<void>;
-  events(id: string, onEvent: (event: RunEvent) => void): AbortController;
+  events(
+    id: string,
+    onEvent: (event: RunEvent) => void | Promise<void>,
+    onReset?: (reset: RunEventStreamReset) => number | Promise<number>
+  ): AbortController;
   evaluations(): Promise<EvaluationSummary[]>;
   startEvaluation(input: {
     scenarioId: string;
@@ -229,6 +410,20 @@ export interface RunClient {
     id: string,
     input?: { modelProfileId?: string; harnessIds?: string[] }
   ): Promise<EvaluationSummary>;
+  agentSession(workspaceId: string, sessionId: string): Promise<AgentSessionDetail>;
+  cancelAgentTurn(workspaceId: string, sessionId: string): Promise<void>;
+  agentSessionEvents(
+    workspaceId: string,
+    sessionId: string,
+    onEvent: (event: RunEvent) => void | Promise<void>,
+    onReset?: (reset: RunEventStreamReset) => number | Promise<number>
+  ): AbortController;
+}
+
+export interface RunEventStreamReset {
+  previousEpoch?: string;
+  epoch: string;
+  responseStatus: number;
 }
 
 async function processToken(): Promise<string> {
@@ -264,7 +459,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 async function streamEvents(
   path: string,
   signal: AbortSignal,
-  onEvent: (event: RunEvent) => void
+  onEvent: (event: RunEvent) => void | Promise<void>,
+  onOpen?: (response: Response) => void | Promise<void>
 ): Promise<void> {
   const token = await processToken();
   const response = await fetch(path, {
@@ -272,28 +468,135 @@ async function streamEvents(
     cache: 'no-store',
     signal
   });
-  if (!response.ok || !response.body) {
+  if (!response.body) {
+    await onOpen?.(response);
     throw new Error(`event stream failed with HTTP ${response.status}`);
   }
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
-  let buffer = '';
-  while (!signal.aborted) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += value;
-    let boundary = buffer.indexOf('\n\n');
-    while (boundary !== -1) {
-      const frame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const data = frame
-        .split('\n')
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trimStart())
-        .join('\n');
-      if (data) onEvent(JSON.parse(data) as RunEvent);
-      boundary = buffer.indexOf('\n\n');
+  let reachedEof = false;
+  try {
+    await onOpen?.(response);
+    if (!response.ok) {
+      throw new Error(`event stream failed with HTTP ${response.status}`);
     }
+    let buffer = '';
+    while (!signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done) {
+        reachedEof = true;
+        break;
+      }
+      buffer += value;
+      let boundary = buffer.indexOf('\n\n');
+      while (boundary !== -1) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const data = frame
+          .split('\n')
+          .filter((line) => line.startsWith('data:'))
+          .map((line) => line.slice(5).trimStart())
+          .join('\n');
+        if (data) await onEvent(JSON.parse(data) as RunEvent);
+        boundary = buffer.indexOf('\n\n');
+      }
+    }
+  } finally {
+    if (!reachedEof) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Fetch aborts can close the body before cancellation reaches the reader.
+      }
+    }
+    reader.releaseLock();
   }
+}
+
+const EVENT_STREAM_RECONNECT_INITIAL_MS = 100;
+const EVENT_STREAM_RECONNECT_MAX_MS = 2_000;
+const EVENT_STREAM_RECONNECT_STABLE_MS = 5_000;
+const EVENT_STREAM_EPOCH_HEADER = 'X-Agent-Lab-Event-Stream-Epoch';
+
+function waitForAbortableDelay(milliseconds: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (elapsed: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+      resolve(elapsed);
+    };
+    const timer = setTimeout(() => finish(true), milliseconds);
+    const abort = () => finish(false);
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
+
+function reconnectingRunEvents(
+  path: string,
+  onEvent: (event: RunEvent) => void | Promise<void>,
+  onReset?: (reset: RunEventStreamReset) => number | Promise<number>
+): AbortController {
+  const controller = new AbortController();
+  void (async () => {
+    let retryDelayMs = EVENT_STREAM_RECONNECT_INITIAL_MS;
+    let lastDeliveredSequence = 0;
+    let eventStreamEpoch: string | undefined;
+    let unavailableResponseHandled = false;
+    while (!controller.signal.aborted) {
+      let connectedAtMs: number | undefined;
+      try {
+        await streamEvents(
+          path,
+          controller.signal,
+          async (event) => {
+            if (event.sequence <= lastDeliveredSequence) return;
+            await onEvent(event);
+            lastDeliveredSequence = event.sequence;
+          },
+          async (response) => {
+            connectedAtMs = Date.now();
+            const responseEpoch = response.headers.get(EVENT_STREAM_EPOCH_HEADER) ?? undefined;
+            if (!responseEpoch) return;
+            const epochChanged = eventStreamEpoch !== undefined && responseEpoch !== eventStreamEpoch;
+            const unavailable = !response.ok;
+            const availabilityChanged = unavailable && !unavailableResponseHandled;
+            if (!epochChanged && !availabilityChanged) {
+              eventStreamEpoch = responseEpoch;
+              if (!unavailable) unavailableResponseHandled = false;
+              return;
+            }
+            const reconciledSequence = await onReset?.({
+              previousEpoch: eventStreamEpoch,
+              epoch: responseEpoch,
+              responseStatus: response.status
+            }) ?? 0;
+            if (!Number.isSafeInteger(reconciledSequence) || reconciledSequence < 0) {
+              throw new Error('run event stream reset returned an invalid sequence');
+            }
+            eventStreamEpoch = responseEpoch;
+            lastDeliveredSequence = reconciledSequence;
+            unavailableResponseHandled = unavailable;
+          }
+        );
+      } catch {
+        // A later connection replays the run's durable event history.
+      }
+      if (controller.signal.aborted) return;
+      if (
+        connectedAtMs !== undefined &&
+        Date.now() - connectedAtMs >= EVENT_STREAM_RECONNECT_STABLE_MS
+      ) {
+        retryDelayMs = EVENT_STREAM_RECONNECT_INITIAL_MS;
+      }
+      if (!(await waitForAbortableDelay(retryDelayMs, controller.signal))) return;
+      retryDelayMs = Math.min(retryDelayMs * 2, EVENT_STREAM_RECONNECT_MAX_MS);
+    }
+  })();
+  return controller;
 }
 
 export function createRunClient(): RunClient {
@@ -303,10 +606,10 @@ export function createRunClient(): RunClient {
     modelProfiles: () => request('/api/model-profiles'),
     scenarios: () => request('/api/scenarios'),
     runs: () => request('/api/runs'),
-    prepare: (scenarioId) =>
+    prepare: (scenarioId, sourceWorkspaceId) =>
       request('/api/explore', {
         method: 'POST',
-        body: JSON.stringify({ scenarioId })
+        body: JSON.stringify({ scenarioId, sourceWorkspaceId })
       }),
     start: (scenarioId, modelId) =>
       request('/api/runs', {
@@ -325,13 +628,8 @@ export function createRunClient(): RunClient {
       }),
     detail: (id) => request(`/api/runs/${encodeURIComponent(id)}`),
     cancel: (id) => request(`/api/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
-    events(id, onEvent) {
-      const controller = new AbortController();
-      void streamEvents(`/api/runs/${encodeURIComponent(id)}/events`, controller.signal, onEvent).catch((error) => {
-        if (!controller.signal.aborted) console.error(error);
-      });
-      return controller;
-    },
+    events: (id, onEvent, onReset) =>
+      reconnectingRunEvents(`/api/runs/${encodeURIComponent(id)}/events`, onEvent, onReset),
     evaluations: () => request('/api/evaluations'),
     startEvaluation: (input) =>
       request('/api/evaluations', { method: 'POST', body: JSON.stringify(input) }),
@@ -359,6 +657,17 @@ export function createRunClient(): RunClient {
       request(`/api/workbench/${encodeURIComponent(id)}/compare`, {
         method: 'POST',
         body: JSON.stringify(input)
-      })
+      }),
+    agentSession: (workspaceId, sessionId) =>
+      request(`/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}`),
+    cancelAgentTurn: (workspaceId, sessionId) =>
+      request(
+        `/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}/cancel`,
+        { method: 'POST' }
+      ),
+    agentSessionEvents(workspaceId, sessionId, onEvent, onReset) {
+      const path = `/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}/events`;
+      return reconnectingRunEvents(path, onEvent, onReset);
+    }
   };
 }

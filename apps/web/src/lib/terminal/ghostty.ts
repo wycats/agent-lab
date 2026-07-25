@@ -14,10 +14,29 @@ function initializeGhostty(): Promise<void> {
 class GhosttyTerminalSurface implements TerminalSurface {
   readonly #terminal: Terminal;
   readonly #fit: FitAddon;
+  readonly #host: HTMLElement;
+  readonly #input: HTMLTextAreaElement;
+  readonly #forwardHostFocus: (event: FocusEvent) => void;
+  readonly #focusInputAfterClick: (event: MouseEvent) => void;
 
-  constructor(terminal: Terminal, fit: FitAddon) {
+  constructor(
+    terminal: Terminal,
+    fit: FitAddon,
+    host: HTMLElement,
+    input: HTMLTextAreaElement
+  ) {
     this.#terminal = terminal;
     this.#fit = fit;
+    this.#host = host;
+    this.#input = input;
+    this.#forwardHostFocus = (event) => {
+      if (event.target === this.#host) this.#input.focus({ preventScroll: true });
+    };
+    this.#focusInputAfterClick = (event) => {
+      if (event.button === 0) this.#input.focus({ preventScroll: true });
+    };
+    this.#host.addEventListener('focusin', this.#forwardHostFocus);
+    this.#host.addEventListener('click', this.#focusInputAfterClick);
   }
 
   get dimensions(): TerminalDimensions {
@@ -47,6 +66,27 @@ class GhosttyTerminalSurface implements TerminalSurface {
     return this.#terminal.onData(listener);
   }
 
+  onUserInput(listener: () => void): Disposable {
+    const key = this.#terminal.onKey(({ domEvent }) => {
+      const keyName = domEvent.key.toLowerCase();
+      const modifierOnly = ['alt', 'altgraph', 'capslock', 'control', 'meta', 'shift'].includes(
+        keyName
+      );
+      if (!domEvent.metaKey && !modifierOnly) listener();
+    });
+    const paste = () => listener();
+    const composition = () => listener();
+    this.#host.addEventListener('paste', paste, { capture: true });
+    this.#host.addEventListener('compositionstart', composition, { capture: true });
+    return {
+      dispose: () => {
+        key.dispose();
+        this.#host.removeEventListener('paste', paste, { capture: true });
+        this.#host.removeEventListener('compositionstart', composition, { capture: true });
+      }
+    };
+  }
+
   onResize(listener: (dimensions: TerminalDimensions) => void): Disposable {
     return this.#terminal.onResize(listener);
   }
@@ -56,10 +96,12 @@ class GhosttyTerminalSurface implements TerminalSurface {
   }
 
   focus(): void {
-    this.#terminal.focus();
+    this.#input.focus({ preventScroll: true });
   }
 
   dispose(): void {
+    this.#host.removeEventListener('focusin', this.#forwardHostFocus);
+    this.#host.removeEventListener('click', this.#focusInputAfterClick);
     this.#fit.dispose();
     this.#terminal.dispose();
   }
@@ -67,7 +109,7 @@ class GhosttyTerminalSurface implements TerminalSurface {
 
 export async function createGhosttySurface(host: HTMLElement): Promise<TerminalSurface> {
   await initializeGhostty();
-  await document.fonts.load('400 14px "Geist Mono Variable"');
+  await document.fonts.load('400 13px "Geist Mono Variable"');
   const terminal = new Terminal({
     cols: 100,
     rows: 30,
@@ -76,7 +118,7 @@ export async function createGhosttySurface(host: HTMLElement): Promise<TerminalS
     cursorBlink: false,
     cursorStyle: 'bar',
     fontFamily: '"Geist Mono Variable", "Geist Mono", monospace',
-    fontSize: 14,
+    fontSize: 13,
     scrollback: 10_000,
     theme: {
       background: '#111715',
@@ -99,7 +141,12 @@ export async function createGhosttySurface(host: HTMLElement): Promise<TerminalS
   const fit = new FitAddon();
   terminal.loadAddon(fit);
   terminal.open(host);
+  const input = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+  if (!input) {
+    terminal.dispose();
+    throw new Error('Ghostty did not create its terminal input');
+  }
   fit.fit();
   fit.observeResize();
-  return new GhosttyTerminalSurface(terminal, fit);
+  return new GhosttyTerminalSurface(terminal, fit, host, input);
 }

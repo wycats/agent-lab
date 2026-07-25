@@ -43,9 +43,3014 @@ test('model access surfaces the provider blocking the shared selection', async (
   const access = page.locator('.model-access-pill');
   await expect(access).toContainText('Connect');
   await expect(access).toHaveAttribute('title', 'Connect the second provider.');
-  await page.getByLabel('Harness').selectOption('v0');
+  await page.getByLabel('Default harness').selectOption('v0');
   await expect(page.getByRole('button', { name: 'Run harness', exact: true })).toBeEnabled();
   await expect(page.getByRole('button', { name: 'Compare v0 with Eve' })).toBeDisabled();
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('an interrupted replay selection reopens durable rendered and source evidence', async ({ page }) => {
+  let replayStreamRequests = 0;
+  page.on('request', (request) => {
+    if (/\/agent-sessions\/replay-session\/events$/.test(new URL(request.url()).pathname)) {
+      replayStreamRequests += 1;
+    }
+  });
+  const summary = {
+    id: 'replay-session',
+    workspaceId: '',
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'interrupted',
+    active: false,
+    createdAtMs: 1,
+    updatedAtMs: 3,
+    turnCount: 1,
+    error: 'the server restarted; start a new agent session to continue'
+  };
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    summary.workspaceId = workbench.workspaceId;
+    workbench.activeAgentSession = null;
+    workbench.replayAgentSession = summary;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(/\/api\/workbench\/[^/]+\/agent-sessions\/replay-session$/, async (route) => {
+    await route.fulfill({
+      json: {
+        projectionVersion: 2,
+        summary,
+        turns: [{
+          id: 'replay-turn',
+          sessionId: summary.id,
+          prompt: 'Markdown report',
+          sourceRevision: 'sha256:replay',
+          capabilityRevisions: {},
+          status: 'completed',
+          startedAtMs: 1,
+          finishedAtMs: 2,
+          outcome: 'completed',
+          presentation: {
+            schemaVersion: 2,
+            response: '# Durable answer\n\n**Reopened** after restart.',
+            messages: [{
+              id: 'replay-message',
+              text: '# Durable answer\n\n**Reopened** after restart.',
+              complete: true,
+              sourceEventSequences: [1]
+            }],
+            activity: [{
+              kind: 'capability-call',
+              title: 'catalog · list',
+              detail: null,
+              status: 'completed',
+              source: 'catalog',
+              path: null,
+              operation: 'list',
+              callId: 'call-1',
+              arguments: {},
+              result: {
+                items: [
+                  { name: 'alpha', score: 3 },
+                  { name: 'beta', score: 5 },
+                  { name: 'gamma', score: 8 }
+                ]
+              },
+              sourceEventSequences: [2, 3]
+            }],
+            usage: null,
+            completeness: {
+              assistantOutput: 'complete',
+              capabilityActivity: 'complete',
+              nativeActivity: 'complete',
+              workspaceEffects: 'complete',
+              usage: 'unavailable'
+            },
+            sourceEventSequences: [1],
+            sourceDigest: 'sha256:replay-answer'
+          }
+        }],
+        events: []
+      }
+    });
+  });
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const session = page.getByTestId('interactive-agent-session');
+  await expect(page.locator('.run-heading')).toContainText('Session replay');
+  await expect(page.locator('.run-heading')).toContainText('interrupted');
+  await expect(session).toContainText('Reopened from durable evidence. Start a new agent session to continue.');
+  await expect(session.getByRole('heading', { name: 'Durable answer', level: 3 })).toBeVisible();
+  const activity = session.getByLabel('Turn activity');
+  await expect(activity).toContainText('catalog · list');
+  await expect(activity).toContainText('Returned 3 items');
+  await expect(activity).not.toContainText('{"items"');
+  const presentation = session.getByRole('group', { name: 'Agent answer presentation' });
+  await presentation.getByRole('button', { name: 'Source' }).click();
+  await expect(session.locator('.response-source')).toContainText('# Durable answer');
+  await expect(session.getByTestId('agent-live-status')).toHaveCount(0);
+  await expect(session.getByRole('button', { name: 'Cancel turn' })).toHaveCount(0);
+  await page.waitForTimeout(100);
+  expect(replayStreamRequests).toBe(0);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('a session that fails while opening becomes retained history', async ({ page }) => {
+  let failedStreamRequests = 0;
+  const startingSummary = {
+    id: 'failed-session',
+    workspaceId: '',
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'starting',
+    active: true,
+    createdAtMs: 1,
+    updatedAtMs: 1,
+    turnCount: 0
+  };
+  const failedSummary = {
+    ...startingSummary,
+    status: 'failed',
+    active: false,
+    updatedAtMs: 2,
+    error: 'fixture driver could not open the session'
+  };
+  page.on('request', (request) => {
+    if (/\/agent-sessions\/failed-session\/events$/.test(new URL(request.url()).pathname)) {
+      failedStreamRequests += 1;
+    }
+  });
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    startingSummary.workspaceId = workbench.workspaceId;
+    failedSummary.workspaceId = workbench.workspaceId;
+    workbench.activeAgentSession = startingSummary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [failedSummary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(/\/api\/workbench\/[^/]+\/agent-sessions\/failed-session$/, async (route) => {
+    await route.fulfill({
+      json: {
+        projectionVersion: 1,
+        summary: failedSummary,
+        turns: [],
+        events: []
+      }
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect(page.locator('.run-heading')).toContainText('Session history');
+  await expect(page.locator('.run-heading')).toContainText('failed');
+  await expect(page.getByTestId('interactive-agent-session')).toContainText(
+    'Retained as durable evidence. Start a new agent session to continue.'
+  );
+  await page.waitForTimeout(100);
+  expect(failedStreamRequests).toBe(0);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('ready agent sessions keep their workspace selected until every driver closes', async ({ page }) => {
+  let exploreRequests = 0;
+  page.on('request', (request) => {
+    if (
+      request.method() === 'POST' &&
+      new URL(request.url()).pathname === '/api/explore'
+    ) {
+      exploreRequests += 1;
+    }
+  });
+  await page.route('/api/scenarios', async (route) => {
+    const response = await route.fetch();
+    const scenarios = await response.json();
+    await route.fulfill({
+      response,
+      json: [
+        ...scenarios,
+        {
+          ...scenarios[0],
+          id: 'alternate-scenario',
+          title: 'Alternate scenario'
+        }
+      ]
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const scenario = page.getByLabel('Scenario');
+  await expect(scenario).toBeEnabled();
+  await page.getByLabel('Default harness').selectOption('v0');
+
+  const screen = page.getByTestId('terminal-text');
+  await submit(page, 'agent new | get status');
+  await expect(page.locator('.run-heading')).toContainText('Active session');
+  await expect(page.getByTestId('interactive-agent-session')).toContainText(
+    'Ask the harness in Explore.'
+  );
+  await expect(scenario).toBeDisabled();
+  const runHarness = page.getByRole('button', { name: 'Run harness', exact: true });
+  await expect(runHarness).toBeDisabled();
+
+  const preparedWorkspaceCount = exploreRequests;
+  const originalScenario = await scenario.inputValue();
+  await page.evaluate(({ originalScenario }) => {
+    const selector = document.querySelector<HTMLSelectElement>('select[aria-label="Scenario"]');
+    if (!selector) throw new Error('scenario selector was not mounted');
+    selector.value = 'alternate-scenario';
+    selector.dispatchEvent(new Event('change', { bubbles: true }));
+    selector.value = originalScenario;
+    selector.dispatchEvent(new Event('change', { bubbles: true }));
+  }, { originalScenario });
+  await page.waitForTimeout(100);
+  expect(exploreRequests).toBe(preparedWorkspaceCount);
+
+  await submit(
+    page,
+    'let first = (agent | get id); let second = (agent new | get id); agent close; agent sessions | where status == ready | length'
+  );
+  await expect(screen).toContainText('1');
+  await expect(page.locator('.run-heading')).toContainText('Session history');
+  await expect(scenario).toBeDisabled();
+  await expect(runHarness).toBeDisabled();
+
+  await submit(
+    page,
+    'let remaining = (agent sessions | where status == ready | get id | first); agent close $remaining'
+  );
+  await expect(page.locator('.run-heading')).toContainText('Session history');
+  await expect(scenario).toBeEnabled();
+  await expect(runHarness).toBeEnabled();
+  expect(exploreRequests).toBe(preparedWorkspaceCount);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('a stale workbench snapshot cannot reopen a terminal non-active session', async ({ page }) => {
+  const sessionId = 'non-active-session';
+  let workspaceId = '';
+  let serveStaleSnapshot = false;
+  let workbenchRequests = 0;
+
+  await page.addInitScript(() => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (/^\/api\/runs\/[^/]+\/events$/.test(requestUrl.pathname)) {
+        const encoder = new TextEncoder();
+        let closed = false;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+              .__publishWorkspaceAgentEvent = (event) => {
+                if (closed || init?.signal?.aborted) return;
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+              };
+            init?.signal?.addEventListener('abort', () => {
+              if (closed) return;
+              closed = true;
+              controller.close();
+            }, { once: true });
+          },
+          cancel() {
+            closed = true;
+          }
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' }
+        });
+      }
+      return nativeFetch(input, init);
+    };
+  });
+
+  const summary = (status: 'ready' | 'closed', updatedAtMs: number) => ({
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status,
+    active: false,
+    createdAtMs: 1,
+    updatedAtMs,
+    turnCount: 0
+  });
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    workbenchRequests += 1;
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    workbench.activeAgentSession = null;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = serveStaleSnapshot ? [summary('ready', 2)] : [];
+    await route.fulfill({ response, json: workbench });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect.poll(() =>
+    page.evaluate(() =>
+      typeof (window as Window & { __publishWorkspaceAgentEvent?: unknown })
+        .__publishWorkspaceAgentEvent
+    )
+  ).toBe('function');
+  const scenario = page.getByLabel('Scenario');
+  await expect(scenario).toBeEnabled();
+
+  await page.evaluate(({ sessionId, session }) => {
+    (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+      .__publishWorkspaceAgentEvent?.({
+        sequence: 1_000_000,
+        atMs: 2,
+        type: 'workbench.agent.session.updated',
+        payload: { sessionId, session }
+      });
+  }, { sessionId, session: summary('ready', 2) });
+  await expect(scenario).toBeDisabled();
+
+  await page.evaluate(({ sessionId, session }) => {
+    (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+      .__publishWorkspaceAgentEvent?.({
+        sequence: 1_000_001,
+        atMs: 3,
+        type: 'workbench.agent.session.updated',
+        payload: { sessionId, session }
+      });
+  }, { sessionId, session: summary('closed', 3) });
+  await expect(scenario).toBeEnabled();
+
+  serveStaleSnapshot = true;
+  const requestsBeforeReload = workbenchRequests;
+  await page.getByLabel('Default harness').selectOption('v0');
+  await expect.poll(() => workbenchRequests).toBeGreaterThan(requestsBeforeReload);
+  await expect(scenario).toBeEnabled();
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('initial active session detail failure reconciles the session after reload', async ({ page }) => {
+  const sessionId = 'initial-reconciliation-session';
+  let workspaceId = '';
+  let sessionDetailRequests = 0;
+  let releaseRecovery = () => {};
+  const recovery = new Promise<void>((resolve) => {
+    releaseRecovery = resolve;
+  });
+  const summary = {
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'ready',
+    active: true,
+    createdAtMs: 1,
+    updatedAtMs: 2,
+    turnCount: 0
+  };
+
+  await page.addInitScript(({ sessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (requestUrl.pathname.endsWith(`/agent-sessions/${sessionId}/events`)) {
+        let closed = false;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            init?.signal?.addEventListener('abort', () => {
+              if (closed) return;
+              closed = true;
+              controller.close();
+            }, { once: true });
+          },
+          cancel() {
+            closed = true;
+          }
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'X-Agent-Lab-Event-Stream-Epoch': 'fixture-boot'
+          }
+        });
+      }
+      return nativeFetch(input, init);
+    };
+  }, { sessionId });
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    summary.workspaceId = workspaceId;
+    workbench.activeAgentSession = summary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(
+    new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`),
+    async (route) => {
+      sessionDetailRequests += 1;
+      if (sessionDetailRequests === 1) {
+        await route.fulfill({
+          status: 503,
+          json: { error: 'fixture initial session detail is temporarily unavailable' }
+        });
+        return;
+      }
+      await recovery;
+      await route.fulfill({
+        json: {
+          projectionVersion: 1,
+          summary,
+          turns: [],
+          events: []
+        }
+      });
+    }
+  );
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect(page.getByRole('alert')).toContainText(
+    'Agent session updates are temporarily unavailable. Retrying…'
+  );
+  await expect.poll(() => sessionDetailRequests).toBe(2);
+  await expect(page.getByTestId('interactive-agent-session')).toHaveCount(0);
+
+  releaseRecovery();
+  const session = page.getByTestId('interactive-agent-session');
+  await expect(session).toBeVisible();
+  await expect(page.locator('.run-heading')).toContainText('Active session');
+  await expect(page.locator('.run-heading')).toContainText('ready');
+  await expect(session).toContainText('Ask the harness in Explore.');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('activation and selection reload preserve an already displayed session lifecycle', async ({ page }) => {
+  const sessionId = 'activating-session';
+  let workspaceId = '';
+  let activated = false;
+  let sessionDetailRequests = 0;
+  let failNextSessionDetail = false;
+  let failedSessionDetailRequests = 0;
+
+  await page.addInitScript(({ sessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      const isWorkspaceStream = /^\/api\/runs\/[^/]+\/events$/.test(requestUrl.pathname);
+      const isAgentStream = requestUrl.pathname.endsWith(
+        `/agent-sessions/${sessionId}/events`
+      );
+      if (isWorkspaceStream || isAgentStream) {
+        const encoder = new TextEncoder();
+        let closed = false;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            if (isWorkspaceStream) {
+              (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+                .__publishWorkspaceAgentEvent = (event) => {
+                  if (closed || init?.signal?.aborted) return;
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                };
+            } else {
+              const state = window as Window & { __activationAgentStreamRequests?: number };
+              state.__activationAgentStreamRequests =
+                (state.__activationAgentStreamRequests ?? 0) + 1;
+            }
+            init?.signal?.addEventListener('abort', () => {
+              if (closed) return;
+              closed = true;
+              try {
+                controller.close();
+              } catch {
+                // The stream may already have been closed by navigation.
+              }
+            }, { once: true });
+          },
+          cancel() {
+            closed = true;
+          }
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' }
+        });
+      }
+      return nativeFetch(input, init);
+    };
+  }, { sessionId });
+
+  const sessionSummary = () => ({
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: activated ? 'ready' : 'starting',
+    active: activated,
+    createdAtMs: 1,
+    updatedAtMs: activated ? 3 : 2,
+    turnCount: 0
+  });
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    const activeSession = activated ? sessionSummary() : null;
+    workbench.activeAgentSession = activeSession;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = activeSession ? [activeSession] : [];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(
+    new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`),
+    async (route) => {
+      sessionDetailRequests += 1;
+      if (failNextSessionDetail) {
+        failNextSessionDetail = false;
+        failedSessionDetailRequests += 1;
+        await route.fulfill({
+          status: 503,
+          json: { error: 'fixture selection refresh is temporarily unavailable' }
+        });
+        return;
+      }
+      if (sessionDetailRequests === 2) {
+        // Keep the first recovery request in flight long enough to assert the
+        // transient retry state independently of machine and worker speed.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      await route.fulfill({
+        json: {
+          projectionVersion: 1,
+          summary: sessionSummary(),
+          turns: [],
+          events: []
+        }
+      });
+    }
+  );
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect.poll(() =>
+    page.evaluate(() =>
+      typeof (window as Window & { __publishWorkspaceAgentEvent?: unknown })
+        .__publishWorkspaceAgentEvent
+    )
+  ).toBe('function');
+
+  failNextSessionDetail = true;
+  await page.evaluate(({ sessionId, summary }) => {
+    (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+      .__publishWorkspaceAgentEvent?.({
+        sequence: 1_000_000,
+        atMs: 2,
+        type: 'workbench.agent.session.started',
+        payload: { sessionId, origin: 'nushell', session: summary }
+      });
+  }, { sessionId, summary: sessionSummary() });
+
+  const session = page.getByTestId('interactive-agent-session');
+  await expect(page.getByRole('alert')).toContainText(
+    'Agent session updates are temporarily unavailable. Retrying…'
+  );
+  await expect.poll(() => failedSessionDetailRequests).toBe(1);
+  await expect.poll(() => sessionDetailRequests).toBe(2);
+  await expect(session).toBeVisible();
+  await expect(page.locator('.run-heading')).toContainText('Agent session');
+  await expect(page.locator('.run-heading')).toContainText('starting');
+  await expect(session).toContainText('This session is getting ready.');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(page.getByLabel('Scenario')).toBeDisabled();
+
+  activated = true;
+  await page.evaluate(({ sessionId }) => {
+    (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+      .__publishWorkspaceAgentEvent?.({
+        sequence: 1_000_001,
+        atMs: 3,
+        type: 'workbench.agent.session.activated',
+        payload: { sessionId, origin: 'nushell' }
+      });
+  }, { sessionId });
+
+  await expect.poll(() => sessionDetailRequests).toBe(3);
+  await expect(page.locator('.run-heading')).toContainText('Active session');
+  await expect(page.locator('.run-heading')).toContainText('ready');
+  await expect(session).toContainText('Ask the harness in Explore.');
+  await expect(session.getByTestId('session-turn')).toHaveCount(0);
+  await expect(page.getByLabel('Scenario')).toBeDisabled();
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { __activationAgentStreamRequests?: number })
+      .__activationAgentStreamRequests ?? 0
+  )).toBe(2);
+
+  failNextSessionDetail = true;
+  await page.getByLabel('Default harness').selectOption('v0');
+  await expect.poll(() => failedSessionDetailRequests).toBe(2);
+  await expect.poll(() => sessionDetailRequests).toBe(5);
+  await expect(session).toBeVisible();
+  await expect(page.locator('.run-heading')).toContainText('Active session');
+  await expect(page.locator('.run-heading')).toContainText('ready');
+  await expect(session).toContainText('Ask the harness in Explore.');
+  expect(await page.evaluate(() =>
+    (window as Window & { __activationAgentStreamRequests?: number })
+      .__activationAgentStreamRequests ?? 0
+  )).toBe(2);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('a terminal event remains authoritative when quarantined run detail disappears', async ({ page }) => {
+  const terminalError =
+    'Bearer credential-that-must-not-be-rendered-from-run-quarantine';
+  const contaminatedEvidence = 'credential-that-must-leave-run-projections';
+  let quarantined = false;
+  let runDetailRequests = 0;
+  let holdNextRunDetail = false;
+  let staleRunDetailStartedResolve = () => {};
+  const staleRunDetailStarted = new Promise<void>((resolve) => {
+    staleRunDetailStartedResolve = resolve;
+  });
+  let releaseStaleRunDetail = () => {};
+  const staleRunDetail = new Promise<void>((resolve) => {
+    releaseStaleRunDetail = resolve;
+  });
+
+  await page.addInitScript(() => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (!/^\/api\/runs\/[^/]+\/events$/.test(requestUrl.pathname)) {
+        return nativeFetch(input, init);
+      }
+      const encoder = new TextEncoder();
+      let closed = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          (window as Window & { __publishTerminalRunEvent?: (event: unknown) => void })
+            .__publishTerminalRunEvent = (event) => {
+              if (closed || init?.signal?.aborted) return;
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            };
+          init?.signal?.addEventListener('abort', () => {
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The stream may already have been closed by navigation.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          closed = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+      });
+    };
+  });
+  await page.route(/\/api\/runs\/[^/]+$/, async (route) => {
+    runDetailRequests += 1;
+    if (quarantined) {
+      await route.fulfill({
+        status: 404,
+        json: { error: 'unknown run after evidence quarantine' }
+      });
+      return;
+    }
+    const response = await route.fetch();
+    const detail = await response.json();
+    detail.assembly = {
+      ...detail.assembly,
+      question: contaminatedEvidence
+    };
+    detail.review = {
+      ...detail.review,
+      steps: [{
+        ordinal: 1,
+        kind: 'model-turn',
+        title: 'Contaminated evidence',
+        detail: contaminatedEvidence,
+        status: 'running',
+        eventSequences: [999_998],
+        source: null,
+        path: null
+      }]
+    };
+    detail.events = [{
+      sequence: 999_998,
+      atMs: Date.now(),
+      type: 'observation.assistant.delta',
+      payload: { detail: contaminatedEvidence }
+    }];
+    detail.output = { detail: contaminatedEvidence };
+    if (holdNextRunDetail) {
+      holdNextRunDetail = false;
+      staleRunDetailStartedResolve();
+      await staleRunDetail;
+    }
+    await route.fulfill({ response, json: detail });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect(page.locator('.run-heading > .run-status')).toHaveText('exploring');
+  await expect(page.locator('body')).toContainText(contaminatedEvidence);
+  await expect.poll(() =>
+    page.evaluate(() =>
+      typeof (window as Window & { __publishTerminalRunEvent?: unknown })
+        .__publishTerminalRunEvent
+    )
+  ).toBe('function');
+
+  holdNextRunDetail = true;
+  await page.evaluate(() => {
+    (window as Window & { __publishTerminalRunEvent?: (event: unknown) => void })
+      .__publishTerminalRunEvent?.({
+        sequence: 999_999,
+        atMs: Date.now(),
+        type: 'run.status',
+        payload: { status: 'running' }
+      });
+  });
+  await staleRunDetailStarted;
+  quarantined = true;
+  await page.evaluate(({ terminalError }) => {
+    (window as Window & { __publishTerminalRunEvent?: (event: unknown) => void })
+      .__publishTerminalRunEvent?.({
+        sequence: 1_000_000,
+        atMs: Date.now(),
+        type: 'run.finished',
+        payload: {
+          status: 'failed',
+          error: terminalError,
+          score: { passed: false, evidenceQuarantined: true }
+        }
+      });
+  }, { terminalError });
+
+  await expect(page.locator('.run-heading > .run-status')).toHaveText('failed');
+  await expect(page.getByRole('button', { name: 'New workspace' })).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveText(
+    'Run evidence is unavailable. It has been removed from this workbench.'
+  );
+  await expect(page.getByRole('alert')).not.toContainText(terminalError);
+  await expect(page.getByRole('alert')).not.toContainText('unknown run');
+  await expect(page.getByTestId('run-evidence-unavailable')).toContainText(
+    'Run evidence unavailable'
+  );
+  await expect(page.locator('body')).not.toContainText(contaminatedEvidence);
+  await expect(page.locator('[data-testid="terminal"] textarea')).toHaveCount(0);
+  releaseStaleRunDetail();
+  await page.waitForTimeout(150);
+  await expect(page.getByTestId('run-evidence-unavailable')).toContainText(
+    'Run evidence unavailable'
+  );
+  await expect(page.locator('body')).not.toContainText(contaminatedEvidence);
+  await expect.poll(() => runDetailRequests).toBeGreaterThanOrEqual(2);
+  await page.getByRole('button', { name: 'Evidence' }).click();
+  await expect(page.locator('.artifact')).toContainText('"evidenceQuarantined": true');
+  await expect(page.locator('.artifact')).not.toContainText(contaminatedEvidence);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('an epoch-bearing run stream 404 clears its stale browser projection', async ({ page }) => {
+  const staleEvidence = 'stale evidence from the previous server epoch';
+  await page.addInitScript(({ staleEvidence }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (!/^\/api\/runs\/[^/]+\/events$/.test(requestUrl.pathname)) {
+        return nativeFetch(input, init);
+      }
+      const state = window as Window & {
+        __missingRunStreamAttempts?: number;
+        __releaseMissingRunStream?: () => void;
+      };
+      const attempt = (state.__missingRunStreamAttempts ?? 0) + 1;
+      state.__missingRunStreamAttempts = attempt;
+      if (attempt > 1) {
+        return new Response('', {
+          status: 404,
+          headers: { 'X-Agent-Lab-Event-Stream-Epoch': 'boot-1' }
+        });
+      }
+      const event = {
+        sequence: 1_000_000,
+        atMs: Date.now(),
+        type: 'observation.assistant.delta',
+        payload: { detail: staleEvidence }
+      };
+      const encoder = new TextEncoder();
+      let closed = false;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          state.__releaseMissingRunStream = () => {
+            if (closed) return;
+            closed = true;
+            controller.close();
+          };
+          init?.signal?.addEventListener('abort', () => {
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The reset handler can abort while the response is closing.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          closed = true;
+        }
+      }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': 'boot-1'
+        }
+      });
+    };
+  }, { staleEvidence });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await page.evaluate(() => {
+    (window as Window & { __releaseMissingRunStream?: () => void })
+      .__releaseMissingRunStream?.();
+  });
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { __missingRunStreamAttempts?: number })
+      .__missingRunStreamAttempts ?? 0
+  )).toBe(2);
+  await expect(page.getByRole('alert')).toHaveText(
+    'Run evidence is unavailable. It has been removed from this workbench.'
+  );
+  await expect(page.getByRole('button', { name: 'New workspace' })).toBeVisible();
+  await expect(page.getByTestId('run-evidence-unavailable')).toContainText(
+    'Run evidence unavailable'
+  );
+  await expect(page.locator('body')).not.toContainText(staleEvidence);
+  await page.waitForTimeout(250);
+  expect(await page.evaluate(() =>
+    (window as Window & { __missingRunStreamAttempts?: number })
+      .__missingRunStreamAttempts ?? 0
+  )).toBe(2);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('an unavailable evaluation clears live evidence without refetching it', async ({ page }) => {
+  const evaluationId = 'evaluation-unavailable-browser';
+  const contaminatedRevision = 'credential-that-must-leave-browser-memory';
+  const unsafeEventMessage = 'Bearer credential-that-must-not-be-rendered';
+  const summary = {
+    id: evaluationId,
+    scenarioId: 'catalog-to-file',
+    modelProfileId: 'fixture',
+    sourceWorkspaceId: 'explore-fixture',
+    sourceRevision: contaminatedRevision,
+    harnessIds: ['v0', 'eve'],
+    arms: [
+      { harnessId: 'v0', status: 'running' },
+      { harnessId: 'eve', status: 'queued' }
+    ],
+    status: 'running',
+    startedAtMs: Date.now()
+  };
+  let detailRequests = 0;
+  let holdNextEvaluationDetail = false;
+  let staleEvaluationDetailStartedResolve = () => {};
+  const staleEvaluationDetailStarted = new Promise<void>((resolve) => {
+    staleEvaluationDetailStartedResolve = resolve;
+  });
+  let releaseStaleEvaluationDetail = () => {};
+  const staleEvaluationDetail = new Promise<void>((resolve) => {
+    releaseStaleEvaluationDetail = resolve;
+  });
+
+  await page.addInitScript(({ evaluationId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (requestUrl.pathname !== `/api/evaluations/${evaluationId}/events`) {
+        return nativeFetch(input, init);
+      }
+      const encoder = new TextEncoder();
+      let closed = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          (window as Window & { __publishUnavailableEvaluation?: (event: unknown) => void })
+            .__publishUnavailableEvaluation = (event) => {
+              if (closed || init?.signal?.aborted) return;
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            };
+          init?.signal?.addEventListener('abort', () => {
+            (window as Window & { __unavailableEvaluationStreamAborted?: boolean })
+              .__unavailableEvaluationStreamAborted = true;
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The server may have closed after its terminal unavailable event.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          closed = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+      });
+    };
+  }, { evaluationId });
+  await page.route(/\/api\/evaluations$/, async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({ json: [summary] });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route(new RegExp(`/api/evaluations/${evaluationId}$`), async (route) => {
+    detailRequests += 1;
+    if (holdNextEvaluationDetail) {
+      holdNextEvaluationDetail = false;
+      staleEvaluationDetailStartedResolve();
+      await staleEvaluationDetail;
+    }
+    await route.fulfill({
+      json: {
+        summary,
+        events: [{
+          sequence: 1,
+          atMs: summary.startedAtMs,
+          type: 'evaluation.status',
+          payload: { status: 'running', detail: contaminatedRevision }
+        }]
+      }
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const history = page
+    .locator('.evaluation-history .history-list button')
+    .filter({ hasText: evaluationId.split('-').at(-1) ?? evaluationId });
+  await history.click();
+  await expect(page.getByTestId('evaluation-view').locator('.run-status')).toHaveText('running');
+  await expect(page.getByTestId('evaluation-view')).toContainText(contaminatedRevision);
+  await expect.poll(() =>
+    page.evaluate(() =>
+      typeof (window as Window & { __publishUnavailableEvaluation?: unknown })
+        .__publishUnavailableEvaluation
+    )
+  ).toBe('function');
+  expect(detailRequests).toBe(1);
+
+  holdNextEvaluationDetail = true;
+  await page.evaluate(({ evaluationId }) => {
+    (window as Window & { __publishUnavailableEvaluation?: (event: unknown) => void })
+      .__publishUnavailableEvaluation?.({
+        sequence: 2,
+        atMs: Date.now(),
+        type: 'evaluation.arm.progress',
+        payload: {
+          evaluationId,
+          harnessId: 'v0',
+          status: 'running'
+        }
+      });
+  }, { evaluationId });
+  await staleEvaluationDetailStarted;
+  await page.evaluate(({ evaluationId, unsafeEventMessage }) => {
+    (window as Window & { __publishUnavailableEvaluation?: (event: unknown) => void })
+      .__publishUnavailableEvaluation?.({
+        sequence: 3,
+        atMs: Date.now(),
+        type: 'evaluation.unavailable',
+        payload: {
+          evaluationId,
+          reason: 'protected-evidence',
+          message: unsafeEventMessage
+        }
+      });
+  }, { evaluationId, unsafeEventMessage });
+
+  await expect(page.getByRole('alert')).toHaveText(
+    'Evaluation evidence is unavailable. It has been removed from this workbench.'
+  );
+  await expect(page.getByRole('alert')).not.toContainText(unsafeEventMessage);
+  await expect(page.getByTestId('evaluation-view')).toContainText('No evaluation selected');
+  await expect(page.getByTestId('evaluation-view')).not.toContainText(contaminatedRevision);
+  await expect(page.locator('.evaluation-history .history-list button')).toHaveCount(0);
+  await expect.poll(() =>
+    page.evaluate(() =>
+      (window as Window & { __unavailableEvaluationStreamAborted?: boolean })
+        .__unavailableEvaluationStreamAborted ?? false
+    )
+  ).toBe(true);
+  releaseStaleEvaluationDetail();
+  await page.waitForTimeout(100);
+  await expect(page.getByTestId('evaluation-view')).toContainText('No evaluation selected');
+  await expect(page.getByTestId('evaluation-view')).not.toContainText(contaminatedRevision);
+  expect(detailRequests).toBe(2);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('failed and stale same-session refreshes keep the existing agent stream live', async ({ page }) => {
+  const sessionId = 'refresh-recovery-session';
+  const turnId = 'refresh-recovery-turn';
+  const messageId = 'refresh-recovery-message';
+  const startedAtMs = Date.now() - 500;
+  const events = [{
+    sequence: 1,
+    atMs: startedAtMs,
+    type: 'agent.turn.started',
+    payload: {
+      sessionId,
+      turnId,
+      prompt: 'Keep following this turn',
+      input: null
+    }
+  }, {
+    sequence: 2,
+    atMs: startedAtMs + 100,
+    type: 'observation.assistant.completed',
+    payload: {
+      sessionId,
+      turnId,
+      event: {
+        messageId,
+        text: '# Still connected\n\nThe original stream delivered this answer.'
+      }
+    }
+  }, {
+    sequence: 3,
+    atMs: startedAtMs + 200,
+    type: 'agent.turn.finished',
+    payload: { sessionId, turnId, outcome: 'completed' }
+  }];
+  const usageEvent = {
+    sequence: 4,
+    atMs: startedAtMs + 300,
+    type: 'observation.usage',
+    payload: {
+      sessionId,
+      turnId,
+      event: { inputTokens: 8, outputTokens: 13, totalTokens: 21 }
+    }
+  };
+  let workspaceId = '';
+  let sessionDetailRequests = 0;
+  let releaseRecoveryRefresh = () => {};
+  const recoveryRefresh = new Promise<void>((resolve) => {
+    releaseRecoveryRefresh = resolve;
+  });
+  let releaseStaleRefresh = () => {};
+  const staleRefresh = new Promise<void>((resolve) => {
+    releaseStaleRefresh = resolve;
+  });
+
+  await page.addInitScript(({ sessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      const isWorkspaceStream = /^\/api\/runs\/[^/]+\/events$/.test(requestUrl.pathname);
+      const isAgentStream = requestUrl.pathname.endsWith(
+        `/agent-sessions/${sessionId}/events`
+      );
+      if (!isWorkspaceStream && !isAgentStream) return nativeFetch(input, init);
+
+      const encoder = new TextEncoder();
+      let closed = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const publish = (event: unknown) => {
+            if (closed || init?.signal?.aborted) return;
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          };
+          if (isWorkspaceStream) {
+            (window as Window & {
+              __publishRefreshWorkspaceEvent?: (event: unknown) => void;
+            }).__publishRefreshWorkspaceEvent = publish;
+          } else {
+            const state = window as Window & {
+              __refreshAgentStreamRequests?: number;
+              __publishRefreshAgentEvent?: (event: unknown) => void;
+            };
+            state.__refreshAgentStreamRequests = (state.__refreshAgentStreamRequests ?? 0) + 1;
+            state.__publishRefreshAgentEvent = publish;
+          }
+          init?.signal?.addEventListener('abort', () => {
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The stream may already have been closed by navigation.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          closed = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+      });
+    };
+  }, { sessionId });
+
+  const summary = {
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'ready',
+    active: true,
+    createdAtMs: startedAtMs - 500,
+    updatedAtMs: startedAtMs - 500,
+    turnCount: 0
+  };
+  const initialDetail = () => ({
+    projectionVersion: 2,
+    summary: { ...summary, workspaceId },
+    turns: [],
+    events: []
+  });
+  const completedDetail = (includeUsage = false) => ({
+    projectionVersion: 2,
+    summary: {
+      ...summary,
+      workspaceId,
+      updatedAtMs: events[2].atMs,
+      turnCount: 1
+    },
+    turns: [{
+      id: turnId,
+      sessionId,
+      prompt: 'Keep following this turn',
+      sourceRevision: 'sha256:refresh-recovery',
+      capabilityRevisions: {},
+      status: 'completed',
+      startedAtMs,
+      finishedAtMs: events[2].atMs,
+      outcome: 'completed',
+      presentation: {
+        schemaVersion: 2,
+        response: '# Still connected\n\nThe original stream delivered this answer.',
+        messages: [{
+          id: messageId,
+          text: '# Still connected\n\nThe original stream delivered this answer.',
+          complete: true,
+          sourceEventSequences: [2]
+        }],
+        activity: [],
+        usage: includeUsage
+          ? { inputTokens: 8, outputTokens: 13, totalTokens: 21 }
+          : null,
+        completeness: {
+          assistantOutput: 'complete',
+          capabilityActivity: 'complete',
+          nativeActivity: 'complete',
+          workspaceEffects: 'complete',
+          usage: includeUsage ? 'complete' : 'unavailable'
+        },
+        sourceEventSequences: includeUsage ? [1, 2, 3, 4] : [1, 2, 3],
+        sourceDigest: includeUsage
+          ? 'sha256:refresh-recovered-with-usage'
+          : 'sha256:refresh-recovered'
+      }
+    }],
+    events: includeUsage ? [...events, usageEvent] : events
+  });
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    summary.workspaceId = workspaceId;
+    workbench.activeAgentSession = summary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(
+    new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`),
+    async (route) => {
+      sessionDetailRequests += 1;
+      if (sessionDetailRequests === 2) {
+        await route.fulfill({
+          status: 503,
+          json: { error: 'fixture same-session refresh is temporarily unavailable' }
+        });
+        return;
+      }
+      if (sessionDetailRequests === 3) {
+        await recoveryRefresh;
+        await route.fulfill({ json: completedDetail() });
+        return;
+      }
+      if (sessionDetailRequests === 4) {
+        await staleRefresh;
+        await route.fulfill({ json: completedDetail() });
+        return;
+      }
+      await route.fulfill({
+        json: sessionDetailRequests >= 5
+          ? completedDetail(true)
+          : sessionDetailRequests >= 3
+            ? completedDetail()
+            : initialDetail()
+      });
+    }
+  );
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { __refreshAgentStreamRequests?: number })
+      .__refreshAgentStreamRequests ?? 0
+  )).toBe(1);
+  await expect.poll(() => page.evaluate(() =>
+    typeof (window as Window & { __publishRefreshWorkspaceEvent?: unknown })
+      .__publishRefreshWorkspaceEvent
+  )).toBe('function');
+
+  const terminalInput = page.locator('[data-testid="terminal"] textarea');
+  await terminalInput.focus();
+  await expect(terminalInput).toBeFocused();
+  await page.evaluate(({ sessionId }) => {
+    const publish = (window as Window & {
+      __publishRefreshWorkspaceEvent?: (event: unknown) => void;
+    }).__publishRefreshWorkspaceEvent;
+    if (!publish) throw new Error('workspace event publisher is unavailable');
+    publish({
+      sequence: 1_000_000,
+      atMs: Date.now(),
+      type: 'workbench.agent.turn.started',
+      payload: { sessionId, origin: 'nushell' }
+    });
+  }, { sessionId });
+
+  await expect.poll(() => sessionDetailRequests).toBeGreaterThanOrEqual(2);
+  await expect(page.getByRole('alert')).toContainText(
+    'Agent session updates are temporarily unavailable. Retrying…'
+  );
+  await expect(terminalInput).toBeFocused();
+  await page.evaluate((events) => {
+    const publish = (window as Window & {
+      __publishRefreshAgentEvent?: (event: unknown) => void;
+    }).__publishRefreshAgentEvent;
+    if (!publish) throw new Error('agent event publisher is unavailable');
+    for (const event of events) publish(event);
+  }, events);
+
+  const session = page.getByTestId('interactive-agent-session');
+  releaseRecoveryRefresh();
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'completed');
+  await expect(session.getByRole('heading', { name: 'Still connected', level: 3 })).toBeVisible();
+  await expect(session).toContainText('The original stream delivered this answer.');
+  await expect.poll(() => sessionDetailRequests).toBe(3);
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(terminalInput).toBeFocused();
+  expect(await page.evaluate(() =>
+    (window as Window & { __refreshAgentStreamRequests?: number })
+      .__refreshAgentStreamRequests ?? 0
+  )).toBe(1);
+
+  await page.evaluate(({ sessionId }) => {
+    const publish = (window as Window & {
+      __publishRefreshWorkspaceEvent?: (event: unknown) => void;
+    }).__publishRefreshWorkspaceEvent;
+    if (!publish) throw new Error('workspace event publisher is unavailable');
+    publish({
+      sequence: 1_000_001,
+      atMs: Date.now(),
+      type: 'workbench.agent.turn.started',
+      payload: { sessionId, origin: 'nushell' }
+    });
+  }, { sessionId });
+  await expect.poll(() => sessionDetailRequests).toBe(4);
+  await page.evaluate((event) => {
+    const publish = (window as Window & {
+      __publishRefreshAgentEvent?: (event: unknown) => void;
+    }).__publishRefreshAgentEvent;
+    if (!publish) throw new Error('agent event publisher is unavailable');
+    publish(event);
+  }, usageEvent);
+  await expect.poll(() => sessionDetailRequests).toBe(5);
+  await expect(session).toContainText('Usage reported');
+  releaseStaleRefresh();
+  await expect.poll(() => sessionDetailRequests).toBe(6);
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'completed');
+  await expect(terminalInput).toBeFocused();
+  expect(await page.evaluate(() =>
+    (window as Window & { __refreshAgentStreamRequests?: number })
+      .__refreshAgentStreamRequests ?? 0
+  )).toBe(1);
+  const evidence = session.locator('.turn-evidence');
+  await evidence.locator(':scope > summary').click();
+  await evidence.locator('.turn-raw-events > summary').click();
+  await expect(evidence.locator('.run-events .sequence')).toHaveText(['01', '02', '03', '04']);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('a sustained agent stream stays incremental while run inspection remains independently navigable', async ({ page }) => {
+  const sessionId = 'stream-session';
+  const turnId = 'stream-turn';
+  const messageId = 'stream-message';
+  const startedAtMs = Date.now() - 1_500;
+  const chunks = Array.from({ length: 96 }, (_, index) => `${index + 1} `);
+  const completedText = `# Stream complete\n\n${chunks.join('')}`;
+  const streamEvents: Array<{
+    sequence: number;
+    atMs: number;
+    type: string;
+    payload: Record<string, unknown>;
+    progress?: {
+      phase: 'reasoning' | 'responding' | 'finalizing';
+      detail: string;
+      source: string;
+      sourceEventSequence: number;
+      sourceEventType: string;
+    };
+  }> = [{
+    sequence: 1,
+    atMs: startedAtMs,
+    type: 'agent.turn.started',
+    payload: {
+      sessionId,
+      turnId,
+      prompt: 'Stream a long answer',
+      input: null
+    },
+    progress: {
+      phase: 'reasoning',
+      detail: 'Reading the shared workspace.',
+      source: 'v0',
+      sourceEventSequence: 1,
+      sourceEventType: 'agent.turn.started'
+    }
+  }, ...chunks.map((text, index) => ({
+    sequence: index + 2,
+    atMs: startedAtMs + index + 1,
+    type: 'observation.assistant.delta',
+    payload: {
+      sessionId,
+      turnId,
+      event: { messageId, text: index === 0 ? '# Stream complete\n\n1 ' : text }
+    },
+    progress: {
+      phase: 'responding' as const,
+      detail: 'Streaming the answer.',
+      source: 'assistant',
+      sourceEventSequence: index + 2,
+      sourceEventType: 'observation.assistant.delta'
+    }
+  }))];
+  streamEvents.push({
+    sequence: streamEvents.length + 1,
+    atMs: startedAtMs + streamEvents.length + 1,
+    type: 'observation.assistant.completed',
+    payload: { sessionId, turnId, event: { messageId, text: completedText } },
+    progress: {
+      phase: 'finalizing',
+      detail: 'Finalizing durable evidence.',
+      source: 'assistant',
+      sourceEventSequence: streamEvents.length + 1,
+      sourceEventType: 'observation.assistant.completed'
+    }
+  });
+  streamEvents.push({
+    sequence: streamEvents.length + 1,
+    atMs: startedAtMs + streamEvents.length + 1,
+    type: 'agent.turn.finished',
+    payload: { sessionId, turnId, outcome: 'completed' },
+    progress: {
+      phase: 'finalizing',
+      detail: 'Durable evidence is ready.',
+      source: 'controller',
+      sourceEventSequence: streamEvents.length + 1,
+      sourceEventType: 'agent.turn.finished'
+    }
+  });
+  const sourceSequences = streamEvents.map((event) => event.sequence);
+  let workspaceId = '';
+  let sessionDetailRequests = 0;
+
+  await page.addInitScript(({ sessionId, streamEvents }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (requestUrl.pathname.endsWith(`/agent-sessions/${sessionId}/events`)) {
+        const encoder = new TextEncoder();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let index = 0;
+        let paused = false;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const emit = () => {
+              if (init?.signal?.aborted) {
+                controller.close();
+                return;
+              }
+              const event = streamEvents[index++];
+              if (!event) {
+                controller.close();
+                return;
+              }
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+              (window as Window & { __agentStreamDeliveredSequence?: number })
+                .__agentStreamDeliveredSequence = event.sequence;
+              if (event.sequence === 2) {
+                paused = true;
+                (window as Window & { __agentStreamPaused?: boolean })
+                  .__agentStreamPaused = true;
+                return;
+              }
+              timer = setTimeout(emit, 25);
+            };
+            (window as Window & { __resumeAgentStream?: () => void })
+              .__resumeAgentStream = () => {
+                if (!paused) return;
+                paused = false;
+                (window as Window & { __agentStreamPaused?: boolean })
+                  .__agentStreamPaused = false;
+                timer = setTimeout(emit, 25);
+              };
+            timer = setTimeout(emit, 25);
+            init?.signal?.addEventListener('abort', () => {
+              if (timer !== undefined) clearTimeout(timer);
+              try {
+                controller.close();
+              } catch {
+                // The stream may already have closed after its terminal event.
+              }
+            }, { once: true });
+          },
+          cancel() {
+            if (timer !== undefined) clearTimeout(timer);
+          }
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' }
+        });
+      }
+      return nativeFetch(input, init);
+    };
+  }, { sessionId, streamEvents });
+
+  const summary = {
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'ready',
+    active: true,
+    createdAtMs: startedAtMs - 500,
+    updatedAtMs: startedAtMs - 500,
+    turnCount: 0
+  };
+  const sessionDetail = (events: typeof streamEvents) => {
+    const started = events.some((event) => event.type === 'agent.turn.started');
+    const complete = events.some((event) => event.type === 'agent.turn.finished');
+    let response = '';
+    const assistantSequences: number[] = [];
+    let messageComplete = false;
+    for (const event of events) {
+      if (
+        event.type !== 'observation.assistant.delta' &&
+        event.type !== 'observation.assistant.completed'
+      ) continue;
+      const body = event.payload.event as { text: string };
+      assistantSequences.push(event.sequence);
+      if (event.type === 'observation.assistant.completed') {
+        response = body.text;
+        messageComplete = true;
+      } else {
+        response += body.text;
+      }
+    }
+    const presentation = {
+      schemaVersion: 1,
+      response: response || null,
+      messages: response
+        ? [{
+          id: messageId,
+          text: response,
+          complete: messageComplete,
+          sourceEventSequences: assistantSequences
+        }]
+        : [],
+      activity: [],
+      usage: null,
+      completeness: {
+        assistantOutput: messageComplete ? 'complete' : response ? 'partial' : 'unavailable',
+        capabilityActivity: complete ? 'complete' : 'partial',
+        nativeActivity: complete ? 'complete' : 'partial',
+        workspaceEffects: complete ? 'complete' : 'partial',
+        usage: 'unavailable'
+      },
+      sourceEventSequences: events.map((event) => event.sequence),
+      sourceDigest: complete ? 'sha256:stream-complete' : 'sha256:stream-pending'
+    };
+    return {
+      projectionVersion: 1,
+      summary: {
+        ...summary,
+        workspaceId,
+        status: started && !complete ? 'running' : 'ready',
+        updatedAtMs: events.at(-1)?.atMs ?? startedAtMs - 500,
+        turnCount: started ? 1 : 0
+      },
+      turns: started
+        ? [{
+            id: turnId,
+            sessionId,
+            prompt: 'Stream a long answer',
+            sourceRevision: 'sha256:explore',
+            capabilityRevisions: { catalog: 'catalog-v2' },
+            status: complete ? 'completed' : 'running',
+            startedAtMs,
+            finishedAtMs: complete ? events.at(-1)?.atMs : undefined,
+            outcome: complete ? 'completed' : undefined,
+            presentation
+          }]
+        : [],
+      events
+    };
+  };
+
+  await page.route(/\/api\/runs$/, async (route) => {
+    const response = await route.fetch();
+    const runs = await response.json();
+    runs.push({
+      id: 'inspection-run',
+      scenarioId: 'catalog-to-file',
+      scenarioTitle: 'Historical inspection',
+      modelId: 'fixture/history',
+      harnessId: 'eve',
+      modelProfileId: 'fixture',
+      status: 'passed',
+      startedAtMs: 1,
+      finishedAtMs: 2,
+      eventCount: 1
+    });
+    await route.fulfill({ response, json: runs });
+  });
+  await page.route(/\/api\/runs\/inspection-run$/, async (route) => {
+    await route.fulfill({
+      json: {
+        summary: {
+          id: 'inspection-run',
+          scenarioId: 'catalog-to-file',
+          scenarioTitle: 'Historical inspection',
+          modelId: 'fixture/history',
+          harnessId: 'eve',
+          modelProfileId: 'fixture',
+          status: 'passed',
+          startedAtMs: 1,
+          finishedAtMs: 2,
+          eventCount: 1
+        },
+        assembly: {
+          question: 'Historical question',
+          scenario: {
+            id: 'catalog-to-file',
+            title: 'Historical inspection',
+            description: 'Historical run',
+            version: 1,
+            output: 'result.json'
+          },
+          harness: {
+            adapter: 'external-jsonl',
+            modelId: 'fixture/history',
+            driver: { name: 'history-driver', version: '1', features: [] }
+          },
+          workspace: {
+            id: 'inspection-run/workspace',
+            seed: 'historical-seed',
+            seedRevision: 'sha256:historical',
+            attachment: 'physical-workspace',
+            changeTracking: 'initial-final-diff'
+          },
+          capabilitySources: [],
+          limits: {
+            maxDurationMs: 1_000,
+            maxCommandCount: 1,
+            maxOrchestratorInvocations: 1,
+            maxToolInvocations: 1
+          }
+        },
+        review: {
+          version: 1,
+          status: 'passed',
+          metrics: {
+            modelTurns: 1,
+            capabilityCalls: 0,
+            nativeActions: 0,
+            workspaceChanges: 0,
+            durationMs: 1
+          },
+          steps: [{
+            ordinal: 1,
+            kind: 'outcome',
+            title: 'Historical review',
+            detail: 'Durable run evidence',
+            status: 'passed',
+            eventSequences: [1],
+            source: null,
+            path: null
+          }]
+        },
+        events: [{
+          sequence: 1,
+          atMs: 1,
+          type: 'run.finished',
+          payload: { status: 'passed' }
+        }],
+        score: { passed: true },
+        output: { activeCount: 2 }
+      }
+    });
+  });
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    summary.workspaceId = workspaceId;
+    workbench.activeAgentSession = summary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`), async (route) => {
+    sessionDetailRequests += 1;
+    const deliveredSequence = await page.evaluate(() =>
+      (window as Window & { __agentStreamDeliveredSequence?: number })
+        .__agentStreamDeliveredSequence ?? 0
+    );
+    await route.fulfill({
+      json: sessionDetail(streamEvents.filter((event) => event.sequence <= deliveredSequence))
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const session = page.getByTestId('interactive-agent-session');
+  await expect(session.getByRole('heading', { name: 'Stream complete', level: 3 })).toBeVisible();
+  await expect.poll(() =>
+    page.evaluate(() =>
+      (window as Window & { __agentStreamPaused?: boolean }).__agentStreamPaused ?? false
+    )
+  ).toBe(true);
+  await expect.poll(() => sessionDetailRequests).toBe(2);
+  const liveStatus = session.getByTestId('agent-live-status');
+  await expect(page.getByLabel('Scenario')).toBeDisabled();
+  await expect(liveStatus).toHaveAttribute('data-phase', 'responding');
+  await expect(liveStatus).toContainText('Streaming the answer.');
+  await expect(liveStatus).toContainText('assistant');
+  await expect(liveStatus.getByRole('button', { name: 'Cancel turn' })).toBeEnabled();
+  const initialElapsed = await liveStatus.locator('time').textContent();
+  await expect.poll(() => liveStatus.locator('time').textContent()).not.toBe(initialElapsed);
+  await page.waitForTimeout(200);
+  expect(sessionDetailRequests).toBe(2);
+  const requestsBeforeResume = sessionDetailRequests;
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'running');
+  await page.evaluate(() => {
+    const resume = (window as Window & { __resumeAgentStream?: () => void }).__resumeAgentStream;
+    if (!resume) throw new Error('agent stream resume hook is unavailable');
+    resume();
+  });
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'completed');
+  await expect.poll(() => sessionDetailRequests).toBe(requestsBeforeResume + 1);
+  await page.waitForTimeout(200);
+  expect(sessionDetailRequests).toBe(requestsBeforeResume + 1);
+  await expect(session.getByTestId('agent-live-status')).toHaveCount(0);
+  await expect(page.getByLabel('Scenario')).toBeDisabled();
+
+  const evidence = session.locator('.turn-evidence');
+  await evidence.locator(':scope > summary').click();
+  await evidence.locator('.turn-raw-events > summary').click();
+  const observedSequences = await evidence.locator('.run-events .sequence').allTextContents();
+  expect(observedSequences).toEqual(sourceSequences.map((sequence) => String(sequence).padStart(2, '0')));
+
+  const historicalRun = page.locator('.history-list button').filter({ hasText: 'Historical inspection' });
+  await historicalRun.click();
+  await expect(page.getByRole('button', { name: 'Agent Run', exact: true })).toHaveClass(/active/);
+  await expect(page.getByTestId('run-review')).toContainText('Historical review');
+  await expect(page.getByTestId('interactive-agent-session')).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Session', exact: true }).click();
+  await expect(page.getByTestId('interactive-agent-session')).toBeVisible();
+  await expect(page.locator('.run-heading')).toContainText('Active session');
+  await expect(session.locator('.session-environment > summary')).toContainText('Session environment');
+  await session.locator('.session-environment > summary').click();
+  await expect(session.locator('.session-environment')).not.toContainText('sha256:historical');
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('agent session events recover from clean EOF and read failure without duplicating evidence', async ({ page }) => {
+  const sessionId = 'recovering-stream-session';
+  const turnId = 'recovering-stream-turn';
+  const messageId = 'recovering-stream-message';
+  const startedAtMs = Date.now() - 1_000;
+  const events = [{
+    sequence: 1,
+    atMs: startedAtMs,
+    type: 'agent.turn.started',
+    payload: { sessionId, turnId, prompt: 'Recover this answer', input: null }
+  }, {
+    sequence: 2,
+    atMs: startedAtMs + 100,
+    type: 'observation.assistant.delta',
+    payload: { sessionId, turnId, event: { messageId, text: '# Recovered answer' } }
+  }, {
+    sequence: 3,
+    atMs: startedAtMs + 200,
+    type: 'observation.assistant.completed',
+    payload: {
+      sessionId,
+      turnId,
+      event: { messageId, text: '# Recovered answer\n\nDurable after reconnect.' }
+    }
+  }, {
+    sequence: 4,
+    atMs: startedAtMs + 300,
+    type: 'agent.turn.finished',
+    payload: { sessionId, turnId, outcome: 'completed' }
+  }];
+  let workspaceId = '';
+  let sessionDetailRequests = 0;
+
+  await page.addInitScript(({ sessionId, events }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (!requestUrl.pathname.endsWith(`/agent-sessions/${sessionId}/events`)) {
+        return nativeFetch(input, init);
+      }
+
+      const state = window as Window & {
+        __recoveringAgentStreamAttempts?: number;
+        __recoveringAgentStreamDeliveredSequence?: number;
+      };
+      const attempt = (state.__recoveringAgentStreamAttempts ?? 0) + 1;
+      state.__recoveringAgentStreamAttempts = attempt;
+      const encoder = new TextEncoder();
+      let closed = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const publish = (event: (typeof events)[number]) => {
+            if (closed || init?.signal?.aborted) return;
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            state.__recoveringAgentStreamDeliveredSequence = Math.max(
+              state.__recoveringAgentStreamDeliveredSequence ?? 0,
+              event.sequence
+            );
+          };
+          timer = setTimeout(() => {
+            if (attempt === 1) {
+              publish(events[0]);
+              closed = true;
+              controller.close();
+              return;
+            }
+            if (attempt === 2) {
+              publish(events[0]);
+              publish(events[1]);
+              closed = true;
+              controller.error(new Error('fixture agent stream read failure'));
+              return;
+            }
+            for (const event of events) publish(event);
+          }, 20);
+          init?.signal?.addEventListener('abort', () => {
+            if (timer !== undefined) clearTimeout(timer);
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The stream may already have failed.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          if (timer !== undefined) clearTimeout(timer);
+          closed = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': 'agent-session-boot-1'
+        }
+      });
+    };
+  }, { sessionId, events });
+
+  const summary = {
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'ready',
+    active: true,
+    createdAtMs: startedAtMs - 500,
+    updatedAtMs: startedAtMs - 500,
+    turnCount: 0
+  };
+  const sessionDetail = (deliveredSequence: number) => {
+    const deliveredEvents = events.filter((event) => event.sequence <= deliveredSequence);
+    const started = deliveredSequence >= 1;
+    const hasDelta = deliveredSequence >= 2;
+    const answerComplete = deliveredSequence >= 3;
+    const finished = deliveredSequence >= 4;
+    const response = answerComplete
+      ? '# Recovered answer\n\nDurable after reconnect.'
+      : hasDelta
+        ? '# Recovered answer'
+        : null;
+    return {
+      projectionVersion: 2,
+      summary: {
+        ...summary,
+        workspaceId,
+        status: started && !finished ? 'running' : 'ready',
+        updatedAtMs: deliveredEvents.at(-1)?.atMs ?? summary.updatedAtMs,
+        turnCount: started ? 1 : 0
+      },
+      turns: started
+        ? [{
+            id: turnId,
+            sessionId,
+            prompt: 'Recover this answer',
+            sourceRevision: 'sha256:recovering-stream',
+            capabilityRevisions: {},
+            status: finished ? 'completed' : 'running',
+            startedAtMs,
+            finishedAtMs: finished ? events[3].atMs : undefined,
+            outcome: finished ? 'completed' : undefined,
+            presentation: {
+              schemaVersion: 2,
+              response,
+              messages: response
+                ? [{
+                    id: messageId,
+                    text: response,
+                    complete: answerComplete,
+                    sourceEventSequences: answerComplete ? [2, 3] : [2]
+                  }]
+                : [],
+              activity: [],
+              usage: null,
+              completeness: {
+                assistantOutput: answerComplete ? 'complete' : response ? 'partial' : 'unavailable',
+                capabilityActivity: finished ? 'complete' : 'partial',
+                nativeActivity: finished ? 'complete' : 'partial',
+                workspaceEffects: finished ? 'complete' : 'partial',
+                usage: 'unavailable'
+              },
+              sourceEventSequences: deliveredEvents.map((event) => event.sequence),
+              sourceDigest: finished ? 'sha256:recovered' : 'sha256:recovering'
+            }
+          }]
+        : [],
+      events: deliveredEvents
+    };
+  };
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    summary.workspaceId = workspaceId;
+    workbench.activeAgentSession = summary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`), async (route) => {
+    sessionDetailRequests += 1;
+    const deliveredSequence = await page.evaluate(() =>
+      (window as Window & { __recoveringAgentStreamDeliveredSequence?: number })
+        .__recoveringAgentStreamDeliveredSequence ?? 0
+    );
+    await route.fulfill({ json: sessionDetail(deliveredSequence) });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { __recoveringAgentStreamAttempts?: number })
+      .__recoveringAgentStreamAttempts ?? 0
+  )).toBe(3);
+  const session = page.getByTestId('interactive-agent-session');
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'completed');
+  await expect(session.getByRole('heading', { name: 'Recovered answer', level: 3 })).toHaveCount(1);
+  await expect(session.locator('.assistant-message')).toHaveCount(1);
+  await expect(session).toContainText('Durable after reconnect.');
+  const evidence = session.locator('.turn-evidence');
+  await evidence.locator(':scope > summary').click();
+  await evidence.locator('.turn-raw-events > summary').click();
+  await expect(evidence.locator('.run-events .sequence')).toHaveText(['01', '02', '03', '04']);
+  const settledDetailRequests = sessionDetailRequests;
+  await page.waitForTimeout(400);
+  expect(sessionDetailRequests).toBe(settledDetailRequests);
+  expect(await page.evaluate(() =>
+    (window as Window & { __recoveringAgentStreamAttempts?: number })
+      .__recoveringAgentStreamAttempts ?? 0
+  )).toBe(3);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('an agent-session epoch reset replaces a stale high-water projection with authoritative detail', async ({ page }) => {
+  const sessionId = 'epoch-reset-session';
+  const turnId = 'stale-turn';
+  const staleAnswer = 'Stale answer from the previous server epoch';
+  const startedAtMs = Date.now() - 1_000;
+  let workspaceId = '';
+  let sessionDetailRequests = 0;
+
+  await page.addInitScript(({ sessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (!requestUrl.pathname.endsWith(`/agent-sessions/${sessionId}/events`)) {
+        return nativeFetch(input, init);
+      }
+      const state = window as Window & {
+        __agentSessionEpochAttempts?: number;
+        __releaseAgentSessionEpoch?: () => void;
+      };
+      const attempt = (state.__agentSessionEpochAttempts ?? 0) + 1;
+      state.__agentSessionEpochAttempts = attempt;
+      let closed = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          if (attempt === 1) {
+            state.__releaseAgentSessionEpoch = () => {
+              if (closed) return;
+              closed = true;
+              controller.close();
+            };
+          }
+          init?.signal?.addEventListener('abort', () => {
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The reset handler can abort while the response is opening.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          closed = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': attempt === 1 ? 'boot-1' : 'boot-2'
+        }
+      });
+    };
+  }, { sessionId });
+
+  const summary = {
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'running',
+    active: true,
+    createdAtMs: startedAtMs - 500,
+    updatedAtMs: startedAtMs,
+    turnCount: 1
+  };
+  const staleDetail = () => ({
+    projectionVersion: 2,
+    summary,
+    turns: [{
+      id: turnId,
+      sessionId,
+      prompt: 'Describe the workspace',
+      sourceRevision: 'sha256:stale',
+      capabilityRevisions: {},
+      status: 'running',
+      startedAtMs,
+      presentation: {
+        schemaVersion: 2,
+        response: staleAnswer,
+        messages: [{
+          id: 'stale-message',
+          text: staleAnswer,
+          complete: false,
+          sourceEventSequences: [99]
+        }],
+        activity: [],
+        usage: null,
+        completeness: {
+          assistantOutput: 'partial',
+          capabilityActivity: 'partial',
+          nativeActivity: 'partial',
+          workspaceEffects: 'partial',
+          usage: 'unavailable'
+        },
+        sourceEventSequences: [99],
+        sourceDigest: 'sha256:stale'
+      }
+    }],
+    events: [{
+      sequence: 99,
+      atMs: startedAtMs,
+      type: 'observation.assistant.delta',
+      payload: {
+        sessionId,
+        turnId,
+        event: { messageId: 'stale-message', text: staleAnswer }
+      }
+    }]
+  });
+  const interruptedDetail = () => ({
+    projectionVersion: 2,
+    summary: {
+      ...summary,
+      status: 'interrupted',
+      active: false,
+      updatedAtMs: startedAtMs + 500,
+      turnCount: 0,
+      error: 'the server restarted; start a new agent session to continue'
+    },
+    turns: [],
+    events: [{
+      sequence: 1,
+      atMs: startedAtMs + 500,
+      type: 'agent.session.interrupted',
+      payload: { sessionId, recovered: true }
+    }]
+  });
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    summary.workspaceId = workspaceId;
+    workbench.activeAgentSession = summary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`), async (route) => {
+    sessionDetailRequests += 1;
+    const attempts = await page.evaluate(() =>
+      (window as Window & { __agentSessionEpochAttempts?: number })
+        .__agentSessionEpochAttempts ?? 0
+    );
+    if (attempts >= 2 && sessionDetailRequests === 2) {
+      await route.fulfill({
+        status: 503,
+        json: { error: 'authoritative session detail is temporarily unavailable' }
+      });
+      return;
+    }
+    await route.fulfill({ json: attempts >= 2 ? interruptedDetail() : staleDetail() });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const session = page.getByTestId('interactive-agent-session');
+  await expect(session).toContainText(staleAnswer);
+  await page.evaluate(() => {
+    (window as Window & { __releaseAgentSessionEpoch?: () => void })
+      .__releaseAgentSessionEpoch?.();
+  });
+  await expect(page.getByRole('alert')).toContainText(
+    'Agent session updates are temporarily unavailable. Retrying…'
+  );
+  await expect(page.locator('.run-heading')).toContainText('Session replay');
+  await expect(page.locator('.run-heading')).toContainText('interrupted');
+  await expect(session).not.toContainText(staleAnswer);
+  await expect(session).toContainText(
+    'Reopened from durable evidence. Start a new agent session to continue.'
+  );
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { __agentSessionEpochAttempts?: number })
+      .__agentSessionEpochAttempts ?? 0
+  )).toBe(3);
+  expect(sessionDetailRequests).toBeGreaterThanOrEqual(3);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('terminal reconciliation retries failed and stale detail without losing canonical evidence', async ({ page }) => {
+  const sessionId = 'reconciliation-retry-session';
+  const turnId = 'reconciliation-retry-turn';
+  const startedAtMs = Date.now() - 1_000;
+  const startedEvent = {
+    sequence: 1,
+    atMs: startedAtMs,
+    type: 'agent.turn.started',
+    payload: { sessionId, turnId, prompt: 'Create the result', input: null }
+  };
+  const finishedEvent = {
+    sequence: 2,
+    atMs: startedAtMs + 500,
+    type: 'agent.turn.finished',
+    payload: { sessionId, turnId, outcome: 'completed' }
+  };
+  let workspaceId = '';
+  let sessionDetailRequests = 0;
+
+  await page.addInitScript(({ sessionId, finishedEvent }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (!requestUrl.pathname.endsWith(`/agent-sessions/${sessionId}/events`)) {
+        return nativeFetch(input, init);
+      }
+      const state = window as Window & { __reconciliationStreamAttempts?: number };
+      state.__reconciliationStreamAttempts = (state.__reconciliationStreamAttempts ?? 0) + 1;
+      const encoder = new TextEncoder();
+      let closed = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          timer = setTimeout(() => {
+            if (closed || init?.signal?.aborted) return;
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(finishedEvent)}\n\n`));
+          }, 25);
+          init?.signal?.addEventListener('abort', () => {
+            if (timer !== undefined) clearTimeout(timer);
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The stream may already have closed with the page.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          if (timer !== undefined) clearTimeout(timer);
+          closed = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+      });
+    };
+  }, { sessionId, finishedEvent });
+
+  const summary = {
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'running',
+    active: true,
+    createdAtMs: startedAtMs - 500,
+    updatedAtMs: startedAtMs,
+    turnCount: 1
+  };
+  const sessionDetail = (complete: boolean) => ({
+    projectionVersion: 2,
+    summary: {
+      ...summary,
+      workspaceId,
+      status: complete ? 'ready' : 'running',
+      updatedAtMs: complete ? finishedEvent.atMs : startedEvent.atMs
+    },
+    turns: [{
+      id: turnId,
+      sessionId,
+      prompt: 'Create the result',
+      sourceRevision: 'sha256:reconcile',
+      capabilityRevisions: {},
+      status: complete ? 'completed' : 'running',
+      startedAtMs,
+      finishedAtMs: complete ? finishedEvent.atMs : undefined,
+      outcome: complete ? 'completed' : undefined,
+      presentation: {
+        schemaVersion: 2,
+        response: 'Created the result.',
+        messages: [{
+          id: 'reconciliation-message',
+          text: 'Created the result.',
+          complete: true,
+          sourceEventSequences: [1]
+        }],
+        activity: complete
+          ? [{
+              kind: 'workspace-effect',
+              title: 'Created result.json',
+              detail: 'Captured in the finalized workspace.',
+              status: 'completed',
+              source: null,
+              path: 'result.json',
+              changeKind: 'created',
+              entryType: 'file',
+              sourceEventSequences: [2]
+            }]
+          : [],
+        usage: null,
+        completeness: {
+          assistantOutput: 'complete',
+          capabilityActivity: complete ? 'complete' : 'partial',
+          nativeActivity: complete ? 'complete' : 'partial',
+          workspaceEffects: complete ? 'complete' : 'partial',
+          usage: 'unavailable'
+        },
+        sourceEventSequences: complete ? [1, 2] : [1],
+        sourceDigest: complete ? 'sha256:reconciled' : 'sha256:pending'
+      }
+    }],
+    events: complete ? [startedEvent, finishedEvent] : [startedEvent]
+  });
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    summary.workspaceId = workspaceId;
+    workbench.activeAgentSession = summary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`), async (route) => {
+    sessionDetailRequests += 1;
+    if (sessionDetailRequests === 2) {
+      await route.fulfill({
+        status: 503,
+        json: { error: 'fixture detail projection is temporarily unavailable' }
+      });
+      return;
+    }
+    if (sessionDetailRequests === 3) {
+      // Keep the stale response in flight long enough to observe the retry
+      // state independently of machine speed and event-stream reconnect timing.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    await route.fulfill({ json: sessionDetail(sessionDetailRequests >= 4) });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect(page.getByRole('alert')).toContainText(
+    'Agent session updates are temporarily unavailable. Retrying…'
+  );
+  await expect.poll(() => sessionDetailRequests).toBe(4);
+  const session = page.getByTestId('interactive-agent-session');
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'completed');
+  const workspaceEffect = session.locator('.turn-activity li[data-kind="workspace-effect"]');
+  await expect(workspaceEffect).toContainText('Created result.json');
+  await expect(workspaceEffect).toContainText('Captured in the finalized workspace.');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  const settledDetailRequests = sessionDetailRequests;
+  await page.waitForTimeout(400);
+  expect(sessionDetailRequests).toBe(settledDetailRequests);
+  expect(await page.evaluate(() =>
+    (window as Window & { __reconciliationStreamAttempts?: number })
+      .__reconciliationStreamAttempts ?? 0
+  )).toBe(1);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('an active turn can be cancelled from compact progress without polling', async ({ page }) => {
+  const sessionId = 'cancel-session';
+  const turnId = 'cancel-turn';
+  const startedAtMs = Date.now() - 1_250;
+  const startedEvent = {
+    sequence: 1,
+    atMs: startedAtMs,
+    type: 'agent.turn.started',
+    payload: {
+      sessionId,
+      turnId,
+      prompt: 'Inspect the catalog until cancelled',
+      input: null
+    }
+  };
+  const capabilityStartedEvent = {
+    sequence: 2,
+    atMs: startedAtMs + 500,
+    type: 'mcp.tool.started',
+    payload: {
+      sessionId,
+      turnId,
+      event: {
+        source: 'catalog',
+        name: 'list',
+        callId: 'catalog-list',
+        arguments: { active: true }
+      }
+    },
+    progress: {
+      phase: 'acting',
+      detail: 'Inspecting the active catalog.',
+      source: 'catalog · list',
+      sourceEventSequence: 14,
+      sourceEventType: 'mcp.tool.started'
+    }
+  };
+  const capabilityCompletedEvent = {
+    sequence: 3,
+    atMs: startedAtMs + 750,
+    type: 'mcp.tool.completed',
+    payload: {
+      sessionId,
+      turnId,
+      event: {
+        source: 'catalog',
+        name: 'list',
+        callId: 'catalog-list',
+        result: { items: [{ name: 'alpha' }] },
+        isError: false
+      }
+    }
+  };
+  const nativeActionEvent = {
+    sequence: 4,
+    atMs: startedAtMs + 1_000,
+    type: 'observation.native-action',
+    payload: {
+      sessionId,
+      turnId,
+      event: {
+        actionId: 'inspect-catalog',
+        name: 'Inspect catalog',
+        status: 'completed',
+        summary: 'Compared active item scores.'
+      }
+    }
+  };
+  const usageEvent = {
+    sequence: 5,
+    atMs: startedAtMs + 1_250,
+    type: 'observation.usage',
+    payload: {
+      sessionId,
+      turnId,
+      event: {
+        inputTokens: 7,
+        outputTokens: 21,
+        totalTokens: 28
+      }
+    }
+  };
+  const finishedEvent = {
+    sequence: 6,
+    atMs: startedAtMs + 2_000,
+    type: 'agent.turn.finished',
+    payload: { sessionId, turnId, outcome: 'cancelled' },
+    progress: {
+      phase: 'finalizing',
+      detail: 'Retaining cancelled turn evidence.',
+      source: 'controller',
+      sourceEventSequence: 15,
+      sourceEventType: 'agent.turn.finished'
+    }
+  };
+  let workspaceId = '';
+  let sessionDetailRequests = 0;
+  let cancelRequests = 0;
+
+  await page.addInitScript(({
+    sessionId,
+    startedEvent,
+    capabilityStartedEvent,
+    capabilityCompletedEvent,
+    nativeActionEvent,
+    usageEvent,
+    finishedEvent
+  }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (requestUrl.pathname.endsWith(`/agent-sessions/${sessionId}/events`)) {
+        const encoder = new TextEncoder();
+        let closed = false;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const publish = (
+              event:
+                | typeof startedEvent
+                | typeof capabilityStartedEvent
+                | typeof capabilityCompletedEvent
+                | typeof nativeActionEvent
+                | typeof usageEvent
+                | typeof finishedEvent,
+              close = false
+            ) => {
+              if (closed || init?.signal?.aborted) return;
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+              (window as Window & { __cancelStreamDeliveredSequence?: number })
+                .__cancelStreamDeliveredSequence = event.sequence;
+              if (close) {
+                closed = true;
+                controller.close();
+              }
+            };
+            setTimeout(() => publish(startedEvent), 25);
+            (window as Window & {
+              __publishAgentEvidence?: (
+                kind: 'capability-started' | 'capability-completed' | 'native-action' | 'usage'
+              ) => void
+            }).__publishAgentEvidence = (kind) => {
+              if (kind === 'capability-started') publish(capabilityStartedEvent);
+              if (kind === 'capability-completed') publish(capabilityCompletedEvent);
+              if (kind === 'native-action') publish(nativeActionEvent);
+              if (kind === 'usage') publish(usageEvent);
+            };
+            (window as Window & { __finishCancelledAgentTurn?: () => void })
+              .__finishCancelledAgentTurn = () => publish(finishedEvent, true);
+            init?.signal?.addEventListener('abort', () => {
+              if (closed) return;
+              closed = true;
+              try {
+                controller.close();
+              } catch {
+                // The stream may already be closed by the terminal event.
+              }
+            }, { once: true });
+          },
+          cancel() {
+            closed = true;
+          }
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' }
+        });
+      }
+      return nativeFetch(input, init);
+    };
+  }, {
+    sessionId,
+    startedEvent,
+    capabilityStartedEvent,
+    capabilityCompletedEvent,
+    nativeActionEvent,
+    usageEvent,
+    finishedEvent
+  });
+
+  const summary = {
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'ready',
+    active: true,
+    createdAtMs: startedAtMs - 500,
+    updatedAtMs: startedAtMs - 500,
+    turnCount: 0
+  };
+  const sessionDetail = (deliveredSequence: number) => {
+    const deliveredEvents = [
+      startedEvent,
+      capabilityStartedEvent,
+      capabilityCompletedEvent,
+      nativeActionEvent,
+      usageEvent,
+      finishedEvent
+    ].filter((event) => event.sequence <= deliveredSequence);
+    const started = deliveredSequence >= startedEvent.sequence;
+    const capabilityStarted = deliveredSequence >= capabilityStartedEvent.sequence;
+    const capabilityCompleted = deliveredSequence >= capabilityCompletedEvent.sequence;
+    const nativeAction = deliveredSequence >= nativeActionEvent.sequence;
+    const usageReported = deliveredSequence >= usageEvent.sequence;
+    const finished = deliveredSequence >= finishedEvent.sequence;
+    return {
+      projectionVersion: 1,
+      summary: {
+        ...summary,
+        workspaceId,
+        status: started && !finished ? 'running' : 'ready',
+        updatedAtMs: deliveredEvents.at(-1)?.atMs ?? summary.updatedAtMs,
+        turnCount: started ? 1 : 0
+      },
+      turns: started
+        ? [{
+            id: turnId,
+            sessionId,
+            prompt: 'Inspect the catalog until cancelled',
+            sourceRevision: 'sha256:cancel',
+            capabilityRevisions: { catalog: 'catalog-v2' },
+            status: finished ? 'cancelled' : 'running',
+            startedAtMs,
+            finishedAtMs: finished ? finishedEvent.atMs : undefined,
+            outcome: finished ? 'cancelled' : undefined,
+            presentation: {
+              schemaVersion: 2,
+              response: null,
+              messages: [],
+              activity: [
+                ...(capabilityStarted
+                  ? [{
+                      kind: 'capability-call',
+                      title: 'catalog · list',
+                      detail: null,
+                      status: capabilityCompleted ? 'completed' : 'running',
+                      source: 'catalog',
+                      path: null,
+                      operation: 'list',
+                      callId: 'catalog-list',
+                      arguments: { active: true },
+                      result: capabilityCompleted ? { items: [{ name: 'alpha' }] } : undefined,
+                      sourceEventSequences: capabilityCompleted ? [2, 3] : [2]
+                    }]
+                  : []),
+                ...(nativeAction
+                  ? [{
+                      kind: 'native-action',
+                      title: 'Inspect catalog',
+                      detail: 'Compared active item scores.',
+                      status: 'completed',
+                      source: null,
+                      path: null,
+                      operation: 'Inspect catalog',
+                      actionId: 'inspect-catalog',
+                      sourceEventSequences: [4]
+                    }]
+                  : [])
+              ],
+              usage: usageReported
+                ? { inputTokens: 7, outputTokens: 21, totalTokens: 28 }
+                : null,
+              completeness: {
+                assistantOutput: 'unavailable',
+                capabilityActivity: 'partial',
+                nativeActivity: 'partial',
+                workspaceEffects: 'partial',
+                usage: usageReported ? 'complete' : 'unavailable'
+              },
+              sourceEventSequences: deliveredEvents.map((event) => event.sequence),
+              sourceDigest: finished ? 'sha256:cancelled' : 'sha256:cancelling'
+            }
+          }]
+        : [],
+      events: deliveredEvents
+    };
+  };
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    summary.workspaceId = workspaceId;
+    workbench.activeAgentSession = summary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`), async (route) => {
+    sessionDetailRequests += 1;
+    const deliveredSequence = await page.evaluate(() =>
+      (window as Window & { __cancelStreamDeliveredSequence?: number })
+        .__cancelStreamDeliveredSequence ?? 0
+    );
+    await route.fulfill({ json: sessionDetail(deliveredSequence) });
+  });
+  await page.route(
+    new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}/cancel$`),
+    async (route) => {
+      cancelRequests += 1;
+      expect(route.request().method()).toBe('POST');
+      await route.fulfill({ status: 202 });
+    }
+  );
+
+  await page.setViewportSize({ width: 320, height: 700 });
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect.poll(() => sessionDetailRequests).toBe(2);
+  const session = page.getByTestId('interactive-agent-session');
+  const liveStatus = session.getByTestId('agent-live-status');
+  await expect(liveStatus).toHaveAttribute('data-phase', 'running');
+  await expect(liveStatus).toContainText('Waiting for the next progress update.');
+  expect(sessionDetailRequests).toBe(2);
+
+  const publishEvidence = async (
+    kind: 'capability-started' | 'capability-completed' | 'native-action' | 'usage'
+  ) => {
+    await page.evaluate((nextKind) => {
+      const publish = (window as Window & {
+        __publishAgentEvidence?: (value: typeof nextKind) => void
+      }).__publishAgentEvidence;
+      if (!publish) throw new Error('agent evidence publish hook is unavailable');
+      publish(nextKind);
+    }, kind);
+  };
+
+  await publishEvidence('capability-started');
+  await expect.poll(() => sessionDetailRequests).toBe(3);
+  await expect(liveStatus).toHaveAttribute('data-phase', 'acting');
+  await expect(liveStatus).toContainText('Inspecting the active catalog.');
+  await expect(liveStatus).toContainText('catalog · list');
+  await expect(liveStatus).toHaveAttribute('data-source-event-sequence', '14');
+  await expect(liveStatus).toHaveAttribute('data-source-event-type', 'mcp.tool.started');
+  const activity = session.locator('.turn-activity');
+  const capability = activity.locator('li[data-kind="capability-call"]');
+  await expect(capability).toHaveAttribute('data-status', 'running');
+  await expect(capability).toContainText('catalog · list');
+  await expect(capability).toContainText('Arguments: active');
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'running');
+
+  await publishEvidence('capability-completed');
+  await expect.poll(() => sessionDetailRequests).toBe(4);
+  await expect(capability).toHaveAttribute('data-status', 'completed');
+  await expect(capability).toContainText('Returned 1 item');
+
+  await publishEvidence('native-action');
+  await expect.poll(() => sessionDetailRequests).toBe(5);
+  const nativeAction = activity.locator('li[data-kind="native-action"]');
+  await expect(nativeAction).toContainText('Inspect catalog');
+  await expect(nativeAction).toContainText('Compared active item scores.');
+
+  await publishEvidence('usage');
+  await expect.poll(() => sessionDetailRequests).toBe(6);
+  await expect(session.locator('.turn-summary')).toContainText('Usage reported');
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'running');
+
+  await liveStatus.evaluate((element) => element.scrollIntoView({ block: 'center' }));
+  const narrowGeometry = await page.evaluate(() => {
+    const status = document.querySelector<HTMLElement>('[data-testid="agent-live-status"]');
+    const panel = document.querySelector<HTMLElement>('.run-panel');
+    const button = status?.querySelector<HTMLElement>('button');
+    const statusBounds = status?.getBoundingClientRect();
+    const panelBounds = panel?.getBoundingClientRect();
+    const buttonBounds = button?.getBoundingClientRect();
+    return {
+      viewportWidth: window.innerWidth,
+      documentWidth: document.documentElement.scrollWidth,
+      status: statusBounds ? { left: statusBounds.left, right: statusBounds.right } : null,
+      panel: panelBounds ? { left: panelBounds.left, right: panelBounds.right } : null,
+      button: buttonBounds ? { left: buttonBounds.left, right: buttonBounds.right } : null
+    };
+  });
+  expect(narrowGeometry.documentWidth).toBeLessThanOrEqual(narrowGeometry.viewportWidth);
+  expect(narrowGeometry.status).not.toBeNull();
+  expect(narrowGeometry.panel).not.toBeNull();
+  expect(narrowGeometry.button).not.toBeNull();
+  expect(narrowGeometry.status!.left).toBeGreaterThanOrEqual(narrowGeometry.panel!.left - 1);
+  expect(narrowGeometry.status!.right).toBeLessThanOrEqual(narrowGeometry.panel!.right + 1);
+  expect(narrowGeometry.button!.left).toBeGreaterThanOrEqual(narrowGeometry.status!.left - 1);
+  expect(narrowGeometry.button!.right).toBeLessThanOrEqual(narrowGeometry.status!.right + 1);
+
+  await liveStatus.getByRole('button', { name: 'Cancel turn' }).click();
+  await expect.poll(() => cancelRequests).toBe(1);
+  await expect(liveStatus).toHaveAttribute('data-phase', 'cancelling');
+  await expect(liveStatus.getByRole('button', { name: 'Cancelling…' })).toBeDisabled();
+  expect(sessionDetailRequests).toBe(6);
+
+  await page.evaluate(() =>
+    (window as Window & { __finishCancelledAgentTurn?: () => void })
+      .__finishCancelledAgentTurn?.()
+  );
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'cancelled');
+  await expect(session.getByTestId('agent-live-status')).toHaveCount(0);
+  await expect.poll(() => sessionDetailRequests).toBe(7);
+  await expect(activity.locator('li[data-kind="capability-call"]')).toHaveCount(1);
+  await expect(activity.locator('li[data-kind="native-action"]')).toHaveCount(1);
+
+  const evidence = session.locator('.turn-evidence');
+  await evidence.locator(':scope > summary').click();
+  await evidence.locator('.turn-raw-events > summary').click();
+  await expect(evidence.locator('.run-events .sequence')).toHaveText([
+    '01',
+    '02',
+    '03',
+    '04',
+    '05',
+    '06'
+  ]);
+  expect(cancelRequests).toBe(1);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('agent answers render constrained Markdown and retain inspectable source', async ({ page }) => {
+  const terminalFramesSent: string[] = [];
+  const terminalBytesSent: string[] = [];
+  const terminalSendOrder: Array<'human-input' | 'ctrl-c' | 'other'> = [];
+  page.on('websocket', (socket) => {
+    if (!/\/api\/terminal(?:\?|$)/.test(socket.url())) return;
+    socket.on('framesent', ({ payload }) => {
+      if (typeof payload === 'string') {
+        terminalFramesSent.push(payload);
+        terminalSendOrder.push(
+          payload === JSON.stringify({ type: 'human_input' }) ? 'human-input' : 'other'
+        );
+      } else {
+        const bytes = payload.toString('hex');
+        terminalBytesSent.push(bytes);
+        terminalSendOrder.push(bytes === '03' ? 'ctrl-c' : 'other');
+      }
+    });
+  });
+  const firstMessage = [
+    '# Findings',
+    '',
+    '- **Alpha** is active',
+    '- `gamma` scored 8',
+    '',
+    '```nu',
+    'catalog list | where active',
+    '```',
+    '',
+    '| item | score |',
+    '| --- | ---: |',
+    '| gamma | 8 |',
+    '',
+    '[Guide](https://example.com/guide)',
+    '[Protocol relative](//example.com/guide)',
+    '[Dial](tel:+15551212)',
+    '[Unsafe](javascript:alert(1))',
+    '![Tracking pixel](https://example.com/agent-image.png)',
+    '<img src="https://example.com/raw-image.png" onerror="alert(1)">',
+    '<script>window.agentMarkdownXss = true</script>'
+  ].join('\n');
+  const streamingSecondMessage = '## Next\n\nWaiting for **authoritative';
+  const completedSecondMessage = '## Next\n\nAuthoritative completion keeps the **same evidence**.';
+  let authoritative = false;
+  const resourceRequests: string[] = [];
+  page.on('request', (request) => {
+    if (request.url().includes('agent-image.png') || request.url().includes('raw-image.png')) {
+      resourceRequests.push(request.url());
+    }
+  });
+  await page.route(/\/api\/workbench\/[^/]+\/agent-sessions\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const detail = (await response.json()) as {
+      turns?: Array<{
+        id: string;
+        presentation?: {
+          response: string | null;
+          messages: Array<{
+            id: string;
+            text: string;
+            complete: boolean;
+            sourceEventSequences: number[];
+          }>;
+          sourceEventSequences: number[];
+        };
+      }>;
+    };
+    if (!Array.isArray(detail.turns)) {
+      await route.fulfill({ response });
+      return;
+    }
+    for (const turn of detail.turns) {
+      if (!turn.presentation?.messages.length) continue;
+      const sourceSequences = turn.presentation.sourceEventSequences;
+      turn.presentation.response = 'Flattened response should not replace message boundaries.';
+      turn.presentation.messages = [
+        { id: `${turn.id}-one`, text: firstMessage, complete: true, sourceEventSequences: sourceSequences },
+        {
+          id: `${turn.id}-two`,
+          text: authoritative ? completedSecondMessage : streamingSecondMessage,
+          complete: authoritative,
+          sourceEventSequences: sourceSequences
+        }
+      ];
+    }
+    await route.fulfill({ response, json: detail });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const terminalInput = page.locator('[data-testid="terminal"] textarea');
+  const terminalCanvas = page.locator('[data-testid="terminal"] canvas');
+  await expect(terminalInput).toBeFocused();
+  await page.getByLabel('Default harness').selectOption('v0');
+  await submit(page, 'agent "Summarize the workspace"');
+
+  const session = page.getByTestId('interactive-agent-session');
+  const answer = session.getByTestId('agent-response').first();
+  await expect(answer.locator('.assistant-message')).toHaveCount(2);
+  await expect(answer).not.toContainText('Flattened response should not replace message boundaries.');
+  await expect(answer.getByRole('heading', { name: 'Findings', level: 3 })).toBeVisible();
+  await expect(answer.getByRole('heading', { name: 'Next', level: 4 })).toBeVisible();
+  await expect(answer.locator('strong').filter({ hasText: 'Alpha' })).toBeVisible();
+  await expect(answer.getByRole('region', { name: 'Table in agent response' })).toContainText('gamma');
+  await expect(answer.getByRole('region', { name: 'nu code from agent response' })).toContainText(
+    'catalog list | where active'
+  );
+  const guide = answer.getByRole('link', { name: 'Guide' });
+  await expect(guide).toHaveAttribute('href', 'https://example.com/guide');
+  await expect(guide).toHaveAttribute('target', '_blank');
+  await expect(guide).toHaveAttribute('rel', 'noopener noreferrer');
+  const protocolRelative = answer.getByRole('link', { name: 'Protocol relative' });
+  await expect(protocolRelative).toHaveAttribute('href', '//example.com/guide');
+  await expect(protocolRelative).toHaveAttribute('target', '_blank');
+  await expect(protocolRelative).toHaveAttribute('rel', 'noopener noreferrer');
+  await expect(answer.getByRole('link', { name: 'Dial' })).toHaveCount(0);
+  await expect(answer.getByRole('link', { name: 'Unsafe' })).toHaveCount(0);
+  await expect(answer.locator('.blocked-link')).toContainText(['Dial', 'Unsafe']);
+  await expect(answer.getByRole('note', { name: 'Image omitted: Tracking pixel' })).toBeVisible();
+  expect(
+    await answer.evaluate((element) =>
+      [...element.querySelectorAll('img, script')].map((unsafeElement) => unsafeElement.outerHTML)
+    )
+  ).toEqual([]);
+  await expect(answer.locator('[data-streaming="true"]')).toHaveCount(1);
+  expect(resourceRequests).toEqual([]);
+  expect(await page.evaluate(() => (window as Window & { agentMarkdownXss?: boolean }).agentMarkdownXss)).toBeUndefined();
+
+  await terminalCanvas.evaluate((canvas) => (canvas.dataset.markdownSessionProbe = 'same-canvas'));
+  authoritative = true;
+  await submit(page, 'agent "Confirm the conclusion"');
+  await expect(answer.locator('.assistant-message').last()).toHaveAttribute('data-complete', 'true');
+  await expect(answer).toContainText('Authoritative completion keeps the same evidence.');
+  await expect(answer.locator('[data-streaming="true"]')).toHaveCount(0);
+  await expect(terminalCanvas).toHaveAttribute('data-markdown-session-probe', 'same-canvas');
+  await expect(terminalInput).toBeFocused();
+
+  const presentation = session.getByRole('group', { name: 'Agent answer presentation' });
+  await presentation.getByRole('button', { name: 'Source' }).click();
+  await expect(answer.locator('.response-source')).toHaveCount(2);
+  await expect(answer.locator('.response-source').first()).toContainText('# Findings');
+  await expect(answer.locator('.response-source').first()).toContainText('<script>window.agentMarkdownXss = true</script>');
+  await expect(answer.locator('.response-source').last()).toContainText('Authoritative completion');
+  await expect(presentation.getByRole('button', { name: 'Source' })).toHaveAttribute('aria-pressed', 'true');
+  await presentation.getByRole('button', { name: 'Rendered' }).click();
+  await expect(answer.getByRole('heading', { name: 'Findings', level: 3 })).toBeVisible();
+
+  await terminalCanvas.click({ position: { x: 10, y: 10 } });
+  await expect(terminalInput).toBeFocused();
+  const humanInputBeforeCancellation = terminalFramesSent.filter(
+    (frame) => frame === JSON.stringify({ type: 'human_input' })
+  ).length;
+  const ctrlCBeforeCancellation = terminalBytesSent.filter((frame) => frame === '03').length;
+  const sendOrderBeforeCancellation = terminalSendOrder.length;
+  await page.keyboard.press('Control+C');
+  await expect.poll(
+    () =>
+      terminalFramesSent.filter(
+        (frame) => frame === JSON.stringify({ type: 'human_input' })
+      ).length
+  ).toBe(humanInputBeforeCancellation + 1);
+  await expect.poll(
+    () => terminalBytesSent.filter((frame) => frame === '03').length
+  ).toBe(ctrlCBeforeCancellation + 1);
+  const cancellationOrder = terminalSendOrder.slice(sendOrderBeforeCancellation);
+  expect(cancellationOrder.indexOf('human-input')).toBeLessThan(
+    cancellationOrder.indexOf('ctrl-c')
+  );
+
+  const humanInputBeforePaste = terminalFramesSent.filter(
+    (frame) => frame === JSON.stringify({ type: 'human_input' })
+  ).length;
+  await terminalInput.evaluate((input) => {
+    const clipboard = new DataTransfer();
+    clipboard.setData('text/plain', '40 + 2');
+    input.dispatchEvent(
+      new ClipboardEvent('paste', {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: clipboard
+      })
+    );
+  });
+  await expect.poll(
+    () =>
+      terminalFramesSent.filter(
+        (frame) => frame === JSON.stringify({ type: 'human_input' })
+      ).length
+  ).toBeGreaterThan(humanInputBeforePaste);
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('terminal-text')).toContainText('42');
+
+  // Keep the persistent e2e workbench neutral for the catalog walkthrough that follows.
+  await submit(page, 'agent close');
+  await expect(page.getByTestId('terminal-text')).toContainText('closing');
+  await expect(page.locator('.run-heading')).toContainText('Session history');
+  await expect(page.locator('.run-heading')).toContainText('closed');
+  await expect(page.getByTestId('interactive-agent-session')).toContainText(
+    'Retained as durable evidence. Start a new agent session to continue.'
+  );
+  await page.reload();
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect(page.getByTestId('interactive-agent-session')).toHaveCount(0);
   await page.unrouteAll({ behavior: 'wait' });
 });
 
@@ -66,6 +3071,7 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await expect(screen).toContainText('Agent Lab');
   await expect(screen).toContainText('Explore the active workspace');
   await expect(screen).toContainText('catalog list | where active');
+  await expect(screen).toContainText('agent "What matters about this workspace?"');
   await expect(screen).toContainText('lab compare');
   await expect(screen).toContainText('agent-lab>');
   await expect(screen).toContainText('MCP namespaces: analysis, catalog');
@@ -156,11 +3162,53 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await expect(screen).toContainText('"activeCount": 2');
   await expect(screen).toContainText('"totalScore": 11');
 
-  await page.getByLabel('Harness').selectOption('v0');
-  await expect(page.getByLabel('Harness')).toHaveValue('v0');
-  await expect(page.getByLabel('Model')).toHaveValue('fixture');
-  await page.getByRole('button', { name: 'Run harness', exact: true }).click();
-  await expect(page.locator('.run-status')).toHaveText('passed');
+  await page.getByLabel('Default harness').selectOption('v0');
+  await expect(page.getByLabel('Default harness')).toHaveValue('v0');
+  await submit(page, 'help agent');
+  await expect(screen).toContainText('Continue the active harness-native agent session');
+  await submit(page, 'agent "Find the active catalog items and explain what matters"');
+  await expect(screen).toContainText('Alpha and gamma are active');
+  await expect(screen).toContainText('Gamma matters most');
+  const interactiveSession = page.getByTestId('interactive-agent-session');
+  await expect(page.locator('.run-heading')).toContainText('Active session');
+  await expect(page.locator('.run-heading')).toContainText('v0 · fixture');
+  await expect(interactiveSession).toContainText('Find the active catalog items and explain what matters');
+  await expect(interactiveSession.getByTestId('agent-response')).toContainText('Alpha and gamma are active');
+  await expect(interactiveSession).toContainText('catalog · list');
+  await expect(interactiveSession).toContainText('analysis · summarize');
+  await expect(page.getByTestId('run-review')).toHaveCount(0);
+  await expect(interactiveSession.getByText('Provided context')).toHaveCount(0);
+  await expect(interactiveSession.getByText(/Human input observed/)).toHaveCount(0);
+  const answerPresentation = interactiveSession.getByRole('group', { name: 'Agent answer presentation' });
+  await expect(answerPresentation.getByRole('button', { name: 'Rendered' })).toHaveAttribute('aria-pressed', 'true');
+  await answerPresentation.getByRole('button', { name: 'Source' }).click();
+  await expect(interactiveSession.locator('.response-source')).toContainText('**Alpha** and **gamma** are active.');
+  await expect(answerPresentation.getByRole('button', { name: 'Source' })).toHaveAttribute('aria-pressed', 'true');
+  await answerPresentation.getByRole('button', { name: 'Rendered' }).click();
+
+  await submit(page, 'agent "Why did you prioritize gamma?"');
+  await expect(screen).toContainText('Gamma matters most');
+  await expect(interactiveSession).toContainText('Why did you prioritize gamma?');
+  await expect(interactiveSession.getByTestId('session-turn')).toHaveCount(2);
+
+  await submit(page, 'catalog list | where active | agent "Use exactly these items and compare them"');
+  await expect(screen).toContainText('Gamma matters most');
+  await expect(interactiveSession).toContainText('Use exactly these items and compare them');
+  await expect(interactiveSession.getByText('Provided context')).toHaveCount(1);
+  await expect(interactiveSession.getByTestId('session-turn')).toHaveCount(3);
+
+  await submit(page, 'let first = (agent | get id); let second = (agent new | get id); agent switch $first | get id');
+  await expect(interactiveSession).toContainText('Find the active catalog items and explain what matters');
+  await expect(interactiveSession.getByTestId('agent-response').first()).toContainText('Alpha and gamma are active');
+  await submit(page, 'let first = (agent | get id); let sessions = (agent sessions | where status == ready); let second = ($sessions | where id != $first | get id | first); agent close; agent switch $second; agent close');
+
+  await page.getByLabel('Default harness').selectOption('v0');
+  await expect(page.getByLabel('Default harness')).toHaveValue('v0');
+  await expect(page.getByLabel('Default model')).toHaveValue('fixture');
+  const runHarness = page.getByRole('button', { name: 'Run harness', exact: true });
+  await expect(runHarness).toBeEnabled();
+  await runHarness.click();
+  await expect(page.locator('.run-heading > .run-status')).toHaveText('passed');
   await expect(assembly).toContainText('agent-lab-fixture');
   await expect(assembly).toContainText('fixture/model');
   const review = page.getByTestId('run-review');
@@ -196,14 +3244,16 @@ test('a catalog run remains explorable and reopens from durable evidence', async
 
   const completedRunId = await page.locator('.terminal-footer span').nth(1).textContent();
   await page.getByRole('button', { name: 'New workspace' }).click();
-  await expect(page.locator('.run-status')).toHaveText('exploring');
+  await expect(page.locator('.run-heading > .run-status')).toHaveText('exploring');
   await expect(page.getByRole('button', { name: 'Run harness', exact: true })).toBeVisible();
   await expect(page.locator('.terminal-footer span').nth(1)).not.toHaveText(completedRunId ?? '');
 
   await page.reload();
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
   const socketsBeforeReplay = socketUrls.length;
-  const historyRun = page.locator('.history-list button').filter({ hasText: 'fixture/model' }).first();
+  const historyRun = page
+    .locator('.history-list button')
+    .filter({ hasText: (completedRunId ?? '').replace(/^run\s+/, '') });
   await expect(historyRun).toContainText('passed');
   await historyRun.click();
   await expect(page.getByTestId('assembly')).toContainText('agent-lab-fixture');
@@ -219,14 +3269,14 @@ test('a catalog run remains explorable and reopens from durable evidence', async
 test('a paired harness evaluation streams, compares, and reopens', async ({ page }) => {
   await page.goto('/');
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
-  await page.getByLabel('Harness').selectOption('v0');
-  await expect(page.getByLabel('Harness')).toHaveValue('v0');
-  await expect(page.getByLabel('Model')).toHaveValue('fixture');
+  await page.getByLabel('Default harness').selectOption('v0');
+  await expect(page.getByLabel('Default harness')).toHaveValue('v0');
+  await expect(page.getByLabel('Default model')).toHaveValue('fixture');
 
   await page.reload();
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
-  await expect(page.getByLabel('Harness')).toHaveValue('v0');
-  await expect(page.getByLabel('Model')).toHaveValue('fixture');
+  await expect(page.getByLabel('Default harness')).toHaveValue('v0');
+  await expect(page.getByLabel('Default model')).toHaveValue('fixture');
 
   const screen = page.getByTestId('terminal-text');
   await submit(page, 'lab assembly | get selection.modelProfileId');
@@ -244,7 +3294,8 @@ test('a paired harness evaluation streams, compares, and reopens', async ({ page
   await expect(behavioralDiff).toContainText('eve');
   await expect(behavioralDiff).toContainText('catalog · list');
   await expect(behavioralDiff).toContainText('analysis · summarize');
-  await expect(behavioralDiff).toContainText('Created result.json');
+  await expect(behavioralDiff).toContainText('Artifact');
+  await expect(behavioralDiff).toContainText('result.json');
   await expect(behavioralDiff.locator('.clock-axis')).toHaveCount(2);
   await expect.poll(() => behavioralDiff.locator('.phase-clock').count()).toBeGreaterThan(0);
   await expect(behavioralDiff.locator('.phase-clock').first()).toContainText('+');
@@ -278,11 +3329,59 @@ test('a paired harness evaluation streams, compares, and reopens', async ({ page
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
   const reopened = page.locator('.evaluation-history .history-list button').first();
   await expect(reopened).toContainText('passed');
+  const detailResponse = page.waitForResponse((response) => {
+    const path = new URL(response.url()).pathname;
+    return response.request().method() === 'GET' && /^\/api\/evaluations\/[^/]+$/.test(path);
+  });
   await reopened.click();
+  const durableDetail = await (await detailResponse).json();
   await expect(page.getByTestId('evaluation-view').locator('.paired-result')).toContainText(
     'Same evaluated artifact'
   );
   await expect(page.getByTestId('behavioral-diff')).toContainText('analysis · summarize');
+
+  const unavailableDetail = structuredClone(durableDetail);
+  const unavailableArm = unavailableDetail.summary.arms[0];
+  const unavailableRunId = unavailableArm.runId as string;
+  unavailableDetail.summary.status = 'failed';
+  unavailableArm.status = 'failed';
+  unavailableDetail.comparison.outputsMatch = false;
+  unavailableDetail.comparison.artifactComparison = 'missing';
+  unavailableDetail.comparison.arms[0] = {
+    harnessId: unavailableArm.harnessId,
+    runId: unavailableRunId,
+    status: 'failed',
+    evidenceComplete: false,
+    usage: 'not reported',
+    cache: 'not reported'
+  };
+  await page.route(
+    new RegExp(`/api/evaluations/${unavailableDetail.summary.id}$`),
+    async (route) => {
+      await route.fulfill({ json: unavailableDetail });
+    }
+  );
+  await page.route(new RegExp(`/api/runs/${unavailableRunId}$`), async (route) => {
+    await route.fulfill({ status: 404, json: { error: 'unknown run' } });
+  });
+
+  await reopened.click();
+  await expect(page.getByTestId('evaluation-view').locator('.run-status')).toHaveText('failed');
+  await expect(page.getByTestId('evaluation-view').locator('.paired-result')).toContainText(
+    'Artifact unavailable'
+  );
+  await expect(page.getByTestId('behavioral-diff')).toContainText('Run evidence unavailable');
+  await page
+    .getByTestId('evaluation-view')
+    .locator('.native-replays')
+    .getByText('Native replays and raw evidence')
+    .click();
+  await expect(
+    page.getByTestId('evaluation-view').getByRole('button', {
+      name: `${unavailableArm.harnessId} replay unavailable`
+    })
+  ).toBeDisabled();
+  await page.unrouteAll({ behavior: 'wait' });
 });
 
 test('stacked surfaces keep their scroll owners inside the viewport', async ({ page }) => {
@@ -333,4 +3432,108 @@ test('stacked surfaces keep their scroll owners inside the viewport', async ({ p
   await page.mouse.wheel(0, 500);
   await expect.poll(() => content.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
   await expect(page.locator('.histories')).toBeInViewport();
+
+  await page.setViewportSize({ width: 320, height: 700 });
+  await runPanel.evaluate((element) => element.scrollIntoView({ block: 'start' }));
+  const tabs = page.getByRole('navigation', { name: 'Run views' });
+  const evaluationTab = tabs.getByRole('button', { name: 'Evaluation', exact: true });
+  await evaluationTab.evaluate((element) =>
+    element.scrollIntoView({ block: 'nearest', inline: 'end' })
+  );
+  const narrowGeometry = await page.evaluate(() => {
+    const tabs = document.querySelector<HTMLElement>('.tabs');
+    const lastTab = tabs?.lastElementChild?.getBoundingClientRect();
+    const bounds = tabs?.getBoundingClientRect();
+    return {
+      viewportWidth: window.innerWidth,
+      documentWidth: document.documentElement.scrollWidth,
+      tabs: bounds ? { left: bounds.left, right: bounds.right } : null,
+      lastTab: lastTab ? { left: lastTab.left, right: lastTab.right } : null,
+      scrollLeft: tabs?.scrollLeft ?? 0,
+      overflowX: tabs ? getComputedStyle(tabs).overflowX : ''
+    };
+  });
+  expect(narrowGeometry.documentWidth).toBeLessThanOrEqual(narrowGeometry.viewportWidth);
+  expect(narrowGeometry.tabs).not.toBeNull();
+  expect(narrowGeometry.lastTab).not.toBeNull();
+  expect(narrowGeometry.lastTab!.left).toBeGreaterThanOrEqual(narrowGeometry.tabs!.left - 1);
+  expect(narrowGeometry.lastTab!.right).toBeLessThanOrEqual(narrowGeometry.tabs!.right + 1);
+  expect(narrowGeometry.scrollLeft).toBeGreaterThan(0);
+  expect(narrowGeometry.overflowX).toBe('auto');
+});
+
+test('workbench controls stay compact and unclipped at desktop widths', async ({ page }) => {
+  for (const viewport of [
+    { width: 990, height: 624 },
+    { width: 1200, height: 760 },
+    { width: 1440, height: 900 }
+  ]) {
+    await page.setViewportSize(viewport);
+    await page.goto('/');
+    await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+
+    const controls = page.locator('.run-controls');
+    const metrics = await controls.evaluate((container) => {
+      const containerBounds = container.getBoundingClientRect();
+      const items = Array.from(container.children).map((item) => {
+        const bounds = item.getBoundingClientRect();
+        const control = item.matches('button, select')
+          ? item
+          : item.querySelector<HTMLElement>('button, select');
+        return {
+          left: bounds.left,
+          right: bounds.right,
+          top: bounds.top,
+          bottom: bounds.bottom,
+          clientWidth: control?.clientWidth ?? 0,
+          scrollWidth: control?.scrollWidth ?? 0,
+          clientHeight: control?.clientHeight ?? 0,
+          scrollHeight: control?.scrollHeight ?? 0,
+          tagName: control?.tagName ?? '',
+          whiteSpace: control ? getComputedStyle(control).whiteSpace : ''
+        };
+      });
+      return {
+        container: {
+          left: containerBounds.left,
+          right: containerBounds.right,
+          top: containerBounds.top,
+          bottom: containerBounds.bottom,
+          height: containerBounds.height
+        },
+        items
+      };
+    });
+
+    expect(metrics.container.left).toBeGreaterThanOrEqual(-1);
+    expect(metrics.container.right).toBeLessThanOrEqual(viewport.width + 1);
+    expect(metrics.container.height).toBeLessThanOrEqual(52);
+    for (const item of metrics.items) {
+      expect(item.left).toBeGreaterThanOrEqual(metrics.container.left - 1);
+      expect(item.right).toBeLessThanOrEqual(metrics.container.right + 1);
+      expect(item.top).toBeGreaterThanOrEqual(metrics.container.top - 1);
+      expect(item.bottom).toBeLessThanOrEqual(metrics.container.bottom + 1);
+      if (item.tagName === 'BUTTON') {
+        expect(item.scrollWidth).toBeLessThanOrEqual(item.clientWidth + 1);
+        expect(item.scrollHeight).toBeLessThanOrEqual(item.clientHeight + 1);
+        expect(item.whiteSpace).toBe('nowrap');
+      }
+    }
+    if (viewport.width === 1200) {
+      const panels = await page.locator('.bench').evaluate((bench) => {
+        const terminal = bench.querySelector<HTMLElement>('.terminal-panel')?.getBoundingClientRect();
+        const run = bench.querySelector<HTMLElement>('.run-panel')?.getBoundingClientRect();
+        return terminal && run
+          ? {
+              terminal: { left: terminal.left, right: terminal.right, top: terminal.top },
+              run: { left: run.left, right: run.right, top: run.top }
+            }
+          : null;
+      });
+      expect(panels).not.toBeNull();
+      expect(panels!.run.left).toBeGreaterThanOrEqual(panels!.terminal.right - 1);
+      expect(Math.abs(panels!.run.top - panels!.terminal.top)).toBeLessThanOrEqual(1);
+      expect(panels!.run.right).toBeLessThanOrEqual(viewport.width + 1);
+    }
+  }
 });

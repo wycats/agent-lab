@@ -97,6 +97,11 @@ export async function connectSession(
   const input = surface.onData((data) => {
     if (socket.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
   });
+  const humanInput = surface.onUserInput(() => {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'human_input' }));
+    }
+  });
   const resize = surface.onResize(({ cols, rows }) => {
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: 'resize', cols, rows }));
@@ -142,6 +147,7 @@ export async function connectSession(
       disposed = true;
       if (screenRefreshTimer !== undefined) clearTimeout(screenRefreshTimer);
       input.dispose();
+      humanInput.dispose();
       resize.dispose();
       scroll.dispose();
       socket.close();

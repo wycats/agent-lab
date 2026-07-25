@@ -685,6 +685,13 @@ impl Drop for ControllerInner {
                 let _ = commands.send(AgentSessionCommand::Shutdown);
             }
         }
+        // Signal every session before joining any actor. An actor may be waiting on shared
+        // workspace cleanup performed by another session, so joining during the signal pass can
+        // deadlock controller shutdown. Drop cannot surface a join failure; keep joining the
+        // remaining actors when one of them panics.
+        for state in sessions.values() {
+            let _ = join_agent_actor(state);
+        }
     }
 }
 
@@ -698,6 +705,7 @@ struct RunState {
     bundle_dir: PathBuf,
     agent_session_directories: AgentSessionDirectoryAnchor,
     workspace: PathBuf,
+    workspace_evidence_root: WorkspaceEvidenceRoot,
     output: PathBuf,
     initial_snapshot: Option<BTreeMap<String, Vec<u8>>>,
     capabilities: Mutex<Vec<CapabilityEndpoint>>,
@@ -751,6 +759,12 @@ struct AgentSessionDirectoryAnchor {
     session_collection: Mutex<Option<rustix::fd::OwnedFd>>,
 }
 
+struct WorkspaceEvidenceRoot {
+    display_path: PathBuf,
+    #[cfg(unix)]
+    directory: Option<rustix::fd::OwnedFd>,
+}
+
 impl AgentSessionEvidenceRoot {
     #[cfg(all(test, unix))]
     fn open(display_path: PathBuf) -> Result<Self, RunError> {
@@ -776,6 +790,26 @@ impl AgentSessionEvidenceRoot {
     }
 }
 
+impl WorkspaceEvidenceRoot {
+    #[cfg(all(test, unix))]
+    fn open(display_path: PathBuf) -> Result<Self, RunError> {
+        Ok(Self {
+            directory: Some(open_confined_evidence_root(&display_path)?),
+            display_path,
+        })
+    }
+
+    #[cfg(unix)]
+    fn is_available(&self) -> bool {
+        self.directory.is_some()
+    }
+
+    #[cfg(not(unix))]
+    fn is_available(&self) -> bool {
+        self.display_path.is_dir()
+    }
+}
+
 impl AgentSessionDirectoryAnchor {
     #[cfg(unix)]
     fn open(display_path: PathBuf) -> Result<Self, RunError> {
@@ -794,6 +828,38 @@ impl AgentSessionDirectoryAnchor {
 
     fn collection_display_path(&self) -> PathBuf {
         self.display_path.join("agent-sessions")
+    }
+
+    #[cfg(unix)]
+    fn workspace_evidence_root(&self) -> Result<WorkspaceEvidenceRoot, RunError> {
+        let display_path = self.display_path.join("workspace");
+        let directory = match rustix::fs::openat(
+            &self.run_directory,
+            "workspace",
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(directory) => Some(directory),
+            Err(rustix::io::Errno::NOENT) => None,
+            Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+                return Err(RunError::PathEscape(display_path));
+            }
+            Err(error) => return Err(io::Error::from(error).into()),
+        };
+        Ok(WorkspaceEvidenceRoot {
+            display_path,
+            directory,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn workspace_evidence_root(&self) -> Result<WorkspaceEvidenceRoot, RunError> {
+        Ok(WorkspaceEvidenceRoot {
+            display_path: self.display_path.join("workspace"),
+        })
     }
 
     #[cfg(unix)]
@@ -1057,6 +1123,11 @@ fn join_agent_actor(state: &AgentSessionState) -> Result<(), RunError> {
         actor.handle.take()
     };
     if let Some(handle) = handle {
+        if handle.thread().id() == thread::current().id() {
+            return Err(RunError::Protocol(
+                "agent session actor cannot join itself during shutdown".to_owned(),
+            ));
+        }
         handle.join().map_err(|_| {
             RunError::Protocol("agent session actor panicked during workspace shutdown".to_owned())
         })?;
@@ -1656,6 +1727,7 @@ impl RunController {
             .get(&harness_id)
             .ok_or_else(|| RunError::InvalidRequest(format!("unknown harness: {harness_id}")))?
             .clone();
+        let model_access_provider = self.model_access_provider_for_harness(&harness)?.cloned();
         let model_id = harness
             .models
             .get(&model_profile_id)
@@ -1731,16 +1803,15 @@ impl RunController {
         *lock(&state.commands) = Some(commands);
         let actor_state = state.clone();
         let actor_workspace = workspace.clone();
-        let actor_controller = Arc::downgrade(&self.inner);
         let workspace_path = workspace.workspace.clone();
         let spawn = thread::Builder::new()
             .name(format!("agent-lab-session-{id}"))
             .spawn(move || {
                 run_agent_session_actor(
-                    &actor_controller,
                     &actor_state,
                     &actor_workspace,
                     &harness,
+                    model_access_provider.as_ref(),
                     &workspace_path,
                     &scenario.limits,
                     &capabilities,
@@ -1784,34 +1855,7 @@ impl RunController {
             return Err(RunError::RunUnavailable(session_id.to_owned()));
         }
         let workspace = self.state(workspace_id)?;
-        let active_turn = lock(&workspace.active_agent_turn);
-        if active_turn.is_some() {
-            return Err(RunError::InvalidRequest(
-                "finish or cancel the active turn before switching sessions".to_owned(),
-            ));
-        }
-        if lock(&workspace.summary).status != RunStatus::Exploring {
-            return Err(RunError::RunUnavailable(workspace_id.to_owned()));
-        }
-        let mut active_id = lock(&workspace.active_agent_session_id);
-        let previous_active_id = active_id.clone();
-        persist_active_agent_session(&workspace, Some(session_id))?;
-        *active_id = Some(session_id.to_owned());
-        if let Err(error) = record_event(
-            &workspace,
-            "workbench.agent.session.activated",
-            json!({ "origin": origin, "sessionId": session_id }),
-        ) {
-            let rollback = persist_active_agent_session(&workspace, previous_active_id.as_deref());
-            *active_id = previous_active_id;
-            rollback?;
-            return Err(error);
-        }
-        drop(active_id);
-        drop(active_turn);
-        let mut summary = lock(&target.summary).clone();
-        summary.active = true;
-        Ok(summary)
+        activate_agent_session_state(&workspace, &target, workspace_id, session_id, origin)
     }
 
     /// Queue one attributable turn on a starting or ready interactive session.
@@ -1891,13 +1935,10 @@ impl RunController {
         let turn_relative = PathBuf::from("turns").join(&id);
         let prepared = (|| -> Result<(AgentTurnSummary, CancellationToken, Vec<CapabilityEndpoint>), RunError> {
             create_confined_evidence_directory(&state.evidence_root, &turn_relative)?;
-            let mut snapshot = capture_tree(&workspace.workspace)?;
-            redact_captured_tree(&mut snapshot, &lock(&state.secret_values));
-            let source_revision = captured_tree_digest(&snapshot);
-            write_confined_captured_tree(
-                &state.evidence_root,
-                &turn_relative.join("initial"),
-                &snapshot,
+            let source_revision = capture_agent_turn_initial_workspace(
+                &state,
+                &workspace.workspace_evidence_root,
+                &turn_relative,
             )?;
             let secrets = lock(&state.secret_values).clone();
             let turn = AgentTurnSummary {
@@ -2155,20 +2196,19 @@ impl RunController {
         } else {
             build_review(&summary, &events)
         };
-        let evidence_root = if summary.status.is_finished() {
-            state.bundle_dir.join("final")
+        let output_result = if summary.status.is_finished() {
+            read_optional_confined_json(&state.bundle_dir.join("final"), &state.output)
         } else {
-            state.workspace.clone()
+            read_optional_workspace_json(&state.workspace_evidence_root, &state.output)
         };
         let secret_values = lock(&state.secret_values).clone();
-        let (output, output_error) =
-            match read_optional_confined_json(&evidence_root, &state.output) {
-                Ok(output) => (
-                    output.map(|value| redact_value(value, &secret_values)),
-                    None,
-                ),
-                Err(error) => (None, Some(error.to_string())),
-            };
+        let (output, output_error) = match output_result {
+            Ok(output) => (
+                output.map(|value| redact_value(value, &secret_values)),
+                None,
+            ),
+            Err(error) => (None, Some(error.to_string())),
+        };
         Ok(RunDetail {
             summary,
             assembly: lock(&state.assembly).clone(),
@@ -2386,6 +2426,10 @@ impl RunController {
         let initial_snapshot = snapshot_tree(&seed)?;
         copy_tree(&seed, &workspace)?;
         copy_tree(&seed, &bundle_dir.join("initial"))?;
+        let workspace_evidence_root = agent_session_directories.workspace_evidence_root()?;
+        if !workspace_evidence_root.is_available() {
+            return Err(RunError::PathEscape(workspace));
+        }
 
         let summary = RunSummary {
             id: id.clone(),
@@ -2415,6 +2459,7 @@ impl RunController {
             bundle_dir,
             agent_session_directories,
             workspace,
+            workspace_evidence_root,
             output: scenario.output.clone(),
             initial_snapshot: Some(initial_snapshot),
             capabilities: Mutex::new(Vec::new()),
@@ -2770,7 +2815,7 @@ impl RunController {
         // Validate and capture the full source before creating a bundle. Writing this exact
         // in-memory snapshot also prevents Explore edits from racing the evaluation copy.
         Ok((
-            capture_tree(&source.workspace)?,
+            capture_workspace_tree(&source.workspace_evidence_root)?,
             lock(&source.assembly).clone(),
         ))
     }
@@ -2942,6 +2987,10 @@ impl RunController {
         let initial_snapshot = snapshot_tree(snapshot)?;
         copy_tree(snapshot, &workspace)?;
         copy_tree(snapshot, &bundle_dir.join("initial"))?;
+        let workspace_evidence_root = agent_session_directories.workspace_evidence_root()?;
+        if !workspace_evidence_root.is_available() {
+            return Err(RunError::PathEscape(workspace));
+        }
         let summary = RunSummary {
             id: id.clone(),
             scenario_id: scenario.id.clone(),
@@ -2971,6 +3020,7 @@ impl RunController {
             bundle_dir,
             agent_session_directories,
             workspace,
+            workspace_evidence_root,
             output: scenario.output.clone(),
             initial_snapshot: Some(initial_snapshot),
             capabilities: Mutex::new(Vec::new()),
@@ -3090,64 +3140,36 @@ impl RunController {
     }
 
     fn resolve_harness_driver(&self, harness: &HarnessProfile) -> Result<DriverLaunch, RunError> {
-        self.resolve_harness_driver_with_cancellation(harness, &CancellationToken::new())
+        resolve_harness_driver_with_cancellation(
+            harness,
+            self.model_access_provider_for_harness(harness)?,
+            &CancellationToken::new(),
+        )
     }
 
-    fn resolve_harness_driver_with_cancellation(
-        &self,
+    fn model_access_provider_for_harness<'a>(
+        &'a self,
         harness: &HarnessProfile,
-        cancel: &CancellationToken,
-    ) -> Result<DriverLaunch, RunError> {
+    ) -> Result<Option<&'a ModelAccessProvider>, RunError> {
         let Some(provider_id) = self.inner.harness_model_access.get(&harness.id) else {
-            return Ok(harness.launch.clone());
+            return Ok(None);
         };
-        let provider = self
-            .inner
+        self.inner
             .model_access_providers
             .get(provider_id)
+            .map(Some)
             .ok_or_else(|| {
                 RunError::InvalidRequest(format!(
                     "unknown model-access provider for harness {}: {provider_id}",
                     harness.id
                 ))
-            })?;
-        let resolution = resolve_model_access_with_cancellation(
-            provider,
-            true,
-            MODEL_ACCESS_TIMEOUT,
-            Some(cancel),
-        )?;
-        if resolution.status != ModelAccessStatus::Ready {
-            return Err(RunError::ModelAccessUnavailable(
-                resolution
-                    .message
-                    .unwrap_or_else(|| provider.setup_hint.clone()),
-            ));
-        }
-        let mut launch = harness.launch.clone();
-        for (name, value) in resolution.environment {
-            launch.env.retain(|(existing, _)| existing != name.as_str());
-            launch
-                .env
-                .push((OsString::from(name), OsString::from(value)));
-        }
-        Ok(launch)
+            })
     }
 
     fn ensure_harness_model_access_ready(&self, harness: &HarnessProfile) -> Result<(), RunError> {
-        let Some(provider_id) = self.inner.harness_model_access.get(&harness.id) else {
+        let Some(provider) = self.model_access_provider_for_harness(harness)? else {
             return Ok(());
         };
-        let provider = self
-            .inner
-            .model_access_providers
-            .get(provider_id)
-            .ok_or_else(|| {
-                RunError::InvalidRequest(format!(
-                    "unknown model-access provider for harness {}: {provider_id}",
-                    harness.id
-                ))
-            })?;
         let resolution = resolve_model_access(provider, false)?;
         if resolution.status == ModelAccessStatus::Ready {
             Ok(())
@@ -3180,6 +3202,49 @@ impl RunController {
             .cloned()
             .ok_or_else(|| RunError::UnknownAgentSession(id.to_owned()))
     }
+}
+
+fn activate_agent_session_state(
+    workspace: &RunState,
+    target: &AgentSessionState,
+    workspace_id: &str,
+    session_id: &str,
+    origin: WorkbenchOrigin,
+) -> Result<AgentSessionSummary, RunError> {
+    let target_summary = lock(&target.summary).clone();
+    if target_summary.workspace_id != workspace_id
+        || target_summary.status != AgentSessionStatus::Ready
+    {
+        return Err(RunError::RunUnavailable(session_id.to_owned()));
+    }
+    let active_turn = lock(&workspace.active_agent_turn);
+    if active_turn.is_some() {
+        return Err(RunError::InvalidRequest(
+            "finish or cancel the active turn before switching sessions".to_owned(),
+        ));
+    }
+    if lock(&workspace.summary).status != RunStatus::Exploring {
+        return Err(RunError::RunUnavailable(workspace_id.to_owned()));
+    }
+    let mut active_id = lock(&workspace.active_agent_session_id);
+    let previous_active_id = active_id.clone();
+    persist_active_agent_session(workspace, Some(session_id))?;
+    *active_id = Some(session_id.to_owned());
+    if let Err(error) = record_event(
+        workspace,
+        "workbench.agent.session.activated",
+        json!({ "origin": origin, "sessionId": session_id }),
+    ) {
+        let rollback = persist_active_agent_session(workspace, previous_active_id.as_deref());
+        *active_id = previous_active_id;
+        rollback?;
+        return Err(error);
+    }
+    drop(active_id);
+    drop(active_turn);
+    let mut summary = lock(&target.summary).clone();
+    summary.active = true;
+    Ok(summary)
 }
 
 fn rollback_prepared_start(
@@ -3270,6 +3335,33 @@ fn configured_limit_error(
             format!("scenario exceeded max {name} count: observed {actual}, allowed {maximum}")
         })
     })
+}
+
+fn resolve_harness_driver_with_cancellation(
+    harness: &HarnessProfile,
+    provider: Option<&ModelAccessProvider>,
+    cancel: &CancellationToken,
+) -> Result<DriverLaunch, RunError> {
+    let Some(provider) = provider else {
+        return Ok(harness.launch.clone());
+    };
+    let resolution =
+        resolve_model_access_with_cancellation(provider, true, MODEL_ACCESS_TIMEOUT, Some(cancel))?;
+    if resolution.status != ModelAccessStatus::Ready {
+        return Err(RunError::ModelAccessUnavailable(
+            resolution
+                .message
+                .unwrap_or_else(|| provider.setup_hint.clone()),
+        ));
+    }
+    let mut launch = harness.launch.clone();
+    for (name, value) in resolution.environment {
+        launch.env.retain(|(existing, _)| existing != name.as_str());
+        launch
+            .env
+            .push((OsString::from(name), OsString::from(value)));
+    }
+    Ok(launch)
 }
 
 fn resolve_model_access(
@@ -4157,10 +4249,10 @@ fn run_driver(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_agent_session_actor(
-    controller: &Weak<ControllerInner>,
     state: &AgentSessionState,
     workspace_state: &RunState,
     harness: &HarnessProfile,
+    model_access_provider: Option<&ModelAccessProvider>,
     workspace: &Path,
     limits: &ScenarioLimits,
     capabilities: &[CapabilityEndpoint],
@@ -4168,13 +4260,11 @@ fn run_agent_session_actor(
     origin: WorkbenchOrigin,
 ) {
     let result = (|| -> Result<(), RunError> {
-        let activation = controller.upgrade().ok_or_else(|| {
-            RunError::RunUnavailable("controller stopped during agent session startup".to_owned())
-        })?;
-        let driver_launch = (RunController {
-            inner: Arc::clone(&activation),
-        })
-        .resolve_harness_driver_with_cancellation(harness, &state.lifecycle_cancel)?;
+        let driver_launch = resolve_harness_driver_with_cancellation(
+            harness,
+            model_access_provider,
+            &state.lifecycle_cancel,
+        )?;
         if state.lifecycle_cancel.is_cancelled() {
             return Err(RunError::RunUnavailable(
                 "agent session startup was cancelled".to_owned(),
@@ -4277,11 +4367,9 @@ fn run_agent_session_actor(
         }
         update_agent_session_status(state, AgentSessionStatus::Ready, None)?;
         let workspace_id = lock(&state.summary).workspace_id.clone();
-        if let Err(error) = (RunController { inner: activation }).activate_agent_session(
-            &workspace_id,
-            &session_id,
-            origin,
-        ) {
+        if let Err(error) =
+            activate_agent_session_state(workspace_state, state, &workspace_id, &session_id, origin)
+        {
             record_agent_event(
                 state,
                 "agent.session.activation-deferred",
@@ -4307,7 +4395,6 @@ fn run_agent_session_actor(
                     &mut driver,
                     &session_id,
                     &turn_id,
-                    workspace,
                     &prompt,
                     input.as_ref(),
                     &capabilities,
@@ -4382,9 +4469,13 @@ fn run_agent_session_actor(
                         .join(&turn_id)
                         .join("presentation.pending.json"),
                 );
-                let workspace_diff =
-                    finalize_agent_turn_workspace(state, &turn_id, workspace, &secrets)
-                        .unwrap_or_else(|_| json!({ "changes": [] }));
+                let workspace_diff = finalize_agent_turn_workspace(
+                    state,
+                    &turn_id,
+                    &workspace_state.workspace_evidence_root,
+                    &secrets,
+                )
+                .unwrap_or_else(|_| json!({ "changes": [] }));
                 let turn_started_at_ms = lock(&state.turns)
                     .iter()
                     .find(|turn| turn.id == turn_id)
@@ -4459,7 +4550,6 @@ fn run_agent_turn(
     driver: &mut DriverProcess,
     session_id: &str,
     turn_id: &str,
-    workspace: &Path,
     prompt: &str,
     input: Option<&JsonValue>,
     capabilities: &[CapabilityEndpoint],
@@ -4655,8 +4745,12 @@ fn run_agent_turn(
                         {
                             require_agent_turn_response(state, turn_id)?;
                         }
-                        let workspace_diff =
-                            finalize_agent_turn_workspace(state, turn_id, workspace, secrets)?;
+                        let workspace_diff = finalize_agent_turn_workspace(
+                            state,
+                            turn_id,
+                            &workspace_state.workspace_evidence_root,
+                            secrets,
+                        )?;
                         write_confined_json_atomic(
                             &state.evidence_root,
                             Path::new("transcript.json"),
@@ -4776,8 +4870,12 @@ fn run_agent_turn(
                             turn_id,
                             &mut assistant_redactor,
                         )?;
-                        let workspace_diff =
-                            finalize_agent_turn_workspace(state, turn_id, workspace, secrets)?;
+                        let workspace_diff = finalize_agent_turn_workspace(
+                            state,
+                            turn_id,
+                            &workspace_state.workspace_evidence_root,
+                            secrets,
+                        )?;
                         write_confined_json_atomic(
                             &state.evidence_root,
                             Path::new("transcript.json"),
@@ -4851,8 +4949,7 @@ fn run_agent_turn(
 }
 
 struct AssistantObservationRedactor<'a> {
-    secrets: &'a [Vec<u8>],
-    secret_patterns: Vec<&'a str>,
+    secret_patterns: Vec<&'a [u8]>,
     messages: BTreeMap<String, AssistantMessageRedactionState>,
 }
 
@@ -4867,14 +4964,8 @@ struct AssistantMessageRedactionState {
 
 impl<'a> AssistantObservationRedactor<'a> {
     fn new(secrets: &'a [Vec<u8>]) -> Self {
-        let secret_patterns = secrets
-            .iter()
-            .filter_map(|secret| std::str::from_utf8(secret).ok())
-            .filter(|secret| secret.len() >= 4)
-            .collect();
         Self {
-            secrets,
-            secret_patterns,
+            secret_patterns: normalized_secret_text_patterns(secrets),
             messages: BTreeMap::new(),
         }
     }
@@ -4933,7 +5024,8 @@ impl<'a> AssistantObservationRedactor<'a> {
                         },
                     ));
                 }
-                let completed_text = redact_string(&completed.text, self.secrets);
+                let completed_text =
+                    redact_string_with_patterns(&completed.text, &self.secret_patterns);
                 if state.saw_delta && state.redacted != completed_text {
                     return Err(RunError::Protocol(format!(
                         "redacted assistant completion disagrees with streamed deltas for {}",
@@ -4995,34 +5087,10 @@ fn flush_pending_assistant_deltas(
     Ok(())
 }
 
-fn drain_redacted_prefix(pending: &mut String, secrets: &[&str], finish: bool) -> String {
-    let mut output = String::new();
-    while !pending.is_empty() {
-        if let Some(secret) = secrets
-            .iter()
-            .copied()
-            .find(|secret| pending.starts_with(secret))
-        {
-            pending.drain(..secret.len());
-            output.push_str("[REDACTED]");
-            continue;
-        }
-        if !finish
-            && secrets
-                .iter()
-                .any(|secret| secret.starts_with(pending.as_str()))
-        {
-            break;
-        }
-        let first_len = pending
-            .chars()
-            .next()
-            .expect("non-empty string has a first character")
-            .len_utf8();
-        output.push_str(&pending[..first_len]);
-        pending.drain(..first_len);
-    }
-    output
+fn drain_redacted_prefix(pending: &mut String, secrets: &[&[u8]], finish: bool) -> String {
+    let (output, consumed) = redact_secret_prefix(pending.as_bytes(), secrets, finish);
+    pending.drain(..consumed);
+    String::from_utf8(output).expect("redacting UTF-8 text preserves UTF-8")
 }
 
 fn require_agent_turn_response(state: &AgentSessionState, turn_id: &str) -> Result<(), RunError> {
@@ -5045,18 +5113,33 @@ fn require_agent_turn_response(state: &AgentSessionState, turn_id: &str) -> Resu
     Ok(())
 }
 
+fn capture_agent_turn_initial_workspace(
+    state: &AgentSessionState,
+    workspace: &WorkspaceEvidenceRoot,
+    turn_relative: &Path,
+) -> Result<String, RunError> {
+    let mut snapshot = capture_workspace_tree(workspace)?;
+    redact_captured_tree(&mut snapshot, &lock(&state.secret_values));
+    let source_revision = captured_tree_digest(&snapshot);
+    write_confined_captured_tree(
+        &state.evidence_root,
+        &turn_relative.join("initial"),
+        &snapshot,
+    )?;
+    Ok(source_revision)
+}
+
 fn finalize_agent_turn_workspace(
     state: &AgentSessionState,
     turn_id: &str,
-    workspace: &Path,
+    workspace: &WorkspaceEvidenceRoot,
     secrets: &[Vec<u8>],
 ) -> Result<JsonValue, RunError> {
-    validate_evidence_tree(workspace)?;
     let turn_relative = PathBuf::from("turns").join(turn_id);
     let final_relative = turn_relative.join("final");
     let staging_relative = turn_relative.join("final.tmp");
     remove_confined_evidence_entry(&state.evidence_root, &staging_relative)?;
-    let mut final_snapshot = capture_tree(workspace)?;
+    let mut final_snapshot = capture_workspace_tree(workspace)?;
     redact_captured_tree(&mut final_snapshot, secrets);
     write_confined_captured_tree(&state.evidence_root, &staging_relative, &final_snapshot)?;
     let initial_snapshot =
@@ -5619,7 +5702,7 @@ fn build_agent_turn_presentation_from_events(
     } else {
         AgentPresentationCompleteness::Unavailable
     };
-    Ok(AgentTurnPresentation {
+    let mut presentation = AgentTurnPresentation {
         schema_version: AGENT_TURN_PRESENTATION_VERSION,
         response,
         messages,
@@ -5634,7 +5717,48 @@ fn build_agent_turn_presentation_from_events(
         },
         source_event_sequences,
         source_digest,
-    })
+    };
+    redact_agent_turn_presentation(&mut presentation, secrets);
+    Ok(presentation)
+}
+
+fn redact_agent_turn_presentation(presentation: &mut AgentTurnPresentation, secrets: &[Vec<u8>]) {
+    if let Some(response) = &mut presentation.response {
+        *response = redact_string(response, secrets);
+    }
+    for message in &mut presentation.messages {
+        message.id = redact_string(&message.id, secrets);
+        message.text = redact_string(&message.text, secrets);
+    }
+    for activity in &mut presentation.activity {
+        activity.title = redact_string(&activity.title, secrets);
+        for value in [
+            &mut activity.detail,
+            &mut activity.source,
+            &mut activity.path,
+            &mut activity.operation,
+            &mut activity.call_id,
+            &mut activity.action_id,
+            &mut activity.change_kind,
+            &mut activity.entry_type,
+            &mut activity.before_mode,
+            &mut activity.after_mode,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *value = redact_string(value, secrets);
+        }
+        if let Some(arguments) = &mut activity.arguments {
+            redact_secret_strings(arguments, secrets);
+        }
+        if let Some(result) = &mut activity.result {
+            redact_secret_strings(result, secrets);
+        }
+    }
+    if let Some(usage) = &mut presentation.usage {
+        redact_secret_strings(usage, secrets);
+    }
 }
 
 fn agent_session_supports_turn_observations(events: &[RunEvent]) -> bool {
@@ -5792,7 +5916,7 @@ fn record_startup_event(
 }
 
 fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonValue, RunError> {
-    let output = read_optional_confined_json(&state.workspace, &scenario.output)?;
+    let output = read_optional_workspace_json(&state.workspace_evidence_root, &scenario.output)?;
     let schema_valid = output.as_ref().is_some_and(catalog_output_schema_valid);
     let active_names = output
         .as_ref()
@@ -7569,7 +7693,8 @@ fn load_run_bundle(
     }
     let scenario = scenarios.get(&summary.scenario_id);
     let workspace = bundle_dir.join("workspace");
-    if !workspace.is_dir() && !summary.status.is_finished() {
+    let workspace_evidence_root = agent_session_directories.workspace_evidence_root()?;
+    if !workspace_evidence_root.is_available() && !summary.status.is_finished() {
         return Ok(None);
     }
     let interrupted = matches!(summary.status, RunStatus::Starting | RunStatus::Running);
@@ -7643,6 +7768,7 @@ fn load_run_bundle(
         bundle_dir: bundle_dir.to_path_buf(),
         agent_session_directories,
         workspace,
+        workspace_evidence_root,
         output,
         initial_snapshot,
         capabilities: Mutex::new(Vec::new()),
@@ -7689,7 +7815,9 @@ fn recover_finalized_run(state: &RunState) -> Result<bool, RunError> {
     let Ok(final_files) = snapshot_tree(&final_dir) else {
         return Ok(false);
     };
-    let Ok(workspace_files) = snapshot_tree(&state.workspace) else {
+    let Ok(workspace_files) =
+        capture_workspace_tree(&state.workspace_evidence_root).map(captured_tree_files)
+    else {
         return Ok(false);
     };
     if final_files != workspace_files
@@ -7992,17 +8120,18 @@ fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
     let staging_dir = state.bundle_dir.join("final.tmp");
     remove_evidence_entry(&staging_dir)?;
     let result = (|| {
-        validate_evidence_tree(&state.workspace)?;
-        copy_tree(&state.workspace, &staging_dir)?;
+        let final_snapshot = capture_workspace_tree(&state.workspace_evidence_root)?;
         let secret_values = lock(&state.secret_values).clone();
-        redact_tree(&staging_dir, &secret_values)?;
+        let mut redacted_final_snapshot = final_snapshot.clone();
+        redact_captured_tree(&mut redacted_final_snapshot, &secret_values);
+        write_captured_tree(&staging_dir, &redacted_final_snapshot)?;
         let initial = state.initial_snapshot.as_ref().ok_or_else(|| {
             RunError::EvidencePersistence(
                 "protected initial workspace snapshot is unavailable".to_owned(),
             )
         })?;
         persist_initial_snapshot(state, initial)?;
-        let final_files = snapshot_tree(&staging_dir)?;
+        let final_files = captured_tree_file_contents(&redacted_final_snapshot);
         let paths = initial
             .keys()
             .chain(final_files.keys())
@@ -8031,7 +8160,11 @@ fn finalize_workspace(state: &RunState) -> Result<JsonValue, RunError> {
         write_json_atomic(&state.bundle_dir.join("diff.json"), &diff)?;
         // The workspace is part of the run bundle too. Keep it usable for an attached shell while
         // applying the same redaction boundary as the immutable final snapshot.
-        redact_tree(&state.workspace, &secret_values)?;
+        redact_workspace_files(
+            &state.workspace_evidence_root,
+            &final_snapshot,
+            &redacted_final_snapshot,
+        )?;
         fs::rename(&staging_dir, final_dir)?;
         Ok(diff)
     })();
@@ -8061,13 +8194,13 @@ fn persist_initial_snapshot(
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct CapturedFile {
     contents: Vec<u8>,
     permissions: fs::Permissions,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct CapturedTree {
     root_permissions: fs::Permissions,
     directories: BTreeMap<String, fs::Permissions>,
@@ -8248,36 +8381,6 @@ fn remove_evidence_entry(path: &Path) -> Result<(), RunError> {
     Ok(())
 }
 
-fn redact_tree(root: &Path, secrets: &[Vec<u8>]) -> Result<(), RunError> {
-    fn visit(
-        directory: &Path,
-        secrets: &[Vec<u8>],
-        retained_bytes: &mut u64,
-    ) -> Result<(), RunError> {
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() {
-                return Err(RunError::PathEscape(entry.path()));
-            }
-            if file_type.is_dir() {
-                visit(&entry.path(), secrets, retained_bytes)?;
-            } else if file_type.is_file() {
-                let original = read_evidence_file(&entry.path(), retained_bytes)?;
-                let redacted = redact_evidence_bytes(&original, secrets);
-                if redacted != original {
-                    fs::write(entry.path(), redacted)?;
-                }
-            } else {
-                return Err(RunError::UnsupportedWorkspaceEntry(entry.path()));
-            }
-        }
-        Ok(())
-    }
-
-    visit(root, secrets, &mut 0)
-}
-
 fn redacted_evidence_text(bytes: &[u8], secrets: &[Vec<u8>]) -> Option<String> {
     String::from_utf8(redact_evidence_bytes(bytes, secrets)).ok()
 }
@@ -8298,11 +8401,23 @@ fn redact_evidence_bytes(bytes: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, RunError> {
-    Ok(capture_tree(root)?
+    Ok(captured_tree_files(capture_tree(root)?))
+}
+
+fn captured_tree_files(snapshot: CapturedTree) -> BTreeMap<String, Vec<u8>> {
+    snapshot
         .files
         .into_iter()
         .map(|(path, file)| (path, file.contents))
-        .collect())
+        .collect()
+}
+
+fn captured_tree_file_contents(snapshot: &CapturedTree) -> BTreeMap<String, Vec<u8>> {
+    snapshot
+        .files
+        .iter()
+        .map(|(path, file)| (path.clone(), file.contents.clone()))
+        .collect()
 }
 
 fn capture_tree(root: &Path) -> Result<CapturedTree, RunError> {
@@ -8778,11 +8893,67 @@ fn write_confined_captured_tree(
     ))
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static CAPTURE_REPLACEMENT_INJECTION:
+        std::cell::RefCell<Option<(PathBuf, PathBuf)>> = const {
+            std::cell::RefCell::new(None)
+        };
+    static WORKSPACE_REDACTION_HARDLINK_INJECTION:
+        std::cell::RefCell<Option<(PathBuf, PathBuf)>> = const {
+            std::cell::RefCell::new(None)
+        };
+}
+
+#[cfg(all(test, unix))]
+fn maybe_inject_confined_capture_replacement(
+    directory: &rustix::fd::OwnedFd,
+    name: &OsStr,
+    entry_display: &Path,
+) -> Result<(), RunError> {
+    let replacement = CAPTURE_REPLACEMENT_INJECTION.with(|injection| {
+        let mut injection = injection.borrow_mut();
+        if injection
+            .as_ref()
+            .is_some_and(|(target, _)| target == entry_display)
+        {
+            injection.take().map(|(_, replacement)| replacement)
+        } else {
+            None
+        }
+    });
+    if let Some(replacement) = replacement {
+        rustix::fs::renameat(rustix::fs::CWD, replacement, directory, name)
+            .map_err(|error| io::Error::from(error).into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+fn maybe_inject_workspace_redaction_hardlink(entry_display: &Path) -> Result<(), RunError> {
+    let outside = WORKSPACE_REDACTION_HARDLINK_INJECTION.with(|injection| {
+        let mut injection = injection.borrow_mut();
+        if injection
+            .as_ref()
+            .is_some_and(|(target, _)| target == entry_display)
+        {
+            injection.take().map(|(_, outside)| outside)
+        } else {
+            None
+        }
+    });
+    if let Some(outside) = outside {
+        fs::hard_link(entry_display, outside)?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[allow(clippy::too_many_lines)]
-fn capture_confined_tree(
-    root: &AgentSessionEvidenceRoot,
-    relative: &Path,
+fn capture_confined_tree_at(
+    directory: &rustix::fd::OwnedFd,
+    display_path: &Path,
 ) -> Result<CapturedTree, RunError> {
     #[allow(clippy::too_many_lines)]
     fn visit(
@@ -8809,6 +8980,8 @@ fn capture_confined_tree(
                     Err(rustix::io::Errno::NOENT) => continue,
                     Err(error) => return Err(io::Error::from(error).into()),
                 };
+            #[cfg(test)]
+            maybe_inject_confined_capture_replacement(directory, &name, &entry_display)?;
             match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
                 rustix::fs::FileType::Directory => {
                     let opened = rustix::fs::openat(
@@ -8899,18 +9072,12 @@ fn capture_confined_tree(
         Ok(())
     }
 
-    let display_path = root.display_path().join(relative);
-    let directory = open_confined_evidence_directory_at(
-        &root.directory,
-        confined_evidence_components(relative, &display_path)?,
-        &display_path,
-    )?;
-    let root_permissions = confined_fd_metadata(&directory)?.permissions();
+    let root_permissions = confined_fd_metadata(directory)?.permissions();
     let mut directories = BTreeMap::new();
     let mut files = BTreeMap::new();
     visit(
-        &directory,
-        &display_path,
+        directory,
+        display_path,
         Path::new(""),
         &mut directories,
         &mut files,
@@ -8923,6 +9090,20 @@ fn capture_confined_tree(
     })
 }
 
+#[cfg(unix)]
+fn capture_confined_tree(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+) -> Result<CapturedTree, RunError> {
+    let display_path = root.display_path().join(relative);
+    let directory = open_confined_evidence_directory_at(
+        &root.directory,
+        confined_evidence_components(relative, &display_path)?,
+        &display_path,
+    )?;
+    capture_confined_tree_at(&directory, &display_path)
+}
+
 #[cfg(not(unix))]
 fn capture_confined_tree(
     root: &AgentSessionEvidenceRoot,
@@ -8931,6 +9112,129 @@ fn capture_confined_tree(
     Err(RunError::ConfinedReadUnavailable(
         root.display_path().join(relative),
     ))
+}
+
+#[cfg(unix)]
+fn capture_workspace_tree(root: &WorkspaceEvidenceRoot) -> Result<CapturedTree, RunError> {
+    let directory = root
+        .directory
+        .as_ref()
+        .ok_or_else(|| RunError::ConfinedReadUnavailable(root.display_path.clone()))?;
+    capture_confined_tree_at(directory, &root.display_path)
+}
+
+#[cfg(not(unix))]
+fn capture_workspace_tree(root: &WorkspaceEvidenceRoot) -> Result<CapturedTree, RunError> {
+    Err(RunError::ConfinedReadUnavailable(root.display_path.clone()))
+}
+
+#[cfg(unix)]
+fn redact_workspace_files(
+    root: &WorkspaceEvidenceRoot,
+    before: &CapturedTree,
+    after: &CapturedTree,
+) -> Result<(), RunError> {
+    let root_directory = root
+        .directory
+        .as_ref()
+        .ok_or_else(|| RunError::ConfinedReadUnavailable(root.display_path.clone()))?;
+    for (relative, after_file) in &after.files {
+        let Some(before_file) = before.files.get(relative) else {
+            return Err(RunError::EvidencePersistence(format!(
+                "redacted workspace snapshot added an unexpected file: {relative}"
+            )));
+        };
+        if before_file.contents == after_file.contents {
+            continue;
+        }
+        let relative = Path::new(relative);
+        let display_path = root.display_path.join(relative);
+        let mut components = confined_evidence_components(relative, &display_path)?;
+        let name = components
+            .pop()
+            .expect("captured workspace file has a final component");
+        let parent =
+            open_confined_evidence_directory_at(root_directory, components, &display_path)?;
+        let opened = rustix::fs::openat(
+            &parent,
+            &name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| match error {
+            rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+                RunError::PathEscape(display_path.clone())
+            }
+            _ => io::Error::from(error).into(),
+        })?;
+        let mut retained_bytes = 0;
+        let opened = fs::File::from(opened);
+        let metadata = opened.metadata()?;
+        if !metadata.is_file() {
+            return Err(RunError::PathEscape(display_path));
+        }
+        validate_evidence_file(&display_path, &metadata, &mut retained_bytes)?;
+        #[cfg(test)]
+        maybe_inject_workspace_redaction_hardlink(&display_path)?;
+
+        let temporary = OsString::from(format!(
+            ".agent-lab-redact-{}-{}.tmp",
+            now_ms(),
+            random_suffix()
+        ));
+        let temporary_descriptor = rustix::fs::openat(
+            &parent,
+            &temporary,
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map_err(io::Error::from)?;
+        let temporary_file = fs::File::from(temporary_descriptor);
+        let prepare_result = (|| -> Result<(), RunError> {
+            (&temporary_file).write_all(&after_file.contents)?;
+            temporary_file.set_permissions(after_file.permissions.clone())?;
+            Ok(())
+        })();
+        if let Err(error) = prepare_result {
+            let _ = rustix::fs::unlinkat(&parent, &temporary, rustix::fs::AtFlags::empty());
+            return Err(error);
+        }
+
+        match rustix::fs::statat(&parent, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat)
+                if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                    == rustix::fs::FileType::RegularFile => {}
+            Ok(_) | Err(rustix::io::Errno::NOENT) => {
+                let _ = rustix::fs::unlinkat(&parent, &temporary, rustix::fs::AtFlags::empty());
+                return Err(RunError::PathEscape(display_path));
+            }
+            Err(error) => {
+                let _ = rustix::fs::unlinkat(&parent, &temporary, rustix::fs::AtFlags::empty());
+                return Err(io::Error::from(error).into());
+            }
+        }
+        if let Err(error) = rustix::fs::renameat(&parent, &temporary, &parent, &name) {
+            let _ = rustix::fs::unlinkat(&parent, &temporary, rustix::fs::AtFlags::empty());
+            return Err(io::Error::from(error).into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn redact_workspace_files(
+    root: &WorkspaceEvidenceRoot,
+    _before: &CapturedTree,
+    _after: &CapturedTree,
+) -> Result<(), RunError> {
+    Err(RunError::ConfinedReadUnavailable(root.display_path.clone()))
 }
 
 #[cfg(unix)]
@@ -9203,6 +9507,33 @@ fn read_optional_confined_json(
 }
 
 #[cfg(unix)]
+fn read_optional_workspace_json(
+    root: &WorkspaceEvidenceRoot,
+    child: impl AsRef<Path>,
+) -> Result<Option<JsonValue>, RunError> {
+    let path = confined_child(&root.display_path, child)?;
+    let relative = path
+        .strip_prefix(&root.display_path)
+        .map_err(|_| RunError::PathEscape(path.clone()))?;
+    let directory = root
+        .directory
+        .as_ref()
+        .ok_or_else(|| RunError::ConfinedReadUnavailable(root.display_path.clone()))?;
+    let Some(bytes) = read_optional_confined_file_at(directory, relative, &path)? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+#[cfg(not(unix))]
+fn read_optional_workspace_json(
+    root: &WorkspaceEvidenceRoot,
+    _child: impl AsRef<Path>,
+) -> Result<Option<JsonValue>, RunError> {
+    Err(RunError::ConfinedReadUnavailable(root.display_path.clone()))
+}
+
+#[cfg(unix)]
 fn read_optional_confined_file(
     root: &Path,
     relative: &Path,
@@ -9470,13 +9801,89 @@ fn redact_secret_strings(value: &mut JsonValue, secrets: &[Vec<u8>]) {
 }
 
 fn redact_string(value: &str, secrets: &[Vec<u8>]) -> String {
-    secrets
+    redact_string_with_patterns(value, &normalized_secret_text_patterns(secrets))
+}
+
+fn redact_string_with_patterns(value: &str, secrets: &[&[u8]]) -> String {
+    let (redacted, consumed) = redact_secret_prefix(value.as_bytes(), secrets, true);
+    debug_assert_eq!(consumed, value.len());
+    String::from_utf8(redacted).expect("redacting UTF-8 text preserves UTF-8")
+}
+
+fn normalized_secret_byte_patterns(secrets: &[Vec<u8>]) -> Vec<&[u8]> {
+    let mut patterns = secrets
         .iter()
-        .filter_map(|secret| std::str::from_utf8(secret).ok())
+        .map(Vec::as_slice)
         .filter(|secret| secret.len() >= 4)
-        .fold(value.to_owned(), |value, secret| {
-            value.replace(secret, "[REDACTED]")
-        })
+        .collect::<Vec<_>>();
+    patterns
+        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    patterns.dedup();
+    patterns
+}
+
+fn normalized_secret_text_patterns(secrets: &[Vec<u8>]) -> Vec<&[u8]> {
+    normalized_secret_byte_patterns(secrets)
+        .into_iter()
+        .filter(|secret| std::str::from_utf8(secret).is_ok())
+        .collect()
+}
+
+fn redact_secret_prefix(value: &[u8], secrets: &[&[u8]], finish: bool) -> (Vec<u8>, usize) {
+    const REDACTED: &[u8] = b"[REDACTED]";
+    let spans = merged_secret_spans(value, secrets);
+    let safe_limit = if finish {
+        value.len()
+    } else {
+        pending_secret_prefix_start(value, secrets).unwrap_or(value.len())
+    };
+    let consume_limit = spans
+        .iter()
+        .find(|(_, end)| *end > safe_limit)
+        .map_or(safe_limit, |(start, _)| (*start).min(safe_limit));
+    let mut redacted = Vec::with_capacity(consume_limit);
+    let mut offset = 0;
+    for (start, end) in spans {
+        if end > consume_limit {
+            break;
+        }
+        redacted.extend_from_slice(&value[offset..start]);
+        redacted.extend_from_slice(REDACTED);
+        offset = end;
+    }
+    redacted.extend_from_slice(&value[offset..consume_limit]);
+    (redacted, consume_limit)
+}
+
+fn merged_secret_spans(value: &[u8], secrets: &[&[u8]]) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for start in 0..value.len() {
+        let Some(secret) = secrets
+            .iter()
+            .copied()
+            .find(|secret| value[start..].starts_with(secret))
+        else {
+            continue;
+        };
+        let end = start + secret.len();
+        if let Some((_, previous_end)) = spans.last_mut()
+            && start < *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            spans.push((start, end));
+        }
+    }
+    spans
+}
+
+fn pending_secret_prefix_start(value: &[u8], secrets: &[&[u8]]) -> Option<usize> {
+    (0..value.len()).find(|start| {
+        let suffix = &value[*start..];
+        secrets
+            .iter()
+            .any(|secret| suffix.len() < secret.len() && secret.starts_with(suffix))
+    })
 }
 
 fn unique_redacted_key(object: &serde_json::Map<String, JsonValue>, key: String) -> String {
@@ -9507,18 +9914,10 @@ fn sensitive_name(name: &str) -> bool {
 }
 
 fn replace_secrets(bytes: &mut Vec<u8>, secrets: &[Vec<u8>]) {
-    const REDACTED: &[u8] = b"[REDACTED]";
-    for secret in secrets.iter().filter(|secret| secret.len() >= 4) {
-        let mut offset = 0;
-        while let Some(relative) = bytes[offset..]
-            .windows(secret.len())
-            .position(|window| window == secret.as_slice())
-        {
-            let start = offset + relative;
-            bytes.splice(start..start + secret.len(), REDACTED.iter().copied());
-            offset = start + REDACTED.len();
-        }
-    }
+    let patterns = normalized_secret_byte_patterns(secrets);
+    let (redacted, consumed) = redact_secret_prefix(bytes, &patterns, true);
+    debug_assert_eq!(consumed, bytes.len());
+    *bytes = redacted;
 }
 
 fn run_id() -> String {
@@ -9991,6 +10390,132 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_secret_redaction_is_order_independent_for_text_and_bytes() {
+        for secrets in [
+            vec![b"abcd".to_vec(), b"abcdef".to_vec()],
+            vec![b"abcdef".to_vec(), b"abcd".to_vec()],
+        ] {
+            assert_eq!(
+                redact_string("before abcdef after", &secrets),
+                "before [REDACTED] after"
+            );
+
+            let mut bytes = b"before abcdef after".to_vec();
+            replace_secrets(&mut bytes, &secrets);
+            assert_eq!(bytes, b"before [REDACTED] after");
+        }
+    }
+
+    #[test]
+    fn streaming_redaction_holds_a_shorter_match_that_can_extend() {
+        for secrets in [
+            vec![b"abcd".to_vec(), b"abcdef".to_vec()],
+            vec![b"abcdef".to_vec(), b"abcd".to_vec()],
+        ] {
+            let mut redactor = AssistantObservationRedactor::new(&secrets);
+            let mut observations = Vec::new();
+            for text in ["ab", "cd", "ef tail"] {
+                observations.extend(
+                    redactor
+                        .redact(TurnObservation::AssistantDelta(
+                            agent_lab_driver_protocol::AssistantDeltaObservation {
+                                message_id: "message-1".to_owned(),
+                                text: text.to_owned(),
+                            },
+                        ))
+                        .unwrap(),
+                );
+            }
+            observations.extend(
+                redactor
+                    .redact(TurnObservation::AssistantCompleted(
+                        agent_lab_driver_protocol::AssistantCompletedObservation {
+                            message_id: "message-1".to_owned(),
+                            text: "abcdef tail".to_owned(),
+                        },
+                    ))
+                    .unwrap(),
+            );
+
+            assert!(observations.iter().all(|observation| {
+                !matches!(
+                    observation,
+                    TurnObservation::AssistantDelta(delta) if delta.text.is_empty()
+                )
+            }));
+            assert_eq!(observations.len(), 2);
+            assert!(matches!(
+                &observations[0],
+                TurnObservation::AssistantDelta(delta)
+                    if delta.text == "[REDACTED] tail"
+            ));
+            assert!(matches!(
+                &observations[1],
+                TurnObservation::AssistantCompleted(completed)
+                    if completed.text == "[REDACTED] tail"
+            ));
+
+            let mut interrupted = AssistantObservationRedactor::new(&secrets);
+            assert!(
+                interrupted
+                    .redact(TurnObservation::AssistantDelta(
+                        agent_lab_driver_protocol::AssistantDeltaObservation {
+                            message_id: "message-2".to_owned(),
+                            text: "abcd".to_owned(),
+                        },
+                    ))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(matches!(
+                interrupted.flush_incomplete().as_slice(),
+                [TurnObservation::AssistantDelta(delta)]
+                    if delta.text == "[REDACTED]"
+            ));
+        }
+    }
+
+    #[test]
+    fn streaming_and_authoritative_redaction_agree_for_offset_overlaps() {
+        for secrets in [
+            vec![b"abcd".to_vec(), b"bcdef".to_vec()],
+            vec![b"bcdef".to_vec(), b"abcd".to_vec()],
+        ] {
+            let mut redactor = AssistantObservationRedactor::new(&secrets);
+            let mut observations = Vec::new();
+            for text in ["abc", "def"] {
+                observations.extend(
+                    redactor
+                        .redact(TurnObservation::AssistantDelta(
+                            agent_lab_driver_protocol::AssistantDeltaObservation {
+                                message_id: "message-1".to_owned(),
+                                text: text.to_owned(),
+                            },
+                        ))
+                        .unwrap(),
+                );
+            }
+            observations.extend(
+                redactor
+                    .redact(TurnObservation::AssistantCompleted(
+                        agent_lab_driver_protocol::AssistantCompletedObservation {
+                            message_id: "message-1".to_owned(),
+                            text: "abcdef".to_owned(),
+                        },
+                    ))
+                    .unwrap(),
+            );
+
+            assert_eq!(redact_string("abcdef", &secrets), "[REDACTED]");
+            assert!(matches!(
+                observations.last(),
+                Some(TurnObservation::AssistantCompleted(completed))
+                    if completed.text == "[REDACTED]"
+            ));
+        }
+    }
+
+    #[test]
     fn split_secret_is_absent_from_live_raw_and_completed_answer_projections() {
         let secrets = vec![b"credential-token".to_vec()];
         let mut redactor = AssistantObservationRedactor::new(&secrets);
@@ -10219,6 +10744,79 @@ mod tests {
         .unwrap();
         assert_eq!(presentation.response.as_deref(), Some("[REDACTED]"));
         assert_eq!(presentation.messages[0].text, "[REDACTED]");
+    }
+
+    #[test]
+    fn assembled_presentation_redacts_secrets_reconstructed_across_fields() {
+        let secrets = vec![
+            b"alpha\n\nbeta".to_vec(),
+            "catalog · list".as_bytes().to_vec(),
+        ];
+        let events = vec![
+            observation_ready_event(1),
+            event(
+                2,
+                "observation.assistant.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "messageId": "message-1",
+                    "text": "alpha",
+                }),
+            ),
+            event(
+                3,
+                "observation.assistant.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "messageId": "message-2",
+                    "text": "beta",
+                }),
+            ),
+            event(
+                4,
+                "mcp.tool.started",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "catalog",
+                    "callId": "call-1",
+                    "name": "list",
+                }),
+            ),
+            event(
+                5,
+                "mcp.tool.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "catalog",
+                    "callId": "call-1",
+                    "name": "list",
+                    "isError": false,
+                }),
+            ),
+            event(
+                6,
+                "agent.turn.finished",
+                json!({
+                    "turnId": "turn-1",
+                    "outcome": "completed",
+                    "workspaceDiff": { "changes": [] },
+                }),
+            ),
+        ];
+
+        let presentation = build_agent_turn_presentation_from_events(
+            &events,
+            &test_agent_turn(AgentTurnStatus::Completed),
+            &secrets,
+        )
+        .unwrap();
+
+        assert_eq!(presentation.response.as_deref(), Some("[REDACTED]"));
+        assert_eq!(presentation.messages[0].text, "alpha");
+        assert_eq!(presentation.messages[1].text, "beta");
+        assert_eq!(presentation.activity[0].title, "[REDACTED]");
+        assert_eq!(presentation.activity[0].source.as_deref(), Some("catalog"));
+        assert_eq!(presentation.activity[0].operation.as_deref(), Some("list"));
     }
 
     #[test]
@@ -11212,6 +11810,166 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn workspace_evidence_root_stays_pinned_across_path_replacement() {
+        let root = temporary_root("workspace-pinned-evidence-root");
+        let bundle = root.join("session");
+        let workspace = root.join("workspace");
+        let displaced = root.join("displaced-workspace");
+        let replacement = root.join("replacement-workspace");
+        let turn_relative = Path::new("turns/turn-1");
+        fs::create_dir_all(bundle.join(turn_relative)).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(workspace.join("original.txt"), b"before").unwrap();
+        fs::write(replacement.join("replacement.txt"), b"replacement-safe").unwrap();
+
+        let state = test_agent_session_state(&bundle);
+        let workspace_evidence_root = WorkspaceEvidenceRoot::open(workspace.clone()).unwrap();
+        fs::rename(&workspace, &displaced).unwrap();
+        fs::rename(&replacement, &workspace).unwrap();
+
+        let source_revision =
+            capture_agent_turn_initial_workspace(&state, &workspace_evidence_root, turn_relative)
+                .unwrap();
+        let initial_snapshot =
+            capture_confined_tree(&state.evidence_root, &turn_relative.join("initial")).unwrap();
+        assert_eq!(source_revision, captured_tree_digest(&initial_snapshot));
+        assert_eq!(
+            fs::read(bundle.join(turn_relative).join("initial/original.txt")).unwrap(),
+            b"before"
+        );
+        assert!(
+            !bundle
+                .join(turn_relative)
+                .join("initial/replacement.txt")
+                .exists()
+        );
+
+        fs::write(displaced.join("original.txt"), b"after").unwrap();
+        fs::write(displaced.join("created.txt"), b"created").unwrap();
+        let diff =
+            finalize_agent_turn_workspace(&state, "turn-1", &workspace_evidence_root, &[]).unwrap();
+        assert_eq!(diff["changes"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            fs::read(bundle.join(turn_relative).join("final/original.txt")).unwrap(),
+            b"after"
+        );
+        assert_eq!(
+            fs::read(bundle.join(turn_relative).join("final/created.txt")).unwrap(),
+            b"created"
+        );
+        assert_eq!(
+            fs::read(workspace.join("replacement.txt")).unwrap(),
+            b"replacement-safe"
+        );
+        assert!(!workspace.join("created.txt").exists());
+
+        drop(workspace_evidence_root);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_capture_rejects_file_replaced_with_symlink_after_stat() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_root("workspace-file-replacement-race");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside.txt");
+        let victim = workspace.join("victim.txt");
+        let replacement = root.join("replacement-link");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(&victim, b"workspace-data").unwrap();
+        fs::write(&outside, b"outside-safe").unwrap();
+        symlink(&outside, &replacement).unwrap();
+        let workspace_evidence_root = WorkspaceEvidenceRoot::open(workspace.clone()).unwrap();
+        CAPTURE_REPLACEMENT_INJECTION.with(|injection| {
+            assert!(
+                injection
+                    .replace(Some((victim.clone(), replacement.clone())))
+                    .is_none()
+            );
+        });
+
+        let error = capture_workspace_tree(&workspace_evidence_root).unwrap_err();
+
+        assert!(matches!(error, RunError::PathEscape(path) if path == victim));
+        CAPTURE_REPLACEMENT_INJECTION.with(|injection| {
+            assert!(
+                injection.borrow().is_none(),
+                "the replacement must happen between statat and openat"
+            );
+        });
+        assert_eq!(fs::read(&outside).unwrap(), b"outside-safe");
+        assert!(
+            fs::symlink_metadata(&victim)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        drop(workspace_evidence_root);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_redaction_replaces_file_after_post_validation_hardlink_race() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = temporary_root("workspace-redaction-hardlink-race");
+        fs::create_dir(root.join("initial")).unwrap();
+        let state = test_run_state(&root);
+        let workspace_secret = state.workspace.join("secret.txt");
+        let outside_sentinel = root.join("outside-sentinel.txt");
+        fs::write(&workspace_secret, b"workspace-secret").unwrap();
+        fs::set_permissions(&workspace_secret, fs::Permissions::from_mode(0o444)).unwrap();
+        let original_metadata = fs::metadata(&workspace_secret).unwrap();
+        lock(&state.secret_values).push(b"workspace-secret".to_vec());
+        WORKSPACE_REDACTION_HARDLINK_INJECTION.with(|injection| {
+            assert!(
+                injection
+                    .replace(Some((workspace_secret.clone(), outside_sentinel.clone(),)))
+                    .is_none()
+            );
+        });
+
+        finalize_workspace(&state).unwrap();
+
+        WORKSPACE_REDACTION_HARDLINK_INJECTION.with(|injection| {
+            assert!(
+                injection.borrow().is_none(),
+                "the hardlink must be created after destination validation"
+            );
+        });
+        assert_eq!(fs::read(&outside_sentinel).unwrap(), b"workspace-secret");
+        assert_eq!(fs::read(&workspace_secret).unwrap(), b"[REDACTED]");
+        assert_eq!(
+            fs::read(root.join("final/secret.txt")).unwrap(),
+            b"[REDACTED]"
+        );
+        let outside_metadata = fs::metadata(&outside_sentinel).unwrap();
+        let workspace_metadata = fs::metadata(&workspace_secret).unwrap();
+        assert_eq!(outside_metadata.ino(), original_metadata.ino());
+        assert_ne!(workspace_metadata.ino(), original_metadata.ino());
+        assert_eq!(outside_metadata.permissions().mode() & 0o7777, 0o444);
+        assert_eq!(workspace_metadata.permissions().mode() & 0o7777, 0o444);
+        assert_eq!(
+            fs::metadata(root.join("final/secret.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o444
+        );
+
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn agent_session_evidence_root_stays_pinned_across_path_replacement() {
         let root = temporary_root("agent-session-pinned-evidence-root");
         let visible = root.join("session");
@@ -11331,10 +12089,12 @@ mod tests {
         fs::write(workspace.join("result.txt"), b"after").unwrap();
         fs::write(workspace.join("created.txt"), b"created").unwrap();
         let state = test_agent_session_state(&visible);
+        let workspace_evidence_root = WorkspaceEvidenceRoot::open(workspace.clone()).unwrap();
 
         fs::rename(&visible, &displaced).unwrap();
         fs::rename(&replacement, &visible).unwrap();
-        let diff = finalize_agent_turn_workspace(&state, "turn-1", &workspace, &[]).unwrap();
+        let diff =
+            finalize_agent_turn_workspace(&state, "turn-1", &workspace_evidence_root, &[]).unwrap();
 
         assert_eq!(diff["changes"].as_array().unwrap().len(), 2);
         assert_eq!(
@@ -11574,11 +12334,12 @@ mod tests {
         )
         .unwrap();
         let state = test_agent_session_state(&bundle);
+        let workspace_evidence_root = WorkspaceEvidenceRoot::open(workspace.clone()).unwrap();
 
         finalize_agent_turn_workspace(
             &state,
             "turn-1",
-            &workspace,
+            &workspace_evidence_root,
             &[b"read-only-secret".to_vec()],
         )
         .unwrap();
@@ -11647,6 +12408,11 @@ mod tests {
     fn interactive_fixture_launch() -> DriverLaunch {
         let script = r#"
 sequence=1
+if [ -n "${AGENT_LAB_FIXTURE_DESCENDANT_PID_FILE:-}" ]; then
+  sleep 30 &
+  descendant=$!
+  printf '%s' "$descendant" > "$AGENT_LAB_FIXTURE_DESCENDANT_PID_FILE"
+fi
 printf '%s\n' '{"protocolVersion":1,"sequence":1,"causedBy":null,"type":"driver.ready","driver":{"name":"interactive-fixture","version":"1","revision":null,"features":["streaming","turn-observations-v1"]}}'
 while IFS= read -r line; do
   session=$(printf '%s' "$line" | sed -E 's/.*"sessionId":"([^"]+)".*/\1/')
@@ -11711,11 +12477,14 @@ while IFS= read -r line; do
       turn=$(printf '%s' "$line" | sed -E 's/.*"turnId":"([^"]+)".*/\1/')
       sequence=$((sequence + 1))
       printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.finished","sessionId":"%s","turnId":"%s","outcome":"%s","evidence":{"fixture":true}}\n' "$sequence" "$session" "$turn" "$abort_outcome"
-      ;;
-    *'"type":"session.close"'*)
-      sequence=$((sequence + 1))
-      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"session.closed","sessionId":"%s"}\n' "$sequence" "$session"
-      exit 0
+	      ;;
+	    *'"type":"session.close"'*)
+	      if [ -n "${AGENT_LAB_FIXTURE_CLOSE_MARKER:-}" ]; then
+	        printf 'closed' > "$AGENT_LAB_FIXTURE_CLOSE_MARKER"
+	      fi
+	      sequence=$((sequence + 1))
+	      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"session.closed","sessionId":"%s"}\n' "$sequence" "$session"
+	      exit 0
       ;;
   esac
 done
@@ -11781,6 +12550,23 @@ done
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         (root, controller, explore, session)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_test_file(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(path.exists(), "{} was not created", path.display());
+    }
+
+    #[cfg(unix)]
+    fn test_process_exists(pid: &str) -> bool {
+        Command::new("kill")
+            .args(["-0", pid.trim()])
+            .output()
+            .is_ok_and(|output| output.status.success())
     }
 
     #[cfg(unix)]
@@ -11961,6 +12747,253 @@ done
             Err(RunError::RunUnavailable(_))
         ));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_controller_joins_agent_actor_after_driver_descendant_cleanup() {
+        let probe_root = temporary_root("controller-drop-driver-cleanup");
+        let descendant_pid = probe_root.join("descendant.pid");
+        let close_marker = probe_root.join("close.marker");
+        let mut launch = interactive_fixture_launch();
+        launch.env.push((
+            "AGENT_LAB_FIXTURE_DESCENDANT_PID_FILE".into(),
+            descendant_pid.clone().into_os_string(),
+        ));
+        launch.env.push((
+            "AGENT_LAB_FIXTURE_CLOSE_MARKER".into(),
+            close_marker.clone().into_os_string(),
+        ));
+        let (root, controller, _explore, session) =
+            start_interactive_fixture("controller-drop-driver-cleanup", launch).await;
+        let session_state = controller.agent_session_state(&session.id).unwrap();
+        wait_for_test_file(&descendant_pid);
+        let descendant = fs::read_to_string(&descendant_pid).unwrap();
+        assert!(test_process_exists(&descendant));
+
+        let started = Instant::now();
+        drop(controller);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "controller drop blocked for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(fs::read_to_string(&close_marker).unwrap(), "closed");
+        assert!(lock(&session_state.actor).handle.is_none());
+        assert_eq!(
+            lock(&session_state.summary).status,
+            AgentSessionStatus::Interrupted
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while test_process_exists(&descendant) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !test_process_exists(&descendant),
+            "driver descendant {} survived controller drop",
+            descendant.trim()
+        );
+
+        drop(session_state);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(probe_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_last_controller_during_resolver_joins_actor_and_descendants() {
+        let root = temporary_root("controller-drop-resolver-cleanup");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let resolver_started = root.join("resolver-started");
+        let descendant_pid = root.join("resolver-descendant.pid");
+        let mut resolver = DriverLaunch::new("/bin/sh");
+        resolver.args = vec![
+            "-c".into(),
+            "sleep 30 & descendant=$!; printf '%s' \"$descendant\" > \"$DESCENDANT_PID\"; printf started > \"$STARTED\"; wait"
+                .into(),
+        ];
+        resolver
+            .env
+            .push(("STARTED".into(), resolver_started.clone().into_os_string()));
+        resolver.env.push((
+            "DESCENDANT_PID".into(),
+            descendant_pid.clone().into_os_string(),
+        ));
+        let controller = RunController::new_with_harnesses_and_model_access(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![HarnessProfile {
+                id: "fixture".to_owned(),
+                display_name: "Fixture".to_owned(),
+                launch: DriverLaunch::new("/bin/false"),
+                models: BTreeMap::from([("test".to_owned(), "fixture/test".to_owned())]),
+            }],
+            BTreeMap::from([("test".to_owned(), "Test".to_owned())]),
+            vec![ModelAccessProvider {
+                id: "gateway".to_owned(),
+                display_name: "Gateway".to_owned(),
+                resolver: Some(resolver),
+                environment_names: vec!["TOKEN".to_owned()],
+                setup_hint: "Connect".to_owned(),
+            }],
+            BTreeMap::from([("fixture".to_owned(), "gateway".to_owned())]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let session_state = controller.agent_session_state(&session.id).unwrap();
+        wait_for_test_file(&resolver_started);
+        wait_for_test_file(&descendant_pid);
+        let descendant = fs::read_to_string(&descendant_pid).unwrap();
+        assert!(test_process_exists(&descendant));
+        assert_eq!(
+            Arc::strong_count(&controller.inner),
+            1,
+            "the startup actor retained strong controller ownership"
+        );
+
+        let started = Instant::now();
+        drop(controller);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "controller drop blocked for {:?}",
+            started.elapsed()
+        );
+        assert!(session_state.lifecycle_cancel.is_cancelled());
+        assert!(lock(&session_state.actor).handle.is_none());
+        assert_eq!(
+            lock(&session_state.summary).status,
+            AgentSessionStatus::Failed
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while test_process_exists(&descendant) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !test_process_exists(&descendant),
+            "resolver descendant {} survived controller drop",
+            descendant.trim()
+        );
+
+        drop(session_state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controller_drop_signals_all_sessions_and_keeps_joining_after_actor_panic() {
+        let root = temporary_root("controller-drop-agent-panic");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-exploration"),
+        })
+        .unwrap();
+        let mut receivers = HashMap::new();
+        for id in ["session-1", "session-2", "session-3"] {
+            let session_dir = root.join(id);
+            fs::create_dir_all(session_dir.join("turns")).unwrap();
+            let session = Arc::new(test_agent_session_state(&session_dir));
+            lock(&session.summary).id = id.to_owned();
+            let (commands, receiver) = mpsc::channel();
+            *lock(&session.commands) = Some(commands);
+            lock(&controller.inner.agent_sessions).insert(id.to_owned(), session);
+            receivers.insert(id.to_owned(), receiver);
+        }
+        let ordered_sessions = lock(&controller.inner.agent_sessions)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let ordered_ids = ordered_sessions
+            .iter()
+            .map(|session| lock(&session.summary).id.clone())
+            .collect::<Vec<_>>();
+
+        let panic_receiver = receivers.remove(&ordered_ids[0]).unwrap();
+        let panic_handle = thread::spawn(move || {
+            assert!(matches!(
+                panic_receiver.recv_timeout(Duration::from_secs(1)),
+                Ok(AgentSessionCommand::Shutdown)
+            ));
+            panic!("injected controller-drop actor panic");
+        });
+        *lock(&ordered_sessions[0].actor) = AgentActorRegistration {
+            complete: true,
+            handle: Some(panic_handle),
+        };
+
+        let middle_receiver = receivers.remove(&ordered_ids[1]).unwrap();
+        let last_receiver = receivers.remove(&ordered_ids[2]).unwrap();
+        let (last_signaled_sender, last_signaled_receiver) = mpsc::channel();
+        let (all_signaled_sender, all_signaled_receiver) = mpsc::channel();
+        let middle_handle = thread::spawn(move || {
+            let received_shutdown = matches!(
+                middle_receiver.recv_timeout(Duration::from_secs(1)),
+                Ok(AgentSessionCommand::Shutdown)
+            );
+            let last_was_signaled = last_signaled_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok();
+            all_signaled_sender
+                .send(received_shutdown && last_was_signaled)
+                .unwrap();
+        });
+        *lock(&ordered_sessions[1].actor) = AgentActorRegistration {
+            complete: true,
+            handle: Some(middle_handle),
+        };
+        let last_handle = thread::spawn(move || {
+            assert!(matches!(
+                last_receiver.recv_timeout(Duration::from_secs(1)),
+                Ok(AgentSessionCommand::Shutdown)
+            ));
+            last_signaled_sender.send(()).unwrap();
+        });
+        *lock(&ordered_sessions[2].actor) = AgentActorRegistration {
+            complete: true,
+            handle: Some(last_handle),
+        };
+
+        drop(controller);
+
+        assert!(
+            all_signaled_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            "controller drop joined a session before signaling every actor"
+        );
+        for session in &ordered_sessions {
+            assert!(lock(&session.actor).handle.is_none());
+            assert!(lock(&session.commands).is_none());
+        }
+
+        drop(ordered_sessions);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -12382,6 +13415,9 @@ totalScore = 11
         fs::create_dir_all(&workspace).unwrap();
         let initial_snapshot = snapshot_tree(&root.join("initial")).ok();
         let (sender, _) = broadcast::channel(1);
+        let agent_session_directories =
+            AgentSessionDirectoryAnchor::open(root.to_path_buf()).unwrap();
+        let workspace_evidence_root = agent_session_directories.workspace_evidence_root().unwrap();
         RunState {
             summary: Mutex::new(RunSummary {
                 id: "run-events".to_owned(),
@@ -12434,9 +13470,9 @@ totalScore = 11
             sender,
             cancel: CancellationToken::new(),
             bundle_dir: root.to_path_buf(),
-            agent_session_directories: AgentSessionDirectoryAnchor::open(root.to_path_buf())
-                .unwrap(),
+            agent_session_directories,
             workspace,
+            workspace_evidence_root,
             output: "result.json".into(),
             initial_snapshot,
             capabilities: Mutex::new(Vec::new()),
@@ -15816,6 +16852,8 @@ fi
         .unwrap();
         let (sender, _) = broadcast::channel(1);
         let capability_cancel = CancellationToken::new();
+        let agent_session_directories = AgentSessionDirectoryAnchor::open(root.clone()).unwrap();
+        let workspace_evidence_root = agent_session_directories.workspace_evidence_root().unwrap();
         let state = RunState {
             summary: Mutex::new(RunSummary {
                 id: "run-diff".to_owned(),
@@ -15868,8 +16906,9 @@ fi
             sender,
             cancel: CancellationToken::new(),
             bundle_dir: root.clone(),
-            agent_session_directories: AgentSessionDirectoryAnchor::open(root.clone()).unwrap(),
+            agent_session_directories,
             workspace: root.join("workspace"),
+            workspace_evidence_root,
             output: "result.json".into(),
             initial_snapshot: Some(snapshot_tree(&root.join("initial")).unwrap()),
             capabilities: Mutex::new(vec![CapabilityEndpoint {

@@ -60,6 +60,7 @@
   let surface: TerminalSurface | undefined;
   let session: BrowserSession | undefined;
   let reviewRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let runReviewGeneration = 0;
   let exploreEventStream: AbortController | undefined;
   let inspectionEventStream: AbortController | undefined;
   let evaluationRefreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1039,7 +1040,7 @@
 
   function watchExploreRun(id: string): void {
     exploreEventStream?.abort();
-    const liveAfterSequence = runEvents.reduce(
+    let liveAfterSequence = runEvents.reduce(
       (latest, event) => Math.max(latest, event.sequence),
       0
     );
@@ -1134,6 +1135,10 @@
             });
           });
       }
+    }, async () => {
+      const reconciledSequence = await reconcileRunEventStreamReset(id);
+      liveAfterSequence = reconciledSequence;
+      return reconciledSequence;
     });
   }
 
@@ -1149,20 +1154,35 @@
         reviewRefreshTimer = undefined;
         void refreshRun(id, applyTerminalRunEvent(id, event));
       }
-    });
+    }, () => reconcileRunEventStreamReset(id));
+  }
+
+  async function reconcileRunEventStreamReset(id: string): Promise<number> {
+    runReviewGeneration += 1;
+    if (reviewRefreshTimer !== undefined) clearTimeout(reviewRefreshTimer);
+    reviewRefreshTimer = undefined;
+    if (selectedRun?.summary.id === id) runEvents = [];
+    const detail = await refreshRun(id, false, true);
+    if (!detail) throw new Error('run event stream reset could not reconcile authoritative detail');
+    return detail.events.reduce(
+      (latest, event) => Math.max(latest, event.sequence),
+      0
+    );
   }
 
   function scheduleReviewRefresh(id: string): void {
     if (reviewRefreshTimer !== undefined) return;
+    const generation = runReviewGeneration;
     reviewRefreshTimer = setTimeout(() => {
       reviewRefreshTimer = undefined;
-      void refreshReview(id);
+      void refreshReview(id, generation);
     }, 100);
   }
 
-  async function refreshReview(id: string): Promise<void> {
+  async function refreshReview(id: string, generation = runReviewGeneration): Promise<void> {
     try {
       const detail = await runClient.detail(id);
+      if (generation !== runReviewGeneration) return;
       if (unavailableRunIds.has(id)) return;
       if (selectedRun?.summary.id !== id) return;
       const currentSequence = runEvents.at(-1)?.sequence ?? 0;
@@ -1186,19 +1206,31 @@
     }
   }
 
-  async function refreshRun(id: string, terminalEventApplied = false): Promise<void> {
+  async function refreshRun(
+    id: string,
+    terminalEventApplied = false,
+    requireSuccess = false
+  ): Promise<RunDetail | undefined> {
+    let detail: RunDetail;
     try {
-      const detail = await runClient.detail(id);
-      if (unavailableRunIds.has(id)) return;
-      if (exploreRun?.summary.id === id) exploreRun = detail;
-      if (selectedRun?.summary.id === id) {
-        selectedRun = detail;
-        runEvents = detail.events;
-      }
+      detail = await runClient.detail(id);
+    } catch (error) {
+      if (!terminalEventApplied) actionError = message(error);
+      if (requireSuccess) throw error;
+      return undefined;
+    }
+    if (unavailableRunIds.has(id)) return undefined;
+    if (exploreRun?.summary.id === id) exploreRun = detail;
+    if (selectedRun?.summary.id === id) {
+      selectedRun = detail;
+      runEvents = detail.events;
+    }
+    try {
       runs = await runClient.runs();
     } catch (error) {
       if (!terminalEventApplied) actionError = message(error);
     }
+    return detail;
   }
 
   async function openRun(id: string): Promise<void> {

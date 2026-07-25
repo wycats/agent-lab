@@ -15,7 +15,7 @@ use axum::{
         Path as AxumPath, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, patch, post},
 };
@@ -46,6 +46,8 @@ pub use runs::{
 const DEFAULT_COLS: u16 = 100;
 const DEFAULT_ROWS: u16 = 30;
 const AUTH_PROTOCOL_PREFIX: &str = "agent-lab.auth.";
+const EVENT_STREAM_EPOCH_HEADER: HeaderName =
+    HeaderName::from_static("x-agent-lab-event-stream-epoch");
 
 /// A source capable of opening a terminal session for the web surface.
 pub trait SessionProvider: Send + Sync + 'static {
@@ -417,6 +419,7 @@ struct AppState {
     config: ServerConfig,
     provider: Arc<dyn SessionProvider>,
     runs: Option<RunController>,
+    event_stream_epoch: HeaderValue,
 }
 
 /// Build the HTTP application around one bounded session provider.
@@ -436,6 +439,8 @@ pub fn app_with_runs(
         config,
         provider,
         runs,
+        event_stream_epoch: HeaderValue::from_str(&generate_token())
+            .unwrap_or_else(|_| HeaderValue::from_static("event-stream-epoch")),
     };
 
     Router::new()
@@ -701,6 +706,7 @@ async fn run_events(
     let Ok((history, receiver)) = runs.subscribe(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let event_stream_epoch = state.event_stream_epoch.clone();
     let stream = run_event_stream(runs, id, history, receiver)
         .map(|event| {
             Event::default()
@@ -709,9 +715,17 @@ async fn run_events(
                 .json_data(event)
         })
         .take_until(state.config.shutdown.cancelled_owned());
-    Sse::new(stream)
+    let response = Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
-        .into_response()
+        .into_response();
+    with_event_stream_epoch(response, event_stream_epoch)
+}
+
+fn with_event_stream_epoch(mut response: Response, epoch: HeaderValue) -> Response {
+    response
+        .headers_mut()
+        .insert(EVENT_STREAM_EPOCH_HEADER, epoch);
+    response
 }
 
 fn run_event_stream(
@@ -1983,6 +1997,19 @@ totalScore = 0
         assert!(event_is_after_history(&next, 7));
     }
 
+    #[test]
+    fn run_event_responses_identify_the_server_epoch() {
+        let response = with_event_stream_epoch(
+            StatusCode::OK.into_response(),
+            HeaderValue::from_static("boot-epoch-1"),
+        );
+
+        assert_eq!(
+            response.headers().get(EVENT_STREAM_EPOCH_HEADER),
+            Some(&HeaderValue::from_static("boot-epoch-1"))
+        );
+    }
+
     #[tokio::test]
     async fn fixture_only_app_metadata_routes_remain_bootable_without_runs() {
         let config = ServerConfig {
@@ -1996,6 +2023,7 @@ totalScore = 0
             config,
             provider: Arc::new(FixtureSessionProvider::new("/fixture-shell", "/workspace")),
             runs: None,
+            event_stream_epoch: HeaderValue::from_static("fixture-event-stream-epoch"),
         };
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:4100"));

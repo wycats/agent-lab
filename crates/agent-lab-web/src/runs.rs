@@ -1155,6 +1155,8 @@ struct AgentSessionState {
     events: Mutex<Vec<RunEvent>>,
     sender: broadcast::Sender<RunEvent>,
     commands: Mutex<Option<mpsc::Sender<AgentSessionCommand>>>,
+    #[cfg(test)]
+    post_open_pause: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
     lifecycle_cancel: CancellationToken,
     turn_cancel: Mutex<Option<CancellationToken>>,
     actor: Mutex<AgentActorRegistration>,
@@ -1211,6 +1213,12 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static AGENT_SESSION_SPAWN_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static AGENT_SESSION_PERSIST_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static AGENT_SESSION_ROLLBACK_PERSIST_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static ACTIVE_AGENT_SESSION_PERSIST_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     static QUARANTINE_PUBLICATION_PAUSE:
         std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
         const { std::cell::RefCell::new(None) };
@@ -1221,6 +1229,12 @@ thread_local! {
         std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
         const { std::cell::RefCell::new(None) };
     static AGENT_SESSION_ACTIVATION_PAUSE:
+        std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
+        const { std::cell::RefCell::new(None) };
+    static AGENT_SESSION_ACTIVATION_PRELOCK_PAUSE:
+        std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
+        const { std::cell::RefCell::new(None) };
+    static AGENT_SESSION_POST_OPEN_PAUSE:
         std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
         const { std::cell::RefCell::new(None) };
     static AGENT_TURN_SESSION_VALIDATION_PAUSE:
@@ -1315,6 +1329,33 @@ fn maybe_pause_agent_session_activation() {
                 .expect("agent session activation release should remain available");
         }
     });
+}
+
+#[cfg(test)]
+fn maybe_pause_agent_session_activation_prelock() {
+    AGENT_SESSION_ACTIVATION_PRELOCK_PAUSE.with(|pause| {
+        if let Some((reached, release)) = pause.borrow_mut().take() {
+            reached
+                .send(())
+                .expect("agent session prelock activation observer should remain available");
+            release
+                .recv()
+                .expect("agent session prelock activation release should remain available");
+        }
+    });
+}
+
+#[cfg(test)]
+fn maybe_pause_agent_session_after_open(state: &AgentSessionState) {
+    let pause = lock(&state.post_open_pause).take();
+    if let Some((reached, release)) = pause {
+        reached
+            .send(())
+            .expect("agent session post-open observer should remain available");
+        release
+            .recv()
+            .expect("agent session post-open release should remain available");
+    }
 }
 
 #[cfg(test)]
@@ -2253,6 +2294,10 @@ impl RunController {
             events: Mutex::new(Vec::new()),
             sender,
             commands: Mutex::new(None),
+            #[cfg(test)]
+            post_open_pause: Mutex::new(
+                AGENT_SESSION_POST_OPEN_PAUSE.with(|pause| pause.borrow_mut().take()),
+            ),
             lifecycle_cancel: CancellationToken::new(),
             turn_cancel: Mutex::new(None),
             actor: Mutex::new(AgentActorRegistration::default()),
@@ -2353,12 +2398,6 @@ impl RunController {
         origin: WorkbenchOrigin,
     ) -> Result<AgentSessionSummary, RunError> {
         let target = self.agent_session_state(session_id)?;
-        let target_summary = lock(&target.summary).clone();
-        if target_summary.workspace_id != workspace_id
-            || target_summary.status != AgentSessionStatus::Ready
-        {
-            return Err(RunError::RunUnavailable(session_id.to_owned()));
-        }
         let workspace = self.state(workspace_id)?;
         activate_agent_session_state(&workspace, &target, workspace_id, session_id, origin)
     }
@@ -2636,9 +2675,10 @@ impl RunController {
         let commands = lock(&state.commands).clone().ok_or_else(|| {
             RunError::RunUnavailable(format!("agent session {session_id} is not live"))
         })?;
-        {
-            let active = lock(&workspace.active_agent_turn);
-            if active
+        let mut shutdown_after_error = None;
+        let was_starting = {
+            let active_turn = lock(&workspace.active_agent_turn);
+            if active_turn
                 .as_ref()
                 .is_some_and(|turn| turn.attribution.session_id == session_id)
             {
@@ -2646,23 +2686,48 @@ impl RunController {
                     "cancel or finish this session's active turn before closing it".to_owned(),
                 ));
             }
-            let mut summary = lock(&state.summary);
-            let was_starting = summary.status == AgentSessionStatus::Starting;
-            if !matches!(
-                summary.status,
-                AgentSessionStatus::Starting | AgentSessionStatus::Ready
-            ) {
-                return Err(RunError::RunUnavailable(session_id.to_owned()));
+            let mut active_id = lock(&workspace.active_agent_session_id);
+            let (previous_summary, closing_summary, was_starting) = {
+                let mut summary = lock(&state.summary);
+                let was_starting = summary.status == AgentSessionStatus::Starting;
+                if !matches!(
+                    summary.status,
+                    AgentSessionStatus::Starting | AgentSessionStatus::Ready
+                ) {
+                    return Err(RunError::RunUnavailable(session_id.to_owned()));
+                }
+                let previous_summary = summary.clone();
+                summary.status = AgentSessionStatus::Closing;
+                summary.updated_at_ms = now_ms();
+                summary.active = false;
+                let closing_summary = summary.clone();
+                (previous_summary, closing_summary, was_starting)
+            };
+            if let Err(error) = persist_agent_session(&state) {
+                *lock(&state.summary) = previous_summary;
+                return Err(error);
             }
-            summary.status = AgentSessionStatus::Closing;
-            summary.updated_at_ms = now_ms();
-            drop(summary);
-            persist_agent_session(&state)?;
-            if was_starting {
-                state.lifecycle_cancel.cancel();
+            if active_id.as_deref() == Some(session_id) {
+                if let Err(error) = persist_active_agent_session(&workspace, None) {
+                    *lock(&state.summary) = previous_summary;
+                    if let Err(rollback_error) = persist_agent_session_rollback(&state) {
+                        *lock(&state.summary) = closing_summary;
+                        shutdown_after_error = Some(RunError::EvidencePersistence(format!(
+                            "{error}; restoring the previous agent session manifest failed: \
+                             {rollback_error}"
+                        )));
+                    } else {
+                        return Err(error);
+                    }
+                } else {
+                    *active_id = None;
+                }
             }
+            was_starting
+        };
+        if was_starting {
+            state.lifecycle_cancel.cancel();
         }
-        clear_active_agent_session(&workspace, &state)?;
         if commands.send(AgentSessionCommand::Close).is_err() {
             update_agent_session_status(
                 &state,
@@ -2670,6 +2735,9 @@ impl RunController {
                 Some("agent session actor stopped before close"),
             )?;
             return Err(RunError::RunUnavailable(session_id.to_owned()));
+        }
+        if let Some(error) = shutdown_after_error {
+            return Err(error);
         }
         Ok(lock(&state.summary).clone())
     }
@@ -4136,6 +4204,8 @@ fn activate_agent_session_state(
     {
         return Err(RunError::RunUnavailable(session_id.to_owned()));
     }
+    #[cfg(test)]
+    maybe_pause_agent_session_activation_prelock();
     let active_turn = lock(&workspace.active_agent_turn);
     if active_turn.is_some() {
         return Err(RunError::InvalidRequest(
@@ -4145,6 +4215,16 @@ fn activate_agent_session_state(
     if lock(&workspace.summary).status != RunStatus::Exploring {
         return Err(RunError::RunUnavailable(workspace_id.to_owned()));
     }
+    let mut activated_summary = {
+        // `close_agent_session` takes the workspace turn lifecycle lock before changing the
+        // session status. Revalidate in that same order so a close that won the race cannot be
+        // persisted as the active session.
+        let summary = lock(&target.summary);
+        if summary.workspace_id != workspace_id || summary.status != AgentSessionStatus::Ready {
+            return Err(RunError::RunUnavailable(session_id.to_owned()));
+        }
+        summary.clone()
+    };
     let mut active_id = lock(&workspace.active_agent_session_id);
     #[cfg(test)]
     maybe_pause_agent_session_activation();
@@ -4161,11 +4241,10 @@ fn activate_agent_session_state(
         rollback?;
         return Err(error);
     }
+    activated_summary.active = true;
     drop(active_id);
     drop(active_turn);
-    let mut summary = lock(&target.summary).clone();
-    summary.active = true;
-    Ok(summary)
+    Ok(activated_summary)
 }
 
 fn rollback_prepared_start(
@@ -5289,7 +5368,7 @@ fn run_agent_session_actor(
             },
         ))?;
         let deadline = Instant::now() + DRIVER_RESPONSE_TIMEOUT;
-        loop {
+        let process_id = loop {
             let message = receive_until_deadline(&mut driver, deadline, &state.lifecycle_cancel)?
                 .ok_or_else(|| {
                 RunError::Protocol("interactive session opening was cancelled".to_owned())
@@ -5310,14 +5389,7 @@ fn run_agent_session_actor(
                 DriverBody::SessionOpened {
                     session_id: opened,
                     process_id,
-                } if opened == session_id => {
-                    record_agent_event(
-                        state,
-                        "agent.session.ready",
-                        json!({ "sessionId": session_id, "processId": process_id, "driver": descriptor }),
-                    )?;
-                    break;
-                }
+                } if opened == session_id => break process_id,
                 DriverBody::Failed { code, message, .. } => {
                     return Err(RunError::Protocol(format!(
                         "driver failed while opening interactive session: {code}: {message}"
@@ -5330,17 +5402,29 @@ fn run_agent_session_actor(
                     ));
                 }
             }
-        }
-        update_agent_session_status(state, AgentSessionStatus::Ready, None)?;
-        let workspace_id = lock(&state.summary).workspace_id.clone();
-        if let Err(error) =
-            activate_agent_session_state(workspace_state, state, &workspace_id, &session_id, origin)
-        {
+        };
+        #[cfg(test)]
+        maybe_pause_agent_session_after_open(state);
+        if transition_starting_agent_session_to_ready(workspace_state, state)? {
             record_agent_event(
                 state,
-                "agent.session.activation-deferred",
-                json!({ "sessionId": session_id, "reason": error.to_string() }),
+                "agent.session.ready",
+                json!({ "sessionId": session_id, "processId": process_id, "driver": descriptor }),
             )?;
+            let workspace_id = lock(&state.summary).workspace_id.clone();
+            if let Err(error) = activate_agent_session_state(
+                workspace_state,
+                state,
+                &workspace_id,
+                &session_id,
+                origin,
+            ) {
+                record_agent_event(
+                    state,
+                    "agent.session.activation-deferred",
+                    json!({ "sessionId": session_id, "reason": error.to_string() }),
+                )?;
+            }
         }
         let supports_turn_observations = descriptor
             .features
@@ -7333,6 +7417,12 @@ fn persist_evaluation(state: &EvaluationState) -> Result<(), RunError> {
 }
 
 fn persist_agent_session(state: &AgentSessionState) -> Result<(), RunError> {
+    #[cfg(test)]
+    if AGENT_SESSION_PERSIST_FAILURE.with(std::cell::Cell::take) {
+        return Err(RunError::EvidencePersistence(
+            "injected agent session persistence failure".to_owned(),
+        ));
+    }
     let manifest = AgentSessionManifest {
         version: AGENT_SESSION_MANIFEST_VERSION,
         summary: lock(&state.summary).clone(),
@@ -7341,6 +7431,16 @@ fn persist_agent_session(state: &AgentSessionState) -> Result<(), RunError> {
     let secrets = lock(&state.secret_values).clone();
     let value = redact_value(serde_json::to_value(manifest)?, &secrets);
     write_confined_json_atomic(&state.evidence_root, Path::new("manifest.json"), &value)
+}
+
+fn persist_agent_session_rollback(state: &AgentSessionState) -> Result<(), RunError> {
+    #[cfg(test)]
+    if AGENT_SESSION_ROLLBACK_PERSIST_FAILURE.with(std::cell::Cell::take) {
+        return Err(RunError::EvidencePersistence(
+            "injected agent session rollback persistence failure".to_owned(),
+        ));
+    }
+    persist_agent_session(state)
 }
 
 fn record_agent_event(
@@ -7609,6 +7709,29 @@ fn update_agent_session_status(
     persist_agent_session(state)
 }
 
+fn transition_starting_agent_session_to_ready(
+    workspace: &RunState,
+    state: &AgentSessionState,
+) -> Result<bool, RunError> {
+    let _active_turn = lock(&workspace.active_agent_turn);
+    let previous_summary = {
+        let mut summary = lock(&state.summary);
+        if summary.status != AgentSessionStatus::Starting {
+            return Ok(false);
+        }
+        let previous_summary = summary.clone();
+        summary.status = AgentSessionStatus::Ready;
+        summary.updated_at_ms = now_ms();
+        summary.error = None;
+        previous_summary
+    };
+    if let Err(error) = persist_agent_session(state) {
+        *lock(&state.summary) = previous_summary;
+        return Err(error);
+    }
+    Ok(true)
+}
+
 fn record_workbench_agent_session_update(
     workspace_state: &RunState,
     state: &AgentSessionState,
@@ -7747,6 +7870,12 @@ fn persist_active_agent_session(
     state: &RunState,
     session_id: Option<&str>,
 ) -> Result<(), RunError> {
+    #[cfg(test)]
+    if ACTIVE_AGENT_SESSION_PERSIST_FAILURE.with(std::cell::Cell::take) {
+        return Err(RunError::EvidencePersistence(
+            "injected active agent session persistence failure".to_owned(),
+        ));
+    }
     write_confined_run_json_atomic(
         &state.agent_session_directories,
         Path::new("active-agent-session.json"),
@@ -8753,6 +8882,8 @@ fn load_agent_sessions(
                     events: Mutex::new(events),
                     sender,
                     commands: Mutex::new(None),
+                    #[cfg(test)]
+                    post_open_pause: Mutex::new(None),
                     lifecycle_cancel: CancellationToken::new(),
                     turn_cancel: Mutex::new(None),
                     actor: Mutex::new(AgentActorRegistration {
@@ -9020,6 +9151,9 @@ fn recover_interrupted_run(state: &RunState, reset_event_log: bool) -> Result<()
         summary.status = RunStatus::Cancelled;
         summary.finished_at_ms = Some(now_ms());
         summary.error = Some("controller stopped before the run finalized".to_owned());
+        if reset_event_log {
+            summary.event_count = 0;
+        }
     }
     if reset_event_log {
         lock(&state.events).clear();
@@ -12864,6 +12998,7 @@ mod tests {
             events: Mutex::new(Vec::new()),
             sender,
             commands: Mutex::new(None),
+            post_open_pause: Mutex::new(None),
             lifecycle_cancel: CancellationToken::new(),
             turn_cancel: Mutex::new(None),
             actor: Mutex::new(AgentActorRegistration {
@@ -15390,6 +15525,11 @@ while IFS= read -r line; do
 	      if [ -n "${AGENT_LAB_FIXTURE_CLOSE_MARKER:-}" ]; then
 	        printf 'closed' > "$AGENT_LAB_FIXTURE_CLOSE_MARKER"
 	      fi
+	      if [ -n "${AGENT_LAB_FIXTURE_CLOSE_RELEASE:-}" ]; then
+	        while [ ! -e "$AGENT_LAB_FIXTURE_CLOSE_RELEASE" ]; do
+	          sleep 0.01
+	        done
+	      fi
 	      sequence=$((sequence + 1))
 	      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"session.closed","sessionId":"%s"}\n' "$sequence" "$session"
 	      exit 0
@@ -15403,10 +15543,10 @@ done
     }
 
     #[cfg(unix)]
-    async fn start_interactive_fixture(
+    async fn prepare_interactive_fixture(
         label: &str,
         launch: DriverLaunch,
-    ) -> (PathBuf, RunController, RunSummary, AgentSessionSummary) {
+    ) -> (PathBuf, RunController, RunSummary) {
         let root = temporary_root(label);
         let scenarios = root.join("scenarios");
         let data = root.join("runs");
@@ -15434,6 +15574,15 @@ done
             })
             .await
             .unwrap();
+        (root, controller, explore)
+    }
+
+    #[cfg(unix)]
+    async fn start_interactive_fixture(
+        label: &str,
+        launch: DriverLaunch,
+    ) -> (PathBuf, RunController, RunSummary, AgentSessionSummary) {
+        let (root, controller, explore) = prepare_interactive_fixture(label, launch).await;
         let session = controller
             .start_agent_session(
                 &explore.id,
@@ -15458,6 +15607,86 @@ done
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         (root, controller, explore, session)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_after_session_open_prevents_ready_and_auto_activation() {
+        let (root, controller, explore) = prepare_interactive_fixture(
+            "agent-session-close-after-open",
+            interactive_fixture_launch(),
+        )
+        .await;
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        AGENT_SESSION_POST_OPEN_PAUSE.with(|pause| {
+            *pause.borrow_mut() = Some((opened_tx, release_rx));
+        });
+        let session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        opened_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("actor should pause after session.opened and before Ready");
+        let state = controller.agent_session_state(&session.id).unwrap();
+        let workspace = controller.state(&explore.id).unwrap();
+        assert_eq!(lock(&state.summary).status, AgentSessionStatus::Starting);
+
+        let closing = controller
+            .close_agent_session(&explore.id, &session.id)
+            .expect("close should win while the opened session remains Starting");
+        assert_eq!(closing.status, AgentSessionStatus::Closing);
+        assert!(state.lifecycle_cancel.is_cancelled());
+        release_tx
+            .send(())
+            .expect("post-open actor should remain available for release");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if controller
+                .agent_session(&explore.id, &session.id)
+                .unwrap()
+                .summary
+                .status
+                == AgentSessionStatus::Closed
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "queued close was not consumed after the skipped Ready transition"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            lock(&state.events)
+                .iter()
+                .all(|event| event.kind != "agent.session.ready"),
+            "a close-won session must not publish Ready"
+        );
+        assert!(
+            lock(&workspace.events)
+                .iter()
+                .all(|event| event.kind != "workbench.agent.session.activated"),
+            "a close-won session must not be automatically activated"
+        );
+        assert!(lock(&workspace.active_agent_session_id).is_none());
+        let durable_active =
+            read_optional_json(&workspace.bundle_dir.join("active-agent-session.json")).unwrap();
+        assert!(
+            durable_active.is_none_or(|active| active["sessionId"].is_null()),
+            "close must not create or resurrect a durable active selection"
+        );
+
+        controller.cancel(&explore.id).unwrap();
+        drop(workspace);
+        drop(state);
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -15502,6 +15731,254 @@ done
 
         drop(controller);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn activation_rechecks_ready_after_a_concurrent_close() {
+        let (root, controller, explore, session) = start_interactive_fixture(
+            "agent-session-activation-close-race",
+            interactive_fixture_launch(),
+        )
+        .await;
+        let workspace = controller.state(&explore.id).unwrap();
+        let activation_events_before = lock(&workspace.events)
+            .iter()
+            .filter(|event| event.kind == "workbench.agent.session.activated")
+            .count();
+        let (activation_reached_tx, activation_reached_rx) = mpsc::channel();
+        let (activation_release_tx, activation_release_rx) = mpsc::channel();
+        let activation_controller = controller.clone();
+        let activation_workspace_id = explore.id.clone();
+        let activation_session_id = session.id.clone();
+        let activation = thread::spawn(move || {
+            AGENT_SESSION_ACTIVATION_PRELOCK_PAUSE.with(|pause| {
+                *pause.borrow_mut() = Some((activation_reached_tx, activation_release_rx));
+            });
+            activation_controller.activate_agent_session(
+                &activation_workspace_id,
+                &activation_session_id,
+                WorkbenchOrigin::Nushell,
+            )
+        });
+        activation_reached_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("activation should pause after its optimistic ready read");
+
+        controller
+            .close_agent_session(&explore.id, &session.id)
+            .expect("close should win while activation is before the lifecycle lock");
+        activation_release_tx
+            .send(())
+            .expect("activation should remain available for release");
+        assert!(matches!(
+            activation.join().unwrap(),
+            Err(RunError::RunUnavailable(id)) if id == session.id
+        ));
+
+        assert_eq!(lock(&workspace.active_agent_session_id).as_deref(), None);
+        let durable = read_optional_json(&workspace.bundle_dir.join("active-agent-session.json"))
+            .unwrap()
+            .unwrap();
+        assert!(durable["sessionId"].is_null());
+        assert_eq!(
+            lock(&workspace.events)
+                .iter()
+                .filter(|event| event.kind == "workbench.agent.session.activated")
+                .count(),
+            activation_events_before,
+            "the losing activation must not publish an activation event"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if controller
+                .agent_session(&explore.id, &session.id)
+                .unwrap()
+                .summary
+                .status
+                == AgentSessionStatus::Closed
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "session did not finish closing after winning the activation race"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        controller.cancel(&explore.id).unwrap();
+        drop(workspace);
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_persistence_failures_restore_a_ready_active_session_for_retry() {
+        for fail_active_selection in [false, true] {
+            let label = if fail_active_selection {
+                "agent-session-close-selection-rollback"
+            } else {
+                "agent-session-close-manifest-rollback"
+            };
+            let (root, controller, explore, session) =
+                start_interactive_fixture(label, interactive_fixture_launch()).await;
+            let workspace = controller.state(&explore.id).unwrap();
+            let state = controller.agent_session_state(&session.id).unwrap();
+            let previous_summary = lock(&state.summary).clone();
+            let previous_projected_summary = controller
+                .agent_session(&explore.id, &session.id)
+                .unwrap()
+                .summary;
+            let manifest_path = state.evidence_root.display_path().join("manifest.json");
+            let active_path = workspace.bundle_dir.join("active-agent-session.json");
+            let previous_manifest = fs::read(&manifest_path).unwrap();
+            let previous_active = fs::read(&active_path).unwrap();
+            assert_eq!(previous_summary.status, AgentSessionStatus::Ready);
+            assert!(previous_projected_summary.active);
+            assert!(!state.lifecycle_cancel.is_cancelled());
+
+            if fail_active_selection {
+                ACTIVE_AGENT_SESSION_PERSIST_FAILURE.with(|failure| failure.set(true));
+            } else {
+                AGENT_SESSION_PERSIST_FAILURE.with(|failure| failure.set(true));
+            }
+            assert!(matches!(
+                controller.close_agent_session(&explore.id, &session.id),
+                Err(RunError::EvidencePersistence(_))
+            ));
+
+            assert_eq!(*lock(&state.summary), previous_summary);
+            assert_eq!(
+                controller
+                    .agent_session(&explore.id, &session.id)
+                    .unwrap()
+                    .summary,
+                previous_projected_summary
+            );
+            assert_eq!(fs::read(&manifest_path).unwrap(), previous_manifest);
+            assert_eq!(fs::read(&active_path).unwrap(), previous_active);
+            assert_eq!(
+                lock(&workspace.active_agent_session_id).as_deref(),
+                Some(session.id.as_str())
+            );
+            assert!(
+                lock(&state.commands).is_some(),
+                "a failed transaction must leave the actor available for retry"
+            );
+            assert!(
+                !state.lifecycle_cancel.is_cancelled(),
+                "a failed transaction must not cancel session startup"
+            );
+
+            controller
+                .close_agent_session(&explore.id, &session.id)
+                .expect("the restored session should accept a close retry");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if controller
+                    .agent_session(&explore.id, &session.id)
+                    .unwrap()
+                    .summary
+                    .status
+                    == AgentSessionStatus::Closed
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "restored session did not close after retry"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(lock(&workspace.active_agent_session_id).is_none());
+            controller.cancel(&explore.id).unwrap();
+            drop(state);
+            drop(workspace);
+            drop(controller);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_rollback_failure_shuts_down_from_the_durable_closing_state() {
+        let release = temporary_root("agent-session-close-release").join("release");
+        let mut launch = interactive_fixture_launch();
+        launch.env.push((
+            "AGENT_LAB_FIXTURE_CLOSE_RELEASE".into(),
+            release.clone().into_os_string(),
+        ));
+        let (root, controller, explore, session) =
+            start_interactive_fixture("agent-session-close-rollback-failure", launch).await;
+        let workspace = controller.state(&explore.id).unwrap();
+        let state = controller.agent_session_state(&session.id).unwrap();
+
+        ACTIVE_AGENT_SESSION_PERSIST_FAILURE.with(|failure| failure.set(true));
+        AGENT_SESSION_ROLLBACK_PERSIST_FAILURE.with(|failure| failure.set(true));
+        let error = controller
+            .close_agent_session(&explore.id, &session.id)
+            .unwrap_err();
+        assert!(
+            matches!(&error, RunError::EvidencePersistence(message)
+                if message.contains("active agent session persistence failure")
+                    && message.contains("rollback persistence failure")),
+            "both persistence failures should remain visible: {error}"
+        );
+
+        assert_eq!(
+            lock(&state.summary).status,
+            AgentSessionStatus::Closing,
+            "memory must match the manifest that could not be rolled back"
+        );
+        let manifest: AgentSessionManifest = serde_json::from_slice(
+            &fs::read(state.evidence_root.display_path().join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.summary.status, AgentSessionStatus::Closing);
+        assert_eq!(
+            lock(&workspace.active_agent_session_id).as_deref(),
+            Some(session.id.as_str()),
+            "the active pointer write failed and remains available for actor cleanup"
+        );
+        let durable_active =
+            read_optional_json(&workspace.bundle_dir.join("active-agent-session.json"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(durable_active["sessionId"], session.id);
+
+        fs::write(&release, "release").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if controller
+                .agent_session(&explore.id, &session.id)
+                .unwrap()
+                .summary
+                .status
+                == AgentSessionStatus::Closed
+                && lock(&workspace.active_agent_session_id).is_none()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fail-closed session did not finish shutdown and clear selection"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let durable_active =
+            read_optional_json(&workspace.bundle_dir.join("active-agent-session.json"))
+                .unwrap()
+                .unwrap();
+        assert!(durable_active["sessionId"].is_null());
+
+        controller.cancel(&explore.id).unwrap();
+        drop(state);
+        drop(workspace);
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(release.parent().unwrap()).unwrap();
     }
 
     #[cfg(unix)]
@@ -16324,6 +16801,7 @@ done
             events: Mutex::new(Vec::new()),
             sender,
             commands: Mutex::new(Some(failed_commands)),
+            post_open_pause: Mutex::new(None),
             lifecycle_cancel: CancellationToken::new(),
             turn_cancel: Mutex::new(None),
             actor: Mutex::new(AgentActorRegistration {
@@ -17497,10 +17975,28 @@ done
             assert!(Instant::now() < deadline, "driver startup did not begin");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let state = controller.agent_session_state(&session.id).unwrap();
+        let previous_summary = lock(&state.summary).clone();
+        let previous_manifest =
+            fs::read(state.evidence_root.display_path().join("manifest.json")).unwrap();
+        assert_eq!(previous_summary.status, AgentSessionStatus::Starting);
+        AGENT_SESSION_PERSIST_FAILURE.with(|failure| failure.set(true));
+        assert!(matches!(
+            controller.close_agent_session(&explore.id, &session.id),
+            Err(RunError::EvidencePersistence(_))
+        ));
+        assert_eq!(*lock(&state.summary), previous_summary);
+        assert_eq!(
+            fs::read(state.evidence_root.display_path().join("manifest.json")).unwrap(),
+            previous_manifest
+        );
+        assert!(!state.lifecycle_cancel.is_cancelled());
+        assert!(lock(&state.commands).is_some());
         controller
             .close_agent_session(&explore.id, &session.id)
             .unwrap();
         wait_for_closed(&controller, &explore.id, &session.id).await;
+        drop(state);
         drop(controller);
 
         let resolver_started = root.join("resolver-started");
@@ -18363,6 +18859,7 @@ sleep 30
             events: Mutex::new(Vec::new()),
             sender,
             commands: Mutex::new(None),
+            post_open_pause: Mutex::new(None),
             lifecycle_cancel: CancellationToken::new(),
             turn_cancel: Mutex::new(None),
             actor: Mutex::new(AgentActorRegistration {
@@ -18758,7 +19255,7 @@ sleep 30
             status: RunStatus::Running,
             started_at_ms: 1,
             finished_at_ms: None,
-            event_count: 1,
+            event_count: 42,
             error: None,
         };
         write_json_atomic(
@@ -18781,6 +19278,8 @@ sleep 30
         let controller = RunController::new(config()).unwrap();
         let detail = controller.get("run-interrupted").unwrap();
         assert_eq!(detail.summary.status, RunStatus::Cancelled);
+        assert_eq!(detail.summary.event_count, 1);
+        assert_eq!(detail.events[0].sequence, 1);
         assert!(detail.output.is_none());
         assert!(!bundle.join("workspace").exists());
         assert!(!bundle.join("initial").exists());
@@ -18791,7 +19290,12 @@ sleep 30
             detail.events.last().unwrap().payload["workspaceEvidence"],
             "discarded because redaction material was unavailable"
         );
-        assert_eq!(read_events(&bundle.join("events.jsonl")).unwrap().len(), 1);
+        let persisted_events = read_events(&bundle.join("events.jsonl")).unwrap();
+        assert_eq!(persisted_events.len(), 1);
+        assert_eq!(persisted_events[0].sequence, 1);
+        let persisted_summary: RunSummary =
+            serde_json::from_slice(&fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(persisted_summary.event_count, 1);
         drop(controller);
 
         let replayed = RunController::new(config()).unwrap();

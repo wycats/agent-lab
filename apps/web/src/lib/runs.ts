@@ -386,7 +386,11 @@ export interface RunClient {
   startPreparedHarness(id: string, harnessId: string, modelProfileId: string): Promise<RunSummary>;
   detail(id: string): Promise<RunDetail>;
   cancel(id: string): Promise<void>;
-  events(id: string, onEvent: (event: RunEvent) => void): AbortController;
+  events(
+    id: string,
+    onEvent: (event: RunEvent) => void | Promise<void>,
+    onReset?: (reset: RunEventStreamReset) => number | Promise<number>
+  ): AbortController;
   evaluations(): Promise<EvaluationSummary[]>;
   startEvaluation(input: {
     scenarioId: string;
@@ -413,6 +417,11 @@ export interface RunClient {
     sessionId: string,
     onEvent: (event: RunEvent) => void
   ): AbortController;
+}
+
+export interface RunEventStreamReset {
+  previousEpoch: string;
+  epoch: string;
 }
 
 async function processToken(): Promise<string> {
@@ -448,8 +457,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 async function streamEvents(
   path: string,
   signal: AbortSignal,
-  onEvent: (event: RunEvent) => void,
-  onOpen?: () => void
+  onEvent: (event: RunEvent) => void | Promise<void>,
+  onOpen?: (response: Response) => void | Promise<void>
 ): Promise<void> {
   const token = await processToken();
   const response = await fetch(path, {
@@ -460,31 +469,47 @@ async function streamEvents(
   if (!response.ok || !response.body) {
     throw new Error(`event stream failed with HTTP ${response.status}`);
   }
-  onOpen?.();
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
-  let buffer = '';
-  while (!signal.aborted) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += value;
-    let boundary = buffer.indexOf('\n\n');
-    while (boundary !== -1) {
-      const frame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const data = frame
-        .split('\n')
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trimStart())
-        .join('\n');
-      if (data) onEvent(JSON.parse(data) as RunEvent);
-      boundary = buffer.indexOf('\n\n');
+  let reachedEof = false;
+  try {
+    await onOpen?.(response);
+    let buffer = '';
+    while (!signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done) {
+        reachedEof = true;
+        break;
+      }
+      buffer += value;
+      let boundary = buffer.indexOf('\n\n');
+      while (boundary !== -1) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const data = frame
+          .split('\n')
+          .filter((line) => line.startsWith('data:'))
+          .map((line) => line.slice(5).trimStart())
+          .join('\n');
+        if (data) await onEvent(JSON.parse(data) as RunEvent);
+        boundary = buffer.indexOf('\n\n');
+      }
     }
+  } finally {
+    if (!reachedEof) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Fetch aborts can close the body before cancellation reaches the reader.
+      }
+    }
+    reader.releaseLock();
   }
 }
 
 const EVENT_STREAM_RECONNECT_INITIAL_MS = 100;
 const EVENT_STREAM_RECONNECT_MAX_MS = 2_000;
 const EVENT_STREAM_RECONNECT_STABLE_MS = 5_000;
+const EVENT_STREAM_EPOCH_HEADER = 'X-Agent-Lab-Event-Stream-Epoch';
 
 function waitForAbortableDelay(milliseconds: number, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false);
@@ -506,24 +531,44 @@ function waitForAbortableDelay(milliseconds: number, signal: AbortSignal): Promi
 
 function reconnectingRunEvents(
   path: string,
-  onEvent: (event: RunEvent) => void
+  onEvent: (event: RunEvent) => void | Promise<void>,
+  onReset?: (reset: RunEventStreamReset) => number | Promise<number>
 ): AbortController {
   const controller = new AbortController();
   void (async () => {
     let retryDelayMs = EVENT_STREAM_RECONNECT_INITIAL_MS;
     let lastDeliveredSequence = 0;
+    let eventStreamEpoch: string | undefined;
     while (!controller.signal.aborted) {
       let connectedAtMs: number | undefined;
       try {
         await streamEvents(
           path,
           controller.signal,
-          (event) => {
+          async (event) => {
             if (event.sequence <= lastDeliveredSequence) return;
-            onEvent(event);
+            await onEvent(event);
             lastDeliveredSequence = event.sequence;
           },
-          () => (connectedAtMs = Date.now())
+          async (response) => {
+            connectedAtMs = Date.now();
+            const responseEpoch = response.headers.get(EVENT_STREAM_EPOCH_HEADER) ?? undefined;
+            if (!responseEpoch) return;
+            if (!eventStreamEpoch) {
+              eventStreamEpoch = responseEpoch;
+              return;
+            }
+            if (responseEpoch === eventStreamEpoch) return;
+            const reconciledSequence = await onReset?.({
+              previousEpoch: eventStreamEpoch,
+              epoch: responseEpoch
+            }) ?? 0;
+            if (!Number.isSafeInteger(reconciledSequence) || reconciledSequence < 0) {
+              throw new Error('run event stream reset returned an invalid sequence');
+            }
+            eventStreamEpoch = responseEpoch;
+            lastDeliveredSequence = reconciledSequence;
+          }
         );
       } catch {
         // A later connection replays the run's durable event history.
@@ -571,8 +616,8 @@ export function createRunClient(): RunClient {
       }),
     detail: (id) => request(`/api/runs/${encodeURIComponent(id)}`),
     cancel: (id) => request(`/api/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
-    events: (id, onEvent) =>
-      reconnectingRunEvents(`/api/runs/${encodeURIComponent(id)}/events`, onEvent),
+    events: (id, onEvent, onReset) =>
+      reconnectingRunEvents(`/api/runs/${encodeURIComponent(id)}/events`, onEvent, onReset),
     evaluations: () => request('/api/evaluations'),
     startEvaluation: (input) =>
       request('/api/evaluations', { method: 'POST', body: JSON.stringify(input) }),
@@ -620,7 +665,9 @@ export function createRunClient(): RunClient {
               path,
               controller.signal,
               onEvent,
-              () => (connectedAtMs = Date.now())
+              () => {
+                connectedAtMs = Date.now();
+              }
             );
           } catch {
             // A later connection replays durable events, and the view de-duplicates

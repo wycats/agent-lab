@@ -17,6 +17,8 @@ test('run event streams reconnect and replay only events after the last delivere
   } satisfies RunEvent;
   let streamRequests = 0;
   let tokenRequests = 0;
+  let resetCalls = 0;
+  let secondDeliveryAttempts = 0;
   const streamRequestTimes: number[] = [];
 
   globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -47,7 +49,10 @@ test('run event streams reconnect and replay only events after the last delivere
         }
       }), {
         status: 200,
-        headers: { 'Content-Type': 'text/event-stream' }
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': 'boot-1'
+        }
       });
     }
     throw new Error(`unexpected request: ${url.pathname}`);
@@ -59,18 +64,362 @@ test('run event streams reconnect and replay only events after the last delivere
     const receivedReplay = new Promise<void>((resolve) => {
       finish = resolve;
     });
-    const controller = createRunClient().events('run-1', (event) => {
-      delivered.push(event.sequence);
-      if (event.sequence === second.sequence) finish?.();
-    });
+    const controller = createRunClient().events(
+      'run-1',
+      (event) => {
+        if (event.sequence === second.sequence) {
+          secondDeliveryAttempts += 1;
+          if (secondDeliveryAttempts === 1) {
+            throw new Error('simulate a failed browser event application');
+          }
+        }
+        delivered.push(event.sequence);
+        if (event.sequence === second.sequence) finish?.();
+      },
+      () => {
+        resetCalls += 1;
+        return 0;
+      }
+    );
 
     await receivedReplay;
     controller.abort();
 
     expect(delivered).toEqual([first.sequence, second.sequence]);
-    expect(streamRequests).toBe(2);
-    expect(tokenRequests).toBe(2);
+    expect(streamRequests).toBe(3);
+    expect(tokenRequests).toBe(3);
+    expect(resetCalls).toBe(0);
+    expect(secondDeliveryAttempts).toBe(2);
     expect(streamRequestTimes[1] - streamRequestTimes[0]).toBeGreaterThanOrEqual(75);
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+test('a new server epoch reconciles authoritative terminal history before resetting sequence delivery', async () => {
+  const nativeFetch = globalThis.fetch;
+  const initial = {
+    sequence: 1,
+    atMs: 1,
+    type: 'run.status',
+    payload: { status: 'running' }
+  } satisfies RunEvent;
+  const highWater = {
+    sequence: 42,
+    atMs: 42,
+    type: 'observation.assistant.delta',
+    payload: { text: 'pre-restart activity' }
+  } satisfies RunEvent;
+  const recovered = {
+    sequence: 1,
+    atMs: 100,
+    type: 'run.finished',
+    payload: {
+      status: 'cancelled',
+      error: 'controller stopped before the run finalized',
+      recovered: true
+    }
+  } satisfies RunEvent;
+  let streamRequests = 0;
+  let detailRequests = 0;
+  let resetAttempts = 0;
+  let recoveredDeliveryAttempts = 0;
+  const delivered: Array<{ sequence: number; type: string }> = [];
+  const phases: string[] = [];
+  let projection = {
+    status: 'running',
+    eventCount: highWater.sequence,
+    events: [initial, highWater] as RunEvent[]
+  };
+
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url,
+      'http://127.0.0.1'
+    );
+    if (url.pathname === '/api/session-token') {
+      return Response.json({ token: 'test-token' });
+    }
+    if (url.pathname === '/api/runs/run-1') {
+      detailRequests += 1;
+      phases.push('detail');
+      return Response.json({
+        summary: {
+          id: 'run-1',
+          status: 'cancelled',
+          eventCount: highWater.sequence
+        },
+        events: [recovered]
+      });
+    }
+    if (url.pathname === '/api/runs/run-1/events') {
+      streamRequests += 1;
+      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer test-token');
+      const firstBoot = streamRequests === 1;
+      const events = firstBoot ? [initial, highWater] : [recovered];
+      const encoder = new TextEncoder();
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const event of events) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          }
+          controller.close();
+        }
+      }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': firstBoot ? 'boot-1' : 'boot-2'
+        }
+      });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  try {
+    let finish: (() => void) | undefined;
+    const receivedRecovery = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const client = createRunClient();
+    const controller = client.events(
+      'run-1',
+      (event) => {
+        if (event.type === 'run.finished') {
+          recoveredDeliveryAttempts += 1;
+          phases.push('unexpected-recovered-delivery');
+        }
+        delivered.push({ sequence: event.sequence, type: event.type });
+      },
+      async () => {
+        resetAttempts += 1;
+        phases.push(`reset:${resetAttempts}`);
+        if (resetAttempts === 1) {
+          throw new Error('simulate a failed authoritative reset');
+        }
+        const detail = await client.detail('run-1');
+        const reconciledSequence = detail.events.reduce(
+          (latest, event) => Math.max(latest, event.sequence),
+          0
+        );
+        projection = {
+          status: detail.summary.status,
+          eventCount: reconciledSequence,
+          events: detail.events
+        };
+        phases.push('reconciled');
+        setTimeout(() => finish?.(), 25);
+        return reconciledSequence;
+      }
+    );
+
+    await receivedRecovery;
+    controller.abort();
+
+    expect(delivered).toEqual([
+      { sequence: initial.sequence, type: initial.type },
+      { sequence: highWater.sequence, type: highWater.type }
+    ]);
+    expect(projection).toEqual({
+      status: 'cancelled',
+      eventCount: 1,
+      events: [recovered]
+    });
+    expect(resetAttempts).toBe(2);
+    expect(detailRequests).toBe(1);
+    expect(recoveredDeliveryAttempts).toBe(0);
+    expect(streamRequests).toBe(3);
+    expect(phases).toEqual([
+      'reset:1',
+      'reset:2',
+      'detail',
+      'reconciled'
+    ]);
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+test('a healthy server epoch change does not replay already reconciled workbench side effects', async () => {
+  const nativeFetch = globalThis.fetch;
+  const prepared = {
+    sequence: 1,
+    atMs: 1,
+    type: 'run.prepared',
+    payload: { scenario: 'catalog-to-file' }
+  } satisfies RunEvent;
+  const reveal = {
+    sequence: 2,
+    atMs: 2,
+    type: 'workbench.agent.session.activated',
+    payload: { sessionId: 'session-1', origin: 'nushell' }
+  } satisfies RunEvent;
+  let streamRequests = 0;
+
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url,
+      'http://127.0.0.1'
+    );
+    if (url.pathname === '/api/session-token') {
+      return Response.json({ token: 'test-token' });
+    }
+    if (url.pathname === '/api/runs/run-1/events') {
+      streamRequests += 1;
+      const encoder = new TextEncoder();
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const event of [prepared, reveal]) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          }
+          controller.close();
+        }
+      }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': streamRequests === 1 ? 'boot-1' : 'boot-2'
+        }
+      });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  try {
+    let finish: (() => void) | undefined;
+    const reconciled = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const delivered: number[] = [];
+    let revealSideEffects = 0;
+    let resetCalls = 0;
+    const controller = createRunClient().events(
+      'run-1',
+      (event) => {
+        delivered.push(event.sequence);
+        if (event.type === reveal.type) revealSideEffects += 1;
+      },
+      () => {
+        resetCalls += 1;
+        setTimeout(() => finish?.(), 25);
+        return reveal.sequence;
+      }
+    );
+
+    await reconciled;
+    controller.abort();
+
+    expect(delivered).toEqual([prepared.sequence, reveal.sequence]);
+    expect(revealSideEffects).toBe(1);
+    expect(resetCalls).toBe(1);
+    expect(streamRequests).toBe(2);
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+test('failed reset and event callbacks cancel a non-closing response before reconnecting', async () => {
+  const nativeFetch = globalThis.fetch;
+  const initial = {
+    sequence: 1,
+    atMs: 1,
+    type: 'run.status',
+    payload: { status: 'running' }
+  } satisfies RunEvent;
+  const recovered = {
+    sequence: 1,
+    atMs: 2,
+    type: 'run.finished',
+    payload: { status: 'cancelled', recovered: true }
+  } satisfies RunEvent;
+  const cancelledBodies = new Set<number>();
+  let streamRequests = 0;
+
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url,
+      'http://127.0.0.1'
+    );
+    if (url.pathname === '/api/session-token') {
+      return Response.json({ token: 'test-token' });
+    }
+    if (url.pathname === '/api/runs/run-1/events') {
+      streamRequests += 1;
+      const request = streamRequests;
+      if (request === 3) expect(cancelledBodies.has(2)).toBe(true);
+      if (request === 4) expect(cancelledBodies.has(3)).toBe(true);
+      const event = request === 1 ? initial : recovered;
+      const encoder = new TextEncoder();
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          if (request === 1) controller.close();
+        },
+        cancel() {
+          cancelledBodies.add(request);
+        }
+      }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': request === 1 ? 'boot-1' : 'boot-2'
+        }
+      });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  try {
+    let finish: (() => void) | undefined;
+    const recoveredAfterCleanup = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const delivered: string[] = [];
+    let resetAttempts = 0;
+    let recoveredAttempts = 0;
+    const controller = createRunClient().events(
+      'run-1',
+      (event) => {
+        if (event.type === recovered.type) {
+          recoveredAttempts += 1;
+          if (recoveredAttempts === 1) {
+            throw new Error('simulate a failed event callback');
+          }
+        }
+        delivered.push(event.type);
+        if (event.type === recovered.type) finish?.();
+      },
+      () => {
+        resetAttempts += 1;
+        if (resetAttempts === 1) {
+          throw new Error('simulate a failed reset callback');
+        }
+        return 0;
+      }
+    );
+
+    await recoveredAfterCleanup;
+    controller.abort();
+
+    expect(streamRequests).toBe(4);
+    expect(resetAttempts).toBe(2);
+    expect(recoveredAttempts).toBe(2);
+    expect(delivered).toEqual([initial.type, recovered.type]);
+    expect(cancelledBodies.has(1)).toBe(false);
+    expect(cancelledBodies.has(2)).toBe(true);
+    expect(cancelledBodies.has(3)).toBe(true);
   } finally {
     globalThis.fetch = nativeFetch;
   }

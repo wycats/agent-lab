@@ -96,6 +96,7 @@
   $: showingAgentSession = Boolean(activeAgentSession && agentInspectionMode === 'session');
   $: sessionAssembly = exploreRun?.assembly;
   $: agentLiveStatus = projectAgentSessionLiveStatus(activeAgentSession, agentTurnCancelling);
+  $: scenarioSwitchBlocked = preparing || running || agentLiveStatus !== null;
   $: if (!activeAgentSession?.turns.some((turn) => turn.status === 'queued' || turn.status === 'running')) {
     agentTurnCancelling = false;
   }
@@ -182,7 +183,7 @@
   }
 
   async function prepareScenario(): Promise<void> {
-    if (!scenarioId || preparing || running) return;
+    if (!scenarioId || scenarioSwitchBlocked) return;
     preparing = true;
     actionError = '';
     exploreEventStream?.abort();
@@ -432,7 +433,11 @@
       event.type === 'agent.turn.finished' ||
       event.type === 'agent.session.failed' ||
       event.type === 'agent.session.closed' ||
-      event.type === 'agent.session.interrupted';
+      event.type === 'agent.session.interrupted' ||
+      event.type === 'mcp.tool.started' ||
+      event.type === 'mcp.tool.completed' ||
+      event.type === 'observation.native-action' ||
+      event.type === 'observation.usage';
   }
 
   function requestAgentSessionReconciliation(
@@ -1092,7 +1097,7 @@
     <div class="run-controls">
       <label>
         <span>Scenario</span>
-        <select bind:value={scenarioId} aria-label="Scenario" disabled={preparing || running} on:change={() => void prepareScenario()}>
+        <select bind:value={scenarioId} aria-label="Scenario" disabled={scenarioSwitchBlocked} on:change={() => void prepareScenario()}>
           {#each scenarios as scenario}
             <option value={scenario.id}>{scenario.title}</option>
           {/each}

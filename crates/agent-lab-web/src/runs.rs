@@ -2091,9 +2091,12 @@ impl RunController {
         })?;
         {
             let active = lock(&workspace.active_agent_turn);
-            if active.is_some() {
+            if active
+                .as_ref()
+                .is_some_and(|turn| turn.session_id == session_id)
+            {
                 return Err(RunError::InvalidRequest(
-                    "cancel or finish the active turn before closing this session".to_owned(),
+                    "cancel or finish this session's active turn before closing it".to_owned(),
                 ));
             }
             let mut summary = lock(&state.summary);
@@ -12651,6 +12654,169 @@ done
         }
 
         controller.cancel(&explore.id).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn closing_an_idle_session_preserves_another_sessions_active_turn() {
+        let (root, controller, explore, active_session) = start_interactive_fixture(
+            "close-idle-session-during-active-turn",
+            interactive_fixture_launch(),
+        )
+        .await;
+        let idle_session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let observed = controller
+                .list_agent_sessions(&explore.id)
+                .into_iter()
+                .find(|session| session.id == idle_session.id)
+                .unwrap();
+            if observed.status == AgentSessionStatus::Ready && observed.active {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "second interactive fixture session did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        controller
+            .activate_agent_session(&explore.id, &active_session.id, WorkbenchOrigin::Nushell)
+            .unwrap();
+        let turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &active_session.id,
+                StartAgentTurnRequest {
+                    prompt: "wait-for-abort".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let workspace = controller.state(&explore.id).unwrap();
+        let active_attribution = AgentTurnAttribution {
+            session_id: active_session.id.clone(),
+            turn_id: turn.id.clone(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller
+                .agent_session(&explore.id, &active_session.id)
+                .unwrap();
+            if detail.summary.status == AgentSessionStatus::Running
+                && lock(&workspace.active_agent_turn).as_ref() == Some(&active_attribution)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "first session did not begin its blocking turn"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let error = controller
+            .close_agent_session(&explore.id, &active_session.id)
+            .unwrap_err();
+        assert!(
+            matches!(error, RunError::InvalidRequest(message) if message.contains("this session's active turn"))
+        );
+        controller
+            .close_agent_session(&explore.id, &idle_session.id)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if controller
+                .agent_session(&explore.id, &idle_session.id)
+                .unwrap()
+                .summary
+                .status
+                == AgentSessionStatus::Closed
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "idle session did not close while the other turn remained active"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            lock(&workspace.active_agent_session_id).as_deref(),
+            Some(active_session.id.as_str())
+        );
+        assert_eq!(
+            lock(&workspace.active_agent_turn).as_ref(),
+            Some(&active_attribution)
+        );
+        assert_eq!(
+            controller
+                .agent_session(&explore.id, &active_session.id)
+                .unwrap()
+                .summary
+                .status,
+            AgentSessionStatus::Running
+        );
+
+        controller
+            .cancel_agent_turn(&explore.id, &active_session.id)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller
+                .agent_session(&explore.id, &active_session.id)
+                .unwrap();
+            let observed_turn = detail
+                .turns
+                .iter()
+                .find(|candidate| candidate.id == turn.id)
+                .unwrap();
+            if detail.summary.status == AgentSessionStatus::Ready
+                && observed_turn.status == AgentTurnStatus::Cancelled
+                && lock(&workspace.active_agent_turn).is_none()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "active turn did not cancel during test cleanup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        controller
+            .close_agent_session(&explore.id, &active_session.id)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if controller
+                .agent_session(&explore.id, &active_session.id)
+                .unwrap()
+                .summary
+                .status
+                == AgentSessionStatus::Closed
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "active session did not close during test cleanup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        controller.cancel(&explore.id).unwrap();
+        drop(workspace);
+        drop(controller);
         fs::remove_dir_all(root).unwrap();
     }
 

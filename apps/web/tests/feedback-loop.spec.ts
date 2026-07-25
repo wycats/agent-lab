@@ -336,6 +336,7 @@ test('activating an already displayed session refreshes its ready lifecycle', as
   await expect(page.locator('.run-heading')).toContainText('Agent session');
   await expect(page.locator('.run-heading')).toContainText('starting');
   await expect(session).toContainText('This session is getting ready.');
+  await expect(page.getByLabel('Scenario')).toBeDisabled();
   await expect.poll(() => sessionDetailRequests).toBe(1);
 
   activated = true;
@@ -354,6 +355,7 @@ test('activating an already displayed session refreshes its ready lifecycle', as
   await expect(page.locator('.run-heading')).toContainText('ready');
   await expect(session).toContainText('Ask the harness in Explore.');
   await expect(session.getByTestId('session-turn')).toHaveCount(0);
+  await expect(page.getByLabel('Scenario')).toBeEnabled();
   await page.unrouteAll({ behavior: 'wait' });
 });
 
@@ -717,6 +719,7 @@ test('a sustained agent stream stays incremental while run inspection remains in
   ).toBe(true);
   await expect.poll(() => sessionDetailRequests).toBe(2);
   const liveStatus = session.getByTestId('agent-live-status');
+  await expect(page.getByLabel('Scenario')).toBeDisabled();
   await expect(liveStatus).toHaveAttribute('data-phase', 'responding');
   await expect(liveStatus).toContainText('Streaming the answer.');
   await expect(liveStatus).toContainText('assistant');
@@ -737,6 +740,7 @@ test('a sustained agent stream stays incremental while run inspection remains in
   await page.waitForTimeout(200);
   expect(sessionDetailRequests).toBe(requestsBeforeResume + 1);
   await expect(session.getByTestId('agent-live-status')).toHaveCount(0);
+  await expect(page.getByLabel('Scenario')).toBeEnabled();
 
   const evidence = session.locator('.turn-evidence');
   await evidence.locator(':scope > summary').click();
@@ -774,11 +778,20 @@ test('an active turn can be cancelled from compact progress without polling', as
       input: null
     }
   };
-  const progressEvent = {
+  const capabilityStartedEvent = {
     sequence: 2,
     atMs: startedAtMs + 500,
-    type: 'fixture.opaque-event',
-    payload: { sessionId, turnId },
+    type: 'mcp.tool.started',
+    payload: {
+      sessionId,
+      turnId,
+      event: {
+        source: 'catalog',
+        name: 'list',
+        callId: 'catalog-list',
+        arguments: { active: true }
+      }
+    },
     progress: {
       phase: 'acting',
       detail: 'Inspecting the active catalog.',
@@ -787,8 +800,53 @@ test('an active turn can be cancelled from compact progress without polling', as
       sourceEventType: 'mcp.tool.started'
     }
   };
-  const finishedEvent = {
+  const capabilityCompletedEvent = {
     sequence: 3,
+    atMs: startedAtMs + 750,
+    type: 'mcp.tool.completed',
+    payload: {
+      sessionId,
+      turnId,
+      event: {
+        source: 'catalog',
+        name: 'list',
+        callId: 'catalog-list',
+        result: { items: [{ name: 'alpha' }] },
+        isError: false
+      }
+    }
+  };
+  const nativeActionEvent = {
+    sequence: 4,
+    atMs: startedAtMs + 1_000,
+    type: 'observation.native-action',
+    payload: {
+      sessionId,
+      turnId,
+      event: {
+        actionId: 'inspect-catalog',
+        name: 'Inspect catalog',
+        status: 'completed',
+        summary: 'Compared active item scores.'
+      }
+    }
+  };
+  const usageEvent = {
+    sequence: 5,
+    atMs: startedAtMs + 1_250,
+    type: 'observation.usage',
+    payload: {
+      sessionId,
+      turnId,
+      event: {
+        inputTokens: 7,
+        outputTokens: 21,
+        totalTokens: 28
+      }
+    }
+  };
+  const finishedEvent = {
+    sequence: 6,
     atMs: startedAtMs + 2_000,
     type: 'agent.turn.finished',
     payload: { sessionId, turnId, outcome: 'cancelled' },
@@ -804,7 +862,15 @@ test('an active turn can be cancelled from compact progress without polling', as
   let sessionDetailRequests = 0;
   let cancelRequests = 0;
 
-  await page.addInitScript(({ sessionId, startedEvent, progressEvent, finishedEvent }) => {
+  await page.addInitScript(({
+    sessionId,
+    startedEvent,
+    capabilityStartedEvent,
+    capabilityCompletedEvent,
+    nativeActionEvent,
+    usageEvent,
+    finishedEvent
+  }) => {
     const nativeFetch = window.fetch.bind(window);
     window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       const requestUrl = new URL(
@@ -821,7 +887,13 @@ test('an active turn can be cancelled from compact progress without polling', as
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
             const publish = (
-              event: typeof startedEvent | typeof progressEvent | typeof finishedEvent,
+              event:
+                | typeof startedEvent
+                | typeof capabilityStartedEvent
+                | typeof capabilityCompletedEvent
+                | typeof nativeActionEvent
+                | typeof usageEvent
+                | typeof finishedEvent,
               close = false
             ) => {
               if (closed || init?.signal?.aborted) return;
@@ -834,8 +906,16 @@ test('an active turn can be cancelled from compact progress without polling', as
               }
             };
             setTimeout(() => publish(startedEvent), 25);
-            (window as Window & { __publishAgentProgress?: () => void })
-              .__publishAgentProgress = () => publish(progressEvent);
+            (window as Window & {
+              __publishAgentEvidence?: (
+                kind: 'capability-started' | 'capability-completed' | 'native-action' | 'usage'
+              ) => void
+            }).__publishAgentEvidence = (kind) => {
+              if (kind === 'capability-started') publish(capabilityStartedEvent);
+              if (kind === 'capability-completed') publish(capabilityCompletedEvent);
+              if (kind === 'native-action') publish(nativeActionEvent);
+              if (kind === 'usage') publish(usageEvent);
+            };
             (window as Window & { __finishCancelledAgentTurn?: () => void })
               .__finishCancelledAgentTurn = () => publish(finishedEvent, true);
             init?.signal?.addEventListener('abort', () => {
@@ -859,7 +939,15 @@ test('an active turn can be cancelled from compact progress without polling', as
       }
       return nativeFetch(input, init);
     };
-  }, { sessionId, startedEvent, progressEvent, finishedEvent });
+  }, {
+    sessionId,
+    startedEvent,
+    capabilityStartedEvent,
+    capabilityCompletedEvent,
+    nativeActionEvent,
+    usageEvent,
+    finishedEvent
+  });
 
   const summary = {
     id: sessionId,
@@ -874,8 +962,19 @@ test('an active turn can be cancelled from compact progress without polling', as
     turnCount: 0
   };
   const sessionDetail = (deliveredSequence: number) => {
+    const deliveredEvents = [
+      startedEvent,
+      capabilityStartedEvent,
+      capabilityCompletedEvent,
+      nativeActionEvent,
+      usageEvent,
+      finishedEvent
+    ].filter((event) => event.sequence <= deliveredSequence);
     const started = deliveredSequence >= startedEvent.sequence;
-    const progressed = deliveredSequence >= progressEvent.sequence;
+    const capabilityStarted = deliveredSequence >= capabilityStartedEvent.sequence;
+    const capabilityCompleted = deliveredSequence >= capabilityCompletedEvent.sequence;
+    const nativeAction = deliveredSequence >= nativeActionEvent.sequence;
+    const usageReported = deliveredSequence >= usageEvent.sequence;
     const finished = deliveredSequence >= finishedEvent.sequence;
     return {
       projectionVersion: 1,
@@ -883,11 +982,7 @@ test('an active turn can be cancelled from compact progress without polling', as
         ...summary,
         workspaceId,
         status: started && !finished ? 'running' : 'ready',
-        updatedAtMs: finished
-          ? finishedEvent.atMs
-          : started
-            ? startedEvent.atMs
-            : summary.updatedAtMs,
+        updatedAtMs: deliveredEvents.at(-1)?.atMs ?? summary.updatedAtMs,
         turnCount: started ? 1 : 0
       },
       turns: started
@@ -902,32 +997,55 @@ test('an active turn can be cancelled from compact progress without polling', as
             finishedAtMs: finished ? finishedEvent.atMs : undefined,
             outcome: finished ? 'cancelled' : undefined,
             presentation: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               response: null,
               messages: [],
-              activity: [],
-              usage: null,
+              activity: [
+                ...(capabilityStarted
+                  ? [{
+                      kind: 'capability-call',
+                      title: 'catalog · list',
+                      detail: null,
+                      status: capabilityCompleted ? 'completed' : 'running',
+                      source: 'catalog',
+                      path: null,
+                      operation: 'list',
+                      callId: 'catalog-list',
+                      arguments: { active: true },
+                      result: capabilityCompleted ? { items: [{ name: 'alpha' }] } : undefined,
+                      sourceEventSequences: capabilityCompleted ? [2, 3] : [2]
+                    }]
+                  : []),
+                ...(nativeAction
+                  ? [{
+                      kind: 'native-action',
+                      title: 'Inspect catalog',
+                      detail: 'Compared active item scores.',
+                      status: 'completed',
+                      source: null,
+                      path: null,
+                      operation: 'Inspect catalog',
+                      actionId: 'inspect-catalog',
+                      sourceEventSequences: [4]
+                    }]
+                  : [])
+              ],
+              usage: usageReported
+                ? { inputTokens: 7, outputTokens: 21, totalTokens: 28 }
+                : null,
               completeness: {
                 assistantOutput: 'unavailable',
                 capabilityActivity: 'partial',
                 nativeActivity: 'partial',
                 workspaceEffects: 'partial',
-                usage: 'unavailable'
+                usage: usageReported ? 'complete' : 'unavailable'
               },
-              sourceEventSequences: [
-                ...(started ? [1] : []),
-                ...(progressed ? [2] : []),
-                ...(finished ? [3] : [])
-              ],
+              sourceEventSequences: deliveredEvents.map((event) => event.sequence),
               sourceDigest: finished ? 'sha256:cancelled' : 'sha256:cancelling'
             }
           }]
         : [],
-      events: [
-        ...(started ? [startedEvent] : []),
-        ...(progressed ? [progressEvent] : []),
-        ...(finished ? [finishedEvent] : [])
-      ]
+      events: deliveredEvents
     };
   };
 
@@ -968,15 +1086,47 @@ test('an active turn can be cancelled from compact progress without polling', as
   await expect(liveStatus).toContainText('Waiting for the next progress update.');
   expect(sessionDetailRequests).toBe(2);
 
-  await page.evaluate(() =>
-    (window as Window & { __publishAgentProgress?: () => void })
-      .__publishAgentProgress?.()
-  );
+  const publishEvidence = async (
+    kind: 'capability-started' | 'capability-completed' | 'native-action' | 'usage'
+  ) => {
+    await page.evaluate((nextKind) => {
+      const publish = (window as Window & {
+        __publishAgentEvidence?: (value: typeof nextKind) => void
+      }).__publishAgentEvidence;
+      if (!publish) throw new Error('agent evidence publish hook is unavailable');
+      publish(nextKind);
+    }, kind);
+  };
+
+  await publishEvidence('capability-started');
+  await expect.poll(() => sessionDetailRequests).toBe(3);
   await expect(liveStatus).toHaveAttribute('data-phase', 'acting');
   await expect(liveStatus).toContainText('Inspecting the active catalog.');
   await expect(liveStatus).toContainText('catalog · list');
   await expect(liveStatus).toHaveAttribute('data-source-event-sequence', '14');
   await expect(liveStatus).toHaveAttribute('data-source-event-type', 'mcp.tool.started');
+  const activity = session.locator('.turn-activity');
+  const capability = activity.locator('li[data-kind="capability-call"]');
+  await expect(capability).toHaveAttribute('data-status', 'running');
+  await expect(capability).toContainText('catalog · list');
+  await expect(capability).toContainText('Arguments: active');
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'running');
+
+  await publishEvidence('capability-completed');
+  await expect.poll(() => sessionDetailRequests).toBe(4);
+  await expect(capability).toHaveAttribute('data-status', 'completed');
+  await expect(capability).toContainText('Returned 1 item');
+
+  await publishEvidence('native-action');
+  await expect.poll(() => sessionDetailRequests).toBe(5);
+  const nativeAction = activity.locator('li[data-kind="native-action"]');
+  await expect(nativeAction).toContainText('Inspect catalog');
+  await expect(nativeAction).toContainText('Compared active item scores.');
+
+  await publishEvidence('usage');
+  await expect.poll(() => sessionDetailRequests).toBe(6);
+  await expect(session.locator('.turn-summary')).toContainText('Usage reported');
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'running');
 
   await liveStatus.evaluate((element) => element.scrollIntoView({ block: 'center' }));
   const narrowGeometry = await page.evaluate(() => {
@@ -1007,7 +1157,7 @@ test('an active turn can be cancelled from compact progress without polling', as
   await expect.poll(() => cancelRequests).toBe(1);
   await expect(liveStatus).toHaveAttribute('data-phase', 'cancelling');
   await expect(liveStatus.getByRole('button', { name: 'Cancelling…' })).toBeDisabled();
-  expect(sessionDetailRequests).toBe(2);
+  expect(sessionDetailRequests).toBe(6);
 
   await page.evaluate(() =>
     (window as Window & { __finishCancelledAgentTurn?: () => void })
@@ -1015,12 +1165,21 @@ test('an active turn can be cancelled from compact progress without polling', as
   );
   await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'cancelled');
   await expect(session.getByTestId('agent-live-status')).toHaveCount(0);
-  await expect.poll(() => sessionDetailRequests).toBe(3);
+  await expect.poll(() => sessionDetailRequests).toBe(7);
+  await expect(activity.locator('li[data-kind="capability-call"]')).toHaveCount(1);
+  await expect(activity.locator('li[data-kind="native-action"]')).toHaveCount(1);
 
   const evidence = session.locator('.turn-evidence');
   await evidence.locator(':scope > summary').click();
   await evidence.locator('.turn-raw-events > summary').click();
-  await expect(evidence.locator('.run-events .sequence')).toHaveText(['01', '02', '03']);
+  await expect(evidence.locator('.run-events .sequence')).toHaveText([
+    '01',
+    '02',
+    '03',
+    '04',
+    '05',
+    '06'
+  ]);
   expect(cancelRequests).toBe(1);
   await page.unrouteAll({ behavior: 'wait' });
 });

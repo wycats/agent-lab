@@ -217,6 +217,191 @@ test('a session that fails while opening becomes retained history', async ({ pag
   await page.unrouteAll({ behavior: 'wait' });
 });
 
+test('ready agent sessions keep their workspace selected until every driver closes', async ({ page }) => {
+  let exploreRequests = 0;
+  page.on('request', (request) => {
+    if (
+      request.method() === 'POST' &&
+      new URL(request.url()).pathname === '/api/explore'
+    ) {
+      exploreRequests += 1;
+    }
+  });
+  await page.route('/api/scenarios', async (route) => {
+    const response = await route.fetch();
+    const scenarios = await response.json();
+    await route.fulfill({
+      response,
+      json: [
+        ...scenarios,
+        {
+          ...scenarios[0],
+          id: 'alternate-scenario',
+          title: 'Alternate scenario'
+        }
+      ]
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const scenario = page.getByLabel('Scenario');
+  await expect(scenario).toBeEnabled();
+  await page.getByLabel('Default harness').selectOption('v0');
+
+  const screen = page.getByTestId('terminal-text');
+  await submit(page, 'agent new | get status');
+  await expect(page.locator('.run-heading')).toContainText('Active session');
+  await expect(page.getByTestId('interactive-agent-session')).toContainText(
+    'Ask the harness in Explore.'
+  );
+  await expect(scenario).toBeDisabled();
+  const runHarness = page.getByRole('button', { name: 'Run harness', exact: true });
+  await expect(runHarness).toBeDisabled();
+
+  const preparedWorkspaceCount = exploreRequests;
+  const originalScenario = await scenario.inputValue();
+  await page.evaluate(({ originalScenario }) => {
+    const selector = document.querySelector<HTMLSelectElement>('select[aria-label="Scenario"]');
+    if (!selector) throw new Error('scenario selector was not mounted');
+    selector.value = 'alternate-scenario';
+    selector.dispatchEvent(new Event('change', { bubbles: true }));
+    selector.value = originalScenario;
+    selector.dispatchEvent(new Event('change', { bubbles: true }));
+  }, { originalScenario });
+  await page.waitForTimeout(100);
+  expect(exploreRequests).toBe(preparedWorkspaceCount);
+
+  await submit(
+    page,
+    'let first = (agent | get id); let second = (agent new | get id); agent close; agent sessions | where status == ready | length'
+  );
+  await expect(screen).toContainText('1');
+  await expect(page.locator('.run-heading')).toContainText('Session history');
+  await expect(scenario).toBeDisabled();
+  await expect(runHarness).toBeDisabled();
+
+  await submit(
+    page,
+    'let remaining = (agent sessions | where status == ready | get id | first); agent close $remaining'
+  );
+  await expect(page.locator('.run-heading')).toContainText('Session history');
+  await expect(scenario).toBeEnabled();
+  await expect(runHarness).toBeEnabled();
+  expect(exploreRequests).toBe(preparedWorkspaceCount);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('a stale workbench snapshot cannot reopen a terminal non-active session', async ({ page }) => {
+  const sessionId = 'non-active-session';
+  let workspaceId = '';
+  let serveStaleSnapshot = false;
+  let workbenchRequests = 0;
+
+  await page.addInitScript(() => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (/^\/api\/runs\/[^/]+\/events$/.test(requestUrl.pathname)) {
+        const encoder = new TextEncoder();
+        let closed = false;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+              .__publishWorkspaceAgentEvent = (event) => {
+                if (closed || init?.signal?.aborted) return;
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+              };
+            init?.signal?.addEventListener('abort', () => {
+              if (closed) return;
+              closed = true;
+              controller.close();
+            }, { once: true });
+          },
+          cancel() {
+            closed = true;
+          }
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' }
+        });
+      }
+      return nativeFetch(input, init);
+    };
+  });
+
+  const summary = (status: 'ready' | 'closed', updatedAtMs: number) => ({
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status,
+    active: false,
+    createdAtMs: 1,
+    updatedAtMs,
+    turnCount: 0
+  });
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    workbenchRequests += 1;
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    workbench.activeAgentSession = null;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = serveStaleSnapshot ? [summary('ready', 2)] : [];
+    await route.fulfill({ response, json: workbench });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect.poll(() =>
+    page.evaluate(() =>
+      typeof (window as Window & { __publishWorkspaceAgentEvent?: unknown })
+        .__publishWorkspaceAgentEvent
+    )
+  ).toBe('function');
+  const scenario = page.getByLabel('Scenario');
+  await expect(scenario).toBeEnabled();
+
+  await page.evaluate(({ sessionId, session }) => {
+    (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+      .__publishWorkspaceAgentEvent?.({
+        sequence: 1_000_000,
+        atMs: 2,
+        type: 'workbench.agent.session.updated',
+        payload: { sessionId, session }
+      });
+  }, { sessionId, session: summary('ready', 2) });
+  await expect(scenario).toBeDisabled();
+
+  await page.evaluate(({ sessionId, session }) => {
+    (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+      .__publishWorkspaceAgentEvent?.({
+        sequence: 1_000_001,
+        atMs: 3,
+        type: 'workbench.agent.session.updated',
+        payload: { sessionId, session }
+      });
+  }, { sessionId, session: summary('closed', 3) });
+  await expect(scenario).toBeEnabled();
+
+  serveStaleSnapshot = true;
+  const requestsBeforeReload = workbenchRequests;
+  await page.getByLabel('Default harness').selectOption('v0');
+  await expect.poll(() => workbenchRequests).toBeGreaterThan(requestsBeforeReload);
+  await expect(scenario).toBeEnabled();
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
 test('initial active session detail failure reconciles the session after reload', async ({ page }) => {
   const sessionId = 'initial-reconciliation-session';
   let workspaceId = '';
@@ -387,6 +572,11 @@ test('activation and selection reload preserve an already displayed session life
         });
         return;
       }
+      if (sessionDetailRequests === 2) {
+        // Keep the first recovery request in flight long enough to assert the
+        // transient retry state independently of machine and worker speed.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
       await route.fulfill({
         json: {
           projectionVersion: 1,
@@ -408,15 +598,15 @@ test('activation and selection reload preserve an already displayed session life
   ).toBe('function');
 
   failNextSessionDetail = true;
-  await page.evaluate(({ sessionId }) => {
+  await page.evaluate(({ sessionId, summary }) => {
     (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
       .__publishWorkspaceAgentEvent?.({
         sequence: 1_000_000,
         atMs: 2,
         type: 'workbench.agent.session.started',
-        payload: { sessionId, origin: 'nushell' }
+        payload: { sessionId, origin: 'nushell', session: summary }
       });
-  }, { sessionId });
+  }, { sessionId, summary: sessionSummary() });
 
   const session = page.getByTestId('interactive-agent-session');
   await expect(page.getByRole('alert')).toContainText(
@@ -447,7 +637,7 @@ test('activation and selection reload preserve an already displayed session life
   await expect(page.locator('.run-heading')).toContainText('ready');
   await expect(session).toContainText('Ask the harness in Explore.');
   await expect(session.getByTestId('session-turn')).toHaveCount(0);
-  await expect(page.getByLabel('Scenario')).toBeEnabled();
+  await expect(page.getByLabel('Scenario')).toBeDisabled();
   await expect.poll(() => page.evaluate(() =>
     (window as Window & { __activationAgentStreamRequests?: number })
       .__activationAgentStreamRequests ?? 0
@@ -1488,7 +1678,7 @@ test('a sustained agent stream stays incremental while run inspection remains in
   await page.waitForTimeout(200);
   expect(sessionDetailRequests).toBe(requestsBeforeResume + 1);
   await expect(session.getByTestId('agent-live-status')).toHaveCount(0);
-  await expect(page.getByLabel('Scenario')).toBeEnabled();
+  await expect(page.getByLabel('Scenario')).toBeDisabled();
 
   const evidence = session.locator('.turn-evidence');
   await evidence.locator(':scope > summary').click();
@@ -1885,6 +2075,11 @@ test('terminal reconciliation retries failed and stale detail without losing can
         json: { error: 'fixture detail projection is temporarily unavailable' }
       });
       return;
+    }
+    if (sessionDetailRequests === 3) {
+      // Keep the stale response in flight long enough to observe the retry
+      // state independently of machine speed and event-stream reconnect timing.
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
     await route.fulfill({ json: sessionDetail(sessionDetailRequests >= 4) });
   });

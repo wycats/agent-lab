@@ -5,7 +5,7 @@
   import AgentSessionLiveStatus from '$lib/AgentSessionLiveStatus.svelte';
   import AssistantMarkdown from '$lib/AssistantMarkdown.svelte';
   import { projectAgentSessionLiveStatus } from '$lib/agent-live-status';
-  import { agentTurnActivityDetail, createRunClient, type AgentSessionDetail, type AgentTurnActivityPresentation, type AgentTurnMessagePresentation, type AgentTurnSummary, type EvaluationComparisonArm, type EvaluationDetail, type EvaluationSummary, type HarnessMetadata, type ModelAccessSnapshot, type ModelProfileMetadata, type RunDetail, type RunEvent, type RunReviewStep, type RunSummary, type ScenarioManifest, type WorkbenchSelection } from '$lib/runs';
+  import { agentTurnActivityDetail, createRunClient, type AgentSessionDetail, type AgentSessionSummary, type AgentTurnActivityPresentation, type AgentTurnMessagePresentation, type AgentTurnSummary, type EvaluationComparisonArm, type EvaluationDetail, type EvaluationSummary, type HarnessMetadata, type ModelAccessSnapshot, type ModelProfileMetadata, type RunDetail, type RunEvent, type RunReviewStep, type RunSummary, type ScenarioManifest, type WorkbenchSelection } from '$lib/runs';
   import { createGhosttySurface } from '$lib/terminal/ghostty';
   import { connectSession } from '$lib/terminal/session';
   import type { BrowserSession, ConnectionState, SessionEvent } from '$lib/terminal/session';
@@ -91,6 +91,8 @@
   let evaluations: EvaluationSummary[] = [];
   let selectedEvaluation: EvaluationDetail | undefined;
   let activeAgentSession: AgentSessionDetail | undefined;
+  let agentSessions: AgentSessionSummary[] = [];
+  let agentSessionsWorkspaceId = '';
   let evaluationRuns: Record<string, RunDetail> = {};
   let exploreRun: RunDetail | undefined;
   let selectedRun: RunDetail | undefined;
@@ -122,7 +124,12 @@
   $: showingAgentSession = Boolean(activeAgentSession && agentInspectionMode === 'session');
   $: sessionAssembly = exploreRun?.assembly;
   $: agentLiveStatus = projectAgentSessionLiveStatus(activeAgentSession, agentTurnCancelling);
-  $: scenarioSwitchBlocked = preparing || running || agentLiveStatus !== null;
+  $: agentSessionLifecycleActive =
+    agentSessions.some((summary) => !agentSessionIsHistorical(summary)) ||
+    Boolean(activeAgentSession && !agentSessionIsHistorical(activeAgentSession.summary));
+  $: scenarioSwitchBlocked = preparing ||
+    running ||
+    agentSessionLifecycleActive;
   $: if (!activeAgentSession?.turns.some((turn) => turn.status === 'queued' || turn.status === 'running')) {
     agentTurnCancelling = false;
   }
@@ -210,12 +217,21 @@
 
   async function prepareScenario(): Promise<void> {
     if (!scenarioId || scenarioSwitchBlocked) return;
+    const sourceExploreRun = exploreRun;
+    const sourceSelectedRun = selectedRun;
+    const sourceRunEvents = runEvents;
+    const sourceUnavailableRunEvidence = unavailableRunEvidence;
+    const sourceWorkspaceId = sourceExploreRun?.summary.id;
+    const sourceScenarioId = sourceExploreRun?.summary.scenarioId;
+    let detachedSource = false;
     preparing = true;
     actionError = '';
-    exploreEventStream?.abort();
-    inspectionEventStream?.abort();
     try {
-      const summary = await runClient.prepare(scenarioId);
+      const summary = await runClient.prepare(scenarioId, sourceWorkspaceId);
+      if (sourceWorkspaceId && summary.id !== sourceWorkspaceId) {
+        detachExploreWorkspace();
+        detachedSource = true;
+      }
       const detail = await runClient.detail(summary.id);
       unavailableRunEvidence = undefined;
       exploreRun = detail;
@@ -227,6 +243,20 @@
       watchExploreRun(summary.id);
       await startTerminal(summary);
     } catch (error) {
+      if (sourceScenarioId) scenarioId = sourceScenarioId;
+      if (detachedSource && sourceExploreRun) {
+        exploreRun = sourceExploreRun;
+        selectedRun = sourceSelectedRun;
+        runEvents = sourceRunEvents;
+        unavailableRunEvidence = sourceUnavailableRunEvidence;
+        try {
+          await loadWorkbench(sourceExploreRun.summary.id);
+          watchExploreRun(sourceExploreRun.summary.id);
+          await startTerminal(sourceExploreRun.summary);
+        } catch {
+          // Preserve the original transition failure as the actionable error.
+        }
+      }
       actionError = message(error);
     } finally {
       preparing = false;
@@ -237,6 +267,7 @@
     const workbench = await runClient.workbench(id);
     applyWorkbenchSelection(workbench.selection);
     modelAccess = workbench.modelAccess;
+    mergeAgentSessionSnapshot(id, workbench.agentSessions);
     const session = workbench.activeAgentSession?.active
       ? workbench.activeAgentSession
       : workbench.replayAgentSession;
@@ -296,6 +327,7 @@
       agentTurnCancelling = false;
     }
     activeAgentSession = detail;
+    rememberAgentSession(detail.summary);
     knownAgentSessionEventSequences = new Set(detail.events.map((event) => event.sequence));
     pendingAgentSessionEvents = [];
     if (agentSessionEventFlushTimer !== undefined) clearTimeout(agentSessionEventFlushTimer);
@@ -327,6 +359,26 @@
     agentTurnCancelling = false;
   }
 
+  function detachExploreWorkspace(): void {
+    exploreEventStream?.abort();
+    exploreEventStream = undefined;
+    inspectionEventStream?.abort();
+    inspectionEventStream = undefined;
+    clearAgentSessionView();
+    agentSessions = [];
+    agentSessionsWorkspaceId = '';
+    session?.dispose();
+    session = undefined;
+    surface?.dispose();
+    surface = undefined;
+    terminalHost?.replaceChildren();
+    terminalRun = undefined;
+    screenText = '';
+    sessionEvents = [];
+    connectionState = 'starting';
+    startupError = '';
+  }
+
   function queueAgentSessionEvent(
     workspaceId: string,
     sessionId: string,
@@ -353,6 +405,7 @@
       const events = pendingAgentSessionEvents.sort((left, right) => left.sequence - right.sequence);
       pendingAgentSessionEvents = [];
       activeAgentSession = applyAgentSessionEvents(activeAgentSession, events);
+      rememberAgentSession(activeAgentSession.summary);
       if (events.some(requiresAgentSessionReconciliation)) {
         requestAgentSessionReconciliation(workspaceId, sessionId, openVersion);
       }
@@ -596,6 +649,7 @@
           agentTurnCancelling = false;
         }
         activeAgentSession = latest;
+        rememberAgentSession(latest.summary);
         agentSessionReconcileRetryDelayMs = AGENT_SESSION_RECONCILE_INITIAL_MS;
         agentSessionSyncError = '';
         if (target.reveal) {
@@ -648,6 +702,38 @@
     comparisonHarnessIds = selection.comparisonHarnessIds;
   }
 
+  function mergeAgentSessionSnapshot(
+    workspaceId: string,
+    snapshot: AgentSessionSummary[]
+  ): void {
+    if (agentSessionsWorkspaceId !== workspaceId) {
+      agentSessionsWorkspaceId = workspaceId;
+      agentSessions = snapshot;
+      return;
+    }
+    const merged = [...agentSessions];
+    for (const summary of snapshot) {
+      const existing = merged.findIndex((candidate) => candidate.id === summary.id);
+      if (existing === -1) {
+        merged.push(summary);
+      } else if (summary.updatedAtMs > merged[existing].updatedAtMs) {
+        merged[existing] = summary;
+      }
+    }
+    agentSessions = merged;
+  }
+
+  function rememberAgentSession(summary: AgentSessionSummary): void {
+    if (agentSessionsWorkspaceId && agentSessionsWorkspaceId !== summary.workspaceId) return;
+    agentSessionsWorkspaceId ||= summary.workspaceId;
+    const existing = agentSessions.findIndex((candidate) => candidate.id === summary.id);
+    agentSessions = existing === -1
+      ? [summary, ...agentSessions]
+      : summary.updatedAtMs >= agentSessions[existing].updatedAtMs
+        ? agentSessions.map((candidate, index) => index === existing ? summary : candidate)
+        : agentSessions;
+  }
+
   async function changeWorkbenchSelection(input: Partial<WorkbenchSelection>): Promise<void> {
     if (!exploreRun) return;
     actionError = '';
@@ -672,7 +758,14 @@
 
   async function beginRun(): Promise<void> {
     const hasSelection = harnesses.length ? Boolean(harnessId && modelProfileId) : Boolean(modelId.trim());
-    if (!exploreRun || exploreRun.summary.status !== 'exploring' || !hasSelection || !runModelAccessReady || starting) return;
+    if (
+      !exploreRun ||
+      exploreRun.summary.status !== 'exploring' ||
+      !hasSelection ||
+      !runModelAccessReady ||
+      starting ||
+      scenarioSwitchBlocked
+    ) return;
     starting = true;
     actionError = '';
     activeTab = 'agent';
@@ -881,6 +974,8 @@
       }
       if (exploreWasQuarantined) {
         exploreRun = undefined;
+        agentSessions = [];
+        agentSessionsWorkspaceId = '';
         clearAgentSessionView();
       }
       const affectedEvaluationIds = new Set(
@@ -983,6 +1078,18 @@
       ) {
         const selection = (event.payload as { selection?: WorkbenchSelection }).selection;
         if (selection) applyWorkbenchSelection(selection);
+      }
+      if (
+        event.sequence > liveAfterSequence &&
+        (
+          event.type === 'workbench.agent.session.started' ||
+          event.type === 'workbench.agent.session.updated'
+        ) &&
+        event.payload &&
+        typeof event.payload === 'object'
+      ) {
+        const summary = (event.payload as { session?: AgentSessionSummary }).session;
+        if (summary?.workspaceId === id) rememberAgentSession(summary);
       }
       if (
         event.sequence > liveAfterSequence &&
@@ -1475,7 +1582,7 @@
           {preparing ? 'Preparing…' : 'New workspace'}
         </button>
       {:else}
-        <button class="primary" disabled={activeExplore?.status !== 'exploring' || !(harnesses.length ? harnessId && modelProfileId : modelId.trim()) || !runModelAccessReady || preparing || starting || running} on:click={() => void beginRun()}>
+        <button class="primary" disabled={activeExplore?.status !== 'exploring' || !(harnesses.length ? harnessId && modelProfileId : modelId.trim()) || !runModelAccessReady || starting || scenarioSwitchBlocked} on:click={() => void beginRun()}>
           {starting ? 'Starting…' : 'Run harness'}
         </button>
       {/if}

@@ -719,6 +719,54 @@ fn total_driver_transcript_retention_is_bounded() {
 }
 
 #[test]
+fn total_controller_transcript_retention_is_bounded_before_writing() {
+    let mut process = DriverProcess::spawn("sh", ["-c", "cat >/dev/null"]).unwrap();
+    let large_command = command(
+        "large-command",
+        CommandBody::OpenSession {
+            session_id: "session-1".to_owned(),
+            config: json!({
+                "payload": "x".repeat(MAX_DRIVER_RECORD_BYTES - 1024),
+            }),
+            limits: json!({}),
+        },
+    );
+    let encoded_len = serde_json::to_vec(&large_command).unwrap().len() + 1;
+    let retained_record_count = MAX_DRIVER_TRANSCRIPT_BYTES / encoded_len;
+    assert!(retained_record_count > 0);
+
+    for _ in 0..retained_record_count {
+        process.send(&large_command).unwrap();
+    }
+    let retained_before_rejection = process
+        .transcript()
+        .controller_records
+        .iter()
+        .map(Vec::len)
+        .sum::<usize>();
+    assert_eq!(
+        retained_before_rejection,
+        retained_record_count * encoded_len
+    );
+
+    assert!(matches!(
+        process.send(&large_command),
+        Err(ProcessError::TranscriptLimitExceeded { limit })
+            if limit == MAX_DRIVER_TRANSCRIPT_BYTES
+    ));
+    let transcript = process.transcript();
+    assert_eq!(transcript.controller_records.len(), retained_record_count);
+    assert_eq!(
+        transcript
+            .controller_records
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>(),
+        retained_before_rejection
+    );
+}
+
+#[test]
 fn raw_runs_remain_distinct_while_named_canonical_evidence_matches() {
     let first = completed_fixture_bundle();
     let second = completed_fixture_bundle();

@@ -56,6 +56,7 @@ const MODEL_ACCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EVIDENCE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_EVIDENCE_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_AGENT_TURN_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_WORKBENCH_AGENT_TURN_INDEX_ENTRIES: usize = 512;
 const CATALOG_REQUIRED_SOURCES: &[&str] = &["catalog", "analysis"];
 const PROTECTED_WORKSPACE_PATH_ERROR: &str =
     "workspace paths contained protected data; unsafe workspace entries were removed";
@@ -309,6 +310,22 @@ pub struct AgentTurnSummary {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_intervention_at_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTurnCompletionRef {
+    pub id: String,
+    pub session_id: String,
+    pub started_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTurnCompletionIndex {
+    pub entries: Vec<AgentTurnCompletionRef>,
+    pub total: u64,
+    pub truncated: bool,
 }
 
 const AGENT_TURN_PRESENTATION_VERSION: u32 = 2;
@@ -632,6 +649,7 @@ pub struct WorkbenchSnapshot {
     pub active_agent_session: Option<AgentSessionSummary>,
     pub replay_agent_session: Option<AgentSessionSummary>,
     pub agent_sessions: Vec<AgentSessionSummary>,
+    pub agent_turn_index: AgentTurnCompletionIndex,
 }
 
 #[derive(Debug, Clone)]
@@ -657,6 +675,7 @@ struct ControllerInner {
     harness_model_access: BTreeMap<String, String>,
     runs: Arc<Mutex<HashMap<String, Arc<RunState>>>>,
     prepare_lock: tokio::sync::Mutex<()>,
+    scenario_transition_lock: tokio::sync::Mutex<()>,
     evaluations_dir: PathBuf,
     evaluations: Arc<Mutex<HashMap<String, Arc<EvaluationState>>>>,
     workbench_grants: Mutex<HashMap<String, String>>,
@@ -711,6 +730,7 @@ struct RunState {
     selection: Mutex<WorkbenchSelection>,
     events: Mutex<Vec<RunEvent>>,
     producer_lifecycle: Mutex<()>,
+    agent_session_acceptance: Mutex<WorkspaceAgentSessionAcceptance>,
     event_commit: Mutex<()>,
     sender: broadcast::Sender<RunEvent>,
     cancel: CancellationToken,
@@ -731,6 +751,36 @@ struct RunState {
     capability_attributions: Mutex<HashMap<String, AgentTurnAttribution>>,
     reusable_explore: bool,
     replay_failed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceAgentSessionAcceptance {
+    Open,
+    Transitioning,
+}
+
+struct WorkspaceScenarioTransition {
+    source: Arc<RunState>,
+    previous: WorkspaceAgentSessionAcceptance,
+    committed: bool,
+}
+
+impl WorkspaceScenarioTransition {
+    fn commit(mut self) {
+        let _source_lifecycle = lock(&self.source.producer_lifecycle);
+        *lock(&self.source.agent_session_acceptance) = self.previous;
+        self.committed = true;
+    }
+}
+
+impl Drop for WorkspaceScenarioTransition {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let _source_lifecycle = lock(&self.source.producer_lifecycle);
+        *lock(&self.source.agent_session_acceptance) = self.previous;
+    }
 }
 
 struct RunCompletion {
@@ -1159,6 +1209,8 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static EVALUATION_EVENT_WRITE_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static AGENT_SESSION_SPAWN_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     static QUARANTINE_PUBLICATION_PAUSE:
         std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
         const { std::cell::RefCell::new(None) };
@@ -1174,6 +1226,11 @@ thread_local! {
     static AGENT_TURN_SESSION_VALIDATION_PAUSE:
         std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn take_agent_session_spawn_failure() -> bool {
+    AGENT_SESSION_SPAWN_FAILURE.with(std::cell::Cell::take)
 }
 
 #[cfg(test)]
@@ -1537,6 +1594,61 @@ pub struct TerminalCapabilityBinding {
     pub token: String,
 }
 
+fn compare_agent_turn_completion_refs(
+    left: &AgentTurnCompletionRef,
+    right: &AgentTurnCompletionRef,
+) -> std::cmp::Ordering {
+    right
+        .started_at_ms
+        .cmp(&left.started_at_ms)
+        .then_with(|| left.id.cmp(&right.id))
+        .then_with(|| left.session_id.cmp(&right.session_id))
+}
+
+fn workbench_agent_turn_index(workspace: &RunState) -> AgentTurnCompletionIndex {
+    let _commit = lock(&workspace.event_commit);
+    if workspace.evidence_quarantined.load(Ordering::Acquire) {
+        return AgentTurnCompletionIndex {
+            entries: Vec::new(),
+            total: 0,
+            truncated: false,
+        };
+    }
+    let workspace_id = lock(&workspace.summary).id.clone();
+    let sessions = lock(&workspace.agent_sessions)
+        .values()
+        .filter_map(Weak::upgrade)
+        .collect::<Vec<_>>();
+    let mut entries = Vec::with_capacity(MAX_WORKBENCH_AGENT_TURN_INDEX_ENTRIES);
+    let mut total = 0_u64;
+    for session in sessions {
+        if lock(&session.summary).workspace_id != workspace_id {
+            continue;
+        }
+        for turn in lock(&session.turns).iter() {
+            total = total.saturating_add(1);
+            let entry = AgentTurnCompletionRef {
+                id: turn.id.clone(),
+                session_id: turn.session_id.clone(),
+                started_at_ms: turn.started_at_ms,
+            };
+            let position = entries
+                .binary_search_by(|existing| compare_agent_turn_completion_refs(existing, &entry))
+                .unwrap_or_else(|position| position);
+            if position < MAX_WORKBENCH_AGENT_TURN_INDEX_ENTRIES {
+                entries.insert(position, entry);
+                entries.truncate(MAX_WORKBENCH_AGENT_TURN_INDEX_ENTRIES);
+            }
+        }
+    }
+    let truncated = total > u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    AgentTurnCompletionIndex {
+        entries,
+        total,
+        truncated,
+    }
+}
+
 impl RunController {
     /// Load checked-in scenarios and prepare the local evidence store.
     ///
@@ -1656,6 +1768,7 @@ impl RunController {
                 harness_model_access,
                 runs: Arc::new(Mutex::new(runs)),
                 prepare_lock: tokio::sync::Mutex::new(()),
+                scenario_transition_lock: tokio::sync::Mutex::new(()),
                 evaluations_dir,
                 evaluations: Arc::new(Mutex::new(evaluations)),
                 workbench_grants: Mutex::new(HashMap::new()),
@@ -1758,6 +1871,7 @@ impl RunController {
         let selection = lock(&state.selection).clone();
         let model_access = self.model_access(&selection);
         let agent_sessions = self.list_agent_sessions(id);
+        let agent_turn_index = workbench_agent_turn_index(&state);
         let active_agent_session = agent_sessions
             .iter()
             .find(|session| {
@@ -1801,6 +1915,7 @@ impl RunController {
             active_agent_session,
             replay_agent_session,
             agent_sessions,
+            agent_turn_index,
         })
     }
 
@@ -2071,6 +2186,11 @@ impl RunController {
         if source.status != RunStatus::Exploring {
             return Err(RunError::RunUnavailable(workspace_id.to_owned()));
         }
+        if *lock(&workspace.agent_session_acceptance) != WorkspaceAgentSessionAcceptance::Open {
+            return Err(RunError::RunUnavailable(
+                "this workspace no longer accepts new agent sessions".to_owned(),
+            ));
+        }
         if active_turn.is_some() {
             return Err(RunError::InvalidRequest(
                 "finish or cancel the active turn before starting another session".to_owned(),
@@ -2147,7 +2267,11 @@ impl RunController {
         if let Err(error) = record_event(
             &workspace,
             "workbench.agent.session.started",
-            json!({ "origin": origin, "sessionId": id }),
+            json!({
+                "origin": origin,
+                "sessionId": id,
+                "session": lock(&state.summary).clone(),
+            }),
         ) {
             register_agent_actor(&state, None);
             let message = "workspace session-start evidence could not be persisted";
@@ -2167,33 +2291,47 @@ impl RunController {
         let actor_state = state.clone();
         let actor_workspace = workspace.clone();
         let workspace_path = workspace.workspace.clone();
-        let spawn = thread::Builder::new()
-            .name(format!("agent-lab-session-{id}"))
-            .spawn(move || {
-                run_agent_session_actor(
-                    &actor_runs,
-                    &actor_evaluations,
-                    &actor_state,
-                    &actor_workspace,
-                    &harness,
-                    model_access_provider.as_ref(),
-                    &workspace_path,
-                    &scenario.limits,
-                    &capabilities,
-                    &receiver,
-                    origin,
-                );
-            });
+        #[cfg(test)]
+        let inject_spawn_failure = take_agent_session_spawn_failure();
+        #[cfg(not(test))]
+        let inject_spawn_failure = false;
+        let spawn = if inject_spawn_failure {
+            Err(io::Error::other(
+                "injected agent session actor spawn failure",
+            ))
+        } else {
+            thread::Builder::new()
+                .name(format!("agent-lab-session-{id}"))
+                .spawn(move || {
+                    run_agent_session_actor(
+                        &actor_runs,
+                        &actor_evaluations,
+                        &actor_state,
+                        &actor_workspace,
+                        &harness,
+                        model_access_provider.as_ref(),
+                        &workspace_path,
+                        &scenario.limits,
+                        &capabilities,
+                        &receiver,
+                        origin,
+                    );
+                })
+        };
         let handle = match spawn {
             Ok(handle) => handle,
             Err(error) => {
                 pending_secret_resolutions.remove(&id);
                 register_agent_actor(&state, None);
-                update_agent_session_status(
+                *lock(&state.commands) = None;
+                let message = "agent session actor could not start";
+                update_agent_session_status(&state, AgentSessionStatus::Failed, Some(message))?;
+                record_agent_event(
                     &state,
-                    AgentSessionStatus::Failed,
-                    Some("agent session actor could not start"),
+                    "agent.session.failed",
+                    json!({ "sessionId": id, "message": message }),
                 )?;
+                record_workbench_agent_session_update(&workspace, &state)?;
                 return Err(RunError::Process(ProcessError::Spawn(error.to_string())));
             }
         };
@@ -2856,6 +2994,107 @@ impl RunController {
     /// Returns an error for an unknown scenario, unsafe path, I/O failure, or capability-source
     /// startup failure.
     pub async fn prepare(&self, request: PrepareRunRequest) -> Result<RunSummary, RunError> {
+        self.prepare_workspace(request).await
+    }
+
+    /// Transition away from one Explore workspace while preparing its replacement.
+    ///
+    /// The source workspace stops accepting new agent sessions before target preparation begins.
+    /// Both failed and successful preparations restore the reusable source after the target is
+    /// known, so later navigation can return to the same workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source is unknown, already transitioning, or owns a live agent
+    /// session, or when target workspace preparation fails.
+    pub async fn prepare_from_workspace(
+        &self,
+        request: PrepareRunRequest,
+        source_workspace_id: Option<&str>,
+    ) -> Result<RunSummary, RunError> {
+        // Keep the source claim, target preparation, and source release one controller operation.
+        // This makes concurrent browser tabs observe one stable reusable-workspace transition at a
+        // time and prevents one transition from changing another transition's target acceptance.
+        let _scenario_transition = self.inner.scenario_transition_lock.lock().await;
+        if let Some(source_workspace_id) = source_workspace_id {
+            let source = self.state(source_workspace_id)?;
+            let source_summary = lock(&source.summary).clone();
+            let acceptance = *lock(&source.agent_session_acceptance);
+            if source_summary.scenario_id == request.scenario_id
+                && acceptance == WorkspaceAgentSessionAcceptance::Open
+            {
+                match source_summary.status {
+                    RunStatus::Exploring => {
+                        if lock(&source.capabilities).is_empty() {
+                            return Err(RunError::RunUnavailable(source_workspace_id.to_owned()));
+                        }
+                        return Ok(source_summary);
+                    }
+                    RunStatus::Starting | RunStatus::Running => {
+                        return Err(RunError::RunUnavailable(source_workspace_id.to_owned()));
+                    }
+                    RunStatus::Passed | RunStatus::Failed | RunStatus::Cancelled => {
+                        // A terminal run remains durable evidence. Preparing the same scenario
+                        // creates (or reuses) a separate unfinished Explore workspace.
+                    }
+                }
+            }
+        }
+        let transition = source_workspace_id
+            .map(|source_workspace_id| {
+                self.begin_workspace_scenario_transition(source_workspace_id)
+            })
+            .transpose()?;
+        let prepared = self.prepare_workspace(request).await?;
+        if let Some(transition) = transition {
+            transition.commit();
+        }
+        Ok(prepared)
+    }
+
+    fn begin_workspace_scenario_transition(
+        &self,
+        source_workspace_id: &str,
+    ) -> Result<WorkspaceScenarioTransition, RunError> {
+        let source = self.state(source_workspace_id)?;
+        let source_lifecycle = lock(&source.producer_lifecycle);
+        let mut acceptance = lock(&source.agent_session_acceptance);
+        if *acceptance == WorkspaceAgentSessionAcceptance::Transitioning {
+            return Err(RunError::RunUnavailable(format!(
+                "workbench {source_workspace_id} is already transitioning"
+            )));
+        }
+        let previous = *acceptance;
+        *acceptance = WorkspaceAgentSessionAcceptance::Transitioning;
+        drop(acceptance);
+        let has_live_session = lock(&source.agent_sessions)
+            .values()
+            .filter_map(Weak::upgrade)
+            .any(|session| {
+                matches!(
+                    lock(&session.summary).status,
+                    AgentSessionStatus::Starting
+                        | AgentSessionStatus::Ready
+                        | AgentSessionStatus::Running
+                        | AgentSessionStatus::Closing
+                )
+            });
+        if has_live_session {
+            *lock(&source.agent_session_acceptance) = previous;
+            return Err(RunError::InvalidRequest(
+                "close interactive agent sessions before switching scenarios".to_owned(),
+            ));
+        }
+        drop(source_lifecycle);
+        Ok(WorkspaceScenarioTransition {
+            source,
+            previous,
+            committed: false,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn prepare_workspace(&self, request: PrepareRunRequest) -> Result<RunSummary, RunError> {
         let scenario = self
             .inner
             .scenarios
@@ -2868,6 +3107,8 @@ impl RunController {
             .find(|state| {
                 let summary = lock(&state.summary);
                 state.reusable_explore
+                    && *lock(&state.agent_session_acceptance)
+                        == WorkspaceAgentSessionAcceptance::Open
                     && summary.scenario_id == scenario.id
                     && summary.status == RunStatus::Exploring
             })
@@ -2923,6 +3164,7 @@ impl RunController {
             )),
             events: Mutex::new(Vec::new()),
             producer_lifecycle: Mutex::new(()),
+            agent_session_acceptance: Mutex::new(WorkspaceAgentSessionAcceptance::Open),
             event_commit: Mutex::new(()),
             sender,
             cancel: CancellationToken::new(),
@@ -3653,6 +3895,7 @@ impl RunController {
             )),
             events: Mutex::new(Vec::new()),
             producer_lifecycle: Mutex::new(()),
+            agent_session_acceptance: Mutex::new(WorkspaceAgentSessionAcceptance::Open),
             event_commit: Mutex::new(()),
             sender,
             cancel: CancellationToken::new(),
@@ -5130,16 +5373,16 @@ fn run_agent_session_actor(
                     )?;
                 }
                 AgentSessionCommand::Close => {
-                    close_agent_driver(state, &mut driver, &session_id, false)?;
+                    close_agent_driver(state, workspace_state, &mut driver, &session_id, false)?;
                     return Ok(());
                 }
                 AgentSessionCommand::Shutdown => {
-                    close_agent_driver(state, &mut driver, &session_id, true)?;
+                    close_agent_driver(state, workspace_state, &mut driver, &session_id, true)?;
                     return Ok(());
                 }
             }
         }
-        close_agent_driver(state, &mut driver, &session_id, true)
+        close_agent_driver(state, workspace_state, &mut driver, &session_id, true)
     })();
 
     if let Err(error) = result {
@@ -5153,6 +5396,7 @@ fn run_agent_session_actor(
                 "agent.session.closed",
                 json!({ "sessionId": session_id, "during": "startup" }),
             );
+            let _ = record_workbench_agent_session_update(workspace_state, state);
             let _ = clear_active_agent_session(workspace_state, state);
             return;
         }
@@ -5266,6 +5510,7 @@ fn run_agent_session_actor(
         }
         let _ = update_agent_session_status(state, AgentSessionStatus::Failed, Some(&message));
         let _ = record_agent_event(state, "agent.session.failed", json!({ "message": message }));
+        let _ = record_workbench_agent_session_update(workspace_state, state);
     }
     let _ = clear_active_agent_session(workspace_state, state);
 }
@@ -6574,6 +6819,7 @@ fn title_case(value: &str) -> String {
 
 fn close_agent_driver(
     state: &AgentSessionState,
+    workspace_state: &RunState,
     driver: &mut DriverProcess,
     session_id: &str,
     interrupted: bool,
@@ -6608,7 +6854,7 @@ fn close_agent_driver(
         },
         json!({ "sessionId": session_id }),
     )?;
-    Ok(())
+    record_workbench_agent_session_update(workspace_state, state)
 }
 
 fn agent_capability_sources(capabilities: &[CapabilityEndpoint]) -> JsonValue {
@@ -7361,6 +7607,18 @@ fn update_agent_session_status(
         }
     }
     persist_agent_session(state)
+}
+
+fn record_workbench_agent_session_update(
+    workspace_state: &RunState,
+    state: &AgentSessionState,
+) -> Result<(), RunError> {
+    let summary = lock(&state.summary).clone();
+    record_event(
+        workspace_state,
+        "workbench.agent.session.updated",
+        json!({ "session": summary }),
+    )
 }
 
 fn update_agent_turn_status(
@@ -8643,6 +8901,7 @@ fn load_run_bundle(
         selection: Mutex::new(selection),
         events: Mutex::new(events),
         producer_lifecycle: Mutex::new(()),
+        agent_session_acceptance: Mutex::new(WorkspaceAgentSessionAcceptance::Open),
         event_commit: Mutex::new(()),
         sender,
         cancel: CancellationToken::new(),
@@ -12618,6 +12877,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn workbench_turn_index_is_bounded_deterministic_and_workspace_scoped() {
+        let root = temporary_root("workbench-turn-index");
+        let workspace = test_run_state(&root.join("run"));
+        let mut retained_sessions = Vec::new();
+
+        for (session_id, range) in [
+            ("session-a", 0_u128..257_u128),
+            ("session-b", 257_u128..513_u128),
+        ] {
+            let bundle = root.join(session_id);
+            fs::create_dir_all(bundle.join("turns")).unwrap();
+            let session = Arc::new(test_agent_session_state(&bundle));
+            {
+                let mut summary = lock(&session.summary);
+                summary.id = session_id.to_owned();
+                summary.workspace_id = "run-events".to_owned();
+                summary.turn_count = u64::try_from(range.clone().count()).unwrap();
+            }
+            *lock(&session.turns) = range
+                .map(|index| {
+                    let mut turn = test_agent_turn(AgentTurnStatus::Completed);
+                    turn.id = format!("turn-{index:03}");
+                    turn.session_id = session_id.to_owned();
+                    turn.started_at_ms = if index == 511 { 512 } else { index };
+                    turn
+                })
+                .collect();
+            lock(&workspace.agent_sessions).insert(session_id.to_owned(), Arc::downgrade(&session));
+            retained_sessions.push(session);
+        }
+
+        let foreign_bundle = root.join("foreign-session");
+        fs::create_dir_all(foreign_bundle.join("turns")).unwrap();
+        let foreign = Arc::new(test_agent_session_state(&foreign_bundle));
+        {
+            let mut summary = lock(&foreign.summary);
+            summary.id = "foreign-session".to_owned();
+            summary.workspace_id = "another-workspace".to_owned();
+        }
+        {
+            let mut turn = test_agent_turn(AgentTurnStatus::Completed);
+            turn.id = "foreign-turn".to_owned();
+            turn.session_id = "foreign-session".to_owned();
+            turn.started_at_ms = 999;
+            *lock(&foreign.turns) = vec![turn];
+        }
+        lock(&workspace.agent_sessions)
+            .insert("foreign-session".to_owned(), Arc::downgrade(&foreign));
+
+        let index = workbench_agent_turn_index(&workspace);
+
+        assert_eq!(index.total, 513);
+        assert!(index.truncated);
+        assert_eq!(index.entries.len(), MAX_WORKBENCH_AGENT_TURN_INDEX_ENTRIES);
+        assert_eq!(index.entries[0].id, "turn-511");
+        assert_eq!(index.entries[1].id, "turn-512");
+        assert_eq!(index.entries.last().unwrap().id, "turn-001");
+        assert!(
+            index
+                .entries
+                .iter()
+                .all(|entry| entry.id != "turn-000" && entry.id != "foreign-turn")
+        );
+
+        let serialized = serde_json::to_value(&index).unwrap();
+        let first = serialized["entries"][0].as_object().unwrap();
+        assert_eq!(first.len(), 3);
+        assert!(first.contains_key("id"));
+        assert!(first.contains_key("sessionId"));
+        assert!(first.contains_key("startedAtMs"));
+
+        drop(foreign);
+        drop(retained_sessions);
+        drop(workspace);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn observation_ready_event(sequence: u64) -> RunEvent {
         event(
             sequence,
@@ -16062,6 +16399,17 @@ done
         assert_eq!(recovered.summary.turn_count, 1);
         assert_eq!(recovered.turns.len(), 1);
         assert_eq!(recovered.turns[0].summary.status, AgentTurnStatus::Failed);
+        let turn_index = reopened.workbench(&explore.id).unwrap().agent_turn_index;
+        assert_eq!(turn_index.total, 1);
+        assert!(!turn_index.truncated);
+        assert_eq!(
+            turn_index.entries,
+            [AgentTurnCompletionRef {
+                id: turn.id,
+                session_id: session_id.to_owned(),
+                started_at_ms: recovered.turns[0].summary.started_at_ms,
+            }]
+        );
         let durable: AgentSessionManifest =
             serde_json::from_slice(&fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(durable.summary.turn_count, 1);
@@ -17075,7 +17423,16 @@ done
                     .iter()
                     .filter(|event| event.kind == "agent.session.closed")
                     .count();
-                if detail.summary.status == AgentSessionStatus::Closed && closed_events == 1 {
+                let workspace = controller.state(workspace_id).unwrap();
+                let workspace_update = lock(&workspace.events).iter().any(|event| {
+                    event.kind == "workbench.agent.session.updated"
+                        && event.payload["session"]["id"] == session_id
+                        && event.payload["session"]["status"] == "closed"
+                });
+                if detail.summary.status == AgentSessionStatus::Closed
+                    && closed_events == 1
+                    && workspace_update
+                {
                     assert!(detail.events.iter().any(|event| {
                         event.kind == "agent.session.closed" && event.payload["during"] == "startup"
                     }));
@@ -17239,6 +17596,33 @@ totalScore = 11
         .unwrap();
     }
 
+    fn write_alternate_scenario(root: &Path) {
+        fs::write(
+            root.join("alternate.toml"),
+            r#"
+version = 1
+id = "alternate"
+title = "Alternate"
+description = "test"
+question = "How does the harness produce the expected alternate artifact?"
+seed = "catalog/workspace"
+prompt = "write output"
+output = "result.json"
+
+[limits]
+maxDurationMs = 1000
+maxCommandCount = 1
+maxOrchestratorInvocations = 1
+maxToolInvocations = 1
+
+[assertions]
+activeNames = ["alpha", "gamma"]
+totalScore = 11
+"#,
+        )
+        .unwrap();
+    }
+
     fn catalog_scenario() -> ScenarioManifest {
         ScenarioManifest {
             version: 1,
@@ -17320,6 +17704,7 @@ totalScore = 11
             }),
             events: Mutex::new(Vec::new()),
             producer_lifecycle: Mutex::new(()),
+            agent_session_acceptance: Mutex::new(WorkspaceAgentSessionAcceptance::Open),
             event_commit: Mutex::new(()),
             sender,
             cancel: CancellationToken::new(),
@@ -18727,6 +19112,299 @@ sleep 30
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn scenario_transition_serializes_agent_acceptance_and_reuses_workspaces() {
+        let root = temporary_root("scenario-transition-agent-acceptance");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        write_alternate_scenario(&scenarios);
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/bin/false"),
+        };
+        let harnesses = || {
+            vec![HarnessProfile {
+                id: "fixture".to_owned(),
+                display_name: "Fixture".to_owned(),
+                launch: interactive_fixture_launch(),
+                models: BTreeMap::from([("test".to_owned(), "fixture/test".to_owned())]),
+            }]
+        };
+        let model_profiles = || BTreeMap::from([("test".to_owned(), "Test".to_owned())]);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), model_profiles()).unwrap();
+        let source = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let source_state = controller.state(&source.id).unwrap();
+
+        let missing = controller
+            .prepare_from_workspace(
+                PrepareRunRequest {
+                    scenario_id: "missing".to_owned(),
+                },
+                Some(&source.id),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, RunError::UnknownScenario(_)));
+        assert_eq!(
+            *lock(&source_state.agent_session_acceptance),
+            WorkspaceAgentSessionAcceptance::Open
+        );
+
+        let session = controller
+            .start_agent_session(
+                &source.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let observed = controller
+                .list_agent_sessions(&source.id)
+                .into_iter()
+                .find(|candidate| candidate.id == session.id)
+                .unwrap();
+            if observed.status == AgentSessionStatus::Ready {
+                break;
+            }
+            assert!(Instant::now() < deadline, "session did not become ready");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let unchanged = controller
+            .prepare_from_workspace(
+                PrepareRunRequest {
+                    scenario_id: "catalog".to_owned(),
+                },
+                Some(&source.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unchanged.id, source.id);
+        let rejected = controller
+            .prepare_from_workspace(
+                PrepareRunRequest {
+                    scenario_id: "alternate".to_owned(),
+                },
+                Some(&source.id),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            rejected
+                .to_string()
+                .contains("close interactive agent sessions")
+        );
+        assert_eq!(
+            *lock(&source_state.agent_session_acceptance),
+            WorkspaceAgentSessionAcceptance::Open
+        );
+
+        controller
+            .close_agent_session(&source.id, &session.id)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller
+            .agent_session(&source.id, &session.id)
+            .unwrap()
+            .summary
+            .status
+            != AgentSessionStatus::Closed
+        {
+            assert!(Instant::now() < deadline, "session did not close");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let target = controller
+            .prepare_from_workspace(
+                PrepareRunRequest {
+                    scenario_id: "alternate".to_owned(),
+                },
+                Some(&source.id),
+            )
+            .await
+            .unwrap();
+        assert_ne!(target.id, source.id);
+        let target_state = controller.state(&target.id).unwrap();
+        assert_eq!(
+            *lock(&source_state.agent_session_acceptance),
+            WorkspaceAgentSessionAcceptance::Open
+        );
+        assert_eq!(
+            *lock(&target_state.agent_session_acceptance),
+            WorkspaceAgentSessionAcceptance::Open
+        );
+        assert_eq!(lock(&source_state.summary).status, RunStatus::Exploring);
+        assert_eq!(lock(&target_state.summary).status, RunStatus::Exploring);
+        assert!(!lock(&source_state.capabilities).is_empty());
+        assert!(!lock(&target_state.capabilities).is_empty());
+
+        let returned = controller
+            .prepare_from_workspace(
+                PrepareRunRequest {
+                    scenario_id: "catalog".to_owned(),
+                },
+                Some(&target.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(returned.id, source.id);
+        assert_eq!(lock(&controller.inner.runs).len(), 2);
+
+        // Queue overlapping transitions behind the controller-wide gate. Tokio's mutex is FIFO,
+        // so each operation observes the workspace restored by the operation ahead of it.
+        let transition_gate = controller.inner.scenario_transition_lock.lock().await;
+        let first_controller = controller.clone();
+        let first_source_id = source.id.clone();
+        let mut first = tokio::spawn(async move {
+            first_controller
+                .prepare_from_workspace(
+                    PrepareRunRequest {
+                        scenario_id: "alternate".to_owned(),
+                    },
+                    Some(&first_source_id),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        let second_controller = controller.clone();
+        let second_source_id = target.id.clone();
+        let mut second = tokio::spawn(async move {
+            second_controller
+                .prepare_from_workspace(
+                    PrepareRunRequest {
+                        scenario_id: "catalog".to_owned(),
+                    },
+                    Some(&second_source_id),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut first)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err()
+        );
+        drop(transition_gate);
+        assert_eq!(first.await.unwrap().unwrap().id, target.id);
+        assert_eq!(second.await.unwrap().unwrap().id, source.id);
+        assert_eq!(lock(&controller.inner.runs).len(), 2);
+        assert_eq!(
+            *lock(&source_state.agent_session_acceptance),
+            WorkspaceAgentSessionAcceptance::Open
+        );
+        assert_eq!(
+            *lock(&target_state.agent_session_acceptance),
+            WorkspaceAgentSessionAcceptance::Open
+        );
+
+        drop(target_state);
+        drop(source_state);
+        drop(controller);
+
+        let reopened =
+            RunController::new_with_harnesses(config(), harnesses(), model_profiles()).unwrap();
+        let reopened_source = reopened
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reopened_source.id, source.id);
+        let reopened_target = reopened
+            .prepare_from_workspace(
+                PrepareRunRequest {
+                    scenario_id: "alternate".to_owned(),
+                },
+                Some(&reopened_source.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reopened_target.id, target.id);
+        assert_eq!(lock(&reopened.inner.runs).len(), 2);
+        for state in lock(&reopened.inner.runs).values() {
+            assert_eq!(lock(&state.summary).status, RunStatus::Exploring);
+            assert_eq!(
+                *lock(&state.agent_session_acceptance),
+                WorkspaceAgentSessionAcceptance::Open
+            );
+            assert!(!lock(&state.capabilities).is_empty());
+        }
+
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn same_scenario_after_terminal_run_prepares_a_fresh_explore_workspace() {
+        let root = temporary_root("same-scenario-after-terminal-run");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/bin/false"),
+        })
+        .unwrap();
+        let completed = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let completed_state = controller.state(&completed.id).unwrap();
+        finish_run(
+            &completed_state,
+            RunStatus::Passed,
+            None,
+            &json!({ "passed": true }),
+        )
+        .unwrap();
+        assert_eq!(lock(&completed_state.summary).status, RunStatus::Passed);
+        assert!(lock(&completed_state.capabilities).is_empty());
+
+        let fresh = controller
+            .prepare_from_workspace(
+                PrepareRunRequest {
+                    scenario_id: "catalog".to_owned(),
+                },
+                Some(&completed.id),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(fresh.id, completed.id);
+        assert_eq!(fresh.status, RunStatus::Exploring);
+        assert_eq!(lock(&completed_state.summary).status, RunStatus::Passed);
+        assert!(!lock(&controller.state(&fresh.id).unwrap().capabilities).is_empty());
+        assert_eq!(lock(&controller.inner.runs).len(), 2);
+
+        drop(completed_state);
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn workbench_selection_persists_and_compare_records_its_origin() {
@@ -18906,6 +19584,79 @@ sleep 30
         );
 
         drop(workspace);
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_session_actor_spawn_failure_publishes_terminal_workspace_summary() {
+        let root = temporary_root("agent-session-actor-spawn-failure");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![HarnessProfile {
+                id: "fixture".to_owned(),
+                display_name: "Fixture".to_owned(),
+                launch: DriverLaunch::new("/bin/false"),
+                models: BTreeMap::from([("test".to_owned(), "fixture/test".to_owned())]),
+            }],
+            BTreeMap::from([("test".to_owned(), "Test".to_owned())]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        AGENT_SESSION_SPAWN_FAILURE.with(|failure| failure.set(true));
+
+        let error = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, RunError::Process(ProcessError::Spawn(_))));
+        let sessions = controller.list_agent_sessions(&explore.id);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, AgentSessionStatus::Failed);
+        let session = controller.agent_session_state(&sessions[0].id).unwrap();
+        assert!(lock(&session.commands).is_none());
+        assert!(
+            lock(&session.events)
+                .iter()
+                .any(|event| event.kind == "agent.session.failed")
+        );
+        let workspace = controller.state(&explore.id).unwrap();
+        let events = lock(&workspace.events);
+        let started = events
+            .iter()
+            .find(|event| event.kind == "workbench.agent.session.started")
+            .unwrap();
+        assert_eq!(started.payload["session"]["id"], sessions[0].id);
+        assert_eq!(started.payload["session"]["status"], "starting");
+        let updated = events
+            .iter()
+            .find(|event| event.kind == "workbench.agent.session.updated")
+            .unwrap();
+        assert_eq!(updated.payload["session"]["id"], sessions[0].id);
+        assert_eq!(updated.payload["session"]["status"], "failed");
+
+        drop(events);
+        drop(workspace);
+        drop(session);
         drop(controller);
         fs::remove_dir_all(root).unwrap();
     }
@@ -21217,6 +21968,7 @@ fi
             }),
             events: Mutex::new(Vec::new()),
             producer_lifecycle: Mutex::new(()),
+            agent_session_acceptance: Mutex::new(WorkspaceAgentSessionAcceptance::Open),
             event_commit: Mutex::new(()),
             sender,
             cancel: CancellationToken::new(),

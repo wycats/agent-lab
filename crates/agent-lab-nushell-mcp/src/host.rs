@@ -302,6 +302,7 @@ pub struct NushellHost {
     workbench_harnesses: Vec<String>,
     workbench_models: Vec<String>,
     workbench_sessions: Arc<RwLock<Vec<String>>>,
+    workbench_turns: Arc<RwLock<Vec<String>>>,
     agent_status: AgentStatusPresenter,
 }
 
@@ -353,6 +354,7 @@ impl NushellHost {
             workbench_harnesses: Vec::new(),
             workbench_models: Vec::new(),
             workbench_sessions: Arc::new(RwLock::new(Vec::new())),
+            workbench_turns: Arc::new(RwLock::new(Vec::new())),
             agent_status: AgentStatusPresenter::terminal(),
         }
     }
@@ -377,6 +379,7 @@ impl NushellHost {
             &self.workbench_sessions,
             workbench_ids(&snapshot, "agentSessions"),
         );
+        replace_turn_ids(&self.workbench_turns, workbench_turn_ids(&snapshot));
         let mut working_set = StateWorkingSet::new(&self.engine_state);
         working_set.add_decl(Box::new(LabAssemblyCommand {
             bridge: bridge.clone(),
@@ -390,6 +393,7 @@ impl NushellHost {
         working_set.add_decl(Box::new(AgentCommand {
             bridge: bridge.clone(),
             session_ids: self.workbench_sessions.clone(),
+            turn_ids: self.workbench_turns.clone(),
             status: self.agent_status.clone(),
         }));
         working_set.add_decl(Box::new(AgentNewCommand {
@@ -400,6 +404,7 @@ impl NushellHost {
         working_set.add_decl(Box::new(AgentSessionsCommand {
             bridge: bridge.clone(),
             session_ids: self.workbench_sessions.clone(),
+            turn_ids: self.workbench_turns.clone(),
         }));
         working_set.add_decl(Box::new(AgentSwitchCommand {
             bridge: bridge.clone(),
@@ -407,6 +412,7 @@ impl NushellHost {
         }));
         working_set.add_decl(Box::new(AgentTurnCommand {
             bridge: bridge.clone(),
+            turn_ids: self.workbench_turns.clone(),
         }));
         working_set.add_decl(Box::new(AgentCancelCommand {
             bridge: bridge.clone(),
@@ -698,6 +704,7 @@ impl NushellHost {
                 self.workbench_harnesses.clone(),
                 self.workbench_models.clone(),
                 self.workbench_sessions.clone(),
+                self.workbench_turns.clone(),
             )))
             .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
             .with_edit_mode(Box::new(Emacs::new(keybindings)))
@@ -754,6 +761,7 @@ impl NushellHost {
 }
 
 const AGENT_ANSWER_TYPE: &str = "agent-answer";
+const MAX_WORKBENCH_TURN_COMPLETION_IDS: usize = 512;
 const MARKDOWN_WIDTH_FALLBACK: usize = 80;
 const MARKDOWN_WIDTH_MINIMUM: usize = 20;
 const TERMINAL_ESCAPE: u8 = 0x1b;
@@ -1440,10 +1448,20 @@ struct AgentLabCompleter {
     workbench_harnesses: Vec<String>,
     workbench_models: Vec<String>,
     workbench_sessions: Arc<RwLock<Vec<String>>>,
+    workbench_turns: Arc<RwLock<Vec<String>>>,
 }
 
 fn workbench_ids(snapshot: &serde_json::Value, key: &str) -> Vec<String> {
     snapshot[key]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn workbench_turn_ids(snapshot: &serde_json::Value) -> Vec<String> {
+    snapshot["agentTurnIndex"]["entries"]
         .as_array()
         .into_iter()
         .flatten()
@@ -1466,6 +1484,30 @@ fn replace_session_ids(cache: &RwLock<Vec<String>>, mut ids: Vec<String>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = ids;
 }
 
+fn turn_ids(cache: &RwLock<Vec<String>>) -> Vec<String> {
+    let mut ids = cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    ids.sort();
+    ids
+}
+
+fn replace_turn_ids(cache: &RwLock<Vec<String>>, ids: Vec<String>) {
+    let mut retained = Vec::with_capacity(ids.len().min(MAX_WORKBENCH_TURN_COMPLETION_IDS));
+    for id in ids {
+        if !retained.iter().any(|known| known == &id) {
+            retained.push(id);
+            if retained.len() == MAX_WORKBENCH_TURN_COMPLETION_IDS {
+                break;
+            }
+        }
+    }
+    *cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = retained;
+}
+
 fn remember_session(cache: &RwLock<Vec<String>>, session: &JsonValue) {
     let Some(id) = session.get("id").and_then(JsonValue::as_str) else {
         return;
@@ -1477,6 +1519,18 @@ fn remember_session(cache: &RwLock<Vec<String>>, session: &JsonValue) {
         ids.push(id.to_owned());
         ids.sort();
     }
+}
+
+fn remember_turn(cache: &RwLock<Vec<String>>, turn: &JsonValue) {
+    let Some(id) = turn.get("id").and_then(JsonValue::as_str) else {
+        return;
+    };
+    let mut ids = cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ids.retain(|known| known != id);
+    ids.insert(0, id.to_owned());
+    ids.truncate(MAX_WORKBENCH_TURN_COMPLETION_IDS);
 }
 
 fn refresh_session_ids(bridge: &WorkbenchBridge, cache: &RwLock<Vec<String>>) {
@@ -1809,6 +1863,7 @@ fn agent_input_limit_error(span: Span) -> ShellError {
 struct AgentCommand {
     bridge: WorkbenchBridge,
     session_ids: Arc<RwLock<Vec<String>>>,
+    turn_ids: Arc<RwLock<Vec<String>>>,
     status: AgentStatusPresenter,
 }
 
@@ -1918,6 +1973,7 @@ impl Command for AgentCommand {
                 !raw && !stream,
             )
             .map_err(|error| shell_error("Agent turn failed", error.to_string(), call.head))?;
+        remember_turn(&self.turn_ids, &turn.turn);
         let session_id = turn
             .session
             .get("id")
@@ -2401,6 +2457,7 @@ impl Command for AgentNewCommand {
 struct AgentSessionsCommand {
     bridge: WorkbenchBridge,
     session_ids: Arc<RwLock<Vec<String>>>,
+    turn_ids: Arc<RwLock<Vec<String>>>,
 }
 
 impl Command for AgentSessionsCommand {
@@ -2431,6 +2488,9 @@ impl Command for AgentSessionsCommand {
             &self.session_ids,
             workbench_ids(&json!({ "sessions": sessions.clone() }), "sessions"),
         );
+        if let Ok(snapshot) = self.bridge.assembly() {
+            replace_turn_ids(&self.turn_ids, workbench_turn_ids(&snapshot));
+        }
         Ok(json_to_nu(sessions, call.head).into_pipeline_data())
     }
 }
@@ -2481,6 +2541,7 @@ impl Command for AgentSwitchCommand {
 #[derive(Clone)]
 struct AgentTurnCommand {
     bridge: WorkbenchBridge,
+    turn_ids: Arc<RwLock<Vec<String>>>,
 }
 
 impl Command for AgentTurnCommand {
@@ -2515,6 +2576,7 @@ impl Command for AgentTurnCommand {
                 resolve_agent_turn_across_workspace(&self.bridge, &turn_id).map_err(|error| {
                     shell_error("Agent turn request failed", error.to_string(), call.head)
                 })?;
+            remember_turn(&self.turn_ids, &turn);
             let answer = agent_answer_record(&turn).map_err(|detail| {
                 shell_error("Agent answer projection failed", detail, call.head)
             })?;
@@ -2546,6 +2608,7 @@ impl Command for AgentTurnCommand {
         })?;
         let turn = select_agent_turn(&detail, None)
             .map_err(|detail| shell_error("Agent turn not found", detail, call.head))?;
+        remember_turn(&self.turn_ids, &turn);
         let answer = agent_answer_record(&turn)
             .map_err(|detail| shell_error("Agent answer projection failed", detail, call.head))?;
         Ok(json_to_nu(answer, call.head).into_pipeline_data())
@@ -2920,6 +2983,7 @@ impl AgentLabCompleter {
         workbench_harnesses: Vec<String>,
         workbench_models: Vec<String>,
         workbench_sessions: Arc<RwLock<Vec<String>>>,
+        workbench_turns: Arc<RwLock<Vec<String>>>,
     ) -> Self {
         let mut commands = engine_state
             .get_decls_sorted(false)
@@ -2938,6 +3002,7 @@ impl AgentLabCompleter {
             workbench_harnesses,
             workbench_models,
             workbench_sessions,
+            workbench_turns,
         }
     }
 }
@@ -2956,6 +3021,10 @@ mod tests {
             workbench_harnesses: vec!["v0".to_owned(), "eve".to_owned()],
             workbench_models: vec!["haiku-4.5".to_owned()],
             workbench_sessions: Arc::new(RwLock::new(vec!["agent-session-1".to_owned()])),
+            workbench_turns: Arc::new(RwLock::new(vec![
+                "agent-turn-1".to_owned(),
+                "agent-turn-2".to_owned(),
+            ])),
         }
     }
 
@@ -3276,6 +3345,49 @@ mod tests {
     }
 
     #[test]
+    fn agent_turn_completion_exposes_durable_turn_ids_in_each_command_position() {
+        for line in [
+            "agent turn agent-turn-",
+            "help agent turn agent-turn-",
+            "lab assembly | agent turn agent-turn-",
+        ] {
+            assert_eq!(completion_values(line), ["agent-turn-1", "agent-turn-2"]);
+        }
+        assert!(completion_values("agent turn agent-turn-1").is_empty());
+    }
+
+    #[test]
+    fn workbench_turn_completion_hydrates_from_the_bounded_snapshot_index() {
+        let snapshot = json!({
+            "agentSessions": [{
+                "id": "agent-session-1",
+                "turns": [{ "id": "not-a-session-summary-field" }]
+            }],
+            "agentTurnIndex": {
+                "entries": [
+                    {
+                        "id": "turn-z",
+                        "sessionId": "agent-session-2",
+                        "startedAtMs": 2
+                    },
+                    {
+                        "id": "turn-a",
+                        "sessionId": "agent-session-1",
+                        "startedAtMs": 1
+                    }
+                ],
+                "total": 2,
+                "truncated": false
+            }
+        });
+        let turns = Arc::new(RwLock::new(vec!["stale-turn".to_owned()]));
+
+        replace_turn_ids(&turns, workbench_turn_ids(&snapshot));
+
+        assert_eq!(turn_ids(&turns), ["turn-a", "turn-z"]);
+    }
+
+    #[test]
     fn session_completion_reads_live_session_ids() {
         let sessions = Arc::new(RwLock::new(vec!["agent-session-1".to_owned()]));
         let mut completer = AgentLabCompleter {
@@ -3283,6 +3395,7 @@ mod tests {
             workbench_harnesses: Vec::new(),
             workbench_models: Vec::new(),
             workbench_sessions: sessions.clone(),
+            workbench_turns: Arc::new(RwLock::new(Vec::new())),
         };
         replace_session_ids(&sessions, vec!["agent-session-2".to_owned()]);
 
@@ -3294,6 +3407,48 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(values, ["agent-session-2"]);
         }
+    }
+
+    #[test]
+    fn turn_completion_reads_sorted_deduplicated_live_turn_ids() {
+        let turns = Arc::new(RwLock::new(vec!["old-turn".to_owned()]));
+        let mut completer = AgentLabCompleter {
+            commands: vec!["agent turn".to_owned()],
+            workbench_harnesses: Vec::new(),
+            workbench_models: Vec::new(),
+            workbench_sessions: Arc::new(RwLock::new(Vec::new())),
+            workbench_turns: turns.clone(),
+        };
+        replace_turn_ids(
+            &turns,
+            vec![
+                "turn-z".to_owned(),
+                "turn-a".to_owned(),
+                "turn-z".to_owned(),
+            ],
+        );
+        remember_turn(&turns, &json!({ "id": "turn-m" }));
+        remember_turn(&turns, &json!({ "id": "turn-a" }));
+
+        let values = completer
+            .complete("agent turn turn-", "agent turn turn-".len())
+            .into_iter()
+            .map(|suggestion| suggestion.value)
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["turn-a", "turn-m", "turn-z"]);
+    }
+
+    #[test]
+    fn live_turn_completion_cache_retains_only_the_newest_bounded_ids() {
+        let turns = RwLock::new(Vec::new());
+        for index in 0..=MAX_WORKBENCH_TURN_COMPLETION_IDS {
+            remember_turn(&turns, &json!({ "id": format!("turn-{index:03}") }));
+        }
+
+        let retained = turn_ids(&turns);
+        assert_eq!(retained.len(), MAX_WORKBENCH_TURN_COMPLETION_IDS);
+        assert!(!retained.iter().any(|id| id == "turn-000"));
+        assert!(retained.iter().any(|id| id == "turn-512"));
     }
 
     #[test]
@@ -3618,6 +3773,7 @@ mod tests {
         working_set.add_decl(Box::new(AgentCommand {
             bridge,
             session_ids: Arc::new(RwLock::new(Vec::new())),
+            turn_ids: Arc::new(RwLock::new(Vec::new())),
             status: AgentStatusPresenter::terminal(),
         }));
         host.engine_state.merge_delta(working_set.render()).unwrap();
@@ -4129,6 +4285,21 @@ impl Completer for AgentLabCompleter {
         if let Some(help_target) = prefix.strip_prefix("help ") {
             replace_start += "help ".len();
             prefix = help_target;
+        }
+
+        if let Some(turn_prefix) = prefix.strip_prefix("agent turn ") {
+            let replace_start = replace_start + "agent turn ".len();
+            return turn_ids(&self.workbench_turns)
+                .into_iter()
+                .filter(|turn| turn.starts_with(turn_prefix) && turn.as_str() != turn_prefix)
+                .map(|turn| Suggestion {
+                    value: turn,
+                    description: Some("Durable Agent Lab turn".to_owned()),
+                    span: ReedlineSpan::new(replace_start, pos),
+                    append_whitespace: true,
+                    ..Suggestion::default()
+                })
+                .collect();
         }
 
         let session_command = ["agent switch ", "agent close "]

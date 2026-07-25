@@ -105,6 +105,7 @@ export interface WorkbenchSnapshot {
   activeAgentSession?: AgentSessionSummary;
   replayAgentSession?: AgentSessionSummary;
   agentSessions: AgentSessionSummary[];
+  agentTurnIndex: AgentTurnCompletionIndex;
 }
 
 export type AgentSessionStatus = 'starting' | 'ready' | 'running' | 'closing' | 'failed' | 'closed' | 'interrupted';
@@ -122,6 +123,18 @@ export interface AgentSessionSummary {
   updatedAtMs: number;
   turnCount: number;
   error?: string;
+}
+
+export interface AgentTurnCompletionRef {
+  id: string;
+  sessionId: string;
+  startedAtMs: number;
+}
+
+export interface AgentTurnCompletionIndex {
+  entries: AgentTurnCompletionRef[];
+  total: number;
+  truncated: boolean;
 }
 
 export interface AgentTurnSummary {
@@ -367,7 +380,7 @@ export interface RunClient {
   modelProfiles(): Promise<ModelProfileMetadata[]>;
   scenarios(): Promise<ScenarioManifest[]>;
   runs(): Promise<RunSummary[]>;
-  prepare(scenarioId: string): Promise<RunSummary>;
+  prepare(scenarioId: string, sourceWorkspaceId?: string): Promise<RunSummary>;
   start(scenarioId: string, modelId: string): Promise<RunSummary>;
   startPrepared(id: string, modelId: string): Promise<RunSummary>;
   startPreparedHarness(id: string, harnessId: string, modelProfileId: string): Promise<RunSummary>;
@@ -469,9 +482,9 @@ async function streamEvents(
   }
 }
 
-const AGENT_SESSION_RECONNECT_INITIAL_MS = 100;
-const AGENT_SESSION_RECONNECT_MAX_MS = 2_000;
-const AGENT_SESSION_RECONNECT_STABLE_MS = 5_000;
+const EVENT_STREAM_RECONNECT_INITIAL_MS = 100;
+const EVENT_STREAM_RECONNECT_MAX_MS = 2_000;
+const EVENT_STREAM_RECONNECT_STABLE_MS = 5_000;
 
 function waitForAbortableDelay(milliseconds: number, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false);
@@ -491,6 +504,44 @@ function waitForAbortableDelay(milliseconds: number, signal: AbortSignal): Promi
   });
 }
 
+function reconnectingRunEvents(
+  path: string,
+  onEvent: (event: RunEvent) => void
+): AbortController {
+  const controller = new AbortController();
+  void (async () => {
+    let retryDelayMs = EVENT_STREAM_RECONNECT_INITIAL_MS;
+    let lastDeliveredSequence = 0;
+    while (!controller.signal.aborted) {
+      let connectedAtMs: number | undefined;
+      try {
+        await streamEvents(
+          path,
+          controller.signal,
+          (event) => {
+            if (event.sequence <= lastDeliveredSequence) return;
+            onEvent(event);
+            lastDeliveredSequence = event.sequence;
+          },
+          () => (connectedAtMs = Date.now())
+        );
+      } catch {
+        // A later connection replays the run's durable event history.
+      }
+      if (controller.signal.aborted) return;
+      if (
+        connectedAtMs !== undefined &&
+        Date.now() - connectedAtMs >= EVENT_STREAM_RECONNECT_STABLE_MS
+      ) {
+        retryDelayMs = EVENT_STREAM_RECONNECT_INITIAL_MS;
+      }
+      if (!(await waitForAbortableDelay(retryDelayMs, controller.signal))) return;
+      retryDelayMs = Math.min(retryDelayMs * 2, EVENT_STREAM_RECONNECT_MAX_MS);
+    }
+  })();
+  return controller;
+}
+
 export function createRunClient(): RunClient {
   return {
     models: () => request('/api/models'),
@@ -498,10 +549,10 @@ export function createRunClient(): RunClient {
     modelProfiles: () => request('/api/model-profiles'),
     scenarios: () => request('/api/scenarios'),
     runs: () => request('/api/runs'),
-    prepare: (scenarioId) =>
+    prepare: (scenarioId, sourceWorkspaceId) =>
       request('/api/explore', {
         method: 'POST',
-        body: JSON.stringify({ scenarioId })
+        body: JSON.stringify({ scenarioId, sourceWorkspaceId })
       }),
     start: (scenarioId, modelId) =>
       request('/api/runs', {
@@ -520,13 +571,8 @@ export function createRunClient(): RunClient {
       }),
     detail: (id) => request(`/api/runs/${encodeURIComponent(id)}`),
     cancel: (id) => request(`/api/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
-    events(id, onEvent) {
-      const controller = new AbortController();
-      void streamEvents(`/api/runs/${encodeURIComponent(id)}/events`, controller.signal, onEvent).catch((error) => {
-        if (!controller.signal.aborted) console.error(error);
-      });
-      return controller;
-    },
+    events: (id, onEvent) =>
+      reconnectingRunEvents(`/api/runs/${encodeURIComponent(id)}/events`, onEvent),
     evaluations: () => request('/api/evaluations'),
     startEvaluation: (input) =>
       request('/api/evaluations', { method: 'POST', body: JSON.stringify(input) }),
@@ -566,7 +612,7 @@ export function createRunClient(): RunClient {
       const controller = new AbortController();
       const path = `/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}/events`;
       void (async () => {
-        let retryDelayMs = AGENT_SESSION_RECONNECT_INITIAL_MS;
+        let retryDelayMs = EVENT_STREAM_RECONNECT_INITIAL_MS;
         while (!controller.signal.aborted) {
           let connectedAtMs: number | undefined;
           try {
@@ -583,12 +629,12 @@ export function createRunClient(): RunClient {
           if (controller.signal.aborted) return;
           if (
             connectedAtMs !== undefined &&
-            Date.now() - connectedAtMs >= AGENT_SESSION_RECONNECT_STABLE_MS
+            Date.now() - connectedAtMs >= EVENT_STREAM_RECONNECT_STABLE_MS
           ) {
-            retryDelayMs = AGENT_SESSION_RECONNECT_INITIAL_MS;
+            retryDelayMs = EVENT_STREAM_RECONNECT_INITIAL_MS;
           }
           if (!(await waitForAbortableDelay(retryDelayMs, controller.signal))) return;
-          retryDelayMs = Math.min(retryDelayMs * 2, AGENT_SESSION_RECONNECT_MAX_MS);
+          retryDelayMs = Math.min(retryDelayMs * 2, EVENT_STREAM_RECONNECT_MAX_MS);
         }
       })();
       return controller;

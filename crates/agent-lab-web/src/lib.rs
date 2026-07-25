@@ -33,14 +33,14 @@ use tower_http::{
 pub use runs::{
     AgentAssistantMessage, AgentPresentationCompleteness, AgentPresentationCompletenessSummary,
     AgentSessionDetail, AgentSessionStatus, AgentSessionSummary, AgentTurnActivity,
-    AgentTurnDetail, AgentTurnPresentation, AgentTurnStatus, AgentTurnSummary,
-    CompareWorkbenchRequest, EvaluationDetail, EvaluationStatus, EvaluationSummary,
-    HarnessMetadata, HarnessProfile, ModelAccessProvider, ModelAccessSnapshot, ModelAccessStatus,
-    ModelProfileMetadata, PrepareRunRequest, RunController, RunControllerConfig, RunDetail,
-    RunError, RunEvent, RunStatus, RunSummary, ScenarioManifest, StartAgentSessionRequest,
-    StartAgentTurnRequest, StartEvaluationRequest, StartPreparedRunRequest, StartRunRequest,
-    TerminalBinding, TerminalCapabilityBinding, UpdateWorkbenchSelectionRequest, WorkbenchOrigin,
-    WorkbenchSelection, WorkbenchSnapshot,
+    AgentTurnCompletionIndex, AgentTurnCompletionRef, AgentTurnDetail, AgentTurnPresentation,
+    AgentTurnStatus, AgentTurnSummary, CompareWorkbenchRequest, EvaluationDetail, EvaluationStatus,
+    EvaluationSummary, HarnessMetadata, HarnessProfile, ModelAccessProvider, ModelAccessSnapshot,
+    ModelAccessStatus, ModelProfileMetadata, PrepareRunRequest, RunController, RunControllerConfig,
+    RunDetail, RunError, RunEvent, RunStatus, RunSummary, ScenarioManifest,
+    StartAgentSessionRequest, StartAgentTurnRequest, StartEvaluationRequest,
+    StartPreparedRunRequest, StartRunRequest, TerminalBinding, TerminalCapabilityBinding,
+    UpdateWorkbenchSelectionRequest, WorkbenchOrigin, WorkbenchSelection, WorkbenchSnapshot,
 };
 
 const DEFAULT_COLS: u16 = 100;
@@ -599,15 +599,31 @@ async fn start_run(
 async fn prepare_run(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<PrepareRunRequest>,
+    Json(request): Json<PrepareExploreRequest>,
 ) -> Response {
     let Some(runs) = authorized_runs(&state, &headers) else {
         return StatusCode::FORBIDDEN.into_response();
     };
-    match runs.prepare(request).await {
+    match runs
+        .prepare_from_workspace(
+            PrepareRunRequest {
+                scenario_id: request.scenario_id,
+            },
+            request.source_workspace_id.as_deref(),
+        )
+        .await
+    {
         Ok(summary) => (StatusCode::CREATED, Json(summary)).into_response(),
         Err(error) => run_error_response(error),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareExploreRequest {
+    scenario_id: String,
+    #[serde(default)]
+    source_workspace_id: Option<String>,
 }
 
 async fn start_prepared_run(

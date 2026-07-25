@@ -13,6 +13,7 @@ use agent_lab_web::{
     HarnessProfile, ModelAccessProvider, RunController, RunControllerConfig, RunSessionProvider,
     ServerConfig, app_with_runs,
 };
+use axum::http::Uri;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
@@ -36,8 +37,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, options.port)).await?;
     let address = listener.local_addr()?;
-    let origin = format!("http://{address}");
-    let config = ServerConfig::new(options.assets, origin.clone()).with_models(options.models);
+    let control_origin = format!("http://{address}");
+    let browser_origin = options
+        .public_origin
+        .unwrap_or_else(|| control_origin.clone());
+    let config =
+        ServerConfig::new(options.assets, browser_origin.clone()).with_models(options.models);
     let shutdown = config.clone();
     let mut driver = DriverLaunch::new(options.driver);
     driver.args = options.driver_args;
@@ -81,10 +86,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = Arc::new(RunSessionProvider::new(
         options.shell,
         runs.clone(),
-        origin.clone(),
+        control_origin,
     ));
 
-    println!("Agent Lab web surface: {origin}");
+    println!("Agent Lab web surface: {browser_origin}");
     println!("Local Nushell and scenario runs; press Ctrl-C to stop.");
 
     axum::serve(listener, app_with_runs(config, provider, Some(runs)))
@@ -96,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[derive(Debug)]
 struct Options {
     port: u16,
+    public_origin: Option<String>,
     assets: PathBuf,
     shell: PathBuf,
     scenarios: PathBuf,
@@ -112,6 +118,7 @@ struct Options {
 impl Options {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut port = 0;
+        let mut public_origin = None;
         let mut assets = PathBuf::from("apps/web/build");
         let shell = default_shell_path()?;
         let mut scenarios = PathBuf::from("scenarios");
@@ -133,6 +140,9 @@ impl Options {
                         .parse()
                         .map_err(|_| usage())?;
                 }
+                "--public-origin" => {
+                    public_origin = Some(validate_public_origin(args.next().ok_or_else(usage)?)?);
+                }
                 "--assets" => assets = args.next().ok_or_else(usage)?.into(),
                 "--scenarios" => scenarios = args.next().ok_or_else(usage)?.into(),
                 "--data" => data = args.next().ok_or_else(usage)?.into(),
@@ -153,6 +163,7 @@ impl Options {
         }
         Ok(Self {
             port,
+            public_origin,
             assets,
             shell,
             scenarios,
@@ -185,7 +196,25 @@ fn default_shell_path() -> Result<PathBuf, String> {
 }
 
 fn usage() -> String {
-    "usage: agent-lab-web [--port PORT] [--assets DIRECTORY] [--scenarios DIRECTORY] [--data DIRECTORY] [--driver EXECUTABLE] [--driver-arg ARG]... [--driver-cwd DIRECTORY] [--driver-env NAME]... [--driver-env-file FILE] [--model MODEL]... [--harness-config FILE]".to_owned()
+    "usage: agent-lab-web [--port PORT] [--public-origin ORIGIN] [--assets DIRECTORY] [--scenarios DIRECTORY] [--data DIRECTORY] [--driver EXECUTABLE] [--driver-arg ARG]... [--driver-cwd DIRECTORY] [--driver-env NAME]... [--driver-env-file FILE] [--model MODEL]... [--harness-config FILE]".to_owned()
+}
+
+fn validate_public_origin(origin: String) -> Result<String, String> {
+    let uri = origin
+        .parse::<Uri>()
+        .map_err(|_| "--public-origin must be an absolute HTTP(S) origin".to_owned())?;
+    let Some(scheme @ ("http" | "https")) = uri.scheme_str() else {
+        return Err("--public-origin must use HTTP or HTTPS".to_owned());
+    };
+    let Some(authority) = uri.authority() else {
+        return Err("--public-origin must include a host".to_owned());
+    };
+    if authority.as_str().contains('@') || origin != format!("{scheme}://{authority}") {
+        return Err(
+            "--public-origin must contain only its scheme, host, and optional port".to_owned(),
+        );
+    }
+    Ok(origin)
 }
 
 #[derive(Debug, Deserialize)]
@@ -476,7 +505,9 @@ async fn shutdown_signal(config: ServerConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_driver_env_file, load_harness_config, parse_env_value};
+    use super::{
+        load_driver_env_file, load_harness_config, parse_env_value, validate_public_origin,
+    };
     use std::{ffi::OsString, fs};
 
     #[test]
@@ -513,6 +544,34 @@ mod tests {
             parse_env_value("\"sensitive\\q\""),
             Err("unsupported escape")
         );
+    }
+
+    #[test]
+    fn public_origin_accepts_only_an_exact_http_or_https_origin() {
+        for origin in [
+            "http://127.0.0.1:4100",
+            "http://localhost:4100",
+            "https://workbench.agent-lab.localhost",
+        ] {
+            assert_eq!(
+                validate_public_origin(origin.to_owned()),
+                Ok(origin.to_owned())
+            );
+        }
+
+        for origin in [
+            "workbench.agent-lab.localhost",
+            "ftp://workbench.agent-lab.localhost",
+            "https://workbench.agent-lab.localhost/",
+            "https://workbench.agent-lab.localhost/path",
+            "https://workbench.agent-lab.localhost?query",
+            "https://user@workbench.agent-lab.localhost",
+        ] {
+            assert!(
+                validate_public_origin(origin.to_owned()).is_err(),
+                "{origin} should not be accepted as a browser origin"
+            );
+        }
     }
 
     #[test]

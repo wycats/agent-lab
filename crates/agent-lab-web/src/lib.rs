@@ -1256,10 +1256,16 @@ fn terminal_request_is_authorized(
 }
 
 fn request_is_same_origin(headers: &HeaderMap, expected: &str, allow_referer: bool) -> bool {
+    let Ok(expected_uri) = expected.parse::<Uri>() else {
+        return false;
+    };
+    let Some(expected_scheme) = expected_uri.scheme_str() else {
+        return false;
+    };
     let Some(request_origin) = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .map(|host| format!("http://{host}"))
+        .map(|host| format!("{expected_scheme}://{host}"))
     else {
         return false;
     };
@@ -1815,6 +1821,34 @@ mod tests {
         assert!(!request_is_same_origin(
             &headers,
             "http://127.0.0.1:4100",
+            false
+        ));
+    }
+
+    #[test]
+    fn same_origin_accepts_an_explicit_https_proxy_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("workbench.agent-lab.localhost"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://workbench.agent-lab.localhost"),
+        );
+        assert!(request_is_same_origin(
+            &headers,
+            "https://workbench.agent-lab.localhost",
+            false
+        ));
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://attacker.example"),
+        );
+        assert!(!request_is_same_origin(
+            &headers,
+            "https://workbench.agent-lab.localhost",
             false
         ));
     }

@@ -65,6 +65,18 @@ workspace projection needs a controller-mediated, attributable interface rather
 than ambient shell access. Keep the loopback workbench local and run the browser
 acceptance with `pnpm web:test`.
 
+For a managed development service, use the checked-in locald configuration:
+
+```console
+$ locald up
+```
+
+Open `https://workbench.agent-lab.localhost/`. locald supplies a sticky `$PORT`
+to the development launcher while the canonical HTTPS origin remains stable for
+the browser, cookies, and same-origin authorization. The random loopback port is
+the private listener behind that browser surface; it is not a second public
+workbench URL.
+
 ## The opening loop
 
 Agent Lab begins with a real environment rather than a prewritten agent run.

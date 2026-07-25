@@ -1,0 +1,13 @@
+[project]
+name = "agent-lab"
+
+[services.workbench]
+command = "./scripts/dev-server.sh"
+stop_signal = "SIGINT"
+
+[services.workbench.env]
+AGENT_LAB_PUBLIC_ORIGIN = "https://workbench.agent-lab.localhost"
+
+[services.workbench.health_check]
+type = "http"
+path = "/"

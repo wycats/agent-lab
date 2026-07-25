@@ -3200,12 +3200,14 @@ test('a catalog run remains explorable and reopens from durable evidence', async
   await submit(page, 'let first = (agent | get id); let second = (agent new | get id); agent switch $first | get id');
   await expect(interactiveSession).toContainText('Find the active catalog items and explain what matters');
   await expect(interactiveSession.getByTestId('agent-response').first()).toContainText('Alpha and gamma are active');
-  await submit(page, 'let first = (agent | get id); let sessions = (agent sessions); let second = ($sessions | where id != $first | get id | first); agent close; agent switch $second; agent close');
+  await submit(page, 'let first = (agent | get id); let sessions = (agent sessions | where status == ready); let second = ($sessions | where id != $first | get id | first); agent close; agent switch $second; agent close');
 
   await page.getByLabel('Default harness').selectOption('v0');
   await expect(page.getByLabel('Default harness')).toHaveValue('v0');
   await expect(page.getByLabel('Default model')).toHaveValue('fixture');
-  await page.getByRole('button', { name: 'Run harness', exact: true }).click();
+  const runHarness = page.getByRole('button', { name: 'Run harness', exact: true });
+  await expect(runHarness).toBeEnabled();
+  await runHarness.click();
   await expect(page.locator('.run-heading > .run-status')).toHaveText('passed');
   await expect(assembly).toContainText('agent-lab-fixture');
   await expect(assembly).toContainText('fixture/model');

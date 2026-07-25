@@ -154,7 +154,74 @@ export interface AgentTurnActivityPresentation {
   status: string;
   source: string | null;
   path: string | null;
+  operation?: string | null;
+  callId?: string | null;
+  arguments?: unknown;
+  result?: unknown;
+  actionId?: string | null;
+  changeKind?: string | null;
+  entryType?: string | null;
+  beforeMode?: string | null;
+  afterMode?: string | null;
   sourceEventSequences: number[];
+}
+
+function countedActivityLabel(count: number, singular: string): string {
+  return `${count} ${singular}${count === 1 ? '' : 's'}`;
+}
+
+function conciseActivityValue(value: string | number | boolean): string {
+  const rendered = typeof value === 'string' ? value : String(value);
+  return rendered.length <= 80 ? rendered : `${rendered.slice(0, 79)}…`;
+}
+
+function agentActivityArgumentsSummary(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (Array.isArray(value)) return `Arguments: ${countedActivityLabel(value.length, 'item')}`;
+  if (typeof value === 'object') {
+    const keys = Object.keys(value);
+    if (keys.length === 0) return null;
+    return keys.length <= 3
+      ? `Arguments: ${keys.join(', ')}`
+      : `Arguments: ${countedActivityLabel(keys.length, 'field')}`;
+  }
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return `Argument: ${conciseActivityValue(value)}`;
+  }
+  return null;
+}
+
+function agentActivityResultSummary(value: unknown, failed: boolean): string | null {
+  if (value === undefined) return null;
+  if (value === null) return failed ? 'Capability failed' : 'Returned no value';
+  if (Array.isArray(value)) {
+    return `${failed ? 'Failed with' : 'Returned'} ${countedActivityLabel(value.length, 'item')}`;
+  }
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const message = record.message ?? record.error;
+    if (failed && typeof message === 'string') return `Failed: ${conciseActivityValue(message)}`;
+    if (Array.isArray(record.items)) {
+      return `${failed ? 'Failed with' : 'Returned'} ${countedActivityLabel(record.items.length, 'item')}`;
+    }
+    const fieldCount = Object.keys(record).length;
+    return `${failed ? 'Failed with' : 'Returned'} ${countedActivityLabel(fieldCount, 'field')}`;
+  }
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return `${failed ? 'Failed' : 'Returned'}: ${conciseActivityValue(value)}`;
+  }
+  return null;
+}
+
+export function agentTurnActivityDetail(activity: AgentTurnActivityPresentation): string | null {
+  if (activity.detail) return activity.detail;
+  if (activity.kind !== 'capability-call') return null;
+
+  const parts = [
+    agentActivityArgumentsSummary(activity.arguments),
+    agentActivityResultSummary(activity.result, activity.status === 'failed')
+  ].filter((part): part is string => part !== null);
+  return parts.length > 0 ? parts.join(' · ') : null;
 }
 
 export interface AgentTurnPresentationCompleteness {
@@ -166,7 +233,7 @@ export interface AgentTurnPresentationCompleteness {
 }
 
 export interface AgentTurnPresentation {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   response: string | null;
   messages: AgentTurnMessagePresentation[];
   activity: AgentTurnActivityPresentation[];

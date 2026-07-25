@@ -297,7 +297,7 @@ pub struct AgentTurnSummary {
     pub human_intervention_at_ms: Option<u128>,
 }
 
-const AGENT_TURN_PRESENTATION_VERSION: u32 = 1;
+const AGENT_TURN_PRESENTATION_VERSION: u32 = 2;
 const AGENT_SESSION_MANIFEST_LEGACY_VERSION: u32 = 1;
 const AGENT_SESSION_MANIFEST_VERSION: u32 = 2;
 const AGENT_SESSION_PRESENTATION_REQUIRED_VERSION: u32 = 2;
@@ -338,6 +338,24 @@ pub struct AgentTurnActivity {
     pub status: String,
     pub source: Option<String>,
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_mode: Option<String>,
     pub source_event_sequences: Vec<u64>,
 }
 
@@ -4961,14 +4979,26 @@ fn build_agent_turn_presentation_from_events(
                     .and_then(JsonValue::as_str)
                     .map_or_else(|| format!("{}:{}", source, event.sequence), str::to_owned);
                 let index = activity.len();
-                capability_indexes.insert((source.to_owned(), call_id), index);
+                capability_indexes.insert((source.to_owned(), call_id.clone()), index);
                 activity.push(AgentTurnActivity {
                     kind: "capability-call".to_owned(),
                     title: format!("{source} · {name}"),
-                    detail: body.get("arguments").map(compact_json_detail),
+                    detail: None,
                     status: "running".to_owned(),
                     source: Some(source.to_owned()),
                     path: None,
+                    operation: Some(name.to_owned()),
+                    call_id: Some(call_id),
+                    arguments: body
+                        .get("arguments")
+                        .filter(|arguments| !arguments.is_null())
+                        .map(|arguments| redact_value(arguments.clone(), secrets)),
+                    result: None,
+                    action_id: None,
+                    change_kind: None,
+                    entry_type: None,
+                    before_mode: None,
+                    after_mode: None,
                     source_event_sequences: vec![event.sequence],
                 });
             }
@@ -5000,6 +5030,15 @@ fn build_agent_turn_presentation_from_events(
                             status: "running".to_owned(),
                             source: Some(source.to_owned()),
                             path: None,
+                            operation: Some(name.to_owned()),
+                            call_id: call_id.clone(),
+                            arguments: None,
+                            result: None,
+                            action_id: None,
+                            change_kind: None,
+                            entry_type: None,
+                            before_mode: None,
+                            after_mode: None,
                             source_event_sequences: Vec::new(),
                         });
                         activity.len() - 1
@@ -5010,7 +5049,10 @@ fn build_agent_turn_presentation_from_events(
                     } else {
                         "completed".to_owned()
                     };
-                activity[index].detail = body.get("result").map(compact_json_detail);
+                activity[index].result = body
+                    .get("result")
+                    .filter(|result| !result.is_null())
+                    .map(|result| redact_value(result.clone(), secrets));
                 activity[index].source_event_sequences.push(event.sequence);
             }
             "observation.native-action" => {
@@ -5029,13 +5071,23 @@ fn build_agent_turn_presentation_from_events(
                             status: "started".to_owned(),
                             source: None,
                             path: None,
+                            operation: Some(name.to_owned()),
+                            call_id: None,
+                            arguments: None,
+                            result: None,
+                            action_id: Some(action_id.to_owned()),
+                            change_kind: None,
+                            entry_type: None,
+                            before_mode: None,
+                            after_mode: None,
                             source_event_sequences: Vec::new(),
                         });
                         activity.len() - 1
                     });
                 name.clone_into(&mut activity[index].title);
+                activity[index].operation = Some(name.to_owned());
                 if let Some(summary) = body.get("summary").and_then(JsonValue::as_str) {
-                    activity[index].detail = Some(summary.to_owned());
+                    activity[index].detail = Some(redact_string(summary, secrets));
                 }
                 body.get("status")
                     .and_then(JsonValue::as_str)
@@ -5059,10 +5111,15 @@ fn build_agent_turn_presentation_from_events(
                             .get("kind")
                             .and_then(JsonValue::as_str)
                             .unwrap_or("changed");
-                        let mode_detail = match (
-                            change.get("beforeMode").and_then(JsonValue::as_str),
-                            change.get("afterMode").and_then(JsonValue::as_str),
-                        ) {
+                        let before_mode = change
+                            .get("beforeMode")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_owned);
+                        let after_mode = change
+                            .get("afterMode")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_owned);
+                        let mode_detail = match (before_mode.as_deref(), after_mode.as_deref()) {
                             (Some(before), Some(after)) if before != after => {
                                 Some(format!("mode {before} -> {after}"))
                             }
@@ -5075,6 +5132,18 @@ fn build_agent_turn_presentation_from_events(
                             status: "completed".to_owned(),
                             source: None,
                             path: Some(path.to_owned()),
+                            operation: None,
+                            call_id: None,
+                            arguments: None,
+                            result: None,
+                            action_id: None,
+                            change_kind: Some(kind.to_owned()),
+                            entry_type: change
+                                .get("entryType")
+                                .and_then(JsonValue::as_str)
+                                .map(str::to_owned),
+                            before_mode,
+                            after_mode,
                             source_event_sequences: vec![event.sequence],
                         });
                     }
@@ -5177,17 +5246,6 @@ fn required_json_string<'a>(
         .get(key)
         .and_then(JsonValue::as_str)
         .ok_or_else(|| RunError::Protocol(format!("{event_kind} requires a string {key}")))
-}
-
-fn compact_json_detail(value: &JsonValue) -> String {
-    value
-        .to_string()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(500)
-        .collect()
 }
 
 fn title_case(value: &str) -> String {
@@ -9152,6 +9210,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn legacy_agent_session_rebuilds_terminal_projection_before_manifest_upgrade() {
         let root = temporary_root("legacy-agent-projection-replay");
         let workspace = Arc::new(test_run_state(&root.join("run")));
@@ -9184,6 +9243,29 @@ mod tests {
             observation_ready_event(1),
             event(
                 2,
+                "mcp.tool.started",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "catalog",
+                    "callId": "call-1",
+                    "name": "list",
+                    "arguments": { "active": true },
+                }),
+            ),
+            event(
+                3,
+                "mcp.tool.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "catalog",
+                    "callId": "call-1",
+                    "name": "list",
+                    "isError": false,
+                    "result": { "items": ["gamma"] },
+                }),
+            ),
+            event(
+                4,
                 "observation.assistant.completed",
                 json!({
                     "turnId": "turn-1",
@@ -9192,7 +9274,7 @@ mod tests {
                 }),
             ),
             event(
-                3,
+                5,
                 "agent.turn.finished",
                 json!({
                     "turnId": "turn-1",
@@ -9207,6 +9289,39 @@ mod tests {
             event_log.push(b'\n');
         }
         fs::write(bundle.join("events.jsonl"), event_log).unwrap();
+        write_json_atomic(
+            &bundle.join("turns/turn-1/presentation.json"),
+            &json!({
+                "schemaVersion": 1,
+                "response": "# Replayed legacy answer",
+                "messages": [{
+                    "id": "message-1",
+                    "text": "# Replayed legacy answer",
+                    "complete": true,
+                    "sourceEventSequences": [4],
+                }],
+                "activity": [{
+                    "kind": "capability-call",
+                    "title": "catalog · list",
+                    "detail": "{\"items\":[\"gamma\"]}",
+                    "status": "completed",
+                    "source": "catalog",
+                    "path": null,
+                    "sourceEventSequences": [2, 3],
+                }],
+                "usage": null,
+                "completeness": {
+                    "assistantOutput": "complete",
+                    "capabilityActivity": "complete",
+                    "nativeActivity": "complete",
+                    "workspaceEffects": "complete",
+                    "usage": "unavailable",
+                },
+                "sourceEventSequences": [1, 2, 3, 4, 5],
+                "sourceDigest": "sha256:legacy",
+            }),
+        )
+        .unwrap();
 
         let runs = HashMap::from([("run-events".to_owned(), Arc::clone(&workspace))]);
         let sessions = load_agent_sessions(&runs).unwrap();
@@ -9218,7 +9333,24 @@ mod tests {
             presentation.response.as_deref(),
             Some("# Replayed legacy answer")
         );
+        assert_eq!(presentation.schema_version, AGENT_TURN_PRESENTATION_VERSION);
+        assert_eq!(presentation.activity[0].detail, None);
+        assert_eq!(
+            presentation.activity[0].arguments,
+            Some(json!({ "active": true }))
+        );
+        assert_eq!(
+            presentation.activity[0].result,
+            Some(json!({ "items": ["gamma"] }))
+        );
         assert!(bundle.join("turns/turn-1/presentation.json").is_file());
+        let stored: JsonValue = serde_json::from_slice(
+            &fs::read(bundle.join("turns/turn-1/presentation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored["schemaVersion"], AGENT_TURN_PRESENTATION_VERSION);
+        assert_eq!(stored["activity"][0]["detail"], JsonValue::Null);
+        assert!(stored["activity"][0]["arguments"].is_object());
 
         let upgraded: AgentSessionManifest =
             serde_json::from_slice(&fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
@@ -9447,7 +9579,7 @@ mod tests {
                     "source": "catalog",
                     "callId": "call-1",
                     "name": "list",
-                    "arguments": {},
+                    "arguments": { "active": true, "minimumScore": 3 },
                 }),
             ),
             event(
@@ -9470,7 +9602,7 @@ mod tests {
                     "callId": "call-1",
                     "name": "list",
                     "isError": false,
-                    "result": { "items": [] },
+                    "result": { "items": [{ "name": "gamma", "score": 8 }] },
                 }),
             ),
             event(
@@ -9492,9 +9624,188 @@ mod tests {
         assert_eq!(presentation.activity[0].source.as_deref(), Some("catalog"));
         assert_eq!(presentation.activity[0].source_event_sequences, [1, 3]);
         assert_eq!(presentation.activity[0].status, "completed");
+        assert_eq!(presentation.activity[0].detail, None);
+        assert_eq!(presentation.activity[0].operation.as_deref(), Some("list"));
+        assert_eq!(presentation.activity[0].call_id.as_deref(), Some("call-1"));
+        assert_eq!(
+            presentation.activity[0].arguments,
+            Some(json!({ "active": true, "minimumScore": 3 }))
+        );
+        assert_eq!(
+            presentation.activity[0].result,
+            Some(json!({ "items": [{ "name": "gamma", "score": 8 }] }))
+        );
         assert_eq!(presentation.activity[1].source.as_deref(), Some("analysis"));
         assert_eq!(presentation.activity[1].source_event_sequences, [2, 4]);
         assert_eq!(presentation.activity[1].status, "completed");
+
+        let serialized = serde_json::to_value(&presentation.activity[0]).unwrap();
+        assert_eq!(serialized["detail"], JsonValue::Null);
+        assert_eq!(serialized["arguments"]["active"], true);
+        assert_eq!(serialized["result"]["items"][0]["score"], 8);
+        assert!(serialized.get("actionId").is_none());
+        assert!(serialized.get("changeKind").is_none());
+    }
+
+    #[test]
+    fn typed_capability_projection_redacts_arguments_and_results() {
+        let events = vec![
+            event(
+                1,
+                "mcp.tool.started",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "catalog",
+                    "callId": "call-1",
+                    "name": "list",
+                    "arguments": {
+                        "query": "use turn-secret",
+                        "authorization": "Bearer turn-secret",
+                    },
+                }),
+            ),
+            event(
+                2,
+                "mcp.tool.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "catalog",
+                    "callId": "call-1",
+                    "name": "list",
+                    "isError": false,
+                    "result": {
+                        "items": [{ "note": "turn-secret stayed private" }],
+                    },
+                }),
+            ),
+        ];
+
+        let presentation = build_agent_turn_presentation_from_events(
+            &events,
+            &test_agent_turn(AgentTurnStatus::Completed),
+            &[b"turn-secret".to_vec()],
+        )
+        .unwrap();
+        let activity = &presentation.activity[0];
+        let serialized = serde_json::to_string(activity).unwrap();
+
+        assert!(!serialized.contains("turn-secret"));
+        assert_eq!(
+            activity.arguments,
+            Some(json!({
+                "query": "use [REDACTED]",
+                "authorization": "[REDACTED]",
+            }))
+        );
+        assert_eq!(
+            activity.result,
+            Some(json!({
+                "items": [{ "note": "[REDACTED] stayed private" }],
+            }))
+        );
+    }
+
+    #[test]
+    fn null_capability_fields_round_trip_and_reload_without_projection_drift() {
+        let root = temporary_root("null-capability-projection");
+        let bundle = root.join("agent-session");
+        fs::create_dir_all(bundle.join("turns/turn-1")).unwrap();
+        let events = vec![
+            event(
+                1,
+                "mcp.tool.started",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "catalog",
+                    "callId": "call-1",
+                    "name": "list",
+                    "arguments": null,
+                }),
+            ),
+            event(
+                2,
+                "mcp.tool.completed",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "catalog",
+                    "callId": "call-1",
+                    "name": "list",
+                    "isError": false,
+                    "result": null,
+                }),
+            ),
+        ];
+        let turn = test_agent_turn(AgentTurnStatus::Running);
+        let expected = build_agent_turn_presentation_from_events(&events, &turn, &[]).unwrap();
+        let serialized = serde_json::to_value(&expected).unwrap();
+        let activity = serialized["activity"][0].as_object().unwrap();
+        assert!(!activity.contains_key("arguments"));
+        assert!(!activity.contains_key("result"));
+        let round_tripped: AgentTurnPresentation =
+            serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(round_tripped, expected);
+        write_json_atomic(&bundle.join("turns/turn-1/presentation.json"), &serialized).unwrap();
+
+        let state = test_agent_session_state(bundle);
+        *lock(&state.events) = events;
+        let workspace = test_run_state(&root.join("run"));
+        let loaded = load_or_build_agent_turn_presentation(&state, &workspace, &turn).unwrap();
+
+        assert_eq!(loaded, expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_and_workspace_activity_retain_kind_specific_fields() {
+        let events = vec![
+            event(
+                1,
+                "observation.native-action",
+                json!({
+                    "turnId": "turn-1",
+                    "actionId": "action-1",
+                    "name": "write_file",
+                    "status": "completed",
+                    "summary": "Wrote ranked.json",
+                }),
+            ),
+            event(
+                2,
+                "agent.turn.finished",
+                json!({
+                    "turnId": "turn-1",
+                    "outcome": "completed",
+                    "workspaceDiff": {
+                        "changes": [{
+                            "path": "ranked.json",
+                            "entryType": "file",
+                            "kind": "mode-changed",
+                            "beforeMode": "0644",
+                            "afterMode": "0755",
+                        }],
+                    },
+                }),
+            ),
+        ];
+
+        let presentation = build_agent_turn_presentation_from_events(
+            &events,
+            &test_agent_turn(AgentTurnStatus::Completed),
+            &[],
+        )
+        .unwrap();
+        let native = &presentation.activity[0];
+        let workspace = &presentation.activity[1];
+
+        assert_eq!(native.action_id.as_deref(), Some("action-1"));
+        assert_eq!(native.operation.as_deref(), Some("write_file"));
+        assert_eq!(native.detail.as_deref(), Some("Wrote ranked.json"));
+        assert_eq!(workspace.path.as_deref(), Some("ranked.json"));
+        assert_eq!(workspace.change_kind.as_deref(), Some("mode-changed"));
+        assert_eq!(workspace.entry_type.as_deref(), Some("file"));
+        assert_eq!(workspace.before_mode.as_deref(), Some("0644"));
+        assert_eq!(workspace.after_mode.as_deref(), Some("0755"));
+        assert_eq!(workspace.detail.as_deref(), Some("mode 0644 -> 0755"));
     }
 
     #[test]

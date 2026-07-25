@@ -2920,7 +2920,7 @@ mod tests {
             "capabilityRevisions": { "catalog": "catalog-2" },
             "error": null,
             "presentation": {
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "response": "# Answer\n\nIt worked.",
                 "messages": [{
                     "id": "message-1",
@@ -2928,7 +2928,21 @@ mod tests {
                     "complete": true,
                     "sourceEventSequences": [4]
                 }],
-                "activity": [],
+                "activity": [{
+                    "kind": "capability-call",
+                    "title": "catalog · list",
+                    "detail": null,
+                    "status": "completed",
+                    "source": "catalog",
+                    "path": null,
+                    "operation": "list",
+                    "callId": "call-1",
+                    "arguments": { "active": true },
+                    "result": {
+                        "items": [{ "name": "gamma", "score": 8 }]
+                    },
+                    "sourceEventSequences": [2, 3]
+                }],
                 "usage": { "inputTokens": 12 },
                 "completeness": {
                     "assistantOutput": "complete",
@@ -3344,6 +3358,32 @@ mod tests {
         );
         assert_eq!(answer["evidence"]["sourceEventSequences"], json!([3, 4, 5]));
         assert!(answer["evidence"].get("prompt").is_none());
+    }
+
+    #[test]
+    fn typed_capability_activity_remains_structured_in_nushell() {
+        let answer = json_to_nu(
+            agent_answer_record(&durable_turn()).unwrap(),
+            Span::unknown(),
+        );
+        let activity = answer
+            .as_record()
+            .unwrap()
+            .get("activity")
+            .unwrap()
+            .as_list()
+            .unwrap();
+        let capability = activity[0].as_record().unwrap();
+        let arguments = capability.get("arguments").unwrap().as_record().unwrap();
+        let result = capability.get("result").unwrap().as_record().unwrap();
+        let items = result.get("items").unwrap().as_list().unwrap();
+
+        assert!(capability.get("detail").unwrap().is_nothing());
+        assert_eq!(arguments.get("active").unwrap().as_bool(), Ok(true));
+        assert_eq!(
+            items[0].as_record().unwrap().get("score").unwrap().as_int(),
+            Ok(8)
+        );
     }
 
     #[test]

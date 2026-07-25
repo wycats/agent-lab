@@ -81,7 +81,7 @@ test('an interrupted replay selection reopens durable rendered and source eviden
   await page.route(/\/api\/workbench\/[^/]+\/agent-sessions\/replay-session$/, async (route) => {
     await route.fulfill({
       json: {
-        projectionVersion: 1,
+        projectionVersion: 2,
         summary,
         turns: [{
           id: 'replay-turn',
@@ -94,7 +94,7 @@ test('an interrupted replay selection reopens durable rendered and source eviden
           finishedAtMs: 2,
           outcome: 'completed',
           presentation: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             response: '# Durable answer\n\n**Reopened** after restart.',
             messages: [{
               id: 'replay-message',
@@ -102,7 +102,25 @@ test('an interrupted replay selection reopens durable rendered and source eviden
               complete: true,
               sourceEventSequences: [1]
             }],
-            activity: [],
+            activity: [{
+              kind: 'capability-call',
+              title: 'catalog · list',
+              detail: null,
+              status: 'completed',
+              source: 'catalog',
+              path: null,
+              operation: 'list',
+              callId: 'call-1',
+              arguments: {},
+              result: {
+                items: [
+                  { name: 'alpha', score: 3 },
+                  { name: 'beta', score: 5 },
+                  { name: 'gamma', score: 8 }
+                ]
+              },
+              sourceEventSequences: [2, 3]
+            }],
             usage: null,
             completeness: {
               assistantOutput: 'complete',
@@ -126,6 +144,10 @@ test('an interrupted replay selection reopens durable rendered and source eviden
   await expect(page.locator('.run-heading')).toContainText('interrupted');
   await expect(session).toContainText('Reopened from durable evidence. Start a new agent session to continue.');
   await expect(session.getByRole('heading', { name: 'Durable answer', level: 3 })).toBeVisible();
+  const activity = session.getByLabel('Turn activity');
+  await expect(activity).toContainText('catalog · list');
+  await expect(activity).toContainText('Returned 3 items');
+  await expect(activity).not.toContainText('{"items"');
   const presentation = session.getByRole('group', { name: 'Agent answer presentation' });
   await presentation.getByRole('button', { name: 'Source' }).click();
   await expect(session.locator('.response-source')).toContainText('# Durable answer');

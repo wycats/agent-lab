@@ -5,7 +5,7 @@
   import AgentSessionLiveStatus from '$lib/AgentSessionLiveStatus.svelte';
   import AssistantMarkdown from '$lib/AssistantMarkdown.svelte';
   import { projectAgentSessionLiveStatus } from '$lib/agent-live-status';
-  import { createRunClient, type AgentSessionDetail, type AgentTurnActivityPresentation, type AgentTurnMessagePresentation, type AgentTurnSummary, type EvaluationComparisonArm, type EvaluationDetail, type EvaluationSummary, type HarnessMetadata, type ModelAccessSnapshot, type ModelProfileMetadata, type RunDetail, type RunEvent, type RunReviewStep, type RunSummary, type ScenarioManifest, type WorkbenchSelection } from '$lib/runs';
+  import { agentTurnActivityDetail, createRunClient, type AgentSessionDetail, type AgentTurnActivityPresentation, type AgentTurnMessagePresentation, type AgentTurnSummary, type EvaluationComparisonArm, type EvaluationDetail, type EvaluationSummary, type HarnessMetadata, type ModelAccessSnapshot, type ModelProfileMetadata, type RunDetail, type RunEvent, type RunReviewStep, type RunSummary, type ScenarioManifest, type WorkbenchSelection } from '$lib/runs';
   import { createGhosttySurface } from '$lib/terminal/ghostty';
   import { connectSession } from '$lib/terminal/session';
   import type { BrowserSession, ConnectionState, SessionEvent } from '$lib/terminal/session';
@@ -1302,6 +1302,7 @@
                         <span class="label">What the harness did</span>
                         <ol>
                           {#each turn.presentation.activity as activity}
+                            {@const detail = agentTurnActivityDetail(activity)}
                             <li data-kind={activity.kind} data-status={activity.status}>
                               <span class="activity-marker"></span>
                               <div>
@@ -1309,7 +1310,7 @@
                                   <strong>{activity.title}</strong>
                                   <em>{activityLabel(activity)}</em>
                                 </div>
-                                {#if activity.detail}<p>{activity.detail}</p>{/if}
+                                {#if detail}<p>{detail}</p>{/if}
                                 {#if activity.source || activity.path}
                                   <small>{activity.source ?? ''}{activity.source && activity.path ? ' · ' : ''}{activity.path ?? ''}</small>
                                 {/if}

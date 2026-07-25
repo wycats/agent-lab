@@ -747,6 +747,7 @@ struct RunState {
     evidence_quarantined: AtomicBool,
     agent_sessions: Mutex<HashMap<String, Weak<AgentSessionState>>>,
     active_agent_session_id: Mutex<Option<String>>,
+    terminal_input_barrier: Mutex<()>,
     active_agent_turn: Mutex<Option<AgentTurnReservation>>,
     capability_attributions: Mutex<HashMap<String, AgentTurnAttribution>>,
     reusable_explore: bool,
@@ -1451,6 +1452,7 @@ impl<'a> ActiveAgentTurnGuard<'a> {
         &mut self,
         persist_terminal_state: impl FnOnce() -> Result<T, RunError>,
     ) -> Result<T, RunError> {
+        let _terminal_input = lock(&self.workspace.terminal_input_barrier);
         let mut active = lock(&self.workspace.active_agent_turn);
         if !active
             .as_ref()
@@ -2629,6 +2631,7 @@ impl RunController {
     /// when the intervention marker cannot be persisted.
     pub fn note_terminal_input(&self, workspace_id: &str) -> Result<(), RunError> {
         let workspace = self.state(workspace_id)?;
+        let _terminal_input = lock(&workspace.terminal_input_barrier);
         let mut active_turn = lock(&workspace.active_agent_turn);
         let Some(reservation) = active_turn.as_mut() else {
             return Ok(());
@@ -3249,6 +3252,7 @@ impl RunController {
             evidence_quarantined: AtomicBool::new(false),
             agent_sessions: Mutex::new(HashMap::new()),
             active_agent_session_id: Mutex::new(None),
+            terminal_input_barrier: Mutex::new(()),
             active_agent_turn: Mutex::new(None),
             capability_attributions: Mutex::new(HashMap::new()),
             reusable_explore: true,
@@ -3980,6 +3984,7 @@ impl RunController {
             evidence_quarantined: AtomicBool::new(false),
             agent_sessions: Mutex::new(HashMap::new()),
             active_agent_session_id: Mutex::new(None),
+            terminal_input_barrier: Mutex::new(()),
             active_agent_turn: Mutex::new(None),
             capability_attributions: Mutex::new(HashMap::new()),
             reusable_explore: false,
@@ -5490,6 +5495,7 @@ fn run_agent_session_actor(
             .as_ref()
             .and_then(|_| lock(&state.turns).last().map(|turn| turn.id.clone()));
         if let Some(turn_id) = terminal_turn {
+            let _terminal_input = lock(&workspace_state.terminal_input_barrier);
             let retained_terminal = lock(&state.events)
                 .iter()
                 .rev()
@@ -5873,19 +5879,22 @@ fn run_agent_turn_reserved(
                         {
                             require_agent_turn_response(state, turn_id)?;
                         }
-                        let workspace_diff = finalize_agent_turn_workspace(
-                            state,
-                            turn_id,
-                            Some(workspace_state),
-                            &workspace_state.workspace_evidence_root,
-                            secrets,
-                        )?;
-                        write_confined_json_atomic(
-                            &state.evidence_root,
-                            Path::new("transcript.json"),
-                            &serde_json::to_value(redact_transcript(driver.transcript(), secrets))?,
-                        )?;
                         let terminal_event = attribution.finish(|| {
+                            let workspace_diff = finalize_agent_turn_workspace(
+                                state,
+                                turn_id,
+                                Some(workspace_state),
+                                &workspace_state.workspace_evidence_root,
+                                secrets,
+                            )?;
+                            write_confined_json_atomic(
+                                &state.evidence_root,
+                                Path::new("transcript.json"),
+                                &serde_json::to_value(redact_transcript(
+                                    driver.transcript(),
+                                    secrets,
+                                ))?,
+                            )?;
                             if termination.is_none() {
                                 termination = if cancel.is_cancelled() {
                                     Some(AgentTurnTermination::Cancelled)
@@ -5999,18 +6008,6 @@ fn run_agent_turn_reserved(
                             turn_id,
                             &mut assistant_redactor,
                         )?;
-                        let workspace_diff = finalize_agent_turn_workspace(
-                            state,
-                            turn_id,
-                            Some(workspace_state),
-                            &workspace_state.workspace_evidence_root,
-                            secrets,
-                        )?;
-                        write_confined_json_atomic(
-                            &state.evidence_root,
-                            Path::new("transcript.json"),
-                            &serde_json::to_value(redact_transcript(driver.transcript(), secrets))?,
-                        )?;
                         if termination.is_none() {
                             termination = if cancel.is_cancelled() {
                                 Some(AgentTurnTermination::Cancelled)
@@ -6023,6 +6020,21 @@ fn run_agent_turn_reserved(
                             };
                         }
                         let terminal_event = attribution.finish(|| {
+                            let workspace_diff = finalize_agent_turn_workspace(
+                                state,
+                                turn_id,
+                                Some(workspace_state),
+                                &workspace_state.workspace_evidence_root,
+                                secrets,
+                            )?;
+                            write_confined_json_atomic(
+                                &state.evidence_root,
+                                Path::new("transcript.json"),
+                                &serde_json::to_value(redact_transcript(
+                                    driver.transcript(),
+                                    secrets,
+                                ))?,
+                            )?;
                             let (status, outcome, terminal_error) = match termination {
                                 Some(AgentTurnTermination::Cancelled) => {
                                     (AgentTurnStatus::Cancelled, "cancelled", None)
@@ -6816,11 +6828,16 @@ fn build_agent_turn_presentation_from_events(
         } else {
             AgentPresentationCompleteness::Partial
         };
-    let capability_activity = if turn_evidence_finalized && turn_successful {
-        AgentPresentationCompleteness::Complete
-    } else {
-        AgentPresentationCompleteness::Partial
-    };
+    let capability_lifecycle_complete = activity
+        .iter()
+        .filter(|item| item.kind == "capability-call")
+        .all(|item| item.status != "running");
+    let capability_activity =
+        if turn_evidence_finalized && turn_successful && capability_lifecycle_complete {
+            AgentPresentationCompleteness::Complete
+        } else {
+            AgentPresentationCompleteness::Partial
+        };
     let native_activity = if turn_evidence_finalized
         && turn_successful
         && (activity
@@ -9140,6 +9157,7 @@ fn load_run_bundle(
         evidence_quarantined: AtomicBool::new(false),
         agent_sessions: Mutex::new(HashMap::new()),
         active_agent_session_id: Mutex::new(None),
+        terminal_input_barrier: Mutex::new(()),
         active_agent_turn: Mutex::new(None),
         capability_attributions: Mutex::new(HashMap::new()),
         reusable_explore,
@@ -14494,6 +14512,40 @@ mod tests {
     }
 
     #[test]
+    fn capability_projection_keeps_incomplete_calls_partial_after_turn_completion() {
+        let turn = test_agent_turn(AgentTurnStatus::Completed);
+        let events = vec![
+            event(
+                1,
+                "mcp.tool.started",
+                json!({
+                    "turnId": "turn-1",
+                    "source": "catalog",
+                    "callId": "call-1",
+                    "name": "list",
+                    "arguments": {},
+                }),
+            ),
+            event(
+                2,
+                "agent.turn.finished",
+                json!({
+                    "turnId": "turn-1",
+                    "outcome": "completed",
+                }),
+            ),
+        ];
+
+        let presentation = build_agent_turn_presentation_from_events(&events, &turn, &[]).unwrap();
+        assert_eq!(presentation.activity.len(), 1);
+        assert_eq!(presentation.activity[0].status, "running");
+        assert_eq!(
+            presentation.completeness.capability_activity,
+            AgentPresentationCompleteness::Partial
+        );
+    }
+
+    #[test]
     fn typed_capability_projection_redacts_arguments_and_results() {
         let events = vec![
             event(
@@ -17815,16 +17867,18 @@ done
         fs::create_dir(&scenarios).unwrap();
         fs::create_dir(&data).unwrap();
         write_scenario(&scenarios);
-        let controller = RunController::new_with_harnesses(
-            RunControllerConfig {
-                scenarios_dir: scenarios,
-                data_dir: data,
-                driver: DriverLaunch::new("/bin/false"),
-            },
-            Vec::new(),
-            BTreeMap::new(),
-        )
-        .unwrap();
+        let controller = Arc::new(
+            RunController::new_with_harnesses(
+                RunControllerConfig {
+                    scenarios_dir: scenarios,
+                    data_dir: data,
+                    driver: DriverLaunch::new("/bin/false"),
+                },
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .unwrap(),
+        );
         let workspace = Arc::new(test_run_state(&root.join("workspace-run")));
         lock(&workspace.summary).status = RunStatus::Exploring;
         let session_dir = workspace.bundle_dir.join("agent-sessions/session-1");
@@ -17867,8 +17921,22 @@ done
         });
         locked_rx.recv().unwrap();
 
-        controller.note_terminal_input("run-events").unwrap();
+        let (input_finished_tx, input_finished_rx) = mpsc::channel();
+        let input_controller = Arc::clone(&controller);
+        let input = thread::spawn(move || {
+            input_controller.note_terminal_input("run-events").unwrap();
+            input_finished_tx.send(()).unwrap();
+        });
+        assert!(
+            input_finished_rx
+                .recv_timeout(Duration::from_millis(30))
+                .is_err()
+        );
         finalizer.join().unwrap();
+        input_finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        input.join().unwrap();
 
         let turn = &lock(&session.turns)[0];
         assert_eq!(turn.status, AgentTurnStatus::Completed);
@@ -18444,6 +18512,7 @@ totalScore = 11
             evidence_quarantined: AtomicBool::new(false),
             agent_sessions: Mutex::new(HashMap::new()),
             active_agent_session_id: Mutex::new(None),
+            terminal_input_barrier: Mutex::new(()),
             active_agent_turn: Mutex::new(None),
             capability_attributions: Mutex::new(HashMap::new()),
             reusable_explore: false,
@@ -22724,6 +22793,7 @@ fi
             evidence_quarantined: AtomicBool::new(false),
             agent_sessions: Mutex::new(HashMap::new()),
             active_agent_session_id: Mutex::new(None),
+            terminal_input_barrier: Mutex::new(()),
             active_agent_turn: Mutex::new(None),
             capability_attributions: Mutex::new(HashMap::new()),
             reusable_explore: false,

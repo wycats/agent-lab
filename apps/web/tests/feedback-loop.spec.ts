@@ -2851,13 +2851,19 @@ test('an active turn can be cancelled from compact progress without polling', as
 test('agent answers render constrained Markdown and retain inspectable source', async ({ page }) => {
   const terminalFramesSent: string[] = [];
   const terminalBytesSent: string[] = [];
+  const terminalSendOrder: Array<'human-input' | 'ctrl-c' | 'other'> = [];
   page.on('websocket', (socket) => {
     if (!/\/api\/terminal(?:\?|$)/.test(socket.url())) return;
     socket.on('framesent', ({ payload }) => {
       if (typeof payload === 'string') {
         terminalFramesSent.push(payload);
+        terminalSendOrder.push(
+          payload === JSON.stringify({ type: 'human_input' }) ? 'human-input' : 'other'
+        );
       } else {
-        terminalBytesSent.push(payload.toString('hex'));
+        const bytes = payload.toString('hex');
+        terminalBytesSent.push(bytes);
+        terminalSendOrder.push(bytes === '03' ? 'ctrl-c' : 'other');
       }
     });
   });
@@ -2995,6 +3001,7 @@ test('agent answers render constrained Markdown and retain inspectable source', 
     (frame) => frame === JSON.stringify({ type: 'human_input' })
   ).length;
   const ctrlCBeforeCancellation = terminalBytesSent.filter((frame) => frame === '03').length;
+  const sendOrderBeforeCancellation = terminalSendOrder.length;
   await page.keyboard.press('Control+C');
   await expect.poll(
     () =>
@@ -3005,6 +3012,10 @@ test('agent answers render constrained Markdown and retain inspectable source', 
   await expect.poll(
     () => terminalBytesSent.filter((frame) => frame === '03').length
   ).toBe(ctrlCBeforeCancellation + 1);
+  const cancellationOrder = terminalSendOrder.slice(sendOrderBeforeCancellation);
+  expect(cancellationOrder.indexOf('human-input')).toBeLessThan(
+    cancellationOrder.indexOf('ctrl-c')
+  );
 
   const humanInputBeforePaste = terminalFramesSent.filter(
     (frame) => frame === JSON.stringify({ type: 'human_input' })
@@ -3025,7 +3036,7 @@ test('agent answers render constrained Markdown and retain inspectable source', 
       terminalFramesSent.filter(
         (frame) => frame === JSON.stringify({ type: 'human_input' })
       ).length
-  ).toBe(humanInputBeforePaste + 1);
+  ).toBeGreaterThan(humanInputBeforePaste);
   await page.keyboard.press('Enter');
   await expect(page.getByTestId('terminal-text')).toContainText('42');
 

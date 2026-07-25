@@ -244,6 +244,19 @@ fn agent_commands_cross_the_real_pty_http_and_sse_boundary() {
         &["partial"],
     );
 
+    let explicit_new = command_output(&mut shell, "agent new | get id");
+    for needle in [
+        "Agent: starting",
+        "Preparing explicit agent new",
+        "agent-session-",
+    ] {
+        assert!(
+            explicit_new.contains(needle),
+            "`agent new` should show `{needle}` while preserving structured output: {explicit_new:?}"
+        );
+    }
+    assert_status_cleared_before(&explicit_new, "agent-session-");
+
     let active_session_id = controller
         .list_agent_sessions(&explore.id)
         .into_iter()
@@ -438,6 +451,10 @@ sequence=1
 if [ "$launch_number" -eq 1 ]; then
   printf '%s\n' '{"protocolVersion":1,"sequence":1,"causedBy":null,"type":"startup.event","phase":"driver-ready","status":"started","detail":"Waiting before driver.ready"}'
   while :; do sleep 1; done
+fi
+if [ "$launch_number" -eq 4 ]; then
+  printf '%s\n' '{"protocolVersion":1,"sequence":1,"causedBy":null,"type":"startup.event","phase":"explicit-new","status":"started","detail":"Preparing explicit agent new"}'
+  sleep 1
 fi
 printf '%s\n' '{"protocolVersion":1,"sequence":1,"causedBy":null,"type":"driver.ready","driver":{"name":"interactive-shell-fixture","version":"1","revision":null,"features":["streaming","turn-observations-v1"]}}'
 while IFS= read -r line; do

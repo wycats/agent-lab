@@ -1455,11 +1455,20 @@ impl RunController {
         lock(&workspace.agent_sessions).insert(id.clone(), Arc::downgrade(&state));
         persist_agent_session(&state)?;
         lock(&self.inner.agent_sessions).insert(id.clone(), state.clone());
-        record_event(
+        if let Err(error) = record_event(
             &workspace,
             "workbench.agent.session.started",
             json!({ "origin": origin, "sessionId": id }),
-        )?;
+        ) {
+            let message = "workspace session-start evidence could not be persisted";
+            let _ = update_agent_session_status(&state, AgentSessionStatus::Failed, Some(message));
+            let _ = record_agent_event(
+                &state,
+                "agent.session.failed",
+                json!({ "sessionId": id, "message": message }),
+            );
+            return Err(error);
+        }
         let (commands, receiver) = mpsc::channel();
         *lock(&state.commands) = Some(commands);
         let actor_state = state.clone();
@@ -11687,6 +11696,74 @@ sleep 30
         assert_eq!(repaired.harness_id.as_deref(), Some("eve"));
         assert_eq!(repaired.model_profile_id.as_deref(), Some("haiku"));
         assert_eq!(repaired.comparison_harness_ids, ["v0", "eve"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_session_start_event_persistence_retains_a_terminal_session() {
+        let root = temporary_root("agent-session-start-event-failure");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![HarnessProfile {
+                id: "fixture".to_owned(),
+                display_name: "Fixture".to_owned(),
+                launch: DriverLaunch::new("/bin/false"),
+                models: BTreeMap::from([("test".to_owned(), "fixture/test".to_owned())]),
+            }],
+            BTreeMap::from([("test".to_owned(), "Test".to_owned())]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let workspace = controller.state(&explore.id).unwrap();
+        let event_log = workspace.bundle_dir.join("events.jsonl");
+        fs::remove_file(&event_log).unwrap();
+        fs::create_dir(&event_log).unwrap();
+
+        let error = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, RunError::Io(_)));
+        let sessions = controller.list_agent_sessions(&explore.id);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, AgentSessionStatus::Failed);
+        assert_eq!(
+            sessions[0].error.as_deref(),
+            Some("workspace session-start evidence could not be persisted")
+        );
+        let state = controller.agent_session_state(&sessions[0].id).unwrap();
+        assert!(lock(&state.commands).is_none());
+        let manifest: AgentSessionManifest =
+            serde_json::from_slice(&fs::read(state.bundle_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.summary.status, AgentSessionStatus::Failed);
+        assert!(
+            lock(&state.events)
+                .iter()
+                .any(|event| event.kind == "agent.session.failed")
+        );
+
+        drop(workspace);
+        drop(controller);
         fs::remove_dir_all(root).unwrap();
     }
 

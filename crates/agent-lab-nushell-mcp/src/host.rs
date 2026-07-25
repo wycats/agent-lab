@@ -395,6 +395,7 @@ impl NushellHost {
         working_set.add_decl(Box::new(AgentNewCommand {
             bridge: bridge.clone(),
             session_ids: self.workbench_sessions.clone(),
+            status: self.agent_status.clone(),
         }));
         working_set.add_decl(Box::new(AgentSessionsCommand {
             bridge: bridge.clone(),
@@ -1510,6 +1511,22 @@ fn active_agent_session(bridge: &WorkbenchBridge) -> Result<Option<JsonValue>, W
     }))
 }
 
+fn agent_turn_session(bridge: &WorkbenchBridge) -> Result<Option<JsonValue>, WorkbenchError> {
+    let snapshot = bridge.assembly()?;
+    Ok(agent_turn_session_from_snapshot(&snapshot))
+}
+
+fn agent_turn_session_from_snapshot(snapshot: &JsonValue) -> Option<JsonValue> {
+    ["activeAgentSession", "replayAgentSession"]
+        .into_iter()
+        .find_map(|field| {
+            snapshot
+                .get(field)
+                .filter(|session| !session.is_null())
+                .cloned()
+        })
+}
+
 fn select_agent_turn(detail: &JsonValue, requested: Option<&str>) -> Result<JsonValue, String> {
     let turns = detail
         .get("turns")
@@ -1525,8 +1542,8 @@ fn select_agent_turn(detail: &JsonValue, requested: Option<&str>) -> Result<Json
     );
     turn.cloned().ok_or_else(|| {
         requested.map_or_else(
-            || "the active session has no turns yet".to_owned(),
-            |id| format!("turn {id} does not belong to the active session"),
+            || "the selected session has no turns yet".to_owned(),
+            |id| format!("turn {id} does not belong to the selected session"),
         )
     })
 }
@@ -2254,6 +2271,7 @@ impl Drop for AgentTurnTextStream {
 struct AgentNewCommand {
     bridge: WorkbenchBridge,
     session_ids: Arc<RwLock<Vec<String>>>,
+    status: AgentStatusPresenter,
 }
 
 impl Command for AgentNewCommand {
@@ -2281,6 +2299,10 @@ impl Command for AgentNewCommand {
     ) -> Result<PipelineData, ShellError> {
         let harness = call.get_flag::<String>(engine_state, stack, "harness")?;
         let model = call.get_flag::<String>(engine_state, stack, "model")?;
+        let mut status = self.status.begin(stack);
+        if let Some(status) = status.as_mut() {
+            status.set_phase("starting", Some("Starting agent session"));
+        }
         let starting = self
             .bridge
             .start_agent_session_interruptible(harness.as_deref(), model.as_deref(), || {
@@ -2297,10 +2319,15 @@ impl Command for AgentNewCommand {
                     call.head,
                 )
             })?;
+        let mut on_progress = |progress: &JsonValue| {
+            if let Some(status) = status.as_mut() {
+                status.apply_progress(progress);
+            }
+        };
         let mut interrupted = || engine_state.signals().interrupted();
         let session = self
             .bridge
-            .wait_for_agent_session_ready(session_id, &mut |_| {}, &mut interrupted)
+            .wait_for_agent_session_ready(session_id, &mut on_progress, &mut interrupted)
             .map_err(|error| agent_session_start_error(error, call.head))?;
         remember_session(&self.session_ids, &session);
         Ok(json_to_nu(session, call.head).into_pipeline_data())
@@ -2404,7 +2431,7 @@ impl Command for AgentTurnCommand {
             .optional(
                 "turn-id",
                 SyntaxShape::String,
-                "durable turn to inspect across this workspace; omit for the active session's latest turn",
+                "durable turn to inspect across this workspace; omit for the active or replay session's latest turn",
             )
     }
 
@@ -2430,14 +2457,14 @@ impl Command for AgentTurnCommand {
             })?;
             return Ok(json_to_nu(answer, call.head).into_pipeline_data());
         }
-        let session = active_agent_session(&self.bridge)
+        let session = agent_turn_session(&self.bridge)
             .map_err(|error| {
                 shell_error("Agent turn request failed", error.to_string(), call.head)
             })?
             .ok_or_else(|| {
                 shell_error(
                     "No active agent",
-                    "start or switch to an agent session first".to_owned(),
+                    "start an agent session first".to_owned(),
                     call.head,
                 )
             })?;
@@ -2447,7 +2474,7 @@ impl Command for AgentTurnCommand {
             .ok_or_else(|| {
                 shell_error(
                     "Agent turn request failed",
-                    "the active session has no id".to_owned(),
+                    "the selected session has no id".to_owned(),
                     call.head,
                 )
             })?;
@@ -3457,6 +3484,60 @@ mod tests {
             error,
             "turn shared-turn is ambiguous across sessions: session-a, session-z"
         );
+    }
+
+    #[test]
+    fn turn_inspection_prefers_active_session_over_replay() {
+        let active = json!({
+            "id": "active-session",
+            "status": "ready",
+            "active": true,
+            "turnCount": 2
+        });
+        let replay = json!({
+            "id": "interrupted-session",
+            "status": "interrupted",
+            "active": false,
+            "turnCount": 3
+        });
+        let snapshot = json!({
+            "activeAgentSession": active,
+            "replayAgentSession": replay
+        });
+
+        let selected = agent_turn_session_from_snapshot(&snapshot).unwrap();
+
+        assert_eq!(selected["id"], "active-session");
+    }
+
+    #[test]
+    fn interrupted_workbench_session_remains_the_default_turn_replay() {
+        let replay = json!({
+            "id": "interrupted-session",
+            "status": "interrupted",
+            "active": false,
+            "turnCount": 3
+        });
+        let snapshot = json!({
+            "activeAgentSession": null,
+            "replayAgentSession": replay
+        });
+
+        let selected = agent_turn_session_from_snapshot(&snapshot).unwrap();
+
+        assert_eq!(selected["id"], "interrupted-session");
+        assert_eq!(selected["status"], "interrupted");
+        assert_eq!(selected["turnCount"], 3);
+    }
+
+    #[test]
+    fn turn_inspection_has_no_default_without_active_or_replay_session() {
+        let snapshot = json!({
+            "activeAgentSession": null,
+            "replayAgentSession": null
+        });
+
+        assert!(agent_turn_session_from_snapshot(&snapshot).is_none());
     }
 
     #[test]

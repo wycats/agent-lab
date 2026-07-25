@@ -455,6 +455,7 @@ test('a sustained agent stream stays incremental while run inspection remains in
         const encoder = new TextEncoder();
         let timer: ReturnType<typeof setTimeout> | undefined;
         let index = 0;
+        let paused = false;
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
             const emit = () => {
@@ -470,8 +471,22 @@ test('a sustained agent stream stays incremental while run inspection remains in
               controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
               (window as Window & { __agentStreamDeliveredSequence?: number })
                 .__agentStreamDeliveredSequence = event.sequence;
+              if (event.sequence === 2) {
+                paused = true;
+                (window as Window & { __agentStreamPaused?: boolean })
+                  .__agentStreamPaused = true;
+                return;
+              }
               timer = setTimeout(emit, 25);
             };
+            (window as Window & { __resumeAgentStream?: () => void })
+              .__resumeAgentStream = () => {
+                if (!paused) return;
+                paused = false;
+                (window as Window & { __agentStreamPaused?: boolean })
+                  .__agentStreamPaused = false;
+                timer = setTimeout(emit, 25);
+              };
             timer = setTimeout(emit, 25);
             init?.signal?.addEventListener('abort', () => {
               if (timer !== undefined) clearTimeout(timer);
@@ -695,6 +710,11 @@ test('a sustained agent stream stays incremental while run inspection remains in
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
   const session = page.getByTestId('interactive-agent-session');
   await expect(session.getByRole('heading', { name: 'Stream complete', level: 3 })).toBeVisible();
+  await expect.poll(() =>
+    page.evaluate(() =>
+      (window as Window & { __agentStreamPaused?: boolean }).__agentStreamPaused ?? false
+    )
+  ).toBe(true);
   await expect.poll(() => sessionDetailRequests).toBe(2);
   const liveStatus = session.getByTestId('agent-live-status');
   await expect(liveStatus).toHaveAttribute('data-phase', 'responding');
@@ -703,10 +723,19 @@ test('a sustained agent stream stays incremental while run inspection remains in
   await expect(liveStatus.getByRole('button', { name: 'Cancel turn' })).toBeEnabled();
   const initialElapsed = await liveStatus.locator('time').textContent();
   await expect.poll(() => liveStatus.locator('time').textContent()).not.toBe(initialElapsed);
+  await page.waitForTimeout(200);
   expect(sessionDetailRequests).toBe(2);
+  const requestsBeforeResume = sessionDetailRequests;
   await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'running');
+  await page.evaluate(() => {
+    const resume = (window as Window & { __resumeAgentStream?: () => void }).__resumeAgentStream;
+    if (!resume) throw new Error('agent stream resume hook is unavailable');
+    resume();
+  });
   await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'completed');
-  await expect.poll(() => sessionDetailRequests).toBe(3);
+  await expect.poll(() => sessionDetailRequests).toBe(requestsBeforeResume + 1);
+  await page.waitForTimeout(200);
+  expect(sessionDetailRequests).toBe(requestsBeforeResume + 1);
   await expect(session.getByTestId('agent-live-status')).toHaveCount(0);
 
   const evidence = session.locator('.turn-evidence');

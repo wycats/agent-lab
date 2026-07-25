@@ -435,7 +435,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 async function streamEvents(
   path: string,
   signal: AbortSignal,
-  onEvent: (event: RunEvent) => void
+  onEvent: (event: RunEvent) => void,
+  onOpen?: () => void
 ): Promise<void> {
   const token = await processToken();
   const response = await fetch(path, {
@@ -446,6 +447,7 @@ async function streamEvents(
   if (!response.ok || !response.body) {
     throw new Error(`event stream failed with HTTP ${response.status}`);
   }
+  onOpen?.();
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = '';
   while (!signal.aborted) {
@@ -465,6 +467,28 @@ async function streamEvents(
       boundary = buffer.indexOf('\n\n');
     }
   }
+}
+
+const AGENT_SESSION_RECONNECT_INITIAL_MS = 100;
+const AGENT_SESSION_RECONNECT_MAX_MS = 2_000;
+const AGENT_SESSION_RECONNECT_STABLE_MS = 5_000;
+
+function waitForAbortableDelay(milliseconds: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (elapsed: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+      resolve(elapsed);
+    };
+    const timer = setTimeout(() => finish(true), milliseconds);
+    const abort = () => finish(false);
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+  });
 }
 
 export function createRunClient(): RunClient {
@@ -540,13 +564,33 @@ export function createRunClient(): RunClient {
       ),
     agentSessionEvents(workspaceId, sessionId, onEvent) {
       const controller = new AbortController();
-      void streamEvents(
-        `/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}/events`,
-        controller.signal,
-        onEvent
-      ).catch((error) => {
-        if (!controller.signal.aborted) console.error(error);
-      });
+      const path = `/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}/events`;
+      void (async () => {
+        let retryDelayMs = AGENT_SESSION_RECONNECT_INITIAL_MS;
+        while (!controller.signal.aborted) {
+          let connectedAtMs: number | undefined;
+          try {
+            await streamEvents(
+              path,
+              controller.signal,
+              onEvent,
+              () => (connectedAtMs = Date.now())
+            );
+          } catch {
+            // A later connection replays durable events, and the view de-duplicates
+            // them by sequence before applying them.
+          }
+          if (controller.signal.aborted) return;
+          if (
+            connectedAtMs !== undefined &&
+            Date.now() - connectedAtMs >= AGENT_SESSION_RECONNECT_STABLE_MS
+          ) {
+            retryDelayMs = AGENT_SESSION_RECONNECT_INITIAL_MS;
+          }
+          if (!(await waitForAbortableDelay(retryDelayMs, controller.signal))) return;
+          retryDelayMs = Math.min(retryDelayMs * 2, AGENT_SESSION_RECONNECT_MAX_MS);
+        }
+      })();
       return controller;
     }
   };

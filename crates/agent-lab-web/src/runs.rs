@@ -712,7 +712,7 @@ struct RunState {
     secret_values: Mutex<Vec<Vec<u8>>>,
     agent_sessions: Mutex<HashMap<String, Weak<AgentSessionState>>>,
     active_agent_session_id: Mutex<Option<String>>,
-    active_agent_turn: Mutex<Option<AgentTurnAttribution>>,
+    active_agent_turn: Mutex<Option<AgentTurnReservation>>,
     capability_attributions: Mutex<HashMap<String, AgentTurnAttribution>>,
     reusable_explore: bool,
     replay_failed: bool,
@@ -1051,6 +1051,46 @@ struct AgentTurnAttribution {
     turn_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentTurnReservation {
+    attribution: AgentTurnAttribution,
+    pending_human_intervention_at_ms: Option<u128>,
+}
+
+impl AgentTurnReservation {
+    fn new(attribution: AgentTurnAttribution) -> Self {
+        Self {
+            attribution,
+            pending_human_intervention_at_ms: None,
+        }
+    }
+
+    fn matches(&self, attribution: &AgentTurnAttribution) -> bool {
+        self.attribution == *attribution
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AGENT_TURN_PREPARATION_PAUSE:
+        std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn maybe_pause_agent_turn_preparation() {
+    AGENT_TURN_PREPARATION_PAUSE.with(|pause| {
+        if let Some((reached, release)) = pause.borrow_mut().take() {
+            reached
+                .send(())
+                .expect("agent turn preparation observer should remain available");
+            release
+                .recv()
+                .expect("agent turn preparation release should remain available");
+        }
+    });
+}
+
 struct ActiveAgentTurnGuard<'a> {
     workspace: &'a RunState,
     attribution: AgentTurnAttribution,
@@ -1062,7 +1102,10 @@ impl<'a> ActiveAgentTurnGuard<'a> {
             session_id: session_id.to_owned(),
             turn_id: turn_id.to_owned(),
         };
-        if lock(&workspace.active_agent_turn).as_ref() != Some(&attribution) {
+        if !lock(&workspace.active_agent_turn)
+            .as_ref()
+            .is_some_and(|reservation| reservation.matches(&attribution))
+        {
             return Err(RunError::Protocol(format!(
                 "agent turn {turn_id} did not own the workspace turn reservation"
             )));
@@ -1078,7 +1121,10 @@ impl<'a> ActiveAgentTurnGuard<'a> {
         persist_terminal_state: impl FnOnce() -> Result<T, RunError>,
     ) -> Result<T, RunError> {
         let mut active = lock(&self.workspace.active_agent_turn);
-        if active.as_ref() != Some(&self.attribution) {
+        if !active
+            .as_ref()
+            .is_some_and(|reservation| reservation.matches(&self.attribution))
+        {
             return Err(RunError::Protocol(format!(
                 "agent turn {} lost the workspace turn reservation",
                 self.attribution.turn_id
@@ -1093,7 +1139,10 @@ impl<'a> ActiveAgentTurnGuard<'a> {
 impl Drop for ActiveAgentTurnGuard<'_> {
     fn drop(&mut self) {
         let mut active = lock(&self.workspace.active_agent_turn);
-        if active.as_ref() == Some(&self.attribution) {
+        if active
+            .as_ref()
+            .is_some_and(|reservation| reservation.matches(&self.attribution))
+        {
             *active = None;
         }
     }
@@ -1101,7 +1150,10 @@ impl Drop for ActiveAgentTurnGuard<'_> {
 
 fn release_agent_turn_reservation(workspace: &RunState, attribution: &AgentTurnAttribution) {
     let mut active = lock(&workspace.active_agent_turn);
-    if active.as_ref() == Some(attribution) {
+    if active
+        .as_ref()
+        .is_some_and(|reservation| reservation.matches(attribution))
+    {
         *active = None;
     }
 }
@@ -1146,6 +1198,23 @@ fn rollback_agent_turn_start(
     let _ = persist_agent_session(state);
     let _ = remove_confined_evidence_entry(&state.evidence_root, turn_relative);
     release_agent_turn_reservation(workspace, attribution);
+}
+
+fn record_agent_human_intervention(
+    state: &AgentSessionState,
+    attribution: &AgentTurnAttribution,
+    marked_at_ms: u128,
+) -> Result<(), RunError> {
+    record_agent_event(
+        state,
+        "agent.turn.human-intervention",
+        json!({
+            "sessionId": attribution.session_id,
+            "turnId": attribution.turn_id,
+            "atMs": marked_at_ms,
+            "source": "terminal-input",
+        }),
+    )
 }
 
 fn agent_turn_was_intervened(state: &AgentSessionState, turn_id: &str) -> bool {
@@ -1454,20 +1523,20 @@ impl RunController {
         let replay_agent_session = active_agent_session
             .is_none()
             .then(|| {
-                let replay_session_id = lock(&state.events)
+                lock(&state.events)
                     .iter()
                     .rev()
-                    .find(|event| event.kind == "workbench.agent.session.activated")
-                    .and_then(|event| event.payload.get("sessionId"))
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_owned)?;
-                agent_sessions
-                    .iter()
-                    .find(|session| {
-                        session.id == replay_session_id
-                            && session.status == AgentSessionStatus::Interrupted
+                    .filter(|event| event.kind == "workbench.agent.session.activated")
+                    .filter_map(|event| event.payload.get("sessionId").and_then(JsonValue::as_str))
+                    .find_map(|replay_session_id| {
+                        agent_sessions
+                            .iter()
+                            .find(|session| {
+                                session.id == replay_session_id
+                                    && session.status == AgentSessionStatus::Interrupted
+                            })
+                            .cloned()
                     })
-                    .cloned()
             })
             .flatten();
         Ok(WorkbenchSnapshot {
@@ -1930,8 +1999,10 @@ impl RunController {
             {
                 return Err(RunError::RunUnavailable(session_id.to_owned()));
             }
-            *active = Some(attribution.clone());
+            *active = Some(AgentTurnReservation::new(attribution.clone()));
         }
+        #[cfg(test)]
+        maybe_pause_agent_turn_preparation();
         let turn_relative = PathBuf::from("turns").join(&id);
         let prepared = (|| -> Result<(AgentTurnSummary, CancellationToken, Vec<CapabilityEndpoint>), RunError> {
             create_confined_evidence_directory(&state.evidence_root, &turn_relative)?;
@@ -1941,7 +2012,7 @@ impl RunController {
                 &turn_relative,
             )?;
             let secrets = lock(&state.secret_values).clone();
-            let turn = AgentTurnSummary {
+            let mut turn = AgentTurnSummary {
                 id: id.clone(),
                 session_id: session_id.to_owned(),
                 prompt: redact_string(&request.prompt, &secrets),
@@ -1961,6 +2032,18 @@ impl RunController {
             error: None,
             human_intervention_at_ms: None,
         };
+            let mut active = lock(&workspace.active_agent_turn);
+            let reservation = active
+                .as_mut()
+                .filter(|reservation| reservation.matches(&attribution))
+                .ok_or_else(|| {
+                    RunError::Protocol(format!(
+                        "agent turn {} lost the workspace turn reservation during preparation",
+                        attribution.turn_id
+                    ))
+                })?;
+            turn.human_intervention_at_ms =
+                reservation.pending_human_intervention_at_ms.take();
             lock(&state.turns).push(turn.clone());
             let cancel = CancellationToken::new();
             *lock(&state.turn_cancel) = Some(cancel.clone());
@@ -1976,6 +2059,10 @@ impl RunController {
                     "capabilityRevisions": turn.capability_revisions,
                 }),
             )?;
+            if let Some(marked_at_ms) = turn.human_intervention_at_ms {
+                record_agent_human_intervention(&state, &attribution, marked_at_ms)?;
+            }
+            drop(active);
             Ok((turn, cancel, capabilities))
         })();
         let (turn, cancel, capabilities) = match prepared {
@@ -2035,19 +2122,20 @@ impl RunController {
     /// when the intervention marker cannot be persisted.
     pub fn note_terminal_input(&self, workspace_id: &str) -> Result<(), RunError> {
         let workspace = self.state(workspace_id)?;
-        let active_turn = lock(&workspace.active_agent_turn);
-        let Some(attribution) = active_turn.clone() else {
+        let mut active_turn = lock(&workspace.active_agent_turn);
+        let Some(reservation) = active_turn.as_mut() else {
             return Ok(());
         };
+        let attribution = reservation.attribution.clone();
         let session = self.agent_session_state(&attribution.session_id)?;
         let marked_at_ms = {
             let mut turns = lock(&session.turns);
-            let turn = turns
-                .iter_mut()
-                .find(|turn| turn.id == attribution.turn_id)
-                .ok_or_else(|| {
-                    RunError::InvalidRequest(format!("unknown agent turn: {}", attribution.turn_id))
-                })?;
+            let Some(turn) = turns.iter_mut().find(|turn| turn.id == attribution.turn_id) else {
+                reservation
+                    .pending_human_intervention_at_ms
+                    .get_or_insert_with(now_ms);
+                return Ok(());
+            };
             if turn.human_intervention_at_ms.is_some() {
                 return Ok(());
             }
@@ -2056,16 +2144,7 @@ impl RunController {
             marked_at_ms
         };
         persist_agent_session(&session)?;
-        let result = record_agent_event(
-            &session,
-            "agent.turn.human-intervention",
-            json!({
-                "sessionId": attribution.session_id,
-                "turnId": attribution.turn_id,
-                "atMs": marked_at_ms,
-                "source": "terminal-input",
-            }),
-        );
+        let result = record_agent_human_intervention(&session, &attribution, marked_at_ms);
         drop(active_turn);
         result
     }
@@ -2093,7 +2172,7 @@ impl RunController {
             let active = lock(&workspace.active_agent_turn);
             if active
                 .as_ref()
-                .is_some_and(|turn| turn.session_id == session_id)
+                .is_some_and(|turn| turn.attribution.session_id == session_id)
             {
                 return Err(RunError::InvalidRequest(
                     "cancel or finish this session's active turn before closing it".to_owned(),
@@ -3686,7 +3765,9 @@ fn capability_event_attribution(
     let call_id = payload.get("callId").and_then(JsonValue::as_str);
     let key = call_id.map(|call_id| format!("{source}:{call_id}"));
     if kind == "mcp.tool.started" {
-        let attribution = lock(&state.active_agent_turn).clone();
+        let attribution = lock(&state.active_agent_turn)
+            .as_ref()
+            .map(|reservation| reservation.attribution.clone());
         if let (Some(key), Some(attribution)) = (key, attribution.clone()) {
             lock(&state.capability_attributions).insert(key, attribution);
         }
@@ -3695,9 +3776,15 @@ fn capability_event_attribution(
     if kind == "mcp.tool.completed" {
         return key
             .and_then(|key| lock(&state.capability_attributions).remove(&key))
-            .or_else(|| lock(&state.active_agent_turn).clone());
+            .or_else(|| {
+                lock(&state.active_agent_turn)
+                    .as_ref()
+                    .map(|reservation| reservation.attribution.clone())
+            });
     }
-    lock(&state.active_agent_turn).clone()
+    lock(&state.active_agent_turn)
+        .as_ref()
+        .map(|reservation| reservation.attribution.clone())
 }
 
 async fn start_mcp_source<S>(
@@ -12714,7 +12801,9 @@ done
                 .agent_session(&explore.id, &active_session.id)
                 .unwrap();
             if detail.summary.status == AgentSessionStatus::Running
-                && lock(&workspace.active_agent_turn).as_ref() == Some(&active_attribution)
+                && lock(&workspace.active_agent_turn)
+                    .as_ref()
+                    .is_some_and(|reservation| reservation.matches(&active_attribution))
             {
                 break;
             }
@@ -12756,9 +12845,10 @@ done
             lock(&workspace.active_agent_session_id).as_deref(),
             Some(active_session.id.as_str())
         );
-        assert_eq!(
-            lock(&workspace.active_agent_turn).as_ref(),
-            Some(&active_attribution)
+        assert!(
+            lock(&workspace.active_agent_turn)
+                .as_ref()
+                .is_some_and(|reservation| reservation.matches(&active_attribution))
         );
         assert_eq!(
             controller
@@ -13258,10 +13348,11 @@ done
         fs::create_dir_all(session_dir.join("turns/turn-1")).unwrap();
         let session = Arc::new(test_agent_session_state(&session_dir));
         lock(&session.summary).workspace_id = "run-events".to_owned();
-        *lock(&workspace.active_agent_turn) = Some(AgentTurnAttribution {
-            session_id: "session-1".to_owned(),
-            turn_id: "turn-1".to_owned(),
-        });
+        *lock(&workspace.active_agent_turn) =
+            Some(AgentTurnReservation::new(AgentTurnAttribution {
+                session_id: "session-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+            }));
         lock(&workspace.agent_sessions).insert("session-1".to_owned(), Arc::downgrade(&session));
         lock(&controller.inner.runs).insert("run-events".to_owned(), Arc::clone(&workspace));
         lock(&controller.inner.agent_sessions).insert("session-1".to_owned(), Arc::clone(&session));
@@ -13306,6 +13397,101 @@ done
                 .all(|event| event.kind != "agent.turn.human-intervention")
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_input_during_turn_preparation_is_retained_without_disconnect() {
+        let (root, controller, explore, session) = start_interactive_fixture(
+            "terminal-input-during-turn-preparation",
+            interactive_fixture_launch(),
+        )
+        .await;
+        let state = controller.agent_session_state(&session.id).unwrap();
+        let workspace = controller.state(&explore.id).unwrap();
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let starter_controller = controller.clone();
+        let workspace_id = explore.id.clone();
+        let session_id = session.id.clone();
+        let starter = thread::spawn(move || {
+            AGENT_TURN_PREPARATION_PAUSE.with(|pause| {
+                assert!(pause.borrow().is_none());
+                *pause.borrow_mut() = Some((reached_tx, release_rx));
+            });
+            starter_controller.start_agent_turn(
+                &workspace_id,
+                &session_id,
+                StartAgentTurnRequest {
+                    prompt: "retain input during preparation".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Nushell,
+            )
+        });
+        reached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("agent turn did not reach the preparation pause");
+
+        controller.note_terminal_input(&explore.id).unwrap();
+        let first_mark = lock(&workspace.active_agent_turn)
+            .as_ref()
+            .and_then(|reservation| reservation.pending_human_intervention_at_ms)
+            .expect("terminal input should mark the pending turn reservation");
+        controller.note_terminal_input(&explore.id).unwrap();
+        assert_eq!(
+            lock(&workspace.active_agent_turn)
+                .as_ref()
+                .and_then(|reservation| reservation.pending_human_intervention_at_ms),
+            Some(first_mark),
+            "repeated pending input should retain the first intervention timestamp"
+        );
+        assert!(lock(&state.turns).is_empty());
+        assert!(
+            lock(&state.events)
+                .iter()
+                .all(|event| event.kind != "agent.turn.human-intervention")
+        );
+
+        release_tx.send(()).unwrap();
+        let turn = starter.join().unwrap().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            let observed = detail
+                .turns
+                .iter()
+                .find(|candidate| candidate.summary.id == turn.id)
+                .unwrap();
+            if observed.summary.status == AgentTurnStatus::Intervened {
+                assert_eq!(observed.summary.outcome.as_deref(), Some("intervened"));
+                assert_eq!(observed.summary.human_intervention_at_ms, Some(first_mark));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "prepared turn did not finish as intervened"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let intervention_events = lock(&state.events)
+            .iter()
+            .filter(|event| {
+                event.kind == "agent.turn.human-intervention" && event.payload["turnId"] == turn.id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(intervention_events.len(), 1);
+        assert_eq!(intervention_events[0].payload["atMs"], json!(first_mark));
+        let manifest: AgentSessionManifest = serde_json::from_slice(
+            &fs::read(state.evidence_root.display_path().join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.turns[0].human_intervention_at_ms, Some(first_mark));
+
+        controller.cancel(&explore.id).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -14215,10 +14401,11 @@ sleep 30
             secret_values: Mutex::new(Vec::new()),
         });
         lock(&workspace.agent_sessions).insert("session-1".to_owned(), Arc::downgrade(&session));
-        *lock(&workspace.active_agent_turn) = Some(AgentTurnAttribution {
-            session_id: "session-1".to_owned(),
-            turn_id: "turn-1".to_owned(),
-        });
+        *lock(&workspace.active_agent_turn) =
+            Some(AgentTurnReservation::new(AgentTurnAttribution {
+                session_id: "session-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+            }));
 
         let observe = source_observer(workspace.clone(), "catalog", "agent");
         observe(
@@ -15665,6 +15852,111 @@ sleep 30
                 .presentation,
             expected
         );
+
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn replay_selection_skips_a_newer_closed_session_after_restart() {
+        let (root, controller, explore, older_session) = start_interactive_fixture(
+            "interrupted-agent-replay-skips-closed",
+            interactive_fixture_launch(),
+        )
+        .await;
+        let newer_session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let observed = controller
+                .list_agent_sessions(&explore.id)
+                .into_iter()
+                .find(|candidate| candidate.id == newer_session.id)
+                .unwrap();
+            if observed.status == AgentSessionStatus::Ready && observed.active {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "newer agent session did not become active"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        controller
+            .close_agent_session(&explore.id, &newer_session.id)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let sessions = controller.list_agent_sessions(&explore.id);
+            let older = sessions
+                .iter()
+                .find(|candidate| candidate.id == older_session.id)
+                .unwrap();
+            let newer = sessions
+                .iter()
+                .find(|candidate| candidate.id == newer_session.id)
+                .unwrap();
+            if older.status == AgentSessionStatus::Ready
+                && !older.active
+                && newer.status == AgentSessionStatus::Closed
+                && !newer.active
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "newer session did not close while the older session remained live"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        drop(controller);
+
+        let reopened = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: root.join("scenarios"),
+                data_dir: root.join("runs"),
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![HarnessProfile {
+                id: "fixture".to_owned(),
+                display_name: "Fixture".to_owned(),
+                launch: interactive_fixture_launch(),
+                models: BTreeMap::from([("test".to_owned(), "fixture/test".to_owned())]),
+            }],
+            BTreeMap::from([("test".to_owned(), "Test".to_owned())]),
+        )
+        .unwrap();
+        let workbench = reopened.workbench(&explore.id).unwrap();
+        assert!(workbench.active_agent_session.is_none());
+        assert_eq!(
+            workbench
+                .agent_sessions
+                .iter()
+                .find(|candidate| candidate.id == newer_session.id)
+                .unwrap()
+                .status,
+            AgentSessionStatus::Closed
+        );
+        assert_eq!(
+            workbench
+                .agent_sessions
+                .iter()
+                .find(|candidate| candidate.id == older_session.id)
+                .unwrap()
+                .status,
+            AgentSessionStatus::Interrupted
+        );
+        let replay = workbench.replay_agent_session.unwrap();
+        assert_eq!(replay.id, older_session.id);
+        assert_eq!(replay.status, AgentSessionStatus::Interrupted);
 
         drop(reopened);
         fs::remove_dir_all(root).unwrap();

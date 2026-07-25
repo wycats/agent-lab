@@ -763,6 +763,406 @@ test('a sustained agent stream stays incremental while run inspection remains in
   await page.unrouteAll({ behavior: 'wait' });
 });
 
+test('agent session events recover from clean EOF and read failure without duplicating evidence', async ({ page }) => {
+  const sessionId = 'recovering-stream-session';
+  const turnId = 'recovering-stream-turn';
+  const messageId = 'recovering-stream-message';
+  const startedAtMs = Date.now() - 1_000;
+  const events = [{
+    sequence: 1,
+    atMs: startedAtMs,
+    type: 'agent.turn.started',
+    payload: { sessionId, turnId, prompt: 'Recover this answer', input: null }
+  }, {
+    sequence: 2,
+    atMs: startedAtMs + 100,
+    type: 'observation.assistant.delta',
+    payload: { sessionId, turnId, event: { messageId, text: '# Recovered answer' } }
+  }, {
+    sequence: 3,
+    atMs: startedAtMs + 200,
+    type: 'observation.assistant.completed',
+    payload: {
+      sessionId,
+      turnId,
+      event: { messageId, text: '# Recovered answer\n\nDurable after reconnect.' }
+    }
+  }, {
+    sequence: 4,
+    atMs: startedAtMs + 300,
+    type: 'agent.turn.finished',
+    payload: { sessionId, turnId, outcome: 'completed' }
+  }];
+  let workspaceId = '';
+  let sessionDetailRequests = 0;
+
+  await page.addInitScript(({ sessionId, events }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (!requestUrl.pathname.endsWith(`/agent-sessions/${sessionId}/events`)) {
+        return nativeFetch(input, init);
+      }
+
+      const state = window as Window & {
+        __recoveringAgentStreamAttempts?: number;
+        __recoveringAgentStreamDeliveredSequence?: number;
+      };
+      const attempt = (state.__recoveringAgentStreamAttempts ?? 0) + 1;
+      state.__recoveringAgentStreamAttempts = attempt;
+      const encoder = new TextEncoder();
+      let closed = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const publish = (event: (typeof events)[number]) => {
+            if (closed || init?.signal?.aborted) return;
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            state.__recoveringAgentStreamDeliveredSequence = Math.max(
+              state.__recoveringAgentStreamDeliveredSequence ?? 0,
+              event.sequence
+            );
+          };
+          timer = setTimeout(() => {
+            if (attempt === 1) {
+              publish(events[0]);
+              closed = true;
+              controller.close();
+              return;
+            }
+            if (attempt === 2) {
+              publish(events[0]);
+              publish(events[1]);
+              closed = true;
+              controller.error(new Error('fixture agent stream read failure'));
+              return;
+            }
+            for (const event of events) publish(event);
+          }, 20);
+          init?.signal?.addEventListener('abort', () => {
+            if (timer !== undefined) clearTimeout(timer);
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The stream may already have failed.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          if (timer !== undefined) clearTimeout(timer);
+          closed = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+      });
+    };
+  }, { sessionId, events });
+
+  const summary = {
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'ready',
+    active: true,
+    createdAtMs: startedAtMs - 500,
+    updatedAtMs: startedAtMs - 500,
+    turnCount: 0
+  };
+  const sessionDetail = (deliveredSequence: number) => {
+    const deliveredEvents = events.filter((event) => event.sequence <= deliveredSequence);
+    const started = deliveredSequence >= 1;
+    const hasDelta = deliveredSequence >= 2;
+    const answerComplete = deliveredSequence >= 3;
+    const finished = deliveredSequence >= 4;
+    const response = answerComplete
+      ? '# Recovered answer\n\nDurable after reconnect.'
+      : hasDelta
+        ? '# Recovered answer'
+        : null;
+    return {
+      projectionVersion: 2,
+      summary: {
+        ...summary,
+        workspaceId,
+        status: started && !finished ? 'running' : 'ready',
+        updatedAtMs: deliveredEvents.at(-1)?.atMs ?? summary.updatedAtMs,
+        turnCount: started ? 1 : 0
+      },
+      turns: started
+        ? [{
+            id: turnId,
+            sessionId,
+            prompt: 'Recover this answer',
+            sourceRevision: 'sha256:recovering-stream',
+            capabilityRevisions: {},
+            status: finished ? 'completed' : 'running',
+            startedAtMs,
+            finishedAtMs: finished ? events[3].atMs : undefined,
+            outcome: finished ? 'completed' : undefined,
+            presentation: {
+              schemaVersion: 2,
+              response,
+              messages: response
+                ? [{
+                    id: messageId,
+                    text: response,
+                    complete: answerComplete,
+                    sourceEventSequences: answerComplete ? [2, 3] : [2]
+                  }]
+                : [],
+              activity: [],
+              usage: null,
+              completeness: {
+                assistantOutput: answerComplete ? 'complete' : response ? 'partial' : 'unavailable',
+                capabilityActivity: finished ? 'complete' : 'partial',
+                nativeActivity: finished ? 'complete' : 'partial',
+                workspaceEffects: finished ? 'complete' : 'partial',
+                usage: 'unavailable'
+              },
+              sourceEventSequences: deliveredEvents.map((event) => event.sequence),
+              sourceDigest: finished ? 'sha256:recovered' : 'sha256:recovering'
+            }
+          }]
+        : [],
+      events: deliveredEvents
+    };
+  };
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    summary.workspaceId = workspaceId;
+    workbench.activeAgentSession = summary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`), async (route) => {
+    sessionDetailRequests += 1;
+    const deliveredSequence = await page.evaluate(() =>
+      (window as Window & { __recoveringAgentStreamDeliveredSequence?: number })
+        .__recoveringAgentStreamDeliveredSequence ?? 0
+    );
+    await route.fulfill({ json: sessionDetail(deliveredSequence) });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { __recoveringAgentStreamAttempts?: number })
+      .__recoveringAgentStreamAttempts ?? 0
+  )).toBe(3);
+  const session = page.getByTestId('interactive-agent-session');
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'completed');
+  await expect(session.getByRole('heading', { name: 'Recovered answer', level: 3 })).toHaveCount(1);
+  await expect(session.locator('.assistant-message')).toHaveCount(1);
+  await expect(session).toContainText('Durable after reconnect.');
+  const evidence = session.locator('.turn-evidence');
+  await evidence.locator(':scope > summary').click();
+  await evidence.locator('.turn-raw-events > summary').click();
+  await expect(evidence.locator('.run-events .sequence')).toHaveText(['01', '02', '03', '04']);
+  const settledDetailRequests = sessionDetailRequests;
+  await page.waitForTimeout(400);
+  expect(sessionDetailRequests).toBe(settledDetailRequests);
+  expect(await page.evaluate(() =>
+    (window as Window & { __recoveringAgentStreamAttempts?: number })
+      .__recoveringAgentStreamAttempts ?? 0
+  )).toBe(3);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('terminal reconciliation retries failed and stale detail without losing canonical evidence', async ({ page }) => {
+  const sessionId = 'reconciliation-retry-session';
+  const turnId = 'reconciliation-retry-turn';
+  const startedAtMs = Date.now() - 1_000;
+  const startedEvent = {
+    sequence: 1,
+    atMs: startedAtMs,
+    type: 'agent.turn.started',
+    payload: { sessionId, turnId, prompt: 'Create the result', input: null }
+  };
+  const finishedEvent = {
+    sequence: 2,
+    atMs: startedAtMs + 500,
+    type: 'agent.turn.finished',
+    payload: { sessionId, turnId, outcome: 'completed' }
+  };
+  let workspaceId = '';
+  let sessionDetailRequests = 0;
+
+  await page.addInitScript(({ sessionId, finishedEvent }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (!requestUrl.pathname.endsWith(`/agent-sessions/${sessionId}/events`)) {
+        return nativeFetch(input, init);
+      }
+      const state = window as Window & { __reconciliationStreamAttempts?: number };
+      state.__reconciliationStreamAttempts = (state.__reconciliationStreamAttempts ?? 0) + 1;
+      const encoder = new TextEncoder();
+      let closed = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          timer = setTimeout(() => {
+            if (closed || init?.signal?.aborted) return;
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(finishedEvent)}\n\n`));
+          }, 25);
+          init?.signal?.addEventListener('abort', () => {
+            if (timer !== undefined) clearTimeout(timer);
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The stream may already have closed with the page.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          if (timer !== undefined) clearTimeout(timer);
+          closed = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+      });
+    };
+  }, { sessionId, finishedEvent });
+
+  const summary = {
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'running',
+    active: true,
+    createdAtMs: startedAtMs - 500,
+    updatedAtMs: startedAtMs,
+    turnCount: 1
+  };
+  const sessionDetail = (complete: boolean) => ({
+    projectionVersion: 2,
+    summary: {
+      ...summary,
+      workspaceId,
+      status: complete ? 'ready' : 'running',
+      updatedAtMs: complete ? finishedEvent.atMs : startedEvent.atMs
+    },
+    turns: [{
+      id: turnId,
+      sessionId,
+      prompt: 'Create the result',
+      sourceRevision: 'sha256:reconcile',
+      capabilityRevisions: {},
+      status: complete ? 'completed' : 'running',
+      startedAtMs,
+      finishedAtMs: complete ? finishedEvent.atMs : undefined,
+      outcome: complete ? 'completed' : undefined,
+      presentation: {
+        schemaVersion: 2,
+        response: 'Created the result.',
+        messages: [{
+          id: 'reconciliation-message',
+          text: 'Created the result.',
+          complete: true,
+          sourceEventSequences: [1]
+        }],
+        activity: complete
+          ? [{
+              kind: 'workspace-effect',
+              title: 'Created result.json',
+              detail: 'Captured in the finalized workspace.',
+              status: 'completed',
+              source: null,
+              path: 'result.json',
+              changeKind: 'created',
+              entryType: 'file',
+              sourceEventSequences: [2]
+            }]
+          : [],
+        usage: null,
+        completeness: {
+          assistantOutput: 'complete',
+          capabilityActivity: complete ? 'complete' : 'partial',
+          nativeActivity: complete ? 'complete' : 'partial',
+          workspaceEffects: complete ? 'complete' : 'partial',
+          usage: 'unavailable'
+        },
+        sourceEventSequences: complete ? [1, 2] : [1],
+        sourceDigest: complete ? 'sha256:reconciled' : 'sha256:pending'
+      }
+    }],
+    events: complete ? [startedEvent, finishedEvent] : [startedEvent]
+  });
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    summary.workspaceId = workspaceId;
+    workbench.activeAgentSession = summary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`), async (route) => {
+    sessionDetailRequests += 1;
+    if (sessionDetailRequests === 2) {
+      await route.fulfill({
+        status: 503,
+        json: { error: 'fixture detail projection is temporarily unavailable' }
+      });
+      return;
+    }
+    await route.fulfill({ json: sessionDetail(sessionDetailRequests >= 4) });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect(page.getByRole('alert')).toContainText(
+    'Agent session evidence is temporarily unavailable'
+  );
+  await expect.poll(() => sessionDetailRequests).toBe(4);
+  const session = page.getByTestId('interactive-agent-session');
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'completed');
+  const workspaceEffect = session.locator('.turn-activity li[data-kind="workspace-effect"]');
+  await expect(workspaceEffect).toContainText('Created result.json');
+  await expect(workspaceEffect).toContainText('Captured in the finalized workspace.');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  const settledDetailRequests = sessionDetailRequests;
+  await page.waitForTimeout(400);
+  expect(sessionDetailRequests).toBe(settledDetailRequests);
+  expect(await page.evaluate(() =>
+    (window as Window & { __reconciliationStreamAttempts?: number })
+      .__reconciliationStreamAttempts ?? 0
+  )).toBe(1);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
 test('an active turn can be cancelled from compact progress without polling', async ({ page }) => {
   const sessionId = 'cancel-session';
   const turnId = 'cancel-turn';

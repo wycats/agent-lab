@@ -35,6 +35,9 @@
     segments: Record<string, BehaviorSegment | undefined>;
   };
 
+  const AGENT_SESSION_RECONCILE_INITIAL_MS = 100;
+  const AGENT_SESSION_RECONCILE_MAX_MS = 2_000;
+
   function agentSessionIsHistorical(summary: AgentSessionDetail['summary']): boolean {
     return summary.status === 'failed' || summary.status === 'closed' || summary.status === 'interrupted';
   }
@@ -53,6 +56,8 @@
   let knownAgentSessionEventSequences = new Set<number>();
   let agentSessionReconcileInFlight: Promise<void> | undefined;
   let agentSessionReconcileTarget: AgentSessionReconcileTarget | undefined;
+  let agentSessionReconcileRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let agentSessionReconcileRetryDelayMs = AGENT_SESSION_RECONCILE_INITIAL_MS;
   let agentSessionOpenVersion = 0;
   let connectionState: ConnectionState = 'starting';
   let sessionEvents: SessionEvent[] = [];
@@ -82,6 +87,7 @@
   let agentView: AgentView = 'review';
   let agentAnswerView: AgentAnswerView = 'rendered';
   let actionError = '';
+  let agentSessionSyncError = '';
   let preparing = false;
   let starting = false;
   let fixtureOnly = false;
@@ -238,6 +244,7 @@
       return;
     }
     const openVersion = ++agentSessionOpenVersion;
+    clearAgentSessionReconciliation();
     const detail = await runClient.agentSession(workspaceId, sessionId);
     if (
       openVersion !== agentSessionOpenVersion ||
@@ -274,7 +281,7 @@
     agentSessionEventFlushTimer = undefined;
     pendingAgentSessionEvents = [];
     knownAgentSessionEventSequences = new Set();
-    agentSessionReconcileTarget = undefined;
+    clearAgentSessionReconciliation();
     activeAgentSession = undefined;
     agentAnswerView = 'rendered';
     agentTurnCancelling = false;
@@ -446,24 +453,86 @@
     openVersion: number
   ): void {
     agentSessionReconcileTarget = { workspaceId, sessionId, openVersion };
-    if (agentSessionReconcileInFlight) return;
+    if (agentSessionReconcileInFlight || agentSessionReconcileRetryTimer !== undefined) return;
+    startAgentSessionReconciliation();
+  }
+
+  function clearAgentSessionReconciliation(): void {
+    if (agentSessionReconcileRetryTimer !== undefined) {
+      clearTimeout(agentSessionReconcileRetryTimer);
+      agentSessionReconcileRetryTimer = undefined;
+    }
+    agentSessionReconcileTarget = undefined;
+    agentSessionReconcileRetryDelayMs = AGENT_SESSION_RECONCILE_INITIAL_MS;
+    agentSessionSyncError = '';
+  }
+
+  function agentSessionReconcileTargetIsCurrent(
+    target: AgentSessionReconcileTarget
+  ): boolean {
+    return target.openVersion === agentSessionOpenVersion &&
+      activeAgentSession?.summary.id === target.sessionId;
+  }
+
+  function scheduleAgentSessionReconciliationRetry(
+    failedTarget: AgentSessionReconcileTarget
+  ): void {
+    if (!agentSessionReconcileTargetIsCurrent(failedTarget)) return;
+    agentSessionReconcileTarget ??= failedTarget;
+    if (agentSessionReconcileRetryTimer !== undefined) return;
+    const delayMs = agentSessionReconcileRetryDelayMs;
+    agentSessionReconcileRetryDelayMs = Math.min(
+      agentSessionReconcileRetryDelayMs * 2,
+      AGENT_SESSION_RECONCILE_MAX_MS
+    );
+    agentSessionReconcileRetryTimer = setTimeout(() => {
+      agentSessionReconcileRetryTimer = undefined;
+      const target = agentSessionReconcileTarget;
+      if (!target || !agentSessionReconcileTargetIsCurrent(target)) {
+        agentSessionReconcileTarget = undefined;
+        return;
+      }
+      startAgentSessionReconciliation();
+    }, delayMs);
+  }
+
+  function startAgentSessionReconciliation(): void {
+    if (
+      agentSessionReconcileInFlight ||
+      agentSessionReconcileRetryTimer !== undefined ||
+      !agentSessionReconcileTarget
+    ) return;
     const reconciliation = (async () => {
       while (agentSessionReconcileTarget) {
         const target: AgentSessionReconcileTarget = agentSessionReconcileTarget;
         agentSessionReconcileTarget = undefined;
-        const latest = await runClient.agentSession(target.workspaceId, target.sessionId);
+        if (!agentSessionReconcileTargetIsCurrent(target)) continue;
+        let latest: AgentSessionDetail;
+        try {
+          latest = await runClient.agentSession(target.workspaceId, target.sessionId);
+        } catch (error) {
+          if (agentSessionReconcileTargetIsCurrent(target)) {
+            agentSessionReconcileTarget ??= target;
+            agentSessionSyncError = `Agent session evidence is temporarily unavailable: ${message(error)} Retrying…`;
+            scheduleAgentSessionReconciliationRetry(target);
+          }
+          return;
+        }
         const current = activeAgentSession;
         if (
-          target.openVersion !== agentSessionOpenVersion ||
+          !agentSessionReconcileTargetIsCurrent(target) ||
           current?.summary.id !== target.sessionId
         ) continue;
         const currentSequence = current.events.at(-1)?.sequence ?? 0;
         const latestSequence = latest.events.at(-1)?.sequence ?? 0;
         if (latestSequence < currentSequence) {
-          agentSessionReconcileTarget = target;
-          continue;
+          agentSessionReconcileTarget ??= target;
+          scheduleAgentSessionReconciliationRetry(target);
+          return;
         }
         activeAgentSession = latest;
+        agentSessionReconcileRetryDelayMs = AGENT_SESSION_RECONCILE_INITIAL_MS;
+        agentSessionSyncError = '';
         const reconciledSequences = new Set(latest.events.map((event) => event.sequence));
         pendingAgentSessionEvents = pendingAgentSessionEvents.filter(
           (event) => !reconciledSequences.has(event.sequence)
@@ -477,11 +546,15 @@
           agentSessionEventStream = undefined;
         }
       }
-    })().catch((error) => {
-      if (openVersion === agentSessionOpenVersion) actionError = message(error);
-    }).finally(() => {
+    })().finally(() => {
       if (agentSessionReconcileInFlight === reconciliation) {
         agentSessionReconcileInFlight = undefined;
+      }
+      if (
+        agentSessionReconcileTarget &&
+        agentSessionReconcileRetryTimer === undefined
+      ) {
+        startAgentSessionReconciliation();
       }
     });
     agentSessionReconcileInFlight = reconciliation;
@@ -1069,6 +1142,9 @@
       if (reviewRefreshTimer !== undefined) clearTimeout(reviewRefreshTimer);
       if (evaluationRefreshTimer) clearTimeout(evaluationRefreshTimer);
       if (agentSessionEventFlushTimer !== undefined) clearTimeout(agentSessionEventFlushTimer);
+      if (agentSessionReconcileRetryTimer !== undefined) {
+        clearTimeout(agentSessionReconcileRetryTimer);
+      }
       exploreEventStream?.abort();
       inspectionEventStream?.abort();
       agentSessionEventStream?.abort();
@@ -1164,8 +1240,8 @@
     </div>
   </header>
 
-  {#if actionError || startupError}
-    <div class="banner" role="alert">{actionError || startupError}</div>
+  {#if actionError || agentSessionSyncError || startupError}
+    <div class="banner" role="alert">{actionError || agentSessionSyncError || startupError}</div>
   {/if}
 
   <section class="bench" aria-label="Agent Lab workbench">

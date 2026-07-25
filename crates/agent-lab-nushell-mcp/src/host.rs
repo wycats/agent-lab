@@ -2222,8 +2222,8 @@ impl Iterator for AgentTurnTextStream {
                 }
                 Ok(Ok(AgentTurnOutput::Finished { outcome })) => {
                     let error = match outcome.as_str() {
-                        "completed" if self.saw_completed => None,
-                        "completed" => Some(self.recoverable_error(
+                        "completed" | "intervened" if self.saw_completed => None,
+                        "completed" | "intervened" => Some(self.recoverable_error(
                             "Agent returned no answer",
                             "the turn completed without an authoritative assistant answer",
                         )),
@@ -3846,6 +3846,19 @@ mod tests {
     }
 
     #[test]
+    fn answer_stream_preserves_an_intervened_turns_authoritative_completion() {
+        let stream = text_stream([
+            AgentTurnOutput::AssistantCompleted("complete answer".to_owned()),
+            AgentTurnOutput::Finished {
+                outcome: "intervened".to_owned(),
+            },
+        ]);
+
+        let chunks = stream.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(chunks.concat(), b"complete answer\n");
+    }
+
+    #[test]
     fn answer_stream_failure_keeps_recoverable_ids_after_partial_text() {
         let mut stream = text_stream([AgentTurnOutput::AssistantDelta("partial".to_owned())]);
 
@@ -3857,15 +3870,17 @@ mod tests {
     }
 
     #[test]
-    fn completed_turn_without_an_answer_is_a_recoverable_error() {
-        let mut stream = text_stream([AgentTurnOutput::Finished {
-            outcome: "completed".to_owned(),
-        }]);
+    fn answer_stream_successful_turn_without_an_answer_is_a_recoverable_error() {
+        for outcome in ["completed", "intervened"] {
+            let mut stream = text_stream([AgentTurnOutput::Finished {
+                outcome: outcome.to_owned(),
+            }]);
 
-        let error = format!("{:?}", stream.next().unwrap().unwrap_err());
-        assert!(error.contains("Agent returned no answer"));
-        assert!(error.contains("agent-session-1"));
-        assert!(error.contains("agent-turn-1"));
+            let error = format!("{:?}", stream.next().unwrap().unwrap_err());
+            assert!(error.contains("Agent returned no answer"));
+            assert!(error.contains("agent-session-1"));
+            assert!(error.contains("agent-turn-1"));
+        }
     }
 
     #[test]

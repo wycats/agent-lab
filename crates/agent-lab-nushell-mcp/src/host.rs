@@ -1950,8 +1950,10 @@ impl Command for AgentCommand {
                     finished: false,
                     saw_text: false,
                     ended_with_newline: false,
-                    streamed_text: String::new(),
-                    saw_completed: false,
+                    messages: Vec::new(),
+                    message_indexes: HashMap::new(),
+                    next_message_to_emit: 0,
+                    finishing: false,
                     pending_error: None,
                 },
                 call.head,
@@ -2004,12 +2006,12 @@ fn collect_agent_answer(
                     status.apply_progress(&progress);
                 }
             }
-            Ok(Ok(AgentTurnOutput::AssistantDelta(_))) => {
+            Ok(Ok(AgentTurnOutput::AssistantDelta { .. })) => {
                 if let Some(status) = status.as_deref_mut() {
                     status.set_phase("responding", Some("Writing response"));
                 }
             }
-            Ok(Ok(AgentTurnOutput::AssistantCompleted(_))) => {
+            Ok(Ok(AgentTurnOutput::AssistantCompleted { .. })) => {
                 if let Some(status) = status.as_deref_mut() {
                     status.set_phase("finalizing", Some("Finalizing answer"));
                 }
@@ -2081,8 +2083,8 @@ impl Iterator for AgentTurnValueStream {
                 }
                 Ok(Ok(
                     AgentTurnOutput::Progress(_)
-                    | AgentTurnOutput::AssistantDelta(_)
-                    | AgentTurnOutput::AssistantCompleted(_)
+                    | AgentTurnOutput::AssistantDelta { .. }
+                    | AgentTurnOutput::AssistantCompleted { .. }
                     | AgentTurnOutput::Finished { .. },
                 )) => {
                     self.finished = true;
@@ -2144,9 +2146,17 @@ struct AgentTurnTextStream {
     finished: bool,
     saw_text: bool,
     ended_with_newline: bool,
-    streamed_text: String,
-    saw_completed: bool,
+    messages: Vec<StreamedAssistantMessage>,
+    message_indexes: HashMap<String, usize>,
+    next_message_to_emit: usize,
+    finishing: bool,
     pending_error: Option<ShellError>,
+}
+
+struct StreamedAssistantMessage {
+    text: String,
+    emitted_bytes: usize,
+    complete: bool,
 }
 
 impl AgentTurnTextStream {
@@ -2163,13 +2173,59 @@ impl AgentTurnTextStream {
     }
 
     fn finish_with(&mut self, error: Option<ShellError>) -> Option<Result<Vec<u8>, ShellError>> {
-        self.finished = true;
+        self.finishing = true;
+        self.pending_error = error;
+        for message in &mut self.messages {
+            message.complete = true;
+        }
+        self.next_finish_item()
+    }
+
+    fn next_finish_item(&mut self) -> Option<Result<Vec<u8>, ShellError>> {
+        if let Some(chunk) = self.emit_ready_message_chunk() {
+            return Some(Ok(chunk));
+        }
         if self.saw_text && !self.ended_with_newline {
-            self.pending_error = error;
             self.ended_with_newline = true;
             return Some(Ok(vec![b'\n']));
         }
-        error.map(Err)
+        self.finished = true;
+        self.pending_error.take().map(Err)
+    }
+
+    fn message_index(&mut self, message_id: String) -> usize {
+        if let Some(index) = self.message_indexes.get(&message_id) {
+            return *index;
+        }
+        let index = self.messages.len();
+        self.messages.push(StreamedAssistantMessage {
+            text: String::new(),
+            emitted_bytes: 0,
+            complete: false,
+        });
+        self.message_indexes.insert(message_id, index);
+        index
+    }
+
+    fn emit_ready_message_chunk(&mut self) -> Option<Vec<u8>> {
+        loop {
+            let message = self.messages.get_mut(self.next_message_to_emit)?;
+            if message.emitted_bytes < message.text.len() {
+                let mut chunk = Vec::new();
+                if self.next_message_to_emit > 0 && message.emitted_bytes == 0 {
+                    chunk.extend_from_slice(b"\n\n");
+                }
+                chunk.extend_from_slice(&message.text.as_bytes()[message.emitted_bytes..]);
+                message.emitted_bytes = message.text.len();
+                self.saw_text = true;
+                self.ended_with_newline = chunk.ends_with(b"\n");
+                return Some(chunk);
+            }
+            if !message.complete {
+                return None;
+            }
+            self.next_message_to_emit += 1;
+        }
     }
 }
 
@@ -2177,42 +2233,47 @@ impl Iterator for AgentTurnTextStream {
     type Item = Result<Vec<u8>, ShellError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(error) = self.pending_error.take() {
-            return Some(Err(error));
+        if self.finishing {
+            return self.next_finish_item();
         }
         if self.finished {
             return None;
         }
         loop {
+            if let Some(chunk) = self.emit_ready_message_chunk() {
+                return Some(Ok(chunk));
+            }
             if self.signals.interrupted() {
                 self.bridge.cancel_agent_turn_detached(&self.session_id);
-                self.finished = true;
-                return None;
+                return self.finish_with(None);
             }
             match self.turn.receiver.recv_timeout(Duration::from_millis(100)) {
-                Ok(Ok(AgentTurnOutput::AssistantDelta(text))) => {
+                Ok(Ok(AgentTurnOutput::AssistantDelta { message_id, text })) => {
                     if text.is_empty() {
                         continue;
                     }
-                    self.saw_text = true;
-                    self.ended_with_newline = text.ends_with('\n');
-                    self.streamed_text.push_str(&text);
-                    return Some(Ok(text.into_bytes()));
-                }
-                Ok(Ok(AgentTurnOutput::AssistantCompleted(text))) => {
-                    self.saw_completed = true;
-                    if text == self.streamed_text {
-                        continue;
+                    let index = self.message_index(message_id);
+                    let message = &mut self.messages[index];
+                    if message.complete {
+                        let error = self.recoverable_error(
+                            "Agent answer stream changed",
+                            "received more text after an authoritative assistant answer",
+                        );
+                        return self.finish_with(Some(error));
                     }
-                    if let Some(suffix) = text.strip_prefix(&self.streamed_text) {
-                        if suffix.is_empty() {
+                    message.text.push_str(&text);
+                }
+                Ok(Ok(AgentTurnOutput::AssistantCompleted { message_id, text })) => {
+                    let index = self.message_index(message_id);
+                    let message = &mut self.messages[index];
+                    if message.complete {
+                        if message.text == text {
                             continue;
                         }
-                        let suffix = suffix.to_owned();
-                        self.saw_text = true;
-                        self.ended_with_newline = suffix.ends_with('\n');
-                        text.clone_into(&mut self.streamed_text);
-                        return Some(Ok(suffix.into_bytes()));
+                    } else if text.starts_with(&message.text) {
+                        message.text = text;
+                        message.complete = true;
+                        continue;
                     }
                     let error = self.recoverable_error(
                         "Agent answer stream changed",
@@ -2221,8 +2282,10 @@ impl Iterator for AgentTurnTextStream {
                     return self.finish_with(Some(error));
                 }
                 Ok(Ok(AgentTurnOutput::Finished { outcome })) => {
+                    let has_completed_answer = !self.messages.is_empty()
+                        && self.messages.iter().all(|message| message.complete);
                     let error = match outcome.as_str() {
-                        "completed" | "intervened" if self.saw_completed => None,
+                        "completed" | "intervened" if has_completed_answer => None,
                         "completed" | "intervened" => Some(self.recoverable_error(
                             "Agent returned no answer",
                             "the turn completed without an authoritative assistant answer",
@@ -2921,8 +2984,10 @@ mod tests {
             finished: false,
             saw_text: false,
             ended_with_newline: false,
-            streamed_text: String::new(),
-            saw_completed: false,
+            messages: Vec::new(),
+            message_indexes: HashMap::new(),
+            next_message_to_emit: 0,
+            finishing: false,
             pending_error: None,
         }
     }
@@ -3806,9 +3871,18 @@ mod tests {
     #[test]
     fn answer_stream_concatenates_deltas_and_adds_one_newline() {
         let stream = text_stream([
-            AgentTurnOutput::AssistantDelta("hello ".to_owned()),
-            AgentTurnOutput::AssistantDelta("world".to_owned()),
-            AgentTurnOutput::AssistantCompleted("hello world".to_owned()),
+            AgentTurnOutput::AssistantDelta {
+                message_id: "message-1".to_owned(),
+                text: "hello ".to_owned(),
+            },
+            AgentTurnOutput::AssistantDelta {
+                message_id: "message-1".to_owned(),
+                text: "world".to_owned(),
+            },
+            AgentTurnOutput::AssistantCompleted {
+                message_id: "message-1".to_owned(),
+                text: "hello world".to_owned(),
+            },
             AgentTurnOutput::Finished {
                 outcome: "completed".to_owned(),
             },
@@ -3821,8 +3895,14 @@ mod tests {
     #[test]
     fn answer_stream_does_not_duplicate_an_existing_newline() {
         let stream = text_stream([
-            AgentTurnOutput::AssistantDelta("hello\n".to_owned()),
-            AgentTurnOutput::AssistantCompleted("hello\n".to_owned()),
+            AgentTurnOutput::AssistantDelta {
+                message_id: "message-1".to_owned(),
+                text: "hello\n".to_owned(),
+            },
+            AgentTurnOutput::AssistantCompleted {
+                message_id: "message-1".to_owned(),
+                text: "hello\n".to_owned(),
+            },
             AgentTurnOutput::Finished {
                 outcome: "completed".to_owned(),
             },
@@ -3835,7 +3915,10 @@ mod tests {
     #[test]
     fn answer_stream_uses_an_authoritative_completion_without_deltas() {
         let stream = text_stream([
-            AgentTurnOutput::AssistantCompleted("complete answer".to_owned()),
+            AgentTurnOutput::AssistantCompleted {
+                message_id: "message-1".to_owned(),
+                text: "complete answer".to_owned(),
+            },
             AgentTurnOutput::Finished {
                 outcome: "completed".to_owned(),
             },
@@ -3848,7 +3931,10 @@ mod tests {
     #[test]
     fn answer_stream_preserves_an_intervened_turns_authoritative_completion() {
         let stream = text_stream([
-            AgentTurnOutput::AssistantCompleted("complete answer".to_owned()),
+            AgentTurnOutput::AssistantCompleted {
+                message_id: "message-1".to_owned(),
+                text: "complete answer".to_owned(),
+            },
             AgentTurnOutput::Finished {
                 outcome: "intervened".to_owned(),
             },
@@ -3859,8 +3945,137 @@ mod tests {
     }
 
     #[test]
+    fn answer_stream_validates_each_authoritative_message_independently() {
+        let stream = text_stream([
+            AgentTurnOutput::AssistantDelta {
+                message_id: "message-1".to_owned(),
+                text: "first\n".to_owned(),
+            },
+            AgentTurnOutput::AssistantDelta {
+                message_id: "message-2".to_owned(),
+                text: "second".to_owned(),
+            },
+            AgentTurnOutput::AssistantCompleted {
+                message_id: "message-1".to_owned(),
+                text: "first\n".to_owned(),
+            },
+            AgentTurnOutput::AssistantCompleted {
+                message_id: "message-2".to_owned(),
+                text: "second\n".to_owned(),
+            },
+            AgentTurnOutput::Finished {
+                outcome: "completed".to_owned(),
+            },
+        ]);
+
+        let chunks = stream.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(chunks.concat(), b"first\n\n\nsecond\n");
+    }
+
+    #[test]
+    fn answer_stream_preserves_markdown_boundaries_between_completed_messages() {
+        let stream = text_stream([
+            AgentTurnOutput::AssistantCompleted {
+                message_id: "message-1".to_owned(),
+                text: "first".to_owned(),
+            },
+            AgentTurnOutput::AssistantCompleted {
+                message_id: "message-2".to_owned(),
+                text: "second".to_owned(),
+            },
+            AgentTurnOutput::Finished {
+                outcome: "completed".to_owned(),
+            },
+        ]);
+
+        let chunks = stream.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(chunks.concat(), b"first\n\nsecond\n");
+    }
+
+    #[test]
+    fn answer_stream_flushes_each_partial_message_before_a_terminal_error() {
+        let mut stream = text_stream([
+            AgentTurnOutput::AssistantDelta {
+                message_id: "message-1".to_owned(),
+                text: "first".to_owned(),
+            },
+            AgentTurnOutput::AssistantDelta {
+                message_id: "message-2".to_owned(),
+                text: "second".to_owned(),
+            },
+            AgentTurnOutput::Finished {
+                outcome: "failed".to_owned(),
+            },
+        ]);
+
+        assert_eq!(stream.next().unwrap().unwrap(), b"first");
+        assert_eq!(stream.next().unwrap().unwrap(), b"\n\nsecond");
+        assert_eq!(stream.next().unwrap().unwrap(), b"\n");
+        let error = format!("{:?}", stream.next().unwrap().unwrap_err());
+        assert!(error.contains("Agent turn failed"));
+        assert!(error.contains("agent-session-1"));
+        assert!(error.contains("agent-turn-1"));
+    }
+
+    #[test]
+    fn answer_stream_flushes_each_partial_message_before_cancellation() {
+        let mut stream = text_stream([
+            AgentTurnOutput::AssistantDelta {
+                message_id: "message-1".to_owned(),
+                text: "first".to_owned(),
+            },
+            AgentTurnOutput::AssistantDelta {
+                message_id: "message-2".to_owned(),
+                text: "second".to_owned(),
+            },
+            AgentTurnOutput::Finished {
+                outcome: "cancelled".to_owned(),
+            },
+        ]);
+
+        assert_eq!(stream.next().unwrap().unwrap(), b"first");
+        assert_eq!(stream.next().unwrap().unwrap(), b"\n\nsecond");
+        assert_eq!(stream.next().unwrap().unwrap(), b"\n");
+        assert!(stream.next().is_none());
+    }
+
+    #[test]
+    fn answer_stream_ctrl_c_flushes_buffered_partial_messages_and_a_newline() {
+        let signals = Signals::new(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        let mut stream = text_stream([]);
+        stream.signals = signals.clone();
+        stream.messages = vec![
+            StreamedAssistantMessage {
+                text: "first".to_owned(),
+                emitted_bytes: "first".len(),
+                complete: false,
+            },
+            StreamedAssistantMessage {
+                text: "second".to_owned(),
+                emitted_bytes: 0,
+                complete: false,
+            },
+        ];
+        stream.next_message_to_emit = 0;
+        stream.saw_text = true;
+        stream.ended_with_newline = false;
+
+        signals.trigger();
+
+        assert_eq!(stream.next().unwrap().unwrap(), b"\n\nsecond");
+        assert_eq!(stream.next().unwrap().unwrap(), b"\n");
+        assert!(stream.next().is_none());
+        assert!(stream.finished);
+    }
+
+    #[test]
     fn answer_stream_failure_keeps_recoverable_ids_after_partial_text() {
-        let mut stream = text_stream([AgentTurnOutput::AssistantDelta("partial".to_owned())]);
+        let mut stream = text_stream([AgentTurnOutput::AssistantDelta {
+            message_id: "message-1".to_owned(),
+            text: "partial".to_owned(),
+        }]);
 
         assert_eq!(stream.next().unwrap().unwrap(), b"partial");
         assert_eq!(stream.next().unwrap().unwrap(), b"\n");

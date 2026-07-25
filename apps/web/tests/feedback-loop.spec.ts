@@ -217,13 +217,87 @@ test('a session that fails while opening becomes retained history', async ({ pag
   await page.unrouteAll({ behavior: 'wait' });
 });
 
-test('activating an already displayed session refreshes its ready lifecycle', async ({ page }) => {
+test('initial active session detail failure reconciles the session after reload', async ({ page }) => {
+  const sessionId = 'initial-reconciliation-session';
+  let workspaceId = '';
+  let sessionDetailRequests = 0;
+  let releaseRecovery = () => {};
+  const recovery = new Promise<void>((resolve) => {
+    releaseRecovery = resolve;
+  });
+  const summary = {
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'ready',
+    active: true,
+    createdAtMs: 1,
+    updatedAtMs: 2,
+    turnCount: 0
+  };
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    summary.workspaceId = workspaceId;
+    workbench.activeAgentSession = summary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(
+    new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`),
+    async (route) => {
+      sessionDetailRequests += 1;
+      if (sessionDetailRequests === 1) {
+        await route.fulfill({
+          status: 503,
+          json: { error: 'fixture initial session detail is temporarily unavailable' }
+        });
+        return;
+      }
+      await recovery;
+      await route.fulfill({
+        json: {
+          projectionVersion: 1,
+          summary,
+          turns: [],
+          events: []
+        }
+      });
+    }
+  );
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect(page.getByRole('alert')).toContainText(
+    'Agent session updates are temporarily unavailable. Retrying…'
+  );
+  await expect.poll(() => sessionDetailRequests).toBe(2);
+  await expect(page.getByTestId('interactive-agent-session')).toHaveCount(0);
+
+  releaseRecovery();
+  const session = page.getByTestId('interactive-agent-session');
+  await expect(session).toBeVisible();
+  await expect(page.locator('.run-heading')).toContainText('Active session');
+  await expect(page.locator('.run-heading')).toContainText('ready');
+  await expect(session).toContainText('Ask the harness in Explore.');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('activation and selection reload preserve an already displayed session lifecycle', async ({ page }) => {
   const sessionId = 'activating-session';
   let workspaceId = '';
   let activated = false;
   let sessionDetailRequests = 0;
+  let failNextSessionDetail = false;
+  let failedSessionDetailRequests = 0;
 
-  await page.addInitScript(() => {
+  await page.addInitScript(({ sessionId }) => {
     const nativeFetch = window.fetch.bind(window);
     window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       const requestUrl = new URL(
@@ -234,16 +308,26 @@ test('activating an already displayed session refreshes its ready lifecycle', as
             : input.url,
         window.location.href
       );
-      if (/^\/api\/runs\/[^/]+\/events$/.test(requestUrl.pathname)) {
+      const isWorkspaceStream = /^\/api\/runs\/[^/]+\/events$/.test(requestUrl.pathname);
+      const isAgentStream = requestUrl.pathname.endsWith(
+        `/agent-sessions/${sessionId}/events`
+      );
+      if (isWorkspaceStream || isAgentStream) {
         const encoder = new TextEncoder();
         let closed = false;
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
-            (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
-              .__publishWorkspaceAgentEvent = (event) => {
-                if (closed || init?.signal?.aborted) return;
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-              };
+            if (isWorkspaceStream) {
+              (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+                .__publishWorkspaceAgentEvent = (event) => {
+                  if (closed || init?.signal?.aborted) return;
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                };
+            } else {
+              const state = window as Window & { __activationAgentStreamRequests?: number };
+              state.__activationAgentStreamRequests =
+                (state.__activationAgentStreamRequests ?? 0) + 1;
+            }
             init?.signal?.addEventListener('abort', () => {
               if (closed) return;
               closed = true;
@@ -265,49 +349,51 @@ test('activating an already displayed session refreshes its ready lifecycle', as
       }
       return nativeFetch(input, init);
     };
+  }, { sessionId });
+
+  const sessionSummary = () => ({
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: activated ? 'ready' : 'starting',
+    active: activated,
+    createdAtMs: 1,
+    updatedAtMs: activated ? 3 : 2,
+    turnCount: 0
   });
 
   await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
     const response = await route.fetch();
     const workbench = await response.json();
     workspaceId = workbench.workspaceId;
-    workbench.activeAgentSession = null;
+    const activeSession = activated ? sessionSummary() : null;
+    workbench.activeAgentSession = activeSession;
     workbench.replayAgentSession = null;
-    workbench.agentSessions = [];
+    workbench.agentSessions = activeSession ? [activeSession] : [];
     await route.fulfill({ response, json: workbench });
   });
   await page.route(
     new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`),
     async (route) => {
       sessionDetailRequests += 1;
+      if (failNextSessionDetail) {
+        failNextSessionDetail = false;
+        failedSessionDetailRequests += 1;
+        await route.fulfill({
+          status: 503,
+          json: { error: 'fixture selection refresh is temporarily unavailable' }
+        });
+        return;
+      }
       await route.fulfill({
         json: {
           projectionVersion: 1,
-          summary: {
-            id: sessionId,
-            workspaceId,
-            harnessId: 'v0',
-            modelProfileId: 'fixture',
-            modelId: 'fixture/v0',
-            status: activated ? 'ready' : 'starting',
-            active: activated,
-            createdAtMs: 1,
-            updatedAtMs: activated ? 3 : 2,
-            turnCount: 0
-          },
+          summary: sessionSummary(),
           turns: [],
           events: []
         }
-      });
-    }
-  );
-  await page.route(
-    new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}/events$`),
-    async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/event-stream',
-        body: ''
       });
     }
   );
@@ -321,6 +407,7 @@ test('activating an already displayed session refreshes its ready lifecycle', as
     )
   ).toBe('function');
 
+  failNextSessionDetail = true;
   await page.evaluate(({ sessionId }) => {
     (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
       .__publishWorkspaceAgentEvent?.({
@@ -332,12 +419,17 @@ test('activating an already displayed session refreshes its ready lifecycle', as
   }, { sessionId });
 
   const session = page.getByTestId('interactive-agent-session');
+  await expect(page.getByRole('alert')).toContainText(
+    'Agent session updates are temporarily unavailable. Retrying…'
+  );
+  await expect.poll(() => failedSessionDetailRequests).toBe(1);
+  await expect.poll(() => sessionDetailRequests).toBe(2);
   await expect(session).toBeVisible();
   await expect(page.locator('.run-heading')).toContainText('Agent session');
   await expect(page.locator('.run-heading')).toContainText('starting');
   await expect(session).toContainText('This session is getting ready.');
+  await expect(page.getByRole('alert')).toHaveCount(0);
   await expect(page.getByLabel('Scenario')).toBeDisabled();
-  await expect.poll(() => sessionDetailRequests).toBe(1);
 
   activated = true;
   await page.evaluate(({ sessionId }) => {
@@ -350,12 +442,668 @@ test('activating an already displayed session refreshes its ready lifecycle', as
       });
   }, { sessionId });
 
-  await expect.poll(() => sessionDetailRequests).toBe(2);
+  await expect.poll(() => sessionDetailRequests).toBe(3);
   await expect(page.locator('.run-heading')).toContainText('Active session');
   await expect(page.locator('.run-heading')).toContainText('ready');
   await expect(session).toContainText('Ask the harness in Explore.');
   await expect(session.getByTestId('session-turn')).toHaveCount(0);
   await expect(page.getByLabel('Scenario')).toBeEnabled();
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { __activationAgentStreamRequests?: number })
+      .__activationAgentStreamRequests ?? 0
+  )).toBe(2);
+
+  failNextSessionDetail = true;
+  await page.getByLabel('Default harness').selectOption('v0');
+  await expect.poll(() => failedSessionDetailRequests).toBe(2);
+  await expect.poll(() => sessionDetailRequests).toBe(5);
+  await expect(session).toBeVisible();
+  await expect(page.locator('.run-heading')).toContainText('Active session');
+  await expect(page.locator('.run-heading')).toContainText('ready');
+  await expect(session).toContainText('Ask the harness in Explore.');
+  expect(await page.evaluate(() =>
+    (window as Window & { __activationAgentStreamRequests?: number })
+      .__activationAgentStreamRequests ?? 0
+  )).toBe(2);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('a terminal event remains authoritative when quarantined run detail disappears', async ({ page }) => {
+  const terminalError =
+    'Bearer credential-that-must-not-be-rendered-from-run-quarantine';
+  const contaminatedEvidence = 'credential-that-must-leave-run-projections';
+  let quarantined = false;
+  let runDetailRequests = 0;
+  let holdNextRunDetail = false;
+  let staleRunDetailStartedResolve = () => {};
+  const staleRunDetailStarted = new Promise<void>((resolve) => {
+    staleRunDetailStartedResolve = resolve;
+  });
+  let releaseStaleRunDetail = () => {};
+  const staleRunDetail = new Promise<void>((resolve) => {
+    releaseStaleRunDetail = resolve;
+  });
+
+  await page.addInitScript(() => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (!/^\/api\/runs\/[^/]+\/events$/.test(requestUrl.pathname)) {
+        return nativeFetch(input, init);
+      }
+      const encoder = new TextEncoder();
+      let closed = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          (window as Window & { __publishTerminalRunEvent?: (event: unknown) => void })
+            .__publishTerminalRunEvent = (event) => {
+              if (closed || init?.signal?.aborted) return;
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            };
+          init?.signal?.addEventListener('abort', () => {
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The stream may already have been closed by navigation.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          closed = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+      });
+    };
+  });
+  await page.route(/\/api\/runs\/[^/]+$/, async (route) => {
+    runDetailRequests += 1;
+    if (quarantined) {
+      await route.fulfill({
+        status: 404,
+        json: { error: 'unknown run after evidence quarantine' }
+      });
+      return;
+    }
+    const response = await route.fetch();
+    const detail = await response.json();
+    detail.assembly = {
+      ...detail.assembly,
+      question: contaminatedEvidence
+    };
+    detail.review = {
+      ...detail.review,
+      steps: [{
+        ordinal: 1,
+        kind: 'model-turn',
+        title: 'Contaminated evidence',
+        detail: contaminatedEvidence,
+        status: 'running',
+        eventSequences: [999_998],
+        source: null,
+        path: null
+      }]
+    };
+    detail.events = [{
+      sequence: 999_998,
+      atMs: Date.now(),
+      type: 'observation.assistant.delta',
+      payload: { detail: contaminatedEvidence }
+    }];
+    detail.output = { detail: contaminatedEvidence };
+    if (holdNextRunDetail) {
+      holdNextRunDetail = false;
+      staleRunDetailStartedResolve();
+      await staleRunDetail;
+    }
+    await route.fulfill({ response, json: detail });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect(page.locator('.run-heading > .run-status')).toHaveText('exploring');
+  await expect(page.locator('body')).toContainText(contaminatedEvidence);
+  await expect.poll(() =>
+    page.evaluate(() =>
+      typeof (window as Window & { __publishTerminalRunEvent?: unknown })
+        .__publishTerminalRunEvent
+    )
+  ).toBe('function');
+
+  holdNextRunDetail = true;
+  await page.evaluate(() => {
+    (window as Window & { __publishTerminalRunEvent?: (event: unknown) => void })
+      .__publishTerminalRunEvent?.({
+        sequence: 999_999,
+        atMs: Date.now(),
+        type: 'run.status',
+        payload: { status: 'running' }
+      });
+  });
+  await staleRunDetailStarted;
+  quarantined = true;
+  await page.evaluate(({ terminalError }) => {
+    (window as Window & { __publishTerminalRunEvent?: (event: unknown) => void })
+      .__publishTerminalRunEvent?.({
+        sequence: 1_000_000,
+        atMs: Date.now(),
+        type: 'run.finished',
+        payload: {
+          status: 'failed',
+          error: terminalError,
+          score: { passed: false, evidenceQuarantined: true }
+        }
+      });
+  }, { terminalError });
+
+  await expect(page.locator('.run-heading > .run-status')).toHaveText('failed');
+  await expect(page.getByRole('button', { name: 'New workspace' })).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveText(
+    'Run evidence is unavailable. It has been removed from this workbench.'
+  );
+  await expect(page.getByRole('alert')).not.toContainText(terminalError);
+  await expect(page.getByRole('alert')).not.toContainText('unknown run');
+  await expect(page.getByTestId('run-evidence-unavailable')).toContainText(
+    'Run evidence unavailable'
+  );
+  await expect(page.locator('body')).not.toContainText(contaminatedEvidence);
+  await expect(page.locator('[data-testid="terminal"] textarea')).toHaveCount(0);
+  releaseStaleRunDetail();
+  await page.waitForTimeout(150);
+  await expect(page.getByTestId('run-evidence-unavailable')).toContainText(
+    'Run evidence unavailable'
+  );
+  await expect(page.locator('body')).not.toContainText(contaminatedEvidence);
+  await expect.poll(() => runDetailRequests).toBeGreaterThanOrEqual(2);
+  await page.getByRole('button', { name: 'Evidence' }).click();
+  await expect(page.locator('.artifact')).toContainText('"evidenceQuarantined": true');
+  await expect(page.locator('.artifact')).not.toContainText(contaminatedEvidence);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('an unavailable evaluation clears live evidence without refetching it', async ({ page }) => {
+  const evaluationId = 'evaluation-unavailable-browser';
+  const contaminatedRevision = 'credential-that-must-leave-browser-memory';
+  const unsafeEventMessage = 'Bearer credential-that-must-not-be-rendered';
+  const summary = {
+    id: evaluationId,
+    scenarioId: 'catalog-to-file',
+    modelProfileId: 'fixture',
+    sourceWorkspaceId: 'explore-fixture',
+    sourceRevision: contaminatedRevision,
+    harnessIds: ['v0', 'eve'],
+    arms: [
+      { harnessId: 'v0', status: 'running' },
+      { harnessId: 'eve', status: 'queued' }
+    ],
+    status: 'running',
+    startedAtMs: Date.now()
+  };
+  let detailRequests = 0;
+  let holdNextEvaluationDetail = false;
+  let staleEvaluationDetailStartedResolve = () => {};
+  const staleEvaluationDetailStarted = new Promise<void>((resolve) => {
+    staleEvaluationDetailStartedResolve = resolve;
+  });
+  let releaseStaleEvaluationDetail = () => {};
+  const staleEvaluationDetail = new Promise<void>((resolve) => {
+    releaseStaleEvaluationDetail = resolve;
+  });
+
+  await page.addInitScript(({ evaluationId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (requestUrl.pathname !== `/api/evaluations/${evaluationId}/events`) {
+        return nativeFetch(input, init);
+      }
+      const encoder = new TextEncoder();
+      let closed = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          (window as Window & { __publishUnavailableEvaluation?: (event: unknown) => void })
+            .__publishUnavailableEvaluation = (event) => {
+              if (closed || init?.signal?.aborted) return;
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            };
+          init?.signal?.addEventListener('abort', () => {
+            (window as Window & { __unavailableEvaluationStreamAborted?: boolean })
+              .__unavailableEvaluationStreamAborted = true;
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The server may have closed after its terminal unavailable event.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          closed = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+      });
+    };
+  }, { evaluationId });
+  await page.route(/\/api\/evaluations$/, async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({ json: [summary] });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route(new RegExp(`/api/evaluations/${evaluationId}$`), async (route) => {
+    detailRequests += 1;
+    if (holdNextEvaluationDetail) {
+      holdNextEvaluationDetail = false;
+      staleEvaluationDetailStartedResolve();
+      await staleEvaluationDetail;
+    }
+    await route.fulfill({
+      json: {
+        summary,
+        events: [{
+          sequence: 1,
+          atMs: summary.startedAtMs,
+          type: 'evaluation.status',
+          payload: { status: 'running', detail: contaminatedRevision }
+        }]
+      }
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const history = page
+    .locator('.evaluation-history .history-list button')
+    .filter({ hasText: evaluationId.split('-').at(-1) ?? evaluationId });
+  await history.click();
+  await expect(page.getByTestId('evaluation-view').locator('.run-status')).toHaveText('running');
+  await expect(page.getByTestId('evaluation-view')).toContainText(contaminatedRevision);
+  await expect.poll(() =>
+    page.evaluate(() =>
+      typeof (window as Window & { __publishUnavailableEvaluation?: unknown })
+        .__publishUnavailableEvaluation
+    )
+  ).toBe('function');
+  expect(detailRequests).toBe(1);
+
+  holdNextEvaluationDetail = true;
+  await page.evaluate(({ evaluationId }) => {
+    (window as Window & { __publishUnavailableEvaluation?: (event: unknown) => void })
+      .__publishUnavailableEvaluation?.({
+        sequence: 2,
+        atMs: Date.now(),
+        type: 'evaluation.arm.progress',
+        payload: {
+          evaluationId,
+          harnessId: 'v0',
+          status: 'running'
+        }
+      });
+  }, { evaluationId });
+  await staleEvaluationDetailStarted;
+  await page.evaluate(({ evaluationId, unsafeEventMessage }) => {
+    (window as Window & { __publishUnavailableEvaluation?: (event: unknown) => void })
+      .__publishUnavailableEvaluation?.({
+        sequence: 3,
+        atMs: Date.now(),
+        type: 'evaluation.unavailable',
+        payload: {
+          evaluationId,
+          reason: 'protected-evidence',
+          message: unsafeEventMessage
+        }
+      });
+  }, { evaluationId, unsafeEventMessage });
+
+  await expect(page.getByRole('alert')).toHaveText(
+    'Evaluation evidence is unavailable. It has been removed from this workbench.'
+  );
+  await expect(page.getByRole('alert')).not.toContainText(unsafeEventMessage);
+  await expect(page.getByTestId('evaluation-view')).toContainText('No evaluation selected');
+  await expect(page.getByTestId('evaluation-view')).not.toContainText(contaminatedRevision);
+  await expect(page.locator('.evaluation-history .history-list button')).toHaveCount(0);
+  await expect.poll(() =>
+    page.evaluate(() =>
+      (window as Window & { __unavailableEvaluationStreamAborted?: boolean })
+        .__unavailableEvaluationStreamAborted ?? false
+    )
+  ).toBe(true);
+  releaseStaleEvaluationDetail();
+  await page.waitForTimeout(100);
+  await expect(page.getByTestId('evaluation-view')).toContainText('No evaluation selected');
+  await expect(page.getByTestId('evaluation-view')).not.toContainText(contaminatedRevision);
+  expect(detailRequests).toBe(2);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('failed and stale same-session refreshes keep the existing agent stream live', async ({ page }) => {
+  const sessionId = 'refresh-recovery-session';
+  const turnId = 'refresh-recovery-turn';
+  const messageId = 'refresh-recovery-message';
+  const startedAtMs = Date.now() - 500;
+  const events = [{
+    sequence: 1,
+    atMs: startedAtMs,
+    type: 'agent.turn.started',
+    payload: {
+      sessionId,
+      turnId,
+      prompt: 'Keep following this turn',
+      input: null
+    }
+  }, {
+    sequence: 2,
+    atMs: startedAtMs + 100,
+    type: 'observation.assistant.completed',
+    payload: {
+      sessionId,
+      turnId,
+      event: {
+        messageId,
+        text: '# Still connected\n\nThe original stream delivered this answer.'
+      }
+    }
+  }, {
+    sequence: 3,
+    atMs: startedAtMs + 200,
+    type: 'agent.turn.finished',
+    payload: { sessionId, turnId, outcome: 'completed' }
+  }];
+  const usageEvent = {
+    sequence: 4,
+    atMs: startedAtMs + 300,
+    type: 'observation.usage',
+    payload: {
+      sessionId,
+      turnId,
+      event: { inputTokens: 8, outputTokens: 13, totalTokens: 21 }
+    }
+  };
+  let workspaceId = '';
+  let sessionDetailRequests = 0;
+  let releaseRecoveryRefresh = () => {};
+  const recoveryRefresh = new Promise<void>((resolve) => {
+    releaseRecoveryRefresh = resolve;
+  });
+  let releaseStaleRefresh = () => {};
+  const staleRefresh = new Promise<void>((resolve) => {
+    releaseStaleRefresh = resolve;
+  });
+
+  await page.addInitScript(({ sessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      const isWorkspaceStream = /^\/api\/runs\/[^/]+\/events$/.test(requestUrl.pathname);
+      const isAgentStream = requestUrl.pathname.endsWith(
+        `/agent-sessions/${sessionId}/events`
+      );
+      if (!isWorkspaceStream && !isAgentStream) return nativeFetch(input, init);
+
+      const encoder = new TextEncoder();
+      let closed = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const publish = (event: unknown) => {
+            if (closed || init?.signal?.aborted) return;
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          };
+          if (isWorkspaceStream) {
+            (window as Window & {
+              __publishRefreshWorkspaceEvent?: (event: unknown) => void;
+            }).__publishRefreshWorkspaceEvent = publish;
+          } else {
+            const state = window as Window & {
+              __refreshAgentStreamRequests?: number;
+              __publishRefreshAgentEvent?: (event: unknown) => void;
+            };
+            state.__refreshAgentStreamRequests = (state.__refreshAgentStreamRequests ?? 0) + 1;
+            state.__publishRefreshAgentEvent = publish;
+          }
+          init?.signal?.addEventListener('abort', () => {
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The stream may already have been closed by navigation.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          closed = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+      });
+    };
+  }, { sessionId });
+
+  const summary = {
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'ready',
+    active: true,
+    createdAtMs: startedAtMs - 500,
+    updatedAtMs: startedAtMs - 500,
+    turnCount: 0
+  };
+  const initialDetail = () => ({
+    projectionVersion: 2,
+    summary: { ...summary, workspaceId },
+    turns: [],
+    events: []
+  });
+  const completedDetail = (includeUsage = false) => ({
+    projectionVersion: 2,
+    summary: {
+      ...summary,
+      workspaceId,
+      updatedAtMs: events[2].atMs,
+      turnCount: 1
+    },
+    turns: [{
+      id: turnId,
+      sessionId,
+      prompt: 'Keep following this turn',
+      sourceRevision: 'sha256:refresh-recovery',
+      capabilityRevisions: {},
+      status: 'completed',
+      startedAtMs,
+      finishedAtMs: events[2].atMs,
+      outcome: 'completed',
+      presentation: {
+        schemaVersion: 2,
+        response: '# Still connected\n\nThe original stream delivered this answer.',
+        messages: [{
+          id: messageId,
+          text: '# Still connected\n\nThe original stream delivered this answer.',
+          complete: true,
+          sourceEventSequences: [2]
+        }],
+        activity: [],
+        usage: includeUsage
+          ? { inputTokens: 8, outputTokens: 13, totalTokens: 21 }
+          : null,
+        completeness: {
+          assistantOutput: 'complete',
+          capabilityActivity: 'complete',
+          nativeActivity: 'complete',
+          workspaceEffects: 'complete',
+          usage: includeUsage ? 'complete' : 'unavailable'
+        },
+        sourceEventSequences: includeUsage ? [1, 2, 3, 4] : [1, 2, 3],
+        sourceDigest: includeUsage
+          ? 'sha256:refresh-recovered-with-usage'
+          : 'sha256:refresh-recovered'
+      }
+    }],
+    events: includeUsage ? [...events, usageEvent] : events
+  });
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    summary.workspaceId = workspaceId;
+    workbench.activeAgentSession = summary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(
+    new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`),
+    async (route) => {
+      sessionDetailRequests += 1;
+      if (sessionDetailRequests === 2) {
+        await route.fulfill({
+          status: 503,
+          json: { error: 'fixture same-session refresh is temporarily unavailable' }
+        });
+        return;
+      }
+      if (sessionDetailRequests === 3) {
+        await recoveryRefresh;
+        await route.fulfill({ json: completedDetail() });
+        return;
+      }
+      if (sessionDetailRequests === 4) {
+        await staleRefresh;
+        await route.fulfill({ json: completedDetail() });
+        return;
+      }
+      await route.fulfill({
+        json: sessionDetailRequests >= 5
+          ? completedDetail(true)
+          : sessionDetailRequests >= 3
+            ? completedDetail()
+            : initialDetail()
+      });
+    }
+  );
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { __refreshAgentStreamRequests?: number })
+      .__refreshAgentStreamRequests ?? 0
+  )).toBe(1);
+  await expect.poll(() => page.evaluate(() =>
+    typeof (window as Window & { __publishRefreshWorkspaceEvent?: unknown })
+      .__publishRefreshWorkspaceEvent
+  )).toBe('function');
+
+  const terminalInput = page.locator('[data-testid="terminal"] textarea');
+  await terminalInput.focus();
+  await expect(terminalInput).toBeFocused();
+  await page.evaluate(({ sessionId }) => {
+    const publish = (window as Window & {
+      __publishRefreshWorkspaceEvent?: (event: unknown) => void;
+    }).__publishRefreshWorkspaceEvent;
+    if (!publish) throw new Error('workspace event publisher is unavailable');
+    publish({
+      sequence: 1_000_000,
+      atMs: Date.now(),
+      type: 'workbench.agent.turn.started',
+      payload: { sessionId, origin: 'nushell' }
+    });
+  }, { sessionId });
+
+  await expect.poll(() => sessionDetailRequests).toBeGreaterThanOrEqual(2);
+  await expect(page.getByRole('alert')).toContainText(
+    'Agent session updates are temporarily unavailable. Retrying…'
+  );
+  await expect(terminalInput).toBeFocused();
+  await page.evaluate((events) => {
+    const publish = (window as Window & {
+      __publishRefreshAgentEvent?: (event: unknown) => void;
+    }).__publishRefreshAgentEvent;
+    if (!publish) throw new Error('agent event publisher is unavailable');
+    for (const event of events) publish(event);
+  }, events);
+
+  const session = page.getByTestId('interactive-agent-session');
+  releaseRecoveryRefresh();
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'completed');
+  await expect(session.getByRole('heading', { name: 'Still connected', level: 3 })).toBeVisible();
+  await expect(session).toContainText('The original stream delivered this answer.');
+  await expect.poll(() => sessionDetailRequests).toBe(3);
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(terminalInput).toBeFocused();
+  expect(await page.evaluate(() =>
+    (window as Window & { __refreshAgentStreamRequests?: number })
+      .__refreshAgentStreamRequests ?? 0
+  )).toBe(1);
+
+  await page.evaluate(({ sessionId }) => {
+    const publish = (window as Window & {
+      __publishRefreshWorkspaceEvent?: (event: unknown) => void;
+    }).__publishRefreshWorkspaceEvent;
+    if (!publish) throw new Error('workspace event publisher is unavailable');
+    publish({
+      sequence: 1_000_001,
+      atMs: Date.now(),
+      type: 'workbench.agent.turn.started',
+      payload: { sessionId, origin: 'nushell' }
+    });
+  }, { sessionId });
+  await expect.poll(() => sessionDetailRequests).toBe(4);
+  await page.evaluate((event) => {
+    const publish = (window as Window & {
+      __publishRefreshAgentEvent?: (event: unknown) => void;
+    }).__publishRefreshAgentEvent;
+    if (!publish) throw new Error('agent event publisher is unavailable');
+    publish(event);
+  }, usageEvent);
+  await expect.poll(() => sessionDetailRequests).toBe(5);
+  await expect(session).toContainText('Usage reported');
+  releaseStaleRefresh();
+  await expect.poll(() => sessionDetailRequests).toBe(6);
+  await expect(session.getByTestId('session-turn')).toHaveAttribute('data-status', 'completed');
+  await expect(terminalInput).toBeFocused();
+  expect(await page.evaluate(() =>
+    (window as Window & { __refreshAgentStreamRequests?: number })
+      .__refreshAgentStreamRequests ?? 0
+  )).toBe(1);
+  const evidence = session.locator('.turn-evidence');
+  await evidence.locator(':scope > summary').click();
+  await evidence.locator('.turn-raw-events > summary').click();
+  await expect(evidence.locator('.run-events .sequence')).toHaveText(['01', '02', '03', '04']);
   await page.unrouteAll({ behavior: 'wait' });
 });
 
@@ -1144,7 +1892,7 @@ test('terminal reconciliation retries failed and stale detail without losing can
   await page.goto('/');
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
   await expect(page.getByRole('alert')).toContainText(
-    'Agent session evidence is temporarily unavailable'
+    'Agent session updates are temporarily unavailable. Retrying…'
   );
   await expect.poll(() => sessionDetailRequests).toBe(4);
   const session = page.getByTestId('interactive-agent-session');
@@ -2032,11 +2780,59 @@ test('a paired harness evaluation streams, compares, and reopens', async ({ page
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
   const reopened = page.locator('.evaluation-history .history-list button').first();
   await expect(reopened).toContainText('passed');
+  const detailResponse = page.waitForResponse((response) => {
+    const path = new URL(response.url()).pathname;
+    return response.request().method() === 'GET' && /^\/api\/evaluations\/[^/]+$/.test(path);
+  });
   await reopened.click();
+  const durableDetail = await (await detailResponse).json();
   await expect(page.getByTestId('evaluation-view').locator('.paired-result')).toContainText(
     'Same evaluated artifact'
   );
   await expect(page.getByTestId('behavioral-diff')).toContainText('analysis · summarize');
+
+  const unavailableDetail = structuredClone(durableDetail);
+  const unavailableArm = unavailableDetail.summary.arms[0];
+  const unavailableRunId = unavailableArm.runId as string;
+  unavailableDetail.summary.status = 'failed';
+  unavailableArm.status = 'failed';
+  unavailableDetail.comparison.outputsMatch = false;
+  unavailableDetail.comparison.artifactComparison = 'missing';
+  unavailableDetail.comparison.arms[0] = {
+    harnessId: unavailableArm.harnessId,
+    runId: unavailableRunId,
+    status: 'failed',
+    evidenceComplete: false,
+    usage: 'not reported',
+    cache: 'not reported'
+  };
+  await page.route(
+    new RegExp(`/api/evaluations/${unavailableDetail.summary.id}$`),
+    async (route) => {
+      await route.fulfill({ json: unavailableDetail });
+    }
+  );
+  await page.route(new RegExp(`/api/runs/${unavailableRunId}$`), async (route) => {
+    await route.fulfill({ status: 404, json: { error: 'unknown run' } });
+  });
+
+  await reopened.click();
+  await expect(page.getByTestId('evaluation-view').locator('.run-status')).toHaveText('failed');
+  await expect(page.getByTestId('evaluation-view').locator('.paired-result')).toContainText(
+    'Artifact unavailable'
+  );
+  await expect(page.getByTestId('behavioral-diff')).toContainText('Run evidence unavailable');
+  await page
+    .getByTestId('evaluation-view')
+    .locator('.native-replays')
+    .getByText('Native replays and raw evidence')
+    .click();
+  await expect(
+    page.getByTestId('evaluation-view').getByRole('button', {
+      name: `${unavailableArm.harnessId} replay unavailable`
+    })
+  ).toBeDisabled();
+  await page.unrouteAll({ behavior: 'wait' });
 });
 
 test('stacked surfaces keep their scroll owners inside the viewport', async ({ page }) => {

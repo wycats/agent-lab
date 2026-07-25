@@ -708,6 +708,12 @@ fn run_event_stream(
         (VecDeque::from(history), receiver, runs, id, 0_u64),
         |(mut pending, mut receiver, runs, id, mut last_sequence)| async move {
             loop {
+                if !pending.is_empty() {
+                    let Ok(current) = runs.events_after(&id, last_sequence) else {
+                        return None;
+                    };
+                    pending = VecDeque::from(current);
+                }
                 if let Some(event) = pending.pop_front() {
                     if event_is_after_history(&event, last_sequence) {
                         last_sequence = event.sequence;
@@ -943,6 +949,12 @@ fn agent_session_event_stream(
         (VecDeque::from(history), receiver, runs, id, 0_u64),
         |(mut pending, mut receiver, runs, id, mut last_sequence)| async move {
             loop {
+                if !pending.is_empty() {
+                    let Ok(current) = runs.agent_session_events_after(&id, last_sequence) else {
+                        return None;
+                    };
+                    pending = VecDeque::from(current);
+                }
                 if let Some(event) = pending.pop_front() {
                     if event_is_after_history(&event, last_sequence) {
                         last_sequence = event.sequence;
@@ -1106,13 +1118,26 @@ fn evaluation_event_stream(
     receiver: tokio::sync::broadcast::Receiver<RunEvent>,
 ) -> impl futures_util::Stream<Item = RunEvent> {
     futures_util::stream::unfold(
-        (VecDeque::from(history), receiver, runs, id, 0_u64),
-        |(mut pending, mut receiver, runs, id, mut last_sequence)| async move {
+        (VecDeque::from(history), receiver, runs, id, 0_u64, false),
+        |(mut pending, mut receiver, runs, id, mut last_sequence, finished)| async move {
+            if finished {
+                return None;
+            }
             loop {
+                if !pending.is_empty() {
+                    let Ok(current) = runs.evaluation_events_after(&id, last_sequence) else {
+                        return None;
+                    };
+                    pending = VecDeque::from(current);
+                }
                 if let Some(event) = pending.pop_front() {
                     if event_is_after_history(&event, last_sequence) {
                         last_sequence = event.sequence;
-                        return Some((event, (pending, receiver, runs, id, last_sequence)));
+                        let finished = evaluation_event_is_terminal(&event);
+                        return Some((
+                            event,
+                            (pending, receiver, runs, id, last_sequence, finished),
+                        ));
                     }
                     continue;
                 }
@@ -1128,6 +1153,13 @@ fn evaluation_event_stream(
                 }
             }
         },
+    )
+}
+
+fn evaluation_event_is_terminal(event: &RunEvent) -> bool {
+    matches!(
+        event.kind.as_str(),
+        "evaluation.finished" | "evaluation.unavailable"
     )
 }
 
@@ -1610,6 +1642,288 @@ mod tests {
 
         assert!(output.recv().await.is_none());
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn evaluation_stream_ends_after_each_terminal_event() {
+        let root =
+            std::env::temp_dir().join(format!("agent-lab-evaluation-stream-{}", generate_token()));
+        let scenarios_dir = root.join("scenarios");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(scenarios_dir.join("fixture/workspace")).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            scenarios_dir.join("fixture.toml"),
+            r#"
+version = 1
+id = "fixture"
+title = "Fixture"
+description = "test"
+question = "Does the event stream stop after a terminal event?"
+seed = "fixture/workspace"
+prompt = "finish"
+output = "result.json"
+
+[limits]
+maxDurationMs = 1000
+maxCommandCount = 1
+maxOrchestratorInvocations = 1
+maxToolInvocations = 1
+
+[assertions]
+activeNames = []
+totalScore = 0
+"#,
+        )
+        .unwrap();
+        let harness = |id: &str| HarnessProfile {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            launch: agent_lab_driver_protocol::DriverLaunch::new("/bin/false"),
+            models: std::collections::BTreeMap::from([("test".to_owned(), format!("{id}/test"))]),
+        };
+        let runs = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir,
+                data_dir,
+                driver: agent_lab_driver_protocol::DriverLaunch::new(
+                    std::env::current_exe().unwrap(),
+                ),
+            },
+            vec![harness("fixture-a"), harness("fixture-b")],
+            std::collections::BTreeMap::from([("test".to_owned(), "Test".to_owned())]),
+        )
+        .unwrap();
+        let workspace = runs
+            .prepare(PrepareRunRequest {
+                scenario_id: "fixture".to_owned(),
+            })
+            .await
+            .unwrap();
+        let evaluation = runs
+            .start_evaluation(StartEvaluationRequest {
+                scenario_id: "fixture".to_owned(),
+                model_profile_id: "test".to_owned(),
+                source_workspace_id: workspace.id,
+                harness_ids: vec!["fixture-a".to_owned(), "fixture-b".to_owned()],
+            })
+            .unwrap();
+        let (history, receiver) = runs.subscribe_evaluation(&evaluation.id).unwrap();
+        let stream = evaluation_event_stream(runs.clone(), evaluation.id, history, receiver)
+            .collect::<Vec<_>>();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(5), stream)
+            .await
+            .expect("evaluation stream should reach a terminal event");
+
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("evaluation.finished")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| evaluation_event_is_terminal(event))
+                .count(),
+            1
+        );
+        assert!(evaluation_event_is_terminal(&RunEvent {
+            sequence: 1,
+            at_ms: 1,
+            kind: "evaluation.unavailable".to_owned(),
+            payload: serde_json::Value::Null,
+            progress: None,
+        }));
+
+        drop(runs);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn evidence_streams_revalidate_unpolled_history_before_yielding() {
+        let root =
+            std::env::temp_dir().join(format!("agent-lab-history-recheck-{}", generate_token()));
+        let scenarios_dir = root.join("scenarios");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(scenarios_dir.join("fixture/workspace")).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            scenarios_dir.join("fixture.toml"),
+            r#"
+version = 1
+id = "fixture"
+title = "Fixture"
+description = "test"
+question = "Does the event stream revalidate history?"
+seed = "fixture/workspace"
+prompt = "finish"
+output = "result.json"
+
+[limits]
+maxDurationMs = 1000
+maxCommandCount = 1
+maxOrchestratorInvocations = 1
+maxToolInvocations = 1
+
+[assertions]
+activeNames = []
+totalScore = 0
+"#,
+        )
+        .unwrap();
+        let runs = RunController::new(RunControllerConfig {
+            scenarios_dir,
+            data_dir,
+            driver: agent_lab_driver_protocol::DriverLaunch::new(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let prepared = runs
+            .prepare(PrepareRunRequest {
+                scenario_id: "fixture".to_owned(),
+            })
+            .await
+            .unwrap();
+        let stale = RunEvent {
+            sequence: 1,
+            at_ms: 1,
+            kind: "stale".to_owned(),
+            payload: serde_json::json!({ "credential": "late-credential" }),
+            progress: None,
+        };
+
+        {
+            let (_sender, receiver) = tokio::sync::broadcast::channel(4);
+            let stream = run_event_stream(
+                runs.clone(),
+                prepared.id.clone(),
+                vec![stale.clone()],
+                receiver,
+            );
+            futures_util::pin_mut!(stream);
+            let event = stream.next().await.expect("authoritative run event");
+            assert!(
+                !serde_json::to_string(&event)
+                    .unwrap()
+                    .contains("late-credential")
+            );
+        }
+        {
+            let (_sender, receiver) = tokio::sync::broadcast::channel(4);
+            let stream = agent_session_event_stream(
+                runs.clone(),
+                "removed-session".to_owned(),
+                vec![stale.clone()],
+                receiver,
+            );
+            futures_util::pin_mut!(stream);
+            assert!(stream.next().await.is_none());
+        }
+        {
+            let (_sender, receiver) = tokio::sync::broadcast::channel(4);
+            let stream = evaluation_event_stream(
+                runs.clone(),
+                "removed-evaluation".to_owned(),
+                vec![stale],
+                receiver,
+            );
+            futures_util::pin_mut!(stream);
+            assert!(stream.next().await.is_none());
+        }
+
+        drop(runs);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn evidence_streams_revalidate_non_lagged_live_events_before_yielding() {
+        let root =
+            std::env::temp_dir().join(format!("agent-lab-live-recheck-{}", generate_token()));
+        let scenarios_dir = root.join("scenarios");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(scenarios_dir.join("fixture/workspace")).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            scenarios_dir.join("fixture.toml"),
+            r#"
+version = 1
+id = "fixture"
+title = "Fixture"
+description = "test"
+question = "Does the event stream revalidate live events?"
+seed = "fixture/workspace"
+prompt = "finish"
+output = "result.json"
+
+[limits]
+maxDurationMs = 1000
+maxCommandCount = 1
+maxOrchestratorInvocations = 1
+maxToolInvocations = 1
+
+[assertions]
+activeNames = []
+totalScore = 0
+"#,
+        )
+        .unwrap();
+        let runs = RunController::new(RunControllerConfig {
+            scenarios_dir,
+            data_dir,
+            driver: agent_lab_driver_protocol::DriverLaunch::new(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let prepared = runs
+            .prepare(PrepareRunRequest {
+                scenario_id: "fixture".to_owned(),
+            })
+            .await
+            .unwrap();
+        let stale = RunEvent {
+            sequence: 99,
+            at_ms: 1,
+            kind: "stale".to_owned(),
+            payload: serde_json::json!({ "credential": "late-credential" }),
+            progress: None,
+        };
+
+        {
+            let (sender, receiver) = tokio::sync::broadcast::channel(4);
+            sender.send(stale.clone()).unwrap();
+            let stream = run_event_stream(runs.clone(), prepared.id.clone(), Vec::new(), receiver);
+            futures_util::pin_mut!(stream);
+            let event = stream.next().await.expect("authoritative run event");
+            assert!(
+                !serde_json::to_string(&event)
+                    .unwrap()
+                    .contains("late-credential")
+            );
+        }
+        {
+            let (sender, receiver) = tokio::sync::broadcast::channel(4);
+            sender.send(stale.clone()).unwrap();
+            let stream = agent_session_event_stream(
+                runs.clone(),
+                "removed-session".to_owned(),
+                Vec::new(),
+                receiver,
+            );
+            futures_util::pin_mut!(stream);
+            assert!(stream.next().await.is_none());
+        }
+        {
+            let (sender, receiver) = tokio::sync::broadcast::channel(4);
+            sender.send(stale).unwrap();
+            let stream = evaluation_event_stream(
+                runs.clone(),
+                "removed-evaluation".to_owned(),
+                Vec::new(),
+                receiver,
+            );
+            futures_util::pin_mut!(stream);
+            assert!(stream.next().await.is_none());
+        }
+
+        drop(runs);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

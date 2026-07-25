@@ -17,9 +17,18 @@
     workspaceId: string;
     sessionId: string;
     openVersion: number;
+    reveal: boolean;
+    replaceCurrent: boolean;
   };
   type AgentView = 'review' | 'raw';
   type AgentAnswerView = 'rendered' | 'source';
+  type UnavailableRunEvidence = {
+    summary: RunSummary;
+    score: {
+      passed: boolean;
+      evidenceQuarantined: boolean;
+    };
+  };
   type BehaviorSegment = {
     key: string;
     label: string;
@@ -37,6 +46,10 @@
 
   const AGENT_SESSION_RECONCILE_INITIAL_MS = 100;
   const AGENT_SESSION_RECONCILE_MAX_MS = 2_000;
+  const RUN_EVIDENCE_UNAVAILABLE =
+    'Run evidence is unavailable. It has been removed from this workbench.';
+  const EVALUATION_EVIDENCE_UNAVAILABLE =
+    'Evaluation evidence is unavailable. It has been removed from this workbench.';
 
   function agentSessionIsHistorical(summary: AgentSessionDetail['summary']): boolean {
     return summary.status === 'failed' || summary.status === 'closed' || summary.status === 'interrupted';
@@ -58,6 +71,7 @@
   let agentSessionReconcileTarget: AgentSessionReconcileTarget | undefined;
   let agentSessionReconcileRetryTimer: ReturnType<typeof setTimeout> | undefined;
   let agentSessionReconcileRetryDelayMs = AGENT_SESSION_RECONCILE_INITIAL_MS;
+  let agentSessionOpenRequestVersion = 0;
   let agentSessionOpenVersion = 0;
   let connectionState: ConnectionState = 'starting';
   let sessionEvents: SessionEvent[] = [];
@@ -82,6 +96,9 @@
   let selectedRun: RunDetail | undefined;
   let terminalRun: RunSummary | undefined;
   let runEvents: RunEvent[] = [];
+  let unavailableRunEvidence: UnavailableRunEvidence | undefined;
+  const unavailableRunIds = new Set<string>();
+  const unavailableEvaluationIds = new Set<string>();
   let activeTab: Tab = 'agent';
   let agentInspectionMode: AgentInspectionMode = 'session';
   let agentView: AgentView = 'review';
@@ -94,8 +111,11 @@
   let comparing = false;
   let agentTurnCancelling = false;
 
-  $: activeExplore = exploreRun?.summary;
-  $: inspectedRun = selectedRun?.summary;
+  $: activeExplore = exploreRun?.summary ??
+    (unavailableRunEvidence && unavailableRunEvidence.summary.id === terminalRun?.id
+      ? unavailableRunEvidence.summary
+      : undefined);
+  $: inspectedRun = selectedRun?.summary ?? unavailableRunEvidence?.summary;
   $: running = activeExplore?.status === 'starting' || activeExplore?.status === 'running';
   $: finished = activeExplore?.status === 'passed' || activeExplore?.status === 'failed' || activeExplore?.status === 'cancelled';
   $: historicalAgentSession = Boolean(activeAgentSession && agentSessionIsHistorical(activeAgentSession.summary));
@@ -197,6 +217,7 @@
     try {
       const summary = await runClient.prepare(scenarioId);
       const detail = await runClient.detail(summary.id);
+      unavailableRunEvidence = undefined;
       exploreRun = detail;
       selectedRun = detail;
       runEvents = detail.events;
@@ -222,8 +243,11 @@
     if (session && !starting && exploreRun?.summary.status === 'exploring') {
       try {
         await openAgentSession(id, session.id, false);
-      } catch {
-        clearAgentSessionView();
+      } catch (error) {
+        agentSessionSyncError = agentSessionUnavailableMessage(error);
+        requestAgentSessionReconciliation(id, session.id, agentSessionOpenVersion, {
+          replaceCurrent: true
+        });
       }
     } else {
       clearAgentSessionView();
@@ -243,14 +267,30 @@
       }
       return;
     }
-    const openVersion = ++agentSessionOpenVersion;
-    clearAgentSessionReconciliation();
+    const requestVersion = ++agentSessionOpenRequestVersion;
+    const currentOpenVersion = agentSessionOpenVersion;
     const detail = await runClient.agentSession(workspaceId, sessionId);
     if (
-      openVersion !== agentSessionOpenVersion ||
+      requestVersion !== agentSessionOpenRequestVersion ||
+      currentOpenVersion !== agentSessionOpenVersion ||
       starting ||
       exploreRun?.summary.status !== 'exploring'
     ) return;
+    const current = activeAgentSession;
+    const currentSequence = pendingAgentSessionEvents.reduce(
+      (latest, event) => Math.max(latest, event.sequence),
+      current?.events.at(-1)?.sequence ?? 0
+    );
+    const detailSequence = detail.events.at(-1)?.sequence ?? 0;
+    if (
+      current?.summary.id === detail.summary.id &&
+      detailSequence < currentSequence
+    ) {
+      requestAgentSessionReconciliation(workspaceId, sessionId, currentOpenVersion);
+      return;
+    }
+    const openVersion = ++agentSessionOpenVersion;
+    clearAgentSessionReconciliation();
     if (activeAgentSession?.summary.id !== detail.summary.id) {
       agentAnswerView = 'rendered';
       agentTurnCancelling = false;
@@ -347,7 +387,9 @@
       const turn = turnIndex === undefined ? undefined : turns[turnIndex];
 
       if (event.type === 'agent.session.starting') summary.status = 'starting';
-      if (event.type === 'agent.session.ready') summary.status = 'ready';
+      if (event.type === 'agent.session.ready') {
+        summary = { ...summary, active: true, status: 'ready', error: undefined };
+      }
       if (event.type === 'agent.session.failed') {
         summary = {
           ...summary,
@@ -438,6 +480,7 @@
   function requiresAgentSessionReconciliation(event: RunEvent): boolean {
     return event.type === 'agent.turn.started' ||
       event.type === 'agent.turn.finished' ||
+      event.type === 'agent.session.ready' ||
       event.type === 'agent.session.failed' ||
       event.type === 'agent.session.closed' ||
       event.type === 'agent.session.interrupted' ||
@@ -450,9 +493,16 @@
   function requestAgentSessionReconciliation(
     workspaceId: string,
     sessionId: string,
-    openVersion: number
+    openVersion: number,
+    options: { reveal?: boolean; replaceCurrent?: boolean } = {}
   ): void {
-    agentSessionReconcileTarget = { workspaceId, sessionId, openVersion };
+    agentSessionReconcileTarget = {
+      workspaceId,
+      sessionId,
+      openVersion,
+      reveal: options.reveal ?? false,
+      replaceCurrent: options.replaceCurrent ?? false
+    };
     if (agentSessionReconcileInFlight || agentSessionReconcileRetryTimer !== undefined) return;
     startAgentSessionReconciliation();
   }
@@ -471,7 +521,11 @@
     target: AgentSessionReconcileTarget
   ): boolean {
     return target.openVersion === agentSessionOpenVersion &&
-      activeAgentSession?.summary.id === target.sessionId;
+      (
+        target.replaceCurrent ||
+        activeAgentSession === undefined ||
+        activeAgentSession.summary.id === target.sessionId
+      );
   }
 
   function scheduleAgentSessionReconciliationRetry(
@@ -513,26 +567,41 @@
         } catch (error) {
           if (agentSessionReconcileTargetIsCurrent(target)) {
             agentSessionReconcileTarget ??= target;
-            agentSessionSyncError = `Agent session evidence is temporarily unavailable: ${message(error)} Retrying…`;
+            agentSessionSyncError = agentSessionUnavailableMessage(error);
             scheduleAgentSessionReconciliationRetry(target);
           }
           return;
         }
         const current = activeAgentSession;
+        if (!agentSessionReconcileTargetIsCurrent(target)) continue;
         if (
-          !agentSessionReconcileTargetIsCurrent(target) ||
-          current?.summary.id !== target.sessionId
+          current !== undefined &&
+          current.summary.id !== target.sessionId &&
+          !target.replaceCurrent
         ) continue;
-        const currentSequence = current.events.at(-1)?.sequence ?? 0;
+        const currentSequence = current?.events.at(-1)?.sequence ?? 0;
         const latestSequence = latest.events.at(-1)?.sequence ?? 0;
         if (latestSequence < currentSequence) {
           agentSessionReconcileTarget ??= target;
           scheduleAgentSessionReconciliationRetry(target);
           return;
         }
+        const replacingSession = current?.summary.id !== latest.summary.id;
+        if (replacingSession) {
+          agentSessionEventStream?.abort();
+          agentSessionEventStream = undefined;
+          pendingAgentSessionEvents = [];
+          knownAgentSessionEventSequences = new Set();
+          agentAnswerView = 'rendered';
+          agentTurnCancelling = false;
+        }
         activeAgentSession = latest;
         agentSessionReconcileRetryDelayMs = AGENT_SESSION_RECONCILE_INITIAL_MS;
         agentSessionSyncError = '';
+        if (target.reveal) {
+          activeTab = 'agent';
+          agentInspectionMode = 'session';
+        }
         const reconciledSequences = new Set(latest.events.map((event) => event.sequence));
         pendingAgentSessionEvents = pendingAgentSessionEvents.filter(
           (event) => !reconciledSequences.has(event.sequence)
@@ -544,6 +613,19 @@
         if (agentSessionIsHistorical(latest.summary)) {
           agentSessionEventStream?.abort();
           agentSessionEventStream = undefined;
+        } else if (!agentSessionEventStream) {
+          agentSessionEventStream = runClient.agentSessionEvents(
+            target.workspaceId,
+            target.sessionId,
+            (event) => {
+              queueAgentSessionEvent(
+                target.workspaceId,
+                target.sessionId,
+                target.openVersion,
+                event
+              );
+            }
+          );
         }
       }
     })().finally(() => {
@@ -635,7 +717,8 @@
     try {
       const summary = await runClient.compareWorkbench(exploreRun.summary.id);
       evaluations = [summary, ...evaluations];
-      await loadEvaluation(summary.id);
+      const detail = await loadEvaluation(summary.id);
+      if (!detail) return;
       activeTab = 'evaluation';
       watchEvaluation(summary.id);
     } catch (error) {
@@ -647,8 +730,22 @@
 
   function watchEvaluation(id: string): void {
     inspectionEventStream?.abort();
-    inspectionEventStream = runClient.evaluationEvents(id, (event) => {
-      if (event.type === 'evaluation.finished') {
+    let stream: AbortController | undefined;
+    stream = runClient.evaluationEvents(id, (event) => {
+      if (inspectionEventStream !== stream) return;
+      if (event.type === 'evaluation.unavailable') {
+        unavailableEvaluationIds.add(id);
+        if (evaluationRefreshTimer) clearTimeout(evaluationRefreshTimer);
+        evaluationRefreshTimer = undefined;
+        stream?.abort();
+        if (inspectionEventStream === stream) inspectionEventStream = undefined;
+        evaluations = evaluations.filter((evaluation) => evaluation.id !== id);
+        if (selectedEvaluation?.summary.id === id) {
+          selectedEvaluation = undefined;
+          evaluationRuns = {};
+        }
+        actionError = EVALUATION_EVIDENCE_UNAVAILABLE;
+      } else if (event.type === 'evaluation.finished') {
         if (evaluationRefreshTimer) clearTimeout(evaluationRefreshTimer);
         evaluationRefreshTimer = undefined;
         void refreshEvaluation(id);
@@ -664,21 +761,36 @@
         }, 75);
       }
     });
+    inspectionEventStream = stream;
   }
 
   async function refreshEvaluation(id: string): Promise<void> {
-    const detail = await loadEvaluation(id);
-    evaluations = await runClient.evaluations();
-    if (detail.summary.status !== 'running' && detail.summary.status !== 'queued') {
-      inspectionEventStream?.abort();
+    try {
+      const detail = await loadEvaluation(id);
+      if (!detail || unavailableEvaluationIds.has(id)) return;
+      const nextEvaluations = await runClient.evaluations();
+      if (unavailableEvaluationIds.has(id)) return;
+      evaluations = nextEvaluations;
+      if (detail.summary.status !== 'running' && detail.summary.status !== 'queued') {
+        inspectionEventStream?.abort();
+      }
+    } catch (error) {
+      if (!unavailableEvaluationIds.has(id)) actionError = message(error);
     }
   }
 
   async function openEvaluation(id: string): Promise<void> {
     inspectionEventStream?.abort();
-    const detail = await loadEvaluation(id);
-    activeTab = 'evaluation';
-    if (detail.summary.status === 'running' || detail.summary.status === 'queued') watchEvaluation(id);
+    try {
+      const detail = await loadEvaluation(id);
+      if (!detail || unavailableEvaluationIds.has(id)) return;
+      activeTab = 'evaluation';
+      if (detail.summary.status === 'running' || detail.summary.status === 'queued') {
+        watchEvaluation(id);
+      }
+    } catch (error) {
+      if (!unavailableEvaluationIds.has(id)) actionError = message(error);
+    }
   }
 
   async function openEvaluationArm(runId: string | undefined): Promise<void> {
@@ -686,16 +798,148 @@
     await openRun(runId);
   }
 
-  async function loadEvaluation(id: string): Promise<EvaluationDetail> {
+  async function loadEvaluation(id: string): Promise<EvaluationDetail | undefined> {
+    if (unavailableEvaluationIds.has(id)) return undefined;
     const detail = await runClient.evaluation(id);
-    const entries = await Promise.all(
+    if (unavailableEvaluationIds.has(id)) return undefined;
+    const entries = (await Promise.all(
       detail.summary.arms
         .filter((arm): arm is typeof arm & { runId: string } => Boolean(arm.runId))
-        .map(async (arm) => [arm.harnessId, await runClient.detail(arm.runId)] as const)
-    );
+        .map(async (arm) => {
+          try {
+            return [arm.harnessId, await runClient.detail(arm.runId)] as const;
+          } catch (error) {
+            const comparison = detail.comparison?.arms.find(
+              (candidate) => candidate.harnessId === arm.harnessId
+            );
+            if (comparison?.evidenceComplete === false) return undefined;
+            throw error;
+          }
+        })
+    )).filter((entry): entry is readonly [string, RunDetail] => entry !== undefined);
+    if (unavailableEvaluationIds.has(id)) return undefined;
     selectedEvaluation = detail;
     evaluationRuns = Object.fromEntries(entries);
     return detail;
+  }
+
+  function quarantinedRunScore(payload: Record<string, unknown>): UnavailableRunEvidence['score'] | undefined {
+    const score = eventRecord(payload.score);
+    if (typeof score.evidenceQuarantined !== 'boolean') return undefined;
+    return {
+      passed: score.passed === true,
+      evidenceQuarantined: score.evidenceQuarantined
+    };
+  }
+
+  function clearTerminalEvidence(id: string, summary: RunSummary): void {
+    if (terminalRun?.id !== id) return;
+    session?.dispose();
+    session = undefined;
+    surface?.dispose();
+    surface = undefined;
+    terminalHost?.replaceChildren();
+    screenText = '';
+    sessionEvents = [];
+    connectionState = 'closed';
+    startupError = '';
+    terminalRun = summary;
+  }
+
+  function applyTerminalRunEvent(id: string, event: RunEvent): boolean {
+    const payload = eventRecord(event.payload);
+    const status = payload.status;
+    if (status !== 'passed' && status !== 'failed' && status !== 'cancelled') return false;
+    const terminalStatus: RunSummary['status'] = status;
+    const error = typeof payload.error === 'string' ? payload.error : undefined;
+    const unavailableScore = quarantinedRunScore(payload);
+    const safeError = unavailableScore ? RUN_EVIDENCE_UNAVAILABLE : error;
+    const currentSummary = exploreRun?.summary.id === id
+      ? exploreRun.summary
+      : selectedRun?.summary.id === id
+        ? selectedRun.summary
+        : terminalRun?.id === id
+          ? terminalRun
+          : runs.find((run) => run.id === id);
+    const safeSummary = currentSummary
+      ? {
+          ...currentSummary,
+          status: terminalStatus,
+          finishedAtMs: event.atMs,
+          eventCount: Math.max(currentSummary.eventCount, event.sequence),
+          error: safeError
+        }
+      : undefined;
+    if (unavailableScore && safeSummary) {
+      const selectedWasQuarantined = selectedRun?.summary.id === id;
+      const exploreWasQuarantined = exploreRun?.summary.id === id;
+      unavailableRunIds.add(id);
+      unavailableRunEvidence = { summary: safeSummary, score: unavailableScore };
+      if (selectedWasQuarantined) {
+        selectedRun = undefined;
+        runEvents = [];
+      }
+      if (exploreWasQuarantined) {
+        exploreRun = undefined;
+        clearAgentSessionView();
+      }
+      const affectedEvaluationIds = new Set(
+        evaluations
+          .filter((evaluation) =>
+            evaluation.sourceWorkspaceId === id ||
+            evaluation.arms.some((arm) => arm.runId === id)
+          )
+          .map((evaluation) => evaluation.id)
+      );
+      const selectedEvaluationAffected = Boolean(
+        selectedEvaluation &&
+        (
+          selectedEvaluation.summary.sourceWorkspaceId === id ||
+          selectedEvaluation.summary.arms.some((arm) => arm.runId === id)
+        )
+      );
+      if (selectedEvaluationAffected && selectedEvaluation) {
+        affectedEvaluationIds.add(selectedEvaluation.summary.id);
+        selectedEvaluation = undefined;
+      }
+      for (const evaluationId of affectedEvaluationIds) {
+        unavailableEvaluationIds.add(evaluationId);
+      }
+      evaluations = evaluations.filter((evaluation) => !affectedEvaluationIds.has(evaluation.id));
+      evaluationRuns = selectedEvaluationAffected
+        ? {}
+        : Object.fromEntries(
+            Object.entries(evaluationRuns).filter(([, detail]) => detail.summary.id !== id)
+          );
+      runs = runs.filter((run) => run.id !== id);
+      clearTerminalEvidence(id, safeSummary);
+      actionError = RUN_EVIDENCE_UNAVAILABLE;
+      return true;
+    }
+    const updateDetail = (detail: RunDetail): RunDetail => ({
+      ...detail,
+      summary: {
+        ...detail.summary,
+        status: terminalStatus,
+        finishedAtMs: event.atMs,
+        eventCount: Math.max(detail.summary.eventCount, event.sequence),
+        error
+      },
+      score: payload.score ?? detail.score
+    });
+    if (exploreRun?.summary.id === id) exploreRun = updateDetail(exploreRun);
+    if (selectedRun?.summary.id === id) selectedRun = updateDetail(selectedRun);
+    runs = runs.map((run) => run.id === id
+      ? {
+          ...run,
+          status: terminalStatus,
+          finishedAtMs: event.atMs,
+          eventCount: Math.max(run.eventCount, event.sequence),
+          error
+        }
+      : run);
+    actionError = error ?? '';
+    return true;
   }
 
   function watchExploreRun(id: string): void {
@@ -729,7 +973,7 @@
       if (event.type === 'run.finished') {
         if (reviewRefreshTimer !== undefined) clearTimeout(reviewRefreshTimer);
         reviewRefreshTimer = undefined;
-        void refreshRun(id);
+        void refreshRun(id, applyTerminalRunEvent(id, event));
       }
       if (
         event.sequence > liveAfterSequence &&
@@ -765,16 +1009,22 @@
         typeof (event.payload as { sessionId?: unknown }).sessionId === 'string'
       ) {
         const sessionId = (event.payload as { sessionId: string }).sessionId;
+        const reveal = (event.payload as { origin?: unknown }).origin === 'nushell';
+        const replaceCurrent = activeAgentSession?.summary.id !== sessionId;
         void openAgentSession(
           id,
           sessionId,
-          (event.payload as { origin?: unknown }).origin === 'nushell',
+          reveal,
           event.type === 'workbench.agent.session.activated' ||
             event.type === 'workbench.agent.turn.started' ||
-            activeAgentSession?.summary.id !== sessionId
+            replaceCurrent
         )
           .catch((error) => {
-            actionError = `Agent session evidence is unavailable: ${message(error)}`;
+            agentSessionSyncError = agentSessionUnavailableMessage(error);
+            requestAgentSessionReconciliation(id, sessionId, agentSessionOpenVersion, {
+              reveal,
+              replaceCurrent
+            });
           });
       }
     });
@@ -790,7 +1040,7 @@
       if (event.type === 'run.finished') {
         if (reviewRefreshTimer !== undefined) clearTimeout(reviewRefreshTimer);
         reviewRefreshTimer = undefined;
-        void refreshRun(id);
+        void refreshRun(id, applyTerminalRunEvent(id, event));
       }
     });
   }
@@ -806,6 +1056,7 @@
   async function refreshReview(id: string): Promise<void> {
     try {
       const detail = await runClient.detail(id);
+      if (unavailableRunIds.has(id)) return;
       if (selectedRun?.summary.id !== id) return;
       const currentSequence = runEvents.at(-1)?.sequence ?? 0;
       const detailSequence = detail.events.at(-1)?.sequence ?? 0;
@@ -828,9 +1079,10 @@
     }
   }
 
-  async function refreshRun(id: string): Promise<void> {
+  async function refreshRun(id: string, terminalEventApplied = false): Promise<void> {
     try {
       const detail = await runClient.detail(id);
+      if (unavailableRunIds.has(id)) return;
       if (exploreRun?.summary.id === id) exploreRun = detail;
       if (selectedRun?.summary.id === id) {
         selectedRun = detail;
@@ -838,7 +1090,7 @@
       }
       runs = await runClient.runs();
     } catch (error) {
-      actionError = message(error);
+      if (!terminalEventApplied) actionError = message(error);
     }
   }
 
@@ -847,6 +1099,8 @@
     inspectionEventStream?.abort();
     try {
       const detail = await runClient.detail(id);
+      if (unavailableRunIds.has(id)) return;
+      unavailableRunEvidence = undefined;
       selectedRun = detail;
       runEvents = detail.events;
       activeTab = 'agent';
@@ -903,6 +1157,10 @@
 
   function message(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
+  }
+
+  function agentSessionUnavailableMessage(error: unknown): string {
+    return `Agent session updates are temporarily unavailable. Retrying… (${message(error)})`;
   }
 
   function pretty(value: unknown): string {
@@ -1295,6 +1553,14 @@
             <strong>{activeAgentSession.summary.harnessId} · {activeAgentSession.summary.modelProfileId}</strong>
           </div>
           <span class="run-status" data-status={activeAgentSession.summary.status}>{activeAgentSession.summary.status}</span>
+        {:else if unavailableRunEvidence && !selectedRun}
+          <div>
+            <span class="label">{unavailableRunEvidence.summary.scenarioTitle}</span>
+            <strong>Run evidence unavailable</strong>
+          </div>
+          <span class="run-status" data-status={unavailableRunEvidence.summary.status}>
+            {unavailableRunEvidence.summary.status}
+          </span>
         {:else if inspectedRun}
           <div>
             <span class="label">{inspectedRun.scenarioTitle}</span>
@@ -1477,6 +1743,11 @@
                 </details>
               {/if}
             </section>
+          {:else if unavailableRunEvidence && !selectedRun}
+            <section class="empty-state" data-testid="run-evidence-unavailable">
+              <strong>Run evidence unavailable</strong>
+              <p>Protected evidence was removed from this workbench. Start a new workspace to continue.</p>
+            </section>
           {:else}
             {#if selectedRun?.assembly}
               <section class="assembly" data-testid="assembly">
@@ -1598,14 +1869,21 @@
             {/if}
           {/if}
         {:else if activeTab === 'workspace'}
-          <section class="artifact">
-            <span class="label">result.json</span>
-            {#if selectedRun?.outputError}
-              <p class="artifact-error">Output could not be parsed: {selectedRun.outputError}</p>
-            {:else}
-              <pre>{pretty(selectedRun?.output)}</pre>
-            {/if}
-          </section>
+          {#if unavailableRunEvidence && !selectedRun}
+            <section class="empty-state" data-testid="run-evidence-unavailable">
+              <strong>Workspace evidence unavailable</strong>
+              <p>Protected workspace evidence was removed from this workbench.</p>
+            </section>
+          {:else}
+            <section class="artifact">
+              <span class="label">result.json</span>
+              {#if selectedRun?.outputError}
+                <p class="artifact-error">Output could not be parsed: {selectedRun.outputError}</p>
+              {:else}
+                <pre>{pretty(selectedRun?.output)}</pre>
+              {/if}
+            </section>
+          {/if}
         {:else if activeTab === 'editor'}
           <section class="empty-state">
             <strong>No editor for this scenario</strong>
@@ -1614,7 +1892,7 @@
         {:else if activeTab === 'evidence'}
           <section class="artifact">
             <span class="label">Score</span>
-            <pre>{pretty(selectedRun?.score)}</pre>
+            <pre>{pretty(selectedRun?.score ?? unavailableRunEvidence?.score)}</pre>
           </section>
         {:else}
           <section class="evaluation" data-testid="evaluation-view">
@@ -1656,7 +1934,11 @@
                             <span>Cache <strong>{usage(comparisonArm(arm.harnessId)?.cache ?? 'not reported')}</strong></span>
                           </div>
                         {:else}
-                          <small>{arm.runId ? 'Loading run evidence' : 'Waiting to start'}</small>
+                          <small>{!arm.runId
+                            ? 'Waiting to start'
+                            : comparisonArm(arm.harnessId)?.evidenceComplete === false
+                              ? 'Run evidence unavailable'
+                              : 'Loading run evidence'}</small>
                         {/if}
                         <div class="clock-axis" aria-label={`Shared elapsed wall clock from zero to ${duration(comparisonClockMs)}`}>
                           <span>0s</span>
@@ -1718,7 +2000,9 @@
                     </div>
                     {#each selectedEvaluation.summary.arms as arm}
                       <div class="result-cell">
-                        <pre>{pretty(evaluationRuns[arm.harnessId]?.output)}</pre>
+                        <pre>{comparisonArm(arm.harnessId)?.evidenceComplete === false
+                          ? 'Run evidence unavailable.'
+                          : pretty(evaluationRuns[arm.harnessId]?.output)}</pre>
                       </div>
                     {/each}
                   </div>
@@ -1746,8 +2030,13 @@
                 <p>Open either arm to inspect its full normalized review, native event stream, workspace, and score.</p>
                 <div>
                   {#each selectedEvaluation.summary.arms as arm}
-                    <button disabled={!arm.runId} on:click={() => void openEvaluationArm(arm.runId)}>
-                      Open {arm.harnessId} replay
+                    <button
+                      disabled={!arm.runId || comparisonArm(arm.harnessId)?.evidenceComplete === false}
+                      on:click={() => void openEvaluationArm(arm.runId)}
+                    >
+                      {comparisonArm(arm.harnessId)?.evidenceComplete === false
+                        ? `${arm.harnessId} replay unavailable`
+                        : `Open ${arm.harnessId} replay`}
                     </button>
                   {/each}
                 </div>

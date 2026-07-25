@@ -61,8 +61,8 @@ pub struct AgentTurnStream {
 #[derive(Debug, PartialEq)]
 pub enum AgentTurnOutput {
     Progress(JsonValue),
-    AssistantDelta(String),
-    AssistantCompleted(String),
+    AssistantDelta { message_id: String, text: String },
+    AssistantCompleted { message_id: String, text: String },
     Raw(JsonValue),
     Finished { outcome: String },
 }
@@ -634,6 +634,7 @@ impl WorkbenchBridge {
             .and_then(reqwest::blocking::Response::error_for_status)
             .map_err(|error| WorkbenchError::Request(error.to_string()))?;
         let mut finished = false;
+        let mut unavailable = false;
         for line in BufReader::new(response).lines() {
             let line = line.map_err(|error| WorkbenchError::Request(error.to_string()))?;
             let Some(data) = line.strip_prefix("data:") else {
@@ -654,8 +655,9 @@ impl WorkbenchBridge {
             {
                 return Ok(());
             }
-            if kind == "evaluation.finished" {
+            if kind == "evaluation.finished" || kind == "evaluation.unavailable" {
                 finished = true;
+                unavailable = kind == "evaluation.unavailable";
                 break;
             }
         }
@@ -664,8 +666,10 @@ impl WorkbenchBridge {
                 "evaluation event stream ended before completion".to_owned(),
             ));
         }
-        let detail = self.evaluation(Some(evaluation_id))?;
-        let _ = sender.send(Ok(milestone("comparison-finished", evaluation_id, &detail)));
+        if !unavailable {
+            let detail = self.evaluation(Some(evaluation_id))?;
+            let _ = sender.send(Ok(milestone("comparison-finished", evaluation_id, &detail)));
+        }
         Ok(())
     }
 
@@ -779,11 +783,15 @@ fn assistant_output(event: &JsonValue) -> Result<Option<AgentTurnOutput>, Workbe
     match TurnObservation::parse(event_type, observation)
         .map_err(|error| WorkbenchError::Malformed(error.to_string()))?
     {
-        Some(TurnObservation::AssistantDelta(delta)) => {
-            Ok(Some(AgentTurnOutput::AssistantDelta(delta.text)))
-        }
+        Some(TurnObservation::AssistantDelta(delta)) => Ok(Some(AgentTurnOutput::AssistantDelta {
+            message_id: delta.message_id,
+            text: delta.text,
+        })),
         Some(TurnObservation::AssistantCompleted(completed)) => {
-            Ok(Some(AgentTurnOutput::AssistantCompleted(completed.text)))
+            Ok(Some(AgentTurnOutput::AssistantCompleted {
+                message_id: completed.message_id,
+                text: completed.text,
+            }))
         }
         _ => Err(WorkbenchError::Malformed(
             "assistant output parsed as another observation kind".to_owned(),
@@ -811,6 +819,7 @@ fn project_milestone(evaluation_id: &str, event: &JsonValue) -> Option<JsonValue
         "evaluation.arm.progress" => "arm-progress",
         "evaluation.arm.finished" => "arm-finished",
         "evaluation.finished" => "comparison-status",
+        "evaluation.unavailable" => "comparison-unavailable",
         _ => return None,
     };
     let payload = event.get("payload").cloned().unwrap_or(JsonValue::Null);
@@ -888,6 +897,16 @@ mod tests {
         write!(
             stream,
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn write_sse_response(stream: &mut TcpStream, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
         .unwrap();
@@ -1032,7 +1051,32 @@ mod tests {
 
         assert_eq!(
             assistant_output(&event).unwrap(),
-            Some(AgentTurnOutput::AssistantDelta("hello".to_owned()))
+            Some(AgentTurnOutput::AssistantDelta {
+                message_id: "message-1".to_owned(),
+                text: "hello".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn assistant_output_preserves_completed_message_identity() {
+        let event = json!({
+            "sequence": 9,
+            "atMs": 32,
+            "type": "observation.assistant.completed",
+            "payload": {
+                "sessionId": "agent-session-1",
+                "turnId": "agent-turn-1",
+                "event": { "messageId": "message-2", "text": "world" }
+            }
+        });
+
+        assert_eq!(
+            assistant_output(&event).unwrap(),
+            Some(AgentTurnOutput::AssistantCompleted {
+                message_id: "message-2".to_owned(),
+                text: "world".to_owned(),
+            })
         );
     }
 
@@ -1085,5 +1129,85 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn unavailable_evaluation_is_a_terminal_inspectable_milestone() {
+        let event = json!({
+            "sequence": 12,
+            "atMs": 33,
+            "type": "evaluation.unavailable",
+            "payload": {
+                "evaluationId": "evaluation-2",
+                "reason": "protected-evidence",
+                "message": "Evaluation evidence is no longer available."
+            }
+        });
+
+        assert_eq!(
+            project_milestone("evaluation-2", &event),
+            Some(json!({
+                "phase": "comparison-unavailable",
+                "evaluationId": "evaluation-2",
+                "harness": null,
+                "status": null,
+                "runId": null,
+                "data": {
+                    "evaluationId": "evaluation-2",
+                    "reason": "protected-evidence",
+                    "message": "Evaluation evidence is no longer available."
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn unavailable_evaluation_stream_finishes_without_fetching_removed_detail() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut events, _) = listener.accept().unwrap();
+            assert_eq!(
+                read_http_request(&events),
+                "GET /api/workbench/workspace-1/evaluations/evaluation-2/events HTTP/1.1\r\n"
+            );
+            let event = json!({
+                "sequence": 12,
+                "atMs": 33,
+                "type": "evaluation.unavailable",
+                "payload": {
+                    "evaluationId": "evaluation-2",
+                    "reason": "protected-evidence",
+                    "message": "Evaluation evidence is no longer available."
+                }
+            });
+            write_sse_response(&mut events, &format!("data: {event}\n\n"));
+        });
+        let bridge =
+            WorkbenchBridge::new(&origin, "workspace-1".to_owned(), "token".to_owned()).unwrap();
+        let (sender, receiver) = mpsc::channel();
+
+        bridge
+            .stream_evaluation("evaluation-2", false, &sender)
+            .unwrap();
+        drop(sender);
+        let output = receiver.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert_eq!(
+            output,
+            vec![json!({
+                "phase": "comparison-unavailable",
+                "evaluationId": "evaluation-2",
+                "harness": null,
+                "status": null,
+                "runId": null,
+                "data": {
+                    "evaluationId": "evaluation-2",
+                    "reason": "protected-evidence",
+                    "message": "Evaluation evidence is no longer available."
+                }
+            })]
+        );
+        server.join().unwrap();
     }
 }

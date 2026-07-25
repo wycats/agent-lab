@@ -423,6 +423,43 @@ test('initial active session detail failure reconciles the session after reload'
     turnCount: 0
   };
 
+  await page.addInitScript(({ sessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (requestUrl.pathname.endsWith(`/agent-sessions/${sessionId}/events`)) {
+        let closed = false;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            init?.signal?.addEventListener('abort', () => {
+              if (closed) return;
+              closed = true;
+              controller.close();
+            }, { once: true });
+          },
+          cancel() {
+            closed = true;
+          }
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'X-Agent-Lab-Event-Stream-Epoch': 'fixture-boot'
+          }
+        });
+      }
+      return nativeFetch(input, init);
+    };
+  }, { sessionId });
+
   await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
     const response = await route.fetch();
     const workbench = await response.json();
@@ -819,6 +856,99 @@ test('a terminal event remains authoritative when quarantined run detail disappe
   await page.getByRole('button', { name: 'Evidence' }).click();
   await expect(page.locator('.artifact')).toContainText('"evidenceQuarantined": true');
   await expect(page.locator('.artifact')).not.toContainText(contaminatedEvidence);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('an epoch-bearing run stream 404 clears its stale browser projection', async ({ page }) => {
+  const staleEvidence = 'stale evidence from the previous server epoch';
+  await page.addInitScript(({ staleEvidence }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (!/^\/api\/runs\/[^/]+\/events$/.test(requestUrl.pathname)) {
+        return nativeFetch(input, init);
+      }
+      const state = window as Window & {
+        __missingRunStreamAttempts?: number;
+        __releaseMissingRunStream?: () => void;
+      };
+      const attempt = (state.__missingRunStreamAttempts ?? 0) + 1;
+      state.__missingRunStreamAttempts = attempt;
+      if (attempt > 1) {
+        return new Response('', {
+          status: 404,
+          headers: { 'X-Agent-Lab-Event-Stream-Epoch': 'boot-1' }
+        });
+      }
+      const event = {
+        sequence: 1_000_000,
+        atMs: Date.now(),
+        type: 'observation.assistant.delta',
+        payload: { detail: staleEvidence }
+      };
+      const encoder = new TextEncoder();
+      let closed = false;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          state.__releaseMissingRunStream = () => {
+            if (closed) return;
+            closed = true;
+            controller.close();
+          };
+          init?.signal?.addEventListener('abort', () => {
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The reset handler can abort while the response is closing.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          closed = true;
+        }
+      }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': 'boot-1'
+        }
+      });
+    };
+  }, { staleEvidence });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await page.evaluate(() => {
+    (window as Window & { __releaseMissingRunStream?: () => void })
+      .__releaseMissingRunStream?.();
+  });
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { __missingRunStreamAttempts?: number })
+      .__missingRunStreamAttempts ?? 0
+  )).toBe(2);
+  await expect(page.getByRole('alert')).toHaveText(
+    'Run evidence is unavailable. It has been removed from this workbench.'
+  );
+  await expect(page.getByRole('button', { name: 'New workspace' })).toBeVisible();
+  await expect(page.getByTestId('run-evidence-unavailable')).toContainText(
+    'Run evidence unavailable'
+  );
+  await expect(page.locator('body')).not.toContainText(staleEvidence);
+  await page.waitForTimeout(250);
+  expect(await page.evaluate(() =>
+    (window as Window & { __missingRunStreamAttempts?: number })
+      .__missingRunStreamAttempts ?? 0
+  )).toBe(2);
   await page.unrouteAll({ behavior: 'wait' });
 });
 
@@ -1802,7 +1932,10 @@ test('agent session events recover from clean EOF and read failure without dupli
       });
       return new Response(stream, {
         status: 200,
-        headers: { 'Content-Type': 'text/event-stream' }
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': 'agent-session-boot-1'
+        }
       });
     };
   }, { sessionId, events });
@@ -1920,6 +2053,194 @@ test('agent session events recover from clean EOF and read failure without dupli
     (window as Window & { __recoveringAgentStreamAttempts?: number })
       .__recoveringAgentStreamAttempts ?? 0
   )).toBe(3);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('an agent-session epoch reset replaces a stale high-water projection with authoritative detail', async ({ page }) => {
+  const sessionId = 'epoch-reset-session';
+  const turnId = 'stale-turn';
+  const staleAnswer = 'Stale answer from the previous server epoch';
+  const startedAtMs = Date.now() - 1_000;
+  let workspaceId = '';
+  let sessionDetailRequests = 0;
+
+  await page.addInitScript(({ sessionId }) => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (!requestUrl.pathname.endsWith(`/agent-sessions/${sessionId}/events`)) {
+        return nativeFetch(input, init);
+      }
+      const state = window as Window & {
+        __agentSessionEpochAttempts?: number;
+        __releaseAgentSessionEpoch?: () => void;
+      };
+      const attempt = (state.__agentSessionEpochAttempts ?? 0) + 1;
+      state.__agentSessionEpochAttempts = attempt;
+      let closed = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          if (attempt === 1) {
+            state.__releaseAgentSessionEpoch = () => {
+              if (closed) return;
+              closed = true;
+              controller.close();
+            };
+          }
+          init?.signal?.addEventListener('abort', () => {
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // The reset handler can abort while the response is opening.
+            }
+          }, { once: true });
+        },
+        cancel() {
+          closed = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': attempt === 1 ? 'boot-1' : 'boot-2'
+        }
+      });
+    };
+  }, { sessionId });
+
+  const summary = {
+    id: sessionId,
+    workspaceId,
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/v0',
+    status: 'running',
+    active: true,
+    createdAtMs: startedAtMs - 500,
+    updatedAtMs: startedAtMs,
+    turnCount: 1
+  };
+  const staleDetail = () => ({
+    projectionVersion: 2,
+    summary,
+    turns: [{
+      id: turnId,
+      sessionId,
+      prompt: 'Describe the workspace',
+      sourceRevision: 'sha256:stale',
+      capabilityRevisions: {},
+      status: 'running',
+      startedAtMs,
+      presentation: {
+        schemaVersion: 2,
+        response: staleAnswer,
+        messages: [{
+          id: 'stale-message',
+          text: staleAnswer,
+          complete: false,
+          sourceEventSequences: [99]
+        }],
+        activity: [],
+        usage: null,
+        completeness: {
+          assistantOutput: 'partial',
+          capabilityActivity: 'partial',
+          nativeActivity: 'partial',
+          workspaceEffects: 'partial',
+          usage: 'unavailable'
+        },
+        sourceEventSequences: [99],
+        sourceDigest: 'sha256:stale'
+      }
+    }],
+    events: [{
+      sequence: 99,
+      atMs: startedAtMs,
+      type: 'observation.assistant.delta',
+      payload: {
+        sessionId,
+        turnId,
+        event: { messageId: 'stale-message', text: staleAnswer }
+      }
+    }]
+  });
+  const interruptedDetail = () => ({
+    projectionVersion: 2,
+    summary: {
+      ...summary,
+      status: 'interrupted',
+      active: false,
+      updatedAtMs: startedAtMs + 500,
+      turnCount: 0,
+      error: 'the server restarted; start a new agent session to continue'
+    },
+    turns: [],
+    events: [{
+      sequence: 1,
+      atMs: startedAtMs + 500,
+      type: 'agent.session.interrupted',
+      payload: { sessionId, recovered: true }
+    }]
+  });
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    summary.workspaceId = workspaceId;
+    workbench.activeAgentSession = summary;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [summary];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`), async (route) => {
+    sessionDetailRequests += 1;
+    const attempts = await page.evaluate(() =>
+      (window as Window & { __agentSessionEpochAttempts?: number })
+        .__agentSessionEpochAttempts ?? 0
+    );
+    if (attempts >= 2 && sessionDetailRequests === 2) {
+      await route.fulfill({
+        status: 503,
+        json: { error: 'authoritative session detail is temporarily unavailable' }
+      });
+      return;
+    }
+    await route.fulfill({ json: attempts >= 2 ? interruptedDetail() : staleDetail() });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const session = page.getByTestId('interactive-agent-session');
+  await expect(session).toContainText(staleAnswer);
+  await page.evaluate(() => {
+    (window as Window & { __releaseAgentSessionEpoch?: () => void })
+      .__releaseAgentSessionEpoch?.();
+  });
+  await expect(page.getByRole('alert')).toContainText(
+    'Agent session updates are temporarily unavailable. Retrying…'
+  );
+  await expect(page.locator('.run-heading')).toContainText('Session replay');
+  await expect(page.locator('.run-heading')).toContainText('interrupted');
+  await expect(session).not.toContainText(staleAnswer);
+  await expect(session).toContainText(
+    'Reopened from durable evidence. Start a new agent session to continue.'
+  );
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { __agentSessionEpochAttempts?: number })
+      .__agentSessionEpochAttempts ?? 0
+  )).toBe(3);
+  expect(sessionDetailRequests).toBeGreaterThanOrEqual(3);
   await page.unrouteAll({ behavior: 'wait' });
 });
 
@@ -2529,10 +2850,15 @@ test('an active turn can be cancelled from compact progress without polling', as
 
 test('agent answers render constrained Markdown and retain inspectable source', async ({ page }) => {
   const terminalFramesSent: string[] = [];
+  const terminalBytesSent: string[] = [];
   page.on('websocket', (socket) => {
     if (!/\/api\/terminal(?:\?|$)/.test(socket.url())) return;
     socket.on('framesent', ({ payload }) => {
-      if (typeof payload === 'string') terminalFramesSent.push(payload);
+      if (typeof payload === 'string') {
+        terminalFramesSent.push(payload);
+      } else {
+        terminalBytesSent.push(payload.toString('hex'));
+      }
     });
   });
   const firstMessage = [
@@ -2665,6 +2991,21 @@ test('agent answers render constrained Markdown and retain inspectable source', 
 
   await terminalCanvas.click({ position: { x: 10, y: 10 } });
   await expect(terminalInput).toBeFocused();
+  const humanInputBeforeCancellation = terminalFramesSent.filter(
+    (frame) => frame === JSON.stringify({ type: 'human_input' })
+  ).length;
+  const ctrlCBeforeCancellation = terminalBytesSent.filter((frame) => frame === '03').length;
+  await page.keyboard.press('Control+C');
+  await expect.poll(
+    () =>
+      terminalFramesSent.filter(
+        (frame) => frame === JSON.stringify({ type: 'human_input' })
+      ).length
+  ).toBe(humanInputBeforeCancellation + 1);
+  await expect.poll(
+    () => terminalBytesSent.filter((frame) => frame === '03').length
+  ).toBe(ctrlCBeforeCancellation + 1);
+
   const humanInputBeforePaste = terminalFramesSent.filter(
     (frame) => frame === JSON.stringify({ type: 'human_input' })
   ).length;

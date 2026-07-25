@@ -424,3 +424,198 @@ test('failed reset and event callbacks cancel a non-closing response before reco
     globalThis.fetch = nativeFetch;
   }
 });
+
+test('an epoch-bearing 404 clears a stale run projection without waiting for replay', async () => {
+  const nativeFetch = globalThis.fetch;
+  const initial = {
+    sequence: 1,
+    atMs: 1,
+    type: 'run.status',
+    payload: { status: 'running' }
+  } satisfies RunEvent;
+  const highWater = {
+    sequence: 42,
+    atMs: 42,
+    type: 'observation.assistant.delta',
+    payload: { text: 'stale projection' }
+  } satisfies RunEvent;
+  let streamRequests = 0;
+
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url,
+      'http://127.0.0.1'
+    );
+    if (url.pathname === '/api/session-token') {
+      return Response.json({ token: 'test-token' });
+    }
+    if (url.pathname === '/api/runs/run-1/events') {
+      streamRequests += 1;
+      if (streamRequests > 1) {
+        return new Response('', {
+          status: 404,
+          headers: { 'X-Agent-Lab-Event-Stream-Epoch': 'boot-1' }
+        });
+      }
+      const encoder = new TextEncoder();
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const event of [initial, highWater]) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          }
+          controller.close();
+        }
+      }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': 'boot-1'
+        }
+      });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  try {
+    let finish: (() => void) | undefined;
+    const cleared = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const delivered: number[] = [];
+    let projection = [initial, highWater] as RunEvent[];
+    const resets: Array<{ previousEpoch?: string; epoch: string; responseStatus: number }> = [];
+    const controller = createRunClient().events(
+      'run-1',
+      (event) => {
+        delivered.push(event.sequence);
+      },
+      (reset) => {
+        resets.push(reset);
+        projection = [];
+        setTimeout(() => finish?.(), 25);
+        return 0;
+      }
+    );
+
+    await cleared;
+    controller.abort();
+
+    expect(delivered).toEqual([initial.sequence, highWater.sequence]);
+    expect(projection).toEqual([]);
+    expect(resets).toEqual([{
+      previousEpoch: 'boot-1',
+      epoch: 'boot-1',
+      responseStatus: 404
+    }]);
+    expect(streamRequests).toBe(2);
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+test('agent-session epoch changes reconcile lower authoritative detail before replay', async () => {
+  const nativeFetch = globalThis.fetch;
+  const started = {
+    sequence: 1,
+    atMs: 1,
+    type: 'agent.turn.started',
+    payload: { sessionId: 'session-1', turnId: 'turn-1' }
+  } satisfies RunEvent;
+  const staleHighWater = {
+    sequence: 9,
+    atMs: 9,
+    type: 'observation.assistant.delta',
+    payload: { text: 'stale answer' }
+  } satisfies RunEvent;
+  const interrupted = {
+    sequence: 1,
+    atMs: 20,
+    type: 'agent.session.interrupted',
+    payload: { sessionId: 'session-1', recovered: true }
+  } satisfies RunEvent;
+  let streamRequests = 0;
+  let detailRequests = 0;
+
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url,
+      'http://127.0.0.1'
+    );
+    if (url.pathname === '/api/session-token') {
+      return Response.json({ token: 'test-token' });
+    }
+    if (url.pathname === '/api/workbench/workspace-1/agent-sessions/session-1') {
+      detailRequests += 1;
+      return Response.json({
+        summary: { id: 'session-1', status: 'interrupted' },
+        turns: [],
+        events: [interrupted]
+      });
+    }
+    if (url.pathname === '/api/workbench/workspace-1/agent-sessions/session-1/events') {
+      streamRequests += 1;
+      const firstBoot = streamRequests === 1;
+      const encoder = new TextEncoder();
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const event of firstBoot ? [started, staleHighWater] : [interrupted]) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          }
+          controller.close();
+        }
+      }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': firstBoot ? 'boot-1' : 'boot-2'
+        }
+      });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  try {
+    let finish: (() => void) | undefined;
+    const reconciled = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const client = createRunClient();
+    const delivered: number[] = [];
+    let projection = [started, staleHighWater] as RunEvent[];
+    const controller = client.agentSessionEvents(
+      'workspace-1',
+      'session-1',
+      (event) => {
+        delivered.push(event.sequence);
+      },
+      async () => {
+        const detail = await client.agentSession('workspace-1', 'session-1');
+        projection = detail.events;
+        const watermark = detail.events.reduce(
+          (sequence, event) => Math.max(sequence, event.sequence),
+          0
+        );
+        setTimeout(() => finish?.(), 25);
+        return watermark;
+      }
+    );
+
+    await reconciled;
+    controller.abort();
+
+    expect(delivered).toEqual([started.sequence, staleHighWater.sequence]);
+    expect(projection).toEqual([interrupted]);
+    expect(detailRequests).toBe(1);
+    expect(streamRequests).toBe(2);
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});

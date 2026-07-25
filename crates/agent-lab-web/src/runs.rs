@@ -5523,14 +5523,29 @@ fn run_agent_session_actor(
                         .join(&turn_id)
                         .join("presentation.pending.json"),
                 );
-                let workspace_diff = finalize_agent_turn_workspace(
-                    state,
-                    &turn_id,
-                    Some(workspace_state),
-                    &workspace_state.workspace_evidence_root,
-                    &secrets,
-                )
-                .unwrap_or_else(|_| json!({ "changes": [] }));
+                let (workspace_diff, workspace_finalization_error) =
+                    match finalize_agent_turn_workspace(
+                        state,
+                        &turn_id,
+                        Some(workspace_state),
+                        &workspace_state.workspace_evidence_root,
+                        &secrets,
+                    ) {
+                        Ok(workspace_diff) => (Some(workspace_diff), None),
+                        Err(finalization_error) => {
+                            let finalization_error = redact_string(
+                                &format!(
+                                    "failed to finalize interactive turn workspace evidence: {finalization_error}"
+                                ),
+                                &secrets,
+                            );
+                            let _ = fail_workspace_after_agent_turn_finalization(
+                                workspace_state,
+                                &finalization_error,
+                            );
+                            (None, Some(finalization_error))
+                        }
+                    };
                 let turn_started_at_ms = lock(&state.turns)
                     .iter()
                     .find(|turn| turn.id == turn_id)
@@ -5547,29 +5562,43 @@ fn run_agent_session_actor(
                 } else {
                     None
                 };
-                let (status, outcome, terminal_error) = match termination {
-                    Some(AgentTurnTermination::Cancelled) => {
-                        (AgentTurnStatus::Cancelled, "cancelled", None)
-                    }
-                    Some(AgentTurnTermination::TimedOut) => (
-                        AgentTurnStatus::Failed,
-                        "timed-out",
-                        Some("interactive turn duration limit exceeded"),
-                    ),
-                    None => (AgentTurnStatus::Failed, "failed", Some(message.as_str())),
-                };
+                let combined_error = workspace_finalization_error
+                    .as_ref()
+                    .map(|finalization| format!("{message}; {finalization}"));
+                let (status, outcome, terminal_error) =
+                    if let Some(finalization_error) = combined_error.as_deref() {
+                        (AgentTurnStatus::Failed, "failed", Some(finalization_error))
+                    } else {
+                        match termination {
+                            Some(AgentTurnTermination::Cancelled) => {
+                                (AgentTurnStatus::Cancelled, "cancelled", None)
+                            }
+                            Some(AgentTurnTermination::TimedOut) => (
+                                AgentTurnStatus::Failed,
+                                "timed-out",
+                                Some("interactive turn duration limit exceeded"),
+                            ),
+                            None => (AgentTurnStatus::Failed, "failed", Some(message.as_str())),
+                        }
+                    };
+                let mut payload = json!({
+                    "sessionId": lock(&state.summary).id,
+                    "turnId": turn_id,
+                    "outcome": outcome,
+                    "error": terminal_error,
+                });
+                if let Some(workspace_diff) = workspace_diff {
+                    payload["workspaceDiff"] = workspace_diff;
+                }
+                if let Some(finalization_error) = workspace_finalization_error {
+                    payload["workspaceFinalizationError"] = json!(finalization_error);
+                }
                 let event = record_finished_agent_turn_event(
                     state,
                     workspace_state,
                     &turn_id,
                     status,
-                    json!({
-                        "sessionId": lock(&state.summary).id,
-                        "turnId": turn_id,
-                        "outcome": outcome,
-                        "error": terminal_error,
-                        "workspaceDiff": workspace_diff,
-                    }),
+                    payload,
                 );
                 let _ = update_agent_turn_status(
                     state,
@@ -5580,13 +5609,17 @@ fn run_agent_session_actor(
                 );
                 event
             };
-            release_agent_turn_reservation(
-                workspace_state,
-                &AgentTurnAttribution {
-                    session_id: lock(&state.summary).id.clone(),
-                    turn_id,
-                },
-            );
+            if lock(&workspace_state.summary).status != RunStatus::Exploring
+                || terminal_event.is_ok()
+            {
+                release_agent_turn_reservation(
+                    workspace_state,
+                    &AgentTurnAttribution {
+                        session_id: lock(&state.summary).id.clone(),
+                        turn_id,
+                    },
+                );
+            }
             *lock(&state.turn_cancel) = None;
             if let Ok(event) = terminal_event {
                 let _ = state.sender.send(event);
@@ -7166,6 +7199,64 @@ fn catalog_output_schema_valid(output: &JsonValue) -> bool {
         score_sum = sum;
     }
     score_sum == total_score
+}
+
+fn fail_workspace_after_agent_turn_finalization(
+    state: &RunState,
+    finalization_error: &str,
+) -> Result<(), RunError> {
+    let secrets = lock(&state.secret_values).clone();
+    let finalization_error = redact_string(finalization_error, &secrets);
+    let score = json!({
+        "passed": false,
+        "workspaceEvidence": "unavailable",
+        "finalizationError": finalization_error,
+    });
+    {
+        let mut summary = lock(&state.summary);
+        summary.status = RunStatus::Failed;
+        summary.finished_at_ms = Some(now_ms());
+        summary.error = Some(finalization_error.clone());
+    }
+    // Close the workspace before attempting the terminal evidence writes. Even if storage is
+    // degraded, no other session or harness may continue from a workspace whose final state could
+    // not be captured.
+    stop_workspace_producers(state);
+
+    let mut persistence_errors = Vec::new();
+    if let Err(error) = write_confined_run_json_atomic(
+        &state.agent_session_directories,
+        Path::new("score.json"),
+        &score,
+    ) {
+        persistence_errors.push(format!("score.json could not be written: {error}"));
+    }
+    if let Err(error) = record_event(
+        state,
+        "run.finished",
+        json!({
+            "status": RunStatus::Failed,
+            "error": finalization_error,
+            "score": score,
+        }),
+    ) {
+        persistence_errors.push(format!("run.finished event could not be written: {error}"));
+    }
+    if let Err(error) = persist_review(state) {
+        persistence_errors.push(format!("review.json could not be written: {error}"));
+    }
+    if let Err(error) = persist_manifest(state) {
+        persistence_errors.push(format!("manifest.json could not be written: {error}"));
+    }
+
+    if persistence_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(RunError::EvidencePersistence(format!(
+            "failed to persist workspace finalization failure: {}",
+            persistence_errors.join("; ")
+        )))
+    }
 }
 
 fn finish_run(
@@ -17226,6 +17317,143 @@ done
         }
 
         controller.cancel(&explore.id).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn fallback_finalization_failure_closes_the_workspace_without_a_fabricated_diff() {
+        let (root, controller, explore, session) = start_interactive_fixture(
+            "turn-fallback-finalization-failure",
+            interactive_fixture_launch(),
+        )
+        .await;
+        let state = controller.agent_session_state(&session.id).unwrap();
+        let workspace = controller.state(&explore.id).unwrap();
+        let turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "turn-scoped-failure-with-evidence-error".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if lock(&state.events).iter().any(|event| {
+                event.kind == "observation.assistant.delta" && event.payload["turnId"] == turn.id
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "turn did not begin before fallback finalization was invalidated"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        *lock(&state.evidence_error) =
+            Some("injected capability evidence persistence failure".to_owned());
+        fs::remove_dir_all(
+            state
+                .evidence_root
+                .display_path()
+                .join("turns")
+                .join(&turn.id)
+                .join("initial"),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let session_detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if session_detail.summary.status == AgentSessionStatus::Failed
+                && lock(&workspace.summary).status == RunStatus::Failed
+            {
+                let observed_turn = session_detail
+                    .turns
+                    .iter()
+                    .find(|candidate| candidate.id == turn.id)
+                    .unwrap();
+                assert_eq!(observed_turn.status, AgentTurnStatus::Failed);
+                assert!(
+                    observed_turn
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("failed to finalize interactive turn"))
+                );
+                let terminal = session_detail
+                    .events
+                    .iter()
+                    .find(|event| {
+                        event.kind == "agent.turn.finished" && event.payload["turnId"] == turn.id
+                    })
+                    .unwrap();
+                assert!(terminal.payload.get("workspaceDiff").is_none());
+                assert!(
+                    terminal.payload["workspaceFinalizationError"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("failed to finalize interactive turn"))
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fallback finalization failure did not close the workspace"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let run = controller.get(&explore.id).unwrap();
+        assert_eq!(run.summary.status, RunStatus::Failed);
+        assert!(
+            run.summary
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed to finalize interactive turn"))
+        );
+        let run_finished = run
+            .events
+            .iter()
+            .find(|event| event.kind == "run.finished")
+            .unwrap();
+        assert!(
+            run_finished.payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("failed to finalize interactive turn"))
+        );
+        assert_eq!(
+            run_finished.payload["score"]["workspaceEvidence"],
+            "unavailable"
+        );
+        assert!(lock(&workspace.active_agent_turn).is_none());
+        assert!(workspace.cancel.is_cancelled());
+        assert!(
+            controller
+                .start_agent_session(
+                    &explore.id,
+                    StartAgentSessionRequest::default(),
+                    WorkbenchOrigin::Nushell,
+                )
+                .is_err()
+        );
+        let score = read_optional_json(&workspace.bundle_dir.join("score.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(score["passed"], false);
+        assert_eq!(score["workspaceEvidence"], "unavailable");
+        assert!(
+            score["finalizationError"]
+                .as_str()
+                .is_some_and(|error| error.contains("failed to finalize interactive turn"))
+        );
+
+        drop(workspace);
+        drop(state);
+        drop(controller);
         fs::remove_dir_all(root).unwrap();
     }
 

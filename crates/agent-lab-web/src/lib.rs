@@ -703,10 +703,10 @@ async fn run_events(
     let Some(runs) = authorized_runs(&state, &headers) else {
         return StatusCode::FORBIDDEN.into_response();
     };
-    let Ok((history, receiver)) = runs.subscribe(&id) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
     let event_stream_epoch = state.event_stream_epoch.clone();
+    let Ok((history, receiver)) = runs.subscribe(&id) else {
+        return with_event_stream_epoch(StatusCode::NOT_FOUND.into_response(), event_stream_epoch);
+    };
     let stream = run_event_stream(runs, id, history, receiver)
         .map(|event| {
             Event::default()
@@ -953,8 +953,9 @@ async fn agent_session_events(
     let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
         return StatusCode::FORBIDDEN.into_response();
     };
+    let event_stream_epoch = state.event_stream_epoch.clone();
     let Ok((history, receiver)) = runs.subscribe_agent_session(&workspace_id, &session_id) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return with_event_stream_epoch(StatusCode::NOT_FOUND.into_response(), event_stream_epoch);
     };
     let stream = agent_session_event_stream(runs, session_id, history, receiver)
         .map(|event| {
@@ -964,9 +965,10 @@ async fn agent_session_events(
                 .json_data(event)
         })
         .take_until(state.config.shutdown.cancelled_owned());
-    Sse::new(stream)
+    let response = Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
-        .into_response()
+        .into_response();
+    with_event_stream_epoch(response, event_stream_epoch)
 }
 
 fn agent_session_event_stream(
@@ -1999,15 +2001,18 @@ totalScore = 0
 
     #[test]
     fn run_event_responses_identify_the_server_epoch() {
-        let response = with_event_stream_epoch(
-            StatusCode::OK.into_response(),
-            HeaderValue::from_static("boot-epoch-1"),
-        );
+        for status in [StatusCode::OK, StatusCode::NOT_FOUND] {
+            let response = with_event_stream_epoch(
+                status.into_response(),
+                HeaderValue::from_static("boot-epoch-1"),
+            );
 
-        assert_eq!(
-            response.headers().get(EVENT_STREAM_EPOCH_HEADER),
-            Some(&HeaderValue::from_static("boot-epoch-1"))
-        );
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().get(EVENT_STREAM_EPOCH_HEADER),
+                Some(&HeaderValue::from_static("boot-epoch-1"))
+            );
+        }
     }
 
     #[tokio::test]

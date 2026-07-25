@@ -72,8 +72,7 @@ class GhosttyTerminalSurface implements TerminalSurface {
       const modifierOnly = ['alt', 'altgraph', 'capslock', 'control', 'meta', 'shift'].includes(
         keyName
       );
-      const cancellation = domEvent.ctrlKey && keyName === 'c';
-      if (!domEvent.metaKey && !modifierOnly && !cancellation) listener();
+      if (!domEvent.metaKey && !modifierOnly) listener();
     });
     const paste = () => listener();
     const composition = () => listener();

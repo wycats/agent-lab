@@ -415,13 +415,15 @@ export interface RunClient {
   agentSessionEvents(
     workspaceId: string,
     sessionId: string,
-    onEvent: (event: RunEvent) => void
+    onEvent: (event: RunEvent) => void | Promise<void>,
+    onReset?: (reset: RunEventStreamReset) => number | Promise<number>
   ): AbortController;
 }
 
 export interface RunEventStreamReset {
-  previousEpoch: string;
+  previousEpoch?: string;
   epoch: string;
+  responseStatus: number;
 }
 
 async function processToken(): Promise<string> {
@@ -466,13 +468,17 @@ async function streamEvents(
     cache: 'no-store',
     signal
   });
-  if (!response.ok || !response.body) {
+  if (!response.body) {
+    await onOpen?.(response);
     throw new Error(`event stream failed with HTTP ${response.status}`);
   }
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let reachedEof = false;
   try {
     await onOpen?.(response);
+    if (!response.ok) {
+      throw new Error(`event stream failed with HTTP ${response.status}`);
+    }
     let buffer = '';
     while (!signal.aborted) {
       const { value, done } = await reader.read();
@@ -539,6 +545,7 @@ function reconnectingRunEvents(
     let retryDelayMs = EVENT_STREAM_RECONNECT_INITIAL_MS;
     let lastDeliveredSequence = 0;
     let eventStreamEpoch: string | undefined;
+    let unavailableResponseHandled = false;
     while (!controller.signal.aborted) {
       let connectedAtMs: number | undefined;
       try {
@@ -554,20 +561,25 @@ function reconnectingRunEvents(
             connectedAtMs = Date.now();
             const responseEpoch = response.headers.get(EVENT_STREAM_EPOCH_HEADER) ?? undefined;
             if (!responseEpoch) return;
-            if (!eventStreamEpoch) {
+            const epochChanged = eventStreamEpoch !== undefined && responseEpoch !== eventStreamEpoch;
+            const unavailable = !response.ok;
+            const availabilityChanged = unavailable && !unavailableResponseHandled;
+            if (!epochChanged && !availabilityChanged) {
               eventStreamEpoch = responseEpoch;
+              if (!unavailable) unavailableResponseHandled = false;
               return;
             }
-            if (responseEpoch === eventStreamEpoch) return;
             const reconciledSequence = await onReset?.({
               previousEpoch: eventStreamEpoch,
-              epoch: responseEpoch
+              epoch: responseEpoch,
+              responseStatus: response.status
             }) ?? 0;
             if (!Number.isSafeInteger(reconciledSequence) || reconciledSequence < 0) {
               throw new Error('run event stream reset returned an invalid sequence');
             }
             eventStreamEpoch = responseEpoch;
             lastDeliveredSequence = reconciledSequence;
+            unavailableResponseHandled = unavailable;
           }
         );
       } catch {
@@ -653,38 +665,9 @@ export function createRunClient(): RunClient {
         `/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}/cancel`,
         { method: 'POST' }
       ),
-    agentSessionEvents(workspaceId, sessionId, onEvent) {
-      const controller = new AbortController();
+    agentSessionEvents(workspaceId, sessionId, onEvent, onReset) {
       const path = `/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}/events`;
-      void (async () => {
-        let retryDelayMs = EVENT_STREAM_RECONNECT_INITIAL_MS;
-        while (!controller.signal.aborted) {
-          let connectedAtMs: number | undefined;
-          try {
-            await streamEvents(
-              path,
-              controller.signal,
-              onEvent,
-              () => {
-                connectedAtMs = Date.now();
-              }
-            );
-          } catch {
-            // A later connection replays durable events, and the view de-duplicates
-            // them by sequence before applying them.
-          }
-          if (controller.signal.aborted) return;
-          if (
-            connectedAtMs !== undefined &&
-            Date.now() - connectedAtMs >= EVENT_STREAM_RECONNECT_STABLE_MS
-          ) {
-            retryDelayMs = EVENT_STREAM_RECONNECT_INITIAL_MS;
-          }
-          if (!(await waitForAbortableDelay(retryDelayMs, controller.signal))) return;
-          retryDelayMs = Math.min(retryDelayMs * 2, EVENT_STREAM_RECONNECT_MAX_MS);
-        }
-      })();
-      return controller;
+      return reconnectingRunEvents(path, onEvent, onReset);
     }
   };
 }

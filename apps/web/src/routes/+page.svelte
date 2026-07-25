@@ -5,7 +5,7 @@
   import AgentSessionLiveStatus from '$lib/AgentSessionLiveStatus.svelte';
   import AssistantMarkdown from '$lib/AssistantMarkdown.svelte';
   import { projectAgentSessionLiveStatus } from '$lib/agent-live-status';
-  import { agentTurnActivityDetail, createRunClient, type AgentSessionDetail, type AgentSessionSummary, type AgentTurnActivityPresentation, type AgentTurnMessagePresentation, type AgentTurnSummary, type EvaluationComparisonArm, type EvaluationDetail, type EvaluationSummary, type HarnessMetadata, type ModelAccessSnapshot, type ModelProfileMetadata, type RunDetail, type RunEvent, type RunReviewStep, type RunSummary, type ScenarioManifest, type WorkbenchSelection } from '$lib/runs';
+  import { agentTurnActivityDetail, createRunClient, type AgentSessionDetail, type AgentSessionSummary, type AgentTurnActivityPresentation, type AgentTurnMessagePresentation, type AgentTurnSummary, type EvaluationComparisonArm, type EvaluationDetail, type EvaluationSummary, type HarnessMetadata, type ModelAccessSnapshot, type ModelProfileMetadata, type RunDetail, type RunEvent, type RunEventStreamReset, type RunReviewStep, type RunSummary, type ScenarioManifest, type WorkbenchSelection } from '$lib/runs';
   import { createGhosttySurface } from '$lib/terminal/ghostty';
   import { connectSession } from '$lib/terminal/session';
   import type { BrowserSession, ConnectionState, SessionEvent } from '$lib/terminal/session';
@@ -17,6 +17,7 @@
     workspaceId: string;
     sessionId: string;
     openVersion: number;
+    evidenceGeneration: number;
     reveal: boolean;
     replaceCurrent: boolean;
   };
@@ -74,6 +75,7 @@
   let agentSessionReconcileRetryDelayMs = AGENT_SESSION_RECONCILE_INITIAL_MS;
   let agentSessionOpenRequestVersion = 0;
   let agentSessionOpenVersion = 0;
+  let agentSessionEvidenceGeneration = 0;
   let connectionState: ConnectionState = 'starting';
   let sessionEvents: SessionEvent[] = [];
   let screenText = '';
@@ -301,10 +303,12 @@
     }
     const requestVersion = ++agentSessionOpenRequestVersion;
     const currentOpenVersion = agentSessionOpenVersion;
+    const currentEvidenceGeneration = agentSessionEvidenceGeneration;
     const detail = await runClient.agentSession(workspaceId, sessionId);
     if (
       requestVersion !== agentSessionOpenRequestVersion ||
       currentOpenVersion !== agentSessionOpenVersion ||
+      currentEvidenceGeneration !== agentSessionEvidenceGeneration ||
       starting ||
       exploreRun?.summary.status !== 'exploring'
     ) return;
@@ -340,14 +344,108 @@
     agentSessionEventStream?.abort();
     agentSessionEventStream = undefined;
     if (!agentSessionIsHistorical(detail.summary)) {
-      agentSessionEventStream = runClient.agentSessionEvents(workspaceId, sessionId, (event) => {
-        queueAgentSessionEvent(workspaceId, sessionId, openVersion, event);
-      });
+      watchAgentSessionEvents(workspaceId, sessionId, openVersion);
     }
+  }
+
+  function watchAgentSessionEvents(
+    workspaceId: string,
+    sessionId: string,
+    openVersion: number
+  ): void {
+    agentSessionEventStream?.abort();
+    let stream: AbortController | undefined;
+    stream = runClient.agentSessionEvents(
+      workspaceId,
+      sessionId,
+      (event) => {
+        if (
+          agentSessionEventStream !== stream ||
+          openVersion !== agentSessionOpenVersion ||
+          activeAgentSession?.summary.id !== sessionId
+        ) return;
+        queueAgentSessionEvent(workspaceId, sessionId, openVersion, event);
+      },
+      (reset) => reconcileAgentSessionEventStreamReset(
+        workspaceId,
+        sessionId,
+        openVersion,
+        reset,
+        stream
+      )
+    );
+    agentSessionEventStream = stream;
+  }
+
+  async function reconcileAgentSessionEventStreamReset(
+    workspaceId: string,
+    sessionId: string,
+    openVersion: number,
+    reset: RunEventStreamReset,
+    stream: AbortController | undefined
+  ): Promise<number> {
+    if (
+      !stream ||
+      agentSessionEventStream !== stream ||
+      openVersion !== agentSessionOpenVersion ||
+      activeAgentSession?.summary.id !== sessionId
+    ) {
+      stream?.abort();
+      return 0;
+    }
+    const evidenceGeneration = ++agentSessionEvidenceGeneration;
+    if (agentSessionEventFlushTimer !== undefined) clearTimeout(agentSessionEventFlushTimer);
+    agentSessionEventFlushTimer = undefined;
+    pendingAgentSessionEvents = [];
+    knownAgentSessionEventSequences = new Set();
+    clearAgentSessionReconciliation();
+    if (reset.responseStatus === 404) {
+      if (
+        openVersion === agentSessionOpenVersion &&
+        activeAgentSession?.summary.id === sessionId
+      ) {
+        agentSessions = agentSessions.filter((session) => session.id !== sessionId);
+        clearAgentSessionView();
+      }
+      return 0;
+    }
+    let latest: AgentSessionDetail;
+    try {
+      latest = await runClient.agentSession(workspaceId, sessionId);
+    } catch (error) {
+      if (
+        agentSessionEventStream === stream &&
+        openVersion === agentSessionOpenVersion &&
+        activeAgentSession?.summary.id === sessionId
+      ) {
+        agentSessionSyncError = agentSessionUnavailableMessage(error);
+      }
+      throw error;
+    }
+    const latestSequence = latest.events.reduce(
+      (sequence, event) => Math.max(sequence, event.sequence),
+      0
+    );
+    if (
+      evidenceGeneration !== agentSessionEvidenceGeneration ||
+      openVersion !== agentSessionOpenVersion ||
+      activeAgentSession?.summary.id !== sessionId ||
+      agentSessionEventStream !== stream
+    ) return latestSequence;
+    activeAgentSession = latest;
+    rememberAgentSession(latest.summary);
+    knownAgentSessionEventSequences = new Set(latest.events.map((event) => event.sequence));
+    agentSessionSyncError = '';
+    if (agentSessionIsHistorical(latest.summary)) {
+      stream.abort();
+      if (agentSessionEventStream === stream) agentSessionEventStream = undefined;
+    }
+    return latestSequence;
   }
 
   function clearAgentSessionView(): void {
     agentSessionOpenVersion += 1;
+    agentSessionEvidenceGeneration += 1;
     agentSessionEventStream?.abort();
     agentSessionEventStream = undefined;
     if (agentSessionEventFlushTimer !== undefined) clearTimeout(agentSessionEventFlushTimer);
@@ -554,6 +652,7 @@
       workspaceId,
       sessionId,
       openVersion,
+      evidenceGeneration: agentSessionEvidenceGeneration,
       reveal: options.reveal ?? false,
       replaceCurrent: options.replaceCurrent ?? false
     };
@@ -575,6 +674,7 @@
     target: AgentSessionReconcileTarget
   ): boolean {
     return target.openVersion === agentSessionOpenVersion &&
+      target.evidenceGeneration === agentSessionEvidenceGeneration &&
       (
         target.replaceCurrent ||
         activeAgentSession === undefined ||
@@ -669,18 +769,7 @@
           agentSessionEventStream?.abort();
           agentSessionEventStream = undefined;
         } else if (!agentSessionEventStream) {
-          agentSessionEventStream = runClient.agentSessionEvents(
-            target.workspaceId,
-            target.sessionId,
-            (event) => {
-              queueAgentSessionEvent(
-                target.workspaceId,
-                target.sessionId,
-                target.openVersion,
-                event
-              );
-            }
-          );
+          watchAgentSessionEvents(target.workspaceId, target.sessionId, target.openVersion);
         }
       }
     })().finally(() => {
@@ -1044,7 +1133,9 @@
       (latest, event) => Math.max(latest, event.sequence),
       0
     );
-    exploreEventStream = runClient.events(id, (event) => {
+    let stream: AbortController | undefined;
+    stream = runClient.events(id, (event) => {
+      if (exploreEventStream !== stream) return;
       if (selectedRun?.summary.id === id && !runEvents.some((known) => known.sequence === event.sequence)) {
         runEvents = [...runEvents, event];
         scheduleReviewRefresh(id);
@@ -1135,16 +1226,19 @@
             });
           });
       }
-    }, async () => {
-      const reconciledSequence = await reconcileRunEventStreamReset(id);
-      liveAfterSequence = reconciledSequence;
+    }, async (reset) => {
+      const reconciledSequence = await reconcileRunEventStreamReset(id, reset, 'explore', stream);
+      if (exploreEventStream === stream) liveAfterSequence = reconciledSequence;
       return reconciledSequence;
     });
+    exploreEventStream = stream;
   }
 
   function watchInspectedRun(id: string): void {
     inspectionEventStream?.abort();
-    inspectionEventStream = runClient.events(id, (event) => {
+    let stream: AbortController | undefined;
+    stream = runClient.events(id, (event) => {
+      if (inspectionEventStream !== stream) return;
       if (selectedRun?.summary.id === id && !runEvents.some((known) => known.sequence === event.sequence)) {
         runEvents = [...runEvents, event];
         scheduleReviewRefresh(id);
@@ -1154,20 +1248,65 @@
         reviewRefreshTimer = undefined;
         void refreshRun(id, applyTerminalRunEvent(id, event));
       }
-    }, () => reconcileRunEventStreamReset(id));
+    }, (reset) => reconcileRunEventStreamReset(id, reset, 'inspection', stream));
+    inspectionEventStream = stream;
   }
 
-  async function reconcileRunEventStreamReset(id: string): Promise<number> {
+  async function reconcileRunEventStreamReset(
+    id: string,
+    reset: RunEventStreamReset,
+    owner: 'explore' | 'inspection',
+    stream: AbortController | undefined
+  ): Promise<number> {
+    const streamIsCurrent = () => Boolean(
+      stream &&
+      (
+        owner === 'explore'
+          ? exploreEventStream === stream
+          : inspectionEventStream === stream
+      )
+    );
+    if (!streamIsCurrent()) {
+      stream?.abort();
+      return 0;
+    }
     runReviewGeneration += 1;
     if (reviewRefreshTimer !== undefined) clearTimeout(reviewRefreshTimer);
     reviewRefreshTimer = undefined;
     if (selectedRun?.summary.id === id) runEvents = [];
-    const detail = await refreshRun(id, false, true);
-    if (!detail) throw new Error('run event stream reset could not reconcile authoritative detail');
-    return detail.events.reduce(
+    if (reset.responseStatus === 404) {
+      applyTerminalRunEvent(id, {
+        sequence: 0,
+        atMs: Date.now(),
+        type: 'run.finished',
+        payload: {
+          status: 'failed',
+          error: RUN_EVIDENCE_UNAVAILABLE,
+          score: { passed: false, evidenceQuarantined: true }
+        }
+      });
+      stream?.abort();
+      if (owner === 'explore' && exploreEventStream === stream) {
+        exploreEventStream = undefined;
+      } else if (owner === 'inspection' && inspectionEventStream === stream) {
+        inspectionEventStream = undefined;
+      }
+      return 0;
+    }
+    const detail = await runClient.detail(id);
+    const latestSequence = detail.events.reduce(
       (latest, event) => Math.max(latest, event.sequence),
       0
     );
+    if (!streamIsCurrent()) return latestSequence;
+    if (unavailableRunIds.has(id)) return latestSequence;
+    if (exploreRun?.summary.id === id) exploreRun = detail;
+    if (selectedRun?.summary.id === id) {
+      selectedRun = detail;
+      runEvents = detail.events;
+    }
+    runs = runs.map((run) => (run.id === id ? detail.summary : run));
+    return latestSequence;
   }
 
   function scheduleReviewRefresh(id: string): void {

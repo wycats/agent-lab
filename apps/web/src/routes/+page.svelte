@@ -691,7 +691,8 @@
           id,
           sessionId,
           (event.payload as { origin?: unknown }).origin === 'nushell',
-          event.type === 'workbench.agent.turn.started' ||
+          event.type === 'workbench.agent.session.activated' ||
+            event.type === 'workbench.agent.turn.started' ||
             activeAgentSession?.summary.id !== sessionId
         )
           .catch((error) => {

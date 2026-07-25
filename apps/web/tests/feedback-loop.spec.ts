@@ -217,6 +217,146 @@ test('a session that fails while opening becomes retained history', async ({ pag
   await page.unrouteAll({ behavior: 'wait' });
 });
 
+test('activating an already displayed session refreshes its ready lifecycle', async ({ page }) => {
+  const sessionId = 'activating-session';
+  let workspaceId = '';
+  let activated = false;
+  let sessionDetailRequests = 0;
+
+  await page.addInitScript(() => {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        window.location.href
+      );
+      if (/^\/api\/runs\/[^/]+\/events$/.test(requestUrl.pathname)) {
+        const encoder = new TextEncoder();
+        let closed = false;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+              .__publishWorkspaceAgentEvent = (event) => {
+                if (closed || init?.signal?.aborted) return;
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+              };
+            init?.signal?.addEventListener('abort', () => {
+              if (closed) return;
+              closed = true;
+              try {
+                controller.close();
+              } catch {
+                // The stream may already have been closed by navigation.
+              }
+            }, { once: true });
+          },
+          cancel() {
+            closed = true;
+          }
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' }
+        });
+      }
+      return nativeFetch(input, init);
+    };
+  });
+
+  await page.route(/\/api\/workbench\/[^/]+$/, async (route) => {
+    const response = await route.fetch();
+    const workbench = await response.json();
+    workspaceId = workbench.workspaceId;
+    workbench.activeAgentSession = null;
+    workbench.replayAgentSession = null;
+    workbench.agentSessions = [];
+    await route.fulfill({ response, json: workbench });
+  });
+  await page.route(
+    new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}$`),
+    async (route) => {
+      sessionDetailRequests += 1;
+      await route.fulfill({
+        json: {
+          projectionVersion: 1,
+          summary: {
+            id: sessionId,
+            workspaceId,
+            harnessId: 'v0',
+            modelProfileId: 'fixture',
+            modelId: 'fixture/v0',
+            status: activated ? 'ready' : 'starting',
+            active: activated,
+            createdAtMs: 1,
+            updatedAtMs: activated ? 3 : 2,
+            turnCount: 0
+          },
+          turns: [],
+          events: []
+        }
+      });
+    }
+  );
+  await page.route(
+    new RegExp(`/api/workbench/[^/]+/agent-sessions/${sessionId}/events$`),
+    async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: ''
+      });
+    }
+  );
+
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect.poll(() =>
+    page.evaluate(() =>
+      typeof (window as Window & { __publishWorkspaceAgentEvent?: unknown })
+        .__publishWorkspaceAgentEvent
+    )
+  ).toBe('function');
+
+  await page.evaluate(({ sessionId }) => {
+    (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+      .__publishWorkspaceAgentEvent?.({
+        sequence: 1_000_000,
+        atMs: 2,
+        type: 'workbench.agent.session.started',
+        payload: { sessionId, origin: 'nushell' }
+      });
+  }, { sessionId });
+
+  const session = page.getByTestId('interactive-agent-session');
+  await expect(session).toBeVisible();
+  await expect(page.locator('.run-heading')).toContainText('Agent session');
+  await expect(page.locator('.run-heading')).toContainText('starting');
+  await expect(session).toContainText('This session is getting ready.');
+  await expect.poll(() => sessionDetailRequests).toBe(1);
+
+  activated = true;
+  await page.evaluate(({ sessionId }) => {
+    (window as Window & { __publishWorkspaceAgentEvent?: (event: unknown) => void })
+      .__publishWorkspaceAgentEvent?.({
+        sequence: 1_000_001,
+        atMs: 3,
+        type: 'workbench.agent.session.activated',
+        payload: { sessionId, origin: 'nushell' }
+      });
+  }, { sessionId });
+
+  await expect.poll(() => sessionDetailRequests).toBe(2);
+  await expect(page.locator('.run-heading')).toContainText('Active session');
+  await expect(page.locator('.run-heading')).toContainText('ready');
+  await expect(session).toContainText('Ask the harness in Explore.');
+  await expect(session.getByTestId('session-turn')).toHaveCount(0);
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
 test('a sustained agent stream stays incremental while run inspection remains independently navigable', async ({ page }) => {
   const sessionId = 'stream-session';
   const turnId = 'stream-turn';

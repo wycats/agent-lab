@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::{OsStr, OsString},
@@ -6,7 +8,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex, MutexGuard, Weak, mpsc},
+    sync::{Arc, Condvar, Mutex, MutexGuard, Weak, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -694,6 +696,7 @@ struct RunState {
     sender: broadcast::Sender<RunEvent>,
     cancel: CancellationToken,
     bundle_dir: PathBuf,
+    agent_session_directories: AgentSessionDirectoryAnchor,
     workspace: PathBuf,
     output: PathBuf,
     initial_snapshot: Option<BTreeMap<String, Vec<u8>>>,
@@ -734,6 +737,227 @@ struct EvaluationState {
     replay_failed: bool,
 }
 
+struct AgentSessionEvidenceRoot {
+    display_path: PathBuf,
+    #[cfg(unix)]
+    directory: rustix::fd::OwnedFd,
+}
+
+struct AgentSessionDirectoryAnchor {
+    display_path: PathBuf,
+    #[cfg(unix)]
+    run_directory: rustix::fd::OwnedFd,
+    #[cfg(unix)]
+    session_collection: Mutex<Option<rustix::fd::OwnedFd>>,
+}
+
+impl AgentSessionEvidenceRoot {
+    #[cfg(all(test, unix))]
+    fn open(display_path: PathBuf) -> Result<Self, RunError> {
+        let directory = open_confined_evidence_root(&display_path)?;
+        Ok(Self::from_opened(display_path, directory))
+    }
+
+    #[cfg(all(test, not(unix)))]
+    fn open(display_path: PathBuf) -> Result<Self, RunError> {
+        Err(RunError::ConfinedReadUnavailable(display_path))
+    }
+
+    fn display_path(&self) -> &Path {
+        &self.display_path
+    }
+
+    #[cfg(unix)]
+    fn from_opened(display_path: PathBuf, directory: rustix::fd::OwnedFd) -> Self {
+        Self {
+            display_path,
+            directory,
+        }
+    }
+}
+
+impl AgentSessionDirectoryAnchor {
+    #[cfg(unix)]
+    fn open(display_path: PathBuf) -> Result<Self, RunError> {
+        let run_directory = open_confined_evidence_root(&display_path)?;
+        Ok(Self {
+            display_path,
+            run_directory,
+            session_collection: Mutex::new(None),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn open(display_path: PathBuf) -> Result<Self, RunError> {
+        Ok(Self { display_path })
+    }
+
+    fn collection_display_path(&self) -> PathBuf {
+        self.display_path.join("agent-sessions")
+    }
+
+    #[cfg(unix)]
+    fn session_collection(&self, create: bool) -> Result<Option<rustix::fd::OwnedFd>, RunError> {
+        let mut pinned = lock(&self.session_collection);
+        if pinned.is_none() {
+            let display_path = self.collection_display_path();
+            let flags = rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW;
+            let mut opened = rustix::fs::openat(
+                &self.run_directory,
+                "agent-sessions",
+                flags,
+                rustix::fs::Mode::empty(),
+            );
+            if create
+                && opened
+                    .as_ref()
+                    .is_err_and(|error| *error == rustix::io::Errno::NOENT)
+            {
+                match rustix::fs::mkdirat(
+                    &self.run_directory,
+                    "agent-sessions",
+                    rustix::fs::Mode::RWXU | rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO,
+                ) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => return Err(io::Error::from(error).into()),
+                }
+                opened = rustix::fs::openat(
+                    &self.run_directory,
+                    "agent-sessions",
+                    flags,
+                    rustix::fs::Mode::empty(),
+                );
+            }
+            let opened = match opened {
+                Ok(opened) => opened,
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+                    return Err(RunError::PathEscape(display_path));
+                }
+                Err(error) => return Err(io::Error::from(error).into()),
+            };
+            *pinned = Some(opened);
+        }
+        let duplicate = rustix::io::fcntl_dupfd_cloexec(
+            pinned
+                .as_ref()
+                .expect("opened agent session collection should be pinned"),
+            0,
+        )
+        .map_err(io::Error::from)?;
+        Ok(Some(duplicate))
+    }
+
+    #[cfg(unix)]
+    fn session_names(&self) -> Result<Vec<OsString>, RunError> {
+        let Some(directory) = self.session_collection(false)? else {
+            return Ok(Vec::new());
+        };
+        let entries = rustix::fs::Dir::read_from(&directory).map_err(io::Error::from)?;
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(io::Error::from)?;
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            names.push(OsString::from_vec(bytes.to_vec()));
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    #[cfg(unix)]
+    fn open_session(&self, name: &OsStr) -> Result<AgentSessionEvidenceRoot, RunError> {
+        let display_path = self.collection_display_path().join(name);
+        let components = confined_evidence_components(Path::new(name), &display_path)?;
+        if components.len() != 1 {
+            return Err(RunError::PathEscape(display_path));
+        }
+        let collection = self.session_collection(false)?.ok_or_else(|| {
+            RunError::InvalidRequest("agent session collection does not exist".to_owned())
+        })?;
+        let directory = rustix::fs::openat(
+            &collection,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| match error {
+            rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+                RunError::PathEscape(display_path.clone())
+            }
+            _ => io::Error::from(error).into(),
+        })?;
+        Ok(AgentSessionEvidenceRoot::from_opened(
+            display_path,
+            directory,
+        ))
+    }
+
+    #[cfg(unix)]
+    fn create_session(&self, id: &str) -> Result<AgentSessionEvidenceRoot, RunError> {
+        validate_portable_evidence_id("agent session", id)?;
+        let display_path = self.collection_display_path().join(id);
+        let collection = self
+            .session_collection(true)?
+            .expect("created agent session collection should be available");
+        let mode = rustix::fs::Mode::RWXU | rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO;
+        rustix::fs::mkdirat(&collection, id, mode).map_err(io::Error::from)?;
+        let directory = match rustix::fs::openat(
+            &collection,
+            id,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(directory) => directory,
+            Err(error) => {
+                let _ = rustix::fs::unlinkat(&collection, id, rustix::fs::AtFlags::REMOVEDIR);
+                return Err(io::Error::from(error).into());
+            }
+        };
+        if let Err(error) = rustix::fs::mkdirat(&directory, "turns", mode) {
+            drop(directory);
+            let _ = rustix::fs::unlinkat(&collection, id, rustix::fs::AtFlags::REMOVEDIR);
+            return Err(io::Error::from(error).into());
+        }
+        Ok(AgentSessionEvidenceRoot::from_opened(
+            display_path,
+            directory,
+        ))
+    }
+
+    #[cfg(not(unix))]
+    fn session_names(&self) -> Result<Vec<OsString>, RunError> {
+        Err(RunError::ConfinedReadUnavailable(
+            self.collection_display_path(),
+        ))
+    }
+
+    #[cfg(not(unix))]
+    fn open_session(&self, name: &OsStr) -> Result<AgentSessionEvidenceRoot, RunError> {
+        Err(RunError::ConfinedReadUnavailable(
+            self.collection_display_path().join(name),
+        ))
+    }
+
+    #[cfg(not(unix))]
+    fn create_session(&self, id: &str) -> Result<AgentSessionEvidenceRoot, RunError> {
+        Err(RunError::ConfinedReadUnavailable(
+            self.collection_display_path().join(id),
+        ))
+    }
+}
+
 struct AgentSessionState {
     summary: Mutex<AgentSessionSummary>,
     turns: Mutex<Vec<AgentTurnSummary>>,
@@ -742,9 +966,17 @@ struct AgentSessionState {
     commands: Mutex<Option<mpsc::Sender<AgentSessionCommand>>>,
     lifecycle_cancel: CancellationToken,
     turn_cancel: Mutex<Option<CancellationToken>>,
+    actor: Mutex<AgentActorRegistration>,
+    actor_registered: Condvar,
     evidence_error: Mutex<Option<String>>,
-    bundle_dir: PathBuf,
+    evidence_root: AgentSessionEvidenceRoot,
     secret_values: Mutex<Vec<Vec<u8>>>,
+}
+
+#[derive(Default)]
+struct AgentActorRegistration {
+    complete: bool,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -775,10 +1007,10 @@ impl<'a> ActiveAgentTurnGuard<'a> {
         })
     }
 
-    fn finish(
+    fn finish<T>(
         &mut self,
-        persist_terminal_state: impl FnOnce() -> Result<(), RunError>,
-    ) -> Result<(), RunError> {
+        persist_terminal_state: impl FnOnce() -> Result<T, RunError>,
+    ) -> Result<T, RunError> {
         let mut active = lock(&self.workspace.active_agent_turn);
         if active.as_ref() != Some(&self.attribution) {
             return Err(RunError::Protocol(format!(
@@ -786,9 +1018,9 @@ impl<'a> ActiveAgentTurnGuard<'a> {
                 self.attribution.turn_id
             )));
         }
-        persist_terminal_state()?;
+        let result = persist_terminal_state()?;
         *active = None;
-        Ok(())
+        Ok(result)
     }
 }
 
@@ -808,16 +1040,40 @@ fn release_agent_turn_reservation(workspace: &RunState, attribution: &AgentTurnA
     }
 }
 
+fn register_agent_actor(state: &AgentSessionState, handle: Option<thread::JoinHandle<()>>) {
+    let mut actor = lock(&state.actor);
+    actor.handle = handle;
+    actor.complete = true;
+    state.actor_registered.notify_all();
+}
+
+fn join_agent_actor(state: &AgentSessionState) -> Result<(), RunError> {
+    let handle = {
+        let actor = lock(&state.actor);
+        let mut actor = state
+            .actor_registered
+            .wait_while(actor, |actor| !actor.complete)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        actor.handle.take()
+    };
+    if let Some(handle) = handle {
+        handle.join().map_err(|_| {
+            RunError::Protocol("agent session actor panicked during workspace shutdown".to_owned())
+        })?;
+    }
+    Ok(())
+}
+
 fn rollback_agent_turn_start(
     state: &AgentSessionState,
     workspace: &RunState,
     attribution: &AgentTurnAttribution,
-    turn_dir: &Path,
+    turn_relative: &Path,
 ) {
     lock(&state.turns).retain(|turn| turn.id != attribution.turn_id);
     *lock(&state.turn_cancel) = None;
     let _ = persist_agent_session(state);
-    let _ = remove_evidence_entry(turn_dir);
+    let _ = remove_confined_evidence_entry(&state.evidence_root, turn_relative);
     release_agent_turn_reservation(workspace, attribution);
 }
 
@@ -986,7 +1242,7 @@ impl RunController {
         }
         let runs = load_runs(&data_dir, &scenarios, &harness_registry, &model_profiles)?;
         let evaluations = load_evaluations(&evaluations_dir)?;
-        let agent_sessions = load_agent_sessions(&runs)?;
+        let agent_sessions = load_agent_sessions(&runs);
         for session in agent_sessions.values() {
             let workspace_id = lock(&session.summary).workspace_id.clone();
             if let Some(workspace) = runs.get(&workspace_id) {
@@ -1420,8 +1676,7 @@ impl RunController {
             .cloned()
             .ok_or_else(|| RunError::UnknownScenario(source.scenario_id.clone()))?;
         let id = format!("agent-session-{}-{}", now_ms(), random_suffix());
-        let bundle_dir = workspace.bundle_dir.join("agent-sessions").join(&id);
-        fs::create_dir_all(bundle_dir.join("turns"))?;
+        let evidence_root = workspace.agent_session_directories.create_session(&id)?;
         let (sender, _) = broadcast::channel(256);
         let summary = AgentSessionSummary {
             id: id.clone(),
@@ -1448,8 +1703,10 @@ impl RunController {
             commands: Mutex::new(None),
             lifecycle_cancel: CancellationToken::new(),
             turn_cancel: Mutex::new(None),
+            actor: Mutex::new(AgentActorRegistration::default()),
+            actor_registered: Condvar::new(),
             evidence_error: Mutex::new(None),
-            bundle_dir,
+            evidence_root,
             secret_values: Mutex::new(secret_values),
         });
         lock(&workspace.agent_sessions).insert(id.clone(), Arc::downgrade(&state));
@@ -1460,6 +1717,7 @@ impl RunController {
             "workbench.agent.session.started",
             json!({ "origin": origin, "sessionId": id }),
         ) {
+            register_agent_actor(&state, None);
             let message = "workspace session-start evidence could not be persisted";
             let _ = update_agent_session_status(&state, AgentSessionStatus::Failed, Some(message));
             let _ = record_agent_event(
@@ -1490,14 +1748,19 @@ impl RunController {
                     origin,
                 );
             });
-        if let Err(error) = spawn {
-            update_agent_session_status(
-                &state,
-                AgentSessionStatus::Failed,
-                Some("agent session actor could not start"),
-            )?;
-            return Err(RunError::Process(ProcessError::Spawn(error.to_string())));
-        }
+        let handle = match spawn {
+            Ok(handle) => handle,
+            Err(error) => {
+                register_agent_actor(&state, None);
+                update_agent_session_status(
+                    &state,
+                    AgentSessionStatus::Failed,
+                    Some("agent session actor could not start"),
+                )?;
+                return Err(RunError::Process(ProcessError::Spawn(error.to_string())));
+            }
+        };
+        register_agent_actor(&state, Some(handle));
         Ok(lock(&state.summary).clone())
     }
 
@@ -1527,13 +1790,24 @@ impl RunController {
                 "finish or cancel the active turn before switching sessions".to_owned(),
             ));
         }
+        if lock(&workspace.summary).status != RunStatus::Exploring {
+            return Err(RunError::RunUnavailable(workspace_id.to_owned()));
+        }
+        let mut active_id = lock(&workspace.active_agent_session_id);
+        let previous_active_id = active_id.clone();
         persist_active_agent_session(&workspace, Some(session_id))?;
-        *lock(&workspace.active_agent_session_id) = Some(session_id.to_owned());
-        record_event(
+        *active_id = Some(session_id.to_owned());
+        if let Err(error) = record_event(
             &workspace,
             "workbench.agent.session.activated",
             json!({ "origin": origin, "sessionId": session_id }),
-        )?;
+        ) {
+            let rollback = persist_active_agent_session(&workspace, previous_active_id.as_deref());
+            *active_id = previous_active_id;
+            rollback?;
+            return Err(error);
+        }
+        drop(active_id);
         drop(active_turn);
         let mut summary = lock(&target.summary).clone();
         summary.active = true;
@@ -1614,13 +1888,17 @@ impl RunController {
             }
             *active = Some(attribution.clone());
         }
-        let turn_dir = state.bundle_dir.join("turns").join(&id);
+        let turn_relative = PathBuf::from("turns").join(&id);
         let prepared = (|| -> Result<(AgentTurnSummary, CancellationToken, Vec<CapabilityEndpoint>), RunError> {
-            fs::create_dir_all(&turn_dir)?;
+            create_confined_evidence_directory(&state.evidence_root, &turn_relative)?;
             let mut snapshot = capture_tree(&workspace.workspace)?;
             redact_captured_tree(&mut snapshot, &lock(&state.secret_values));
             let source_revision = captured_tree_digest(&snapshot);
-            write_captured_tree(&turn_dir.join("initial"), &snapshot)?;
+            write_confined_captured_tree(
+                &state.evidence_root,
+                &turn_relative.join("initial"),
+                &snapshot,
+            )?;
             let secrets = lock(&state.secret_values).clone();
             let turn = AgentTurnSummary {
                 id: id.clone(),
@@ -1662,7 +1940,7 @@ impl RunController {
         let (turn, cancel, capabilities) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                rollback_agent_turn_start(&state, &workspace, &attribution, &turn_dir);
+                rollback_agent_turn_start(&state, &workspace, &attribution, &turn_relative);
                 return Err(error);
             }
         };
@@ -1676,7 +1954,7 @@ impl RunController {
             })
             .is_err()
         {
-            rollback_agent_turn_start(&state, &workspace, &attribution, &turn_dir);
+            rollback_agent_turn_start(&state, &workspace, &attribution, &turn_relative);
             let _ = record_event(
                 &workspace,
                 "workbench.agent.turn.start-failed",
@@ -1716,7 +1994,8 @@ impl RunController {
     /// when the intervention marker cannot be persisted.
     pub fn note_terminal_input(&self, workspace_id: &str) -> Result<(), RunError> {
         let workspace = self.state(workspace_id)?;
-        let Some(attribution) = lock(&workspace.active_agent_turn).clone() else {
+        let active_turn = lock(&workspace.active_agent_turn);
+        let Some(attribution) = active_turn.clone() else {
             return Ok(());
         };
         let session = self.agent_session_state(&attribution.session_id)?;
@@ -1736,7 +2015,7 @@ impl RunController {
             marked_at_ms
         };
         persist_agent_session(&session)?;
-        record_agent_event(
+        let result = record_agent_event(
             &session,
             "agent.turn.human-intervention",
             json!({
@@ -1745,7 +2024,9 @@ impl RunController {
                 "atMs": marked_at_ms,
                 "source": "terminal-input",
             }),
-        )
+        );
+        drop(active_turn);
+        result
     }
 
     /// Request an orderly close of one ready session.
@@ -1956,19 +2237,55 @@ impl RunController {
         };
         drop(active_turn);
         if cancel_prepared {
-            for session in lock(&self.inner.agent_sessions).values() {
-                if lock(&session.summary).workspace_id == id
-                    && let Some(commands) = lock(&session.commands).clone()
-                {
+            let sessions = lock(&state.agent_sessions)
+                .values()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            for session in &sessions {
+                if matches!(
+                    lock(&session.summary).status,
+                    AgentSessionStatus::Starting
+                        | AgentSessionStatus::Ready
+                        | AgentSessionStatus::Running
+                ) {
+                    let mut summary = lock(&session.summary);
+                    summary.status = AgentSessionStatus::Closing;
+                    summary.updated_at_ms = now_ms();
+                    summary.error = None;
+                }
+                session.lifecycle_cancel.cancel();
+                if let Some(cancel) = lock(&session.turn_cancel).as_ref() {
+                    cancel.cancel();
+                }
+                if let Some(commands) = lock(&session.commands).clone() {
                     let _ = commands.send(AgentSessionCommand::Shutdown);
                 }
             }
-            return finish_run(
+            let mut actor_failures = Vec::new();
+            for session in &sessions {
+                if let Err(error) = join_agent_actor(session) {
+                    actor_failures.push(error.to_string());
+                }
+                if let Err(error) = clear_active_agent_session(&state, session) {
+                    actor_failures.push(error.to_string());
+                }
+            }
+            let actor_error = (!actor_failures.is_empty()).then(|| {
+                format!(
+                    "agent session shutdown failed: {}",
+                    actor_failures.join("; ")
+                )
+            });
+            finish_run(
                 &state,
                 RunStatus::Cancelled,
-                None,
+                actor_error.as_deref(),
                 &json!({ "passed": false, "cancelled": true }),
-            );
+            )?;
+            if let Some(error) = actor_error {
+                return Err(RunError::Protocol(error));
+            }
+            return Ok(());
         }
         state.cancel.cancel();
         Ok(())
@@ -2063,6 +2380,7 @@ impl RunController {
         let id = run_id();
         let bundle_dir = confined_child(&self.inner.data_dir, &id)?;
         fs::create_dir(&bundle_dir)?;
+        let agent_session_directories = AgentSessionDirectoryAnchor::open(bundle_dir.clone())?;
         let workspace = bundle_dir.join("workspace");
         let seed = confined_existing_child(&self.inner.scenarios_dir, &scenario.seed)?;
         let initial_snapshot = snapshot_tree(&seed)?;
@@ -2095,6 +2413,7 @@ impl RunController {
             sender,
             cancel: CancellationToken::new(),
             bundle_dir,
+            agent_session_directories,
             workspace,
             output: scenario.output.clone(),
             initial_snapshot: Some(initial_snapshot),
@@ -2618,6 +2937,7 @@ impl RunController {
         let id = run_id();
         let bundle_dir = confined_child(&self.inner.data_dir, &id)?;
         fs::create_dir(&bundle_dir)?;
+        let agent_session_directories = AgentSessionDirectoryAnchor::open(bundle_dir.clone())?;
         let workspace = bundle_dir.join("workspace");
         let initial_snapshot = snapshot_tree(snapshot)?;
         copy_tree(snapshot, &workspace)?;
@@ -2649,6 +2969,7 @@ impl RunController {
             sender,
             cancel: CancellationToken::new(),
             bundle_dir,
+            agent_session_directories,
             workspace,
             output: scenario.output.clone(),
             initial_snapshot: Some(initial_snapshot),
@@ -4046,20 +4367,18 @@ fn run_agent_session_actor(
                 {
                     let _ = load_or_build_agent_turn_presentation(state, workspace_state, &turn);
                 }
-                let _ = remove_evidence_entry(
-                    &state
-                        .bundle_dir
-                        .join("turns")
+                let _ = remove_confined_evidence_file(
+                    &state.evidence_root,
+                    &PathBuf::from("turns")
                         .join(&turn_id)
                         .join("presentation.pending.json"),
                 );
                 let _ = persist_agent_session(state);
                 Ok(event)
             } else {
-                let _ = remove_evidence_entry(
-                    &state
-                        .bundle_dir
-                        .join("turns")
+                let _ = remove_confined_evidence_file(
+                    &state.evidence_root,
+                    &PathBuf::from("turns")
                         .join(&turn_id)
                         .join("presentation.pending.json"),
                 );
@@ -4338,62 +4657,62 @@ fn run_agent_turn(
                         }
                         let workspace_diff =
                             finalize_agent_turn_workspace(state, turn_id, workspace, secrets)?;
-                        write_json_atomic(
-                            &state.bundle_dir.join("transcript.json"),
+                        write_confined_json_atomic(
+                            &state.evidence_root,
+                            Path::new("transcript.json"),
                             &serde_json::to_value(redact_transcript(driver.transcript(), secrets))?,
                         )?;
-                        let mut turn_cancel = lock(&state.turn_cancel);
-                        if termination.is_none() {
-                            termination = if cancel.is_cancelled() {
-                                Some(AgentTurnTermination::Cancelled)
-                            } else if started.elapsed()
-                                >= Duration::from_millis(limits.max_duration_ms)
-                            {
-                                Some(AgentTurnTermination::TimedOut)
-                            } else {
-                                None
-                            };
-                        }
-                        let (status, recorded_outcome, terminal_error) = match termination {
-                            Some(AgentTurnTermination::Cancelled) => {
-                                (AgentTurnStatus::Cancelled, "cancelled".to_owned(), None)
-                            }
-                            Some(AgentTurnTermination::TimedOut) => (
-                                AgentTurnStatus::Failed,
-                                "timed-out".to_owned(),
-                                Some("interactive turn duration limit exceeded".to_owned()),
-                            ),
-                            None if outcome == "aborted" => {
-                                (AgentTurnStatus::Cancelled, "aborted".to_owned(), None)
-                            }
-                            None if outcome == "completed" => {
-                                if agent_turn_was_intervened(state, turn_id) {
-                                    (AgentTurnStatus::Intervened, "intervened".to_owned(), None)
+                        let terminal_event = attribution.finish(|| {
+                            if termination.is_none() {
+                                termination = if cancel.is_cancelled() {
+                                    Some(AgentTurnTermination::Cancelled)
+                                } else if started.elapsed()
+                                    >= Duration::from_millis(limits.max_duration_ms)
+                                {
+                                    Some(AgentTurnTermination::TimedOut)
                                 } else {
-                                    (AgentTurnStatus::Completed, "completed".to_owned(), None)
-                                }
+                                    None
+                                };
                             }
-                            None => (AgentTurnStatus::Failed, outcome.clone(), None),
-                        };
-                        let terminal_event = record_finished_agent_turn_event(
-                            state,
-                            workspace_state,
-                            turn_id,
-                            status,
-                            redact_value(
-                                json!({
-                                    "sessionId": session_id,
-                                    "turnId": turn_id,
-                                    "outcome": recorded_outcome,
-                                    "driverOutcome": outcome,
-                                    "evidence": evidence,
-                                    "error": terminal_error,
-                                    "workspaceDiff": workspace_diff,
-                                }),
-                                secrets,
-                            ),
-                        )?;
-                        attribution.finish(|| {
+                            let (status, recorded_outcome, terminal_error) = match termination {
+                                Some(AgentTurnTermination::Cancelled) => {
+                                    (AgentTurnStatus::Cancelled, "cancelled".to_owned(), None)
+                                }
+                                Some(AgentTurnTermination::TimedOut) => (
+                                    AgentTurnStatus::Failed,
+                                    "timed-out".to_owned(),
+                                    Some("interactive turn duration limit exceeded".to_owned()),
+                                ),
+                                None if outcome == "aborted" => {
+                                    (AgentTurnStatus::Cancelled, "aborted".to_owned(), None)
+                                }
+                                None if outcome == "completed" => {
+                                    if agent_turn_was_intervened(state, turn_id) {
+                                        (AgentTurnStatus::Intervened, "intervened".to_owned(), None)
+                                    } else {
+                                        (AgentTurnStatus::Completed, "completed".to_owned(), None)
+                                    }
+                                }
+                                None => (AgentTurnStatus::Failed, outcome.clone(), None),
+                            };
+                            let terminal_event = record_finished_agent_turn_event(
+                                state,
+                                workspace_state,
+                                turn_id,
+                                status,
+                                redact_value(
+                                    json!({
+                                        "sessionId": session_id,
+                                        "turnId": turn_id,
+                                        "outcome": recorded_outcome,
+                                        "driverOutcome": outcome,
+                                        "evidence": evidence,
+                                        "error": terminal_error,
+                                        "workspaceDiff": workspace_diff,
+                                    }),
+                                    secrets,
+                                ),
+                            )?;
                             persist_agent_turn_terminal_state(
                                 state,
                                 turn_id,
@@ -4401,9 +4720,9 @@ fn run_agent_turn(
                                 Some(&recorded_outcome),
                                 terminal_error.as_deref(),
                             )?;
-                            Ok(())
+                            *lock(&state.turn_cancel) = None;
+                            Ok(terminal_event)
                         })?;
-                        *turn_cancel = None;
                         let _ = state.sender.send(terminal_event);
                         return Ok(());
                     }
@@ -4445,14 +4764,78 @@ fn run_agent_turn(
                             &format!("driver failed during interactive turn: {code}: {message}"),
                             secrets,
                         );
-                        update_agent_turn_status(
+                        if scope != DriverFailureScope::Turn {
+                            return Err(RunError::Protocol(message));
+                        }
+                        if let Some(error) = lock(&state.evidence_error).take() {
+                            return Err(RunError::EvidencePersistence(error));
+                        }
+                        flush_pending_assistant_deltas(
                             state,
+                            session_id,
                             turn_id,
-                            AgentTurnStatus::Failed,
-                            None,
-                            Some(&message),
+                            &mut assistant_redactor,
                         )?;
-                        return Err(RunError::Protocol(message));
+                        let workspace_diff =
+                            finalize_agent_turn_workspace(state, turn_id, workspace, secrets)?;
+                        write_confined_json_atomic(
+                            &state.evidence_root,
+                            Path::new("transcript.json"),
+                            &serde_json::to_value(redact_transcript(driver.transcript(), secrets))?,
+                        )?;
+                        if termination.is_none() {
+                            termination = if cancel.is_cancelled() {
+                                Some(AgentTurnTermination::Cancelled)
+                            } else if started.elapsed()
+                                >= Duration::from_millis(limits.max_duration_ms)
+                            {
+                                Some(AgentTurnTermination::TimedOut)
+                            } else {
+                                None
+                            };
+                        }
+                        let terminal_event = attribution.finish(|| {
+                            let (status, outcome, terminal_error) = match termination {
+                                Some(AgentTurnTermination::Cancelled) => {
+                                    (AgentTurnStatus::Cancelled, "cancelled", None)
+                                }
+                                Some(AgentTurnTermination::TimedOut) => (
+                                    AgentTurnStatus::Failed,
+                                    "timed-out",
+                                    Some("interactive turn duration limit exceeded"),
+                                ),
+                                None => (AgentTurnStatus::Failed, "failed", Some(message.as_str())),
+                            };
+                            let terminal_event = record_finished_agent_turn_event(
+                                state,
+                                workspace_state,
+                                turn_id,
+                                status,
+                                json!({
+                                    "sessionId": session_id,
+                                    "turnId": turn_id,
+                                    "outcome": outcome,
+                                    "driverFailure": {
+                                        "scope": "turn",
+                                        "code": code,
+                                        "message": message,
+                                    },
+                                    "error": terminal_error,
+                                    "workspaceDiff": workspace_diff,
+                                }),
+                            )?;
+                            persist_agent_turn_terminal_state(
+                                state,
+                                turn_id,
+                                status,
+                                Some(outcome),
+                                terminal_error,
+                            )?;
+                            *lock(&state.turn_cancel) = None;
+                            Ok(terminal_event)
+                        })?;
+                        let _ = state.sender.send(terminal_event);
+                        return Ok(());
                     }
                     _ => {}
                 },
@@ -4511,12 +4894,16 @@ impl<'a> AssistantObservationRedactor<'a> {
                 state.pending.push_str(&delta.text);
                 let text = drain_redacted_prefix(&mut state.pending, &self.secret_patterns, false);
                 state.redacted.push_str(&text);
-                Ok(vec![TurnObservation::AssistantDelta(
-                    agent_lab_driver_protocol::AssistantDeltaObservation {
-                        message_id: delta.message_id,
-                        text,
-                    },
-                )])
+                if text.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![TurnObservation::AssistantDelta(
+                        agent_lab_driver_protocol::AssistantDeltaObservation {
+                            message_id: delta.message_id,
+                            text,
+                        },
+                    )])
+                }
             }
             TurnObservation::AssistantCompleted(completed) => {
                 let state = self
@@ -4665,14 +5052,15 @@ fn finalize_agent_turn_workspace(
     secrets: &[Vec<u8>],
 ) -> Result<JsonValue, RunError> {
     validate_evidence_tree(workspace)?;
-    let turn_dir = state.bundle_dir.join("turns").join(turn_id);
-    let final_dir = turn_dir.join("final");
-    let staging_dir = turn_dir.join("final.tmp");
-    remove_evidence_entry(&staging_dir)?;
+    let turn_relative = PathBuf::from("turns").join(turn_id);
+    let final_relative = turn_relative.join("final");
+    let staging_relative = turn_relative.join("final.tmp");
+    remove_confined_evidence_entry(&state.evidence_root, &staging_relative)?;
     let mut final_snapshot = capture_tree(workspace)?;
     redact_captured_tree(&mut final_snapshot, secrets);
-    write_captured_tree(&staging_dir, &final_snapshot)?;
-    let initial_snapshot = capture_tree(&turn_dir.join("initial"))?;
+    write_confined_captured_tree(&state.evidence_root, &staging_relative, &final_snapshot)?;
+    let initial_snapshot =
+        capture_confined_tree(&state.evidence_root, &turn_relative.join("initial"))?;
     let changes = captured_tree_changes(&initial_snapshot, &final_snapshot, secrets);
     let event_changes = changes
         .iter()
@@ -4687,9 +5075,13 @@ fn finalize_agent_turn_workspace(
         })
         .collect::<Vec<_>>();
     let diff = json!({ "changes": changes });
-    write_json_atomic(&turn_dir.join("diff.json"), &diff)?;
-    remove_evidence_entry(&final_dir)?;
-    fs::rename(&staging_dir, &final_dir)?;
+    write_confined_json_atomic(
+        &state.evidence_root,
+        &turn_relative.join("diff.json"),
+        &diff,
+    )?;
+    remove_confined_evidence_entry(&state.evidence_root, &final_relative)?;
+    rename_confined_evidence_file(&state.evidence_root, &staging_relative, &final_relative)?;
     Ok(json!({ "changes": event_changes }))
 }
 
@@ -4705,12 +5097,10 @@ fn load_or_build_agent_turn_presentation(
         event.kind == "agent.turn.finished"
             && event.payload.get("turnId").and_then(JsonValue::as_str) == Some(&turn.id)
     });
-    let path = state
-        .bundle_dir
-        .join("turns")
+    let relative = PathBuf::from("turns")
         .join(&turn.id)
         .join("presentation.json");
-    let stored = read_agent_turn_presentation(&path)?;
+    let stored = read_agent_turn_presentation(&state.evidence_root, &relative)?;
     if !terminal_evidence_finalized {
         return match stored {
             None => Ok(expected),
@@ -4723,22 +5113,25 @@ fn load_or_build_agent_turn_presentation(
     }
     validate_agent_turn_presentation(turn, &expected, &events)?;
     if stored.as_ref() != Some(&expected) {
-        write_json_atomic(&path, &serde_json::to_value(&expected)?)?;
+        write_confined_json_atomic(
+            &state.evidence_root,
+            &relative,
+            &serde_json::to_value(&expected)?,
+        )?;
     }
     Ok(expected)
 }
 
 fn repair_terminal_agent_turn_presentations(
-    bundle_dir: &Path,
+    evidence_root: &AgentSessionEvidenceRoot,
     turns: &[AgentTurnSummary],
     events: &[RunEvent],
 ) -> Result<bool, RunError> {
     let mut repaired = false;
     for turn in turns {
-        let turn_dir = bundle_dir.join("turns").join(&turn.id);
-        let pending_path = turn_dir.join("presentation.pending.json");
-        if pending_path.exists() {
-            remove_evidence_entry(&pending_path)?;
+        let turn_relative = PathBuf::from("turns").join(&turn.id);
+        let pending_relative = turn_relative.join("presentation.pending.json");
+        if remove_confined_evidence_file(evidence_root, &pending_relative)? {
             repaired = true;
         }
         let terminal_evidence_finalized = events.iter().any(|event| {
@@ -4751,21 +5144,22 @@ fn repair_terminal_agent_turn_presentations(
 
         let expected = build_agent_turn_presentation_from_events(events, turn, &[])?;
         validate_agent_turn_presentation(turn, &expected, events)?;
-        let path = turn_dir.join("presentation.json");
-        if read_agent_turn_presentation(&path)?.as_ref() != Some(&expected) {
-            write_json_atomic(&path, &serde_json::to_value(expected)?)?;
+        let relative = turn_relative.join("presentation.json");
+        if read_agent_turn_presentation(evidence_root, &relative)?.as_ref() != Some(&expected) {
+            write_confined_json_atomic(evidence_root, &relative, &serde_json::to_value(expected)?)?;
             repaired = true;
         }
     }
     Ok(repaired)
 }
 
-fn read_agent_turn_presentation(path: &Path) -> Result<Option<AgentTurnPresentation>, RunError> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
+fn read_agent_turn_presentation(
+    evidence_root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+) -> Result<Option<AgentTurnPresentation>, RunError> {
+    let display_path = evidence_root.display_path().join(relative);
+    read_optional_agent_evidence_file(evidence_root, relative, &display_path)
+        .map(|bytes| bytes.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
 }
 
 fn record_finished_agent_turn_event(
@@ -4810,13 +5204,21 @@ fn record_finished_agent_turn_event(
         validate_agent_turn_presentation(&turn, &presentation, &prospective_events)?;
         #[cfg(test)]
         maybe_inject_agent_presentation_write_failure(state, turn_id)?;
-        let turn_dir = state.bundle_dir.join("turns").join(turn_id);
-        let pending_path = turn_dir.join("presentation.pending.json");
-        write_json_atomic(&pending_path, &serde_json::to_value(presentation)?)?;
+        let turn_relative = PathBuf::from("turns").join(turn_id);
+        let pending_relative = turn_relative.join("presentation.pending.json");
+        write_confined_json_atomic(
+            &state.evidence_root,
+            &pending_relative,
+            &serde_json::to_value(presentation)?,
+        )?;
         #[cfg(test)]
         maybe_inject_agent_terminal_event_append_failure(state, turn_id)?;
         append_agent_event_record_locked(state, &mut events, event.clone())?;
-        fs::rename(pending_path, turn_dir.join("presentation.json"))?;
+        rename_confined_evidence_file(
+            &state.evidence_root,
+            &pending_relative,
+            &turn_relative.join("presentation.json"),
+        )?;
         event
     };
     Ok(event)
@@ -4828,7 +5230,8 @@ fn maybe_inject_agent_terminal_event_append_failure(
     turn_id: &str,
 ) -> Result<(), RunError> {
     let marker = state
-        .bundle_dir
+        .evidence_root
+        .display_path()
         .join("turns")
         .join(turn_id)
         .join("fail-terminal-event-append.once");
@@ -4847,7 +5250,8 @@ fn maybe_inject_agent_presentation_write_failure(
     turn_id: &str,
 ) -> Result<(), RunError> {
     let marker = state
-        .bundle_dir
+        .evidence_root
+        .display_path()
         .join("turns")
         .join(turn_id)
         .join("fail-presentation-write.once");
@@ -5717,7 +6121,7 @@ fn persist_agent_session(state: &AgentSessionState) -> Result<(), RunError> {
     };
     let secrets = lock(&state.secret_values).clone();
     let value = redact_value(serde_json::to_value(manifest)?, &secrets);
-    write_json_atomic(&state.bundle_dir.join("manifest.json"), &value)
+    write_confined_json_atomic(&state.evidence_root, Path::new("manifest.json"), &value)
 }
 
 fn record_agent_event(
@@ -5959,11 +6363,7 @@ fn append_agent_event_record_locked(
     }
     let mut line = serde_json::to_vec(&event)?;
     line.push(b'\n');
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(state.bundle_dir.join("events.jsonl"))?;
-    file.write_all(&line)?;
+    append_confined_bytes(&state.evidence_root, Path::new("events.jsonl"), &line)?;
     events.push(event);
     Ok(())
 }
@@ -6121,16 +6521,24 @@ fn clear_active_agent_session(
 ) -> Result<(), RunError> {
     let _operation = lock(&workspace.active_agent_turn);
     let session_id = lock(&session.summary).id.clone();
-    let mut active_id = lock(&workspace.active_agent_session_id);
-    if active_id.as_deref() == Some(&session_id) {
-        persist_active_agent_session(workspace, None)?;
-        *active_id = None;
+    {
+        let mut active_id = lock(&workspace.active_agent_session_id);
+        if active_id.as_deref() == Some(&session_id) {
+            persist_active_agent_session(workspace, None)?;
+            *active_id = None;
+        }
     }
-    let mut summary = lock(&session.summary);
-    if summary.active {
-        summary.active = false;
-        summary.updated_at_ms = now_ms();
-        drop(summary);
+    let summary_changed = {
+        let mut summary = lock(&session.summary);
+        if summary.active {
+            summary.active = false;
+            summary.updated_at_ms = now_ms();
+            true
+        } else {
+            false
+        }
+    };
+    if summary_changed {
         persist_agent_session(session)?;
     }
     Ok(())
@@ -6953,36 +7361,83 @@ fn load_runs(
     Ok(runs)
 }
 
+fn validate_recovered_agent_manifest(manifest: &AgentSessionManifest) -> Result<(), RunError> {
+    validate_portable_evidence_id("agent session", &manifest.summary.id)?;
+    let mut turn_ids = HashSet::new();
+    for turn in &manifest.turns {
+        validate_portable_evidence_id("agent turn", &turn.id)?;
+        if turn.session_id != manifest.summary.id {
+            return Err(RunError::InvalidRequest(format!(
+                "agent turn {} does not belong to session {}",
+                turn.id, manifest.summary.id
+            )));
+        }
+        if !turn_ids.insert(turn.id.as_str()) {
+            return Err(RunError::InvalidRequest(format!(
+                "agent session contains duplicate turn id: {}",
+                turn.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_portable_evidence_id(kind: &str, id: &str) -> Result<(), RunError> {
+    let valid = !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && id
+            .bytes()
+            .any(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && matches!(
+            Path::new(id).components().collect::<Vec<_>>().as_slice(),
+            [std::path::Component::Normal(_)]
+        );
+    if valid {
+        Ok(())
+    } else {
+        Err(RunError::InvalidRequest(format!(
+            "{kind} id is not a portable evidence component: {id:?}"
+        )))
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn load_agent_sessions(
     runs: &HashMap<String, Arc<RunState>>,
-) -> Result<HashMap<String, Arc<AgentSessionState>>, RunError> {
+) -> HashMap<String, Arc<AgentSessionState>> {
     let mut sessions = HashMap::new();
     for run in runs.values() {
-        let sessions_dir = run.bundle_dir.join("agent-sessions");
-        let entries = match fs::read_dir(&sessions_dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
+        let session_names = match run.agent_session_directories.session_names() {
+            Ok(session_names) => session_names,
+            Err(error) => {
+                tracing::warn!(
+                    collection = %run.agent_session_directories.collection_display_path().display(),
+                    %error,
+                    "skipping malformed agent session collection"
+                );
+                continue;
+            }
         };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    tracing::warn!(%error, "skipping unreadable agent session entry");
-                    continue;
-                }
-            };
-            let bundle_dir = entry.path();
+        for session_name in session_names {
+            let bundle_dir = run
+                .agent_session_directories
+                .collection_display_path()
+                .join(&session_name);
             let loaded = (|| -> Result<Arc<AgentSessionState>, RunError> {
-                if !entry.file_type()?.is_dir() {
-                    return Err(RunError::InvalidRequest(
-                        "agent session bundle is not a directory".to_owned(),
-                    ));
-                }
-                let manifest_path = bundle_dir.join("manifest.json");
-                let mut manifest: AgentSessionManifest =
-                    serde_json::from_slice(&fs::read(manifest_path)?)?;
+                let evidence_root = run.agent_session_directories.open_session(&session_name)?;
+                let manifest_relative = Path::new("manifest.json");
+                let manifest_path = bundle_dir.join(manifest_relative);
+                let manifest_bytes = read_optional_agent_evidence_file(
+                    &evidence_root,
+                    manifest_relative,
+                    &manifest_path,
+                )?
+                .ok_or_else(|| {
+                    RunError::InvalidRequest("agent session bundle has no manifest".to_owned())
+                })?;
+                let mut manifest: AgentSessionManifest = serde_json::from_slice(&manifest_bytes)?;
                 if !(AGENT_SESSION_MANIFEST_LEGACY_VERSION..=AGENT_SESSION_MANIFEST_VERSION)
                     .contains(&manifest.version)
                 {
@@ -6991,9 +7446,10 @@ fn load_agent_sessions(
                         manifest.version
                     )));
                 }
+                validate_recovered_agent_manifest(&manifest)?;
                 let migrate_legacy_presentations =
                     manifest.version < AGENT_SESSION_PRESENTATION_REQUIRED_VERSION;
-                if manifest.summary.id != entry.file_name().to_string_lossy()
+                if manifest.summary.id != session_name.to_string_lossy()
                     || manifest.summary.workspace_id != lock(&run.summary).id
                 {
                     return Err(RunError::InvalidRequest(
@@ -7035,11 +7491,11 @@ fn load_agent_sessions(
                         }
                     }
                 }
-                let events = read_agent_events_recovering(&bundle_dir)?;
+                let events = read_agent_events_recovering(&evidence_root)?;
                 let repaired_terminal =
                     repair_agent_turns_from_events(&mut manifest.turns, &events);
                 let repaired_presentations = repair_terminal_agent_turn_presentations(
-                    &bundle_dir,
+                    &evidence_root,
                     &manifest.turns,
                     &events,
                 )?;
@@ -7052,8 +7508,13 @@ fn load_agent_sessions(
                     commands: Mutex::new(None),
                     lifecycle_cancel: CancellationToken::new(),
                     turn_cancel: Mutex::new(None),
+                    actor: Mutex::new(AgentActorRegistration {
+                        complete: true,
+                        handle: None,
+                    }),
+                    actor_registered: Condvar::new(),
                     evidence_error: Mutex::new(None),
-                    bundle_dir: bundle_dir.clone(),
+                    evidence_root,
                     secret_values: Mutex::new(Vec::new()),
                 });
                 if was_live
@@ -7086,9 +7547,10 @@ fn load_agent_sessions(
             }
         }
     }
-    Ok(sessions)
+    sessions
 }
 
+#[allow(clippy::too_many_lines)]
 fn load_run_bundle(
     bundle_dir: &Path,
     bundle_name: &OsStr,
@@ -7096,6 +7558,7 @@ fn load_run_bundle(
     harnesses: &BTreeMap<String, HarnessProfile>,
     model_profiles: &BTreeMap<String, String>,
 ) -> Result<Option<Arc<RunState>>, RunError> {
+    let agent_session_directories = AgentSessionDirectoryAnchor::open(bundle_dir.to_path_buf())?;
     let manifest_path = bundle_dir.join("manifest.json");
     if !manifest_path.is_file() {
         return Ok(None);
@@ -7178,6 +7641,7 @@ fn load_run_bundle(
         sender,
         cancel: CancellationToken::new(),
         bundle_dir: bundle_dir.to_path_buf(),
+        agent_session_directories,
         workspace,
         output,
         initial_snapshot,
@@ -7420,9 +7884,15 @@ fn read_events(path: &Path) -> Result<Vec<RunEvent>, RunError> {
         .collect()
 }
 
-fn read_agent_events_recovering(bundle_dir: &Path) -> Result<Vec<RunEvent>, RunError> {
-    let path = bundle_dir.join("events.jsonl");
-    let source = fs::read(&path)?;
+fn read_agent_events_recovering(
+    evidence_root: &AgentSessionEvidenceRoot,
+) -> Result<Vec<RunEvent>, RunError> {
+    let relative = Path::new("events.jsonl");
+    let path = evidence_root.display_path().join(relative);
+    let source =
+        read_optional_agent_evidence_file(evidence_root, relative, &path)?.ok_or_else(|| {
+            RunError::InvalidRequest("agent session bundle has no event log".to_owned())
+        })?;
     let mut events = Vec::new();
     let mut valid_bytes = 0_usize;
     for line in source.split_inclusive(|byte| *byte == b'\n') {
@@ -7445,7 +7915,7 @@ fn read_agent_events_recovering(bundle_dir: &Path) -> Result<Vec<RunEvent>, RunE
         return Ok(events);
     }
 
-    write_bytes_atomic(&bundle_dir.join("events.corrupt.jsonl"), &source)?;
+    write_confined_bytes_atomic(evidence_root, Path::new("events.corrupt.jsonl"), &source)?;
     let marker = RunEvent {
         sequence: events.len() as u64 + 1,
         at_ms: now_ms(),
@@ -7463,7 +7933,7 @@ fn read_agent_events_recovering(bundle_dir: &Path) -> Result<Vec<RunEvent>, RunE
         repaired.extend(serde_json::to_vec(event)?);
         repaired.push(b'\n');
     }
-    write_bytes_atomic(&path, &repaired)?;
+    write_confined_bytes_atomic(evidence_root, relative, &repaired)?;
     Ok(events)
 }
 
@@ -8066,11 +8536,648 @@ fn write_json_atomic(path: &Path, value: &JsonValue) -> Result<(), RunError> {
     Ok(())
 }
 
-fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), RunError> {
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes)?;
-    fs::rename(temporary, path)?;
+fn confined_evidence_components(
+    relative: &Path,
+    display_path: &Path,
+) -> Result<Vec<OsString>, RunError> {
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(component) => Ok(component.to_owned()),
+            _ => Err(RunError::PathEscape(display_path.to_path_buf())),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if components.is_empty() {
+        return Err(RunError::PathEscape(display_path.to_path_buf()));
+    }
+    Ok(components)
+}
+
+#[cfg(unix)]
+fn open_confined_evidence_root(root: &Path) -> Result<rustix::fd::OwnedFd, RunError> {
+    rustix::fs::open(
+        root,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+            RunError::PathEscape(root.to_path_buf())
+        }
+        _ => io::Error::from(error).into(),
+    })
+}
+
+#[cfg(unix)]
+fn open_confined_evidence_directory_at(
+    root: &rustix::fd::OwnedFd,
+    components: Vec<OsString>,
+    display_path: &Path,
+) -> Result<rustix::fd::OwnedFd, RunError> {
+    let mut directory = rustix::io::fcntl_dupfd_cloexec(root, 0).map_err(io::Error::from)?;
+    for component in components {
+        directory = rustix::fs::openat(
+            &directory,
+            component,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| match error {
+            rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+                RunError::PathEscape(display_path.to_path_buf())
+            }
+            _ => io::Error::from(error).into(),
+        })?;
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_confined_evidence_parent(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<(rustix::fd::OwnedFd, OsString), RunError> {
+    let mut components = confined_evidence_components(relative, display_path)?;
+    let name = components
+        .pop()
+        .expect("confined evidence path has a final component");
+    let directory = open_confined_evidence_directory_at(&root.directory, components, display_path)?;
+    Ok((directory, name))
+}
+
+#[cfg(unix)]
+fn create_confined_evidence_directory(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+) -> Result<rustix::fd::OwnedFd, RunError> {
+    let display_path = root.display_path().join(relative);
+    let (parent, name) = open_confined_evidence_parent(root, relative, &display_path)?;
+    rustix::fs::mkdirat(
+        &parent,
+        &name,
+        rustix::fs::Mode::RWXU | rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO,
+    )
+    .map_err(io::Error::from)?;
+    rustix::fs::openat(
+        &parent,
+        &name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => RunError::PathEscape(display_path),
+        _ => io::Error::from(error).into(),
+    })
+}
+
+#[cfg(not(unix))]
+fn create_confined_evidence_directory(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+) -> Result<(), RunError> {
+    Err(RunError::ConfinedReadUnavailable(
+        root.display_path().join(relative),
+    ))
+}
+
+#[cfg(unix)]
+fn open_or_create_confined_directory_at(
+    root: &rustix::fd::OwnedFd,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<rustix::fd::OwnedFd, RunError> {
+    let components = if relative.as_os_str().is_empty() {
+        Vec::new()
+    } else {
+        confined_evidence_components(relative, display_path)?
+    };
+    let mut directory = rustix::io::fcntl_dupfd_cloexec(root, 0).map_err(io::Error::from)?;
+    for component in components {
+        match rustix::fs::mkdirat(
+            &directory,
+            &component,
+            rustix::fs::Mode::RWXU | rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO,
+        ) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(io::Error::from(error).into()),
+        }
+        directory = rustix::fs::openat(
+            &directory,
+            &component,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| match error {
+            rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+                RunError::PathEscape(display_path.to_path_buf())
+            }
+            _ => io::Error::from(error).into(),
+        })?;
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn confined_fd_metadata(descriptor: &rustix::fd::OwnedFd) -> Result<fs::Metadata, RunError> {
+    let duplicate = rustix::io::fcntl_dupfd_cloexec(descriptor, 0).map_err(io::Error::from)?;
+    Ok(fs::File::from(duplicate).metadata()?)
+}
+
+#[cfg(unix)]
+fn set_confined_fd_permissions(
+    descriptor: &rustix::fd::OwnedFd,
+    permissions: &fs::Permissions,
+) -> Result<(), RunError> {
+    let duplicate = rustix::io::fcntl_dupfd_cloexec(descriptor, 0).map_err(io::Error::from)?;
+    fs::File::from(duplicate).set_permissions(permissions.clone())?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn write_confined_captured_tree(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+    snapshot: &CapturedTree,
+) -> Result<(), RunError> {
+    let display_path = root.display_path().join(relative);
+    let destination = create_confined_evidence_directory(root, relative)?;
+    for directory_relative in snapshot.directories.keys() {
+        let directory_relative = Path::new(directory_relative);
+        open_or_create_confined_directory_at(
+            &destination,
+            directory_relative,
+            &display_path.join(directory_relative),
+        )?;
+    }
+    for (file_relative, file) in &snapshot.files {
+        let file_relative = Path::new(file_relative);
+        let file_display = display_path.join(file_relative);
+        let mut components = confined_evidence_components(file_relative, &file_display)?;
+        let name = components
+            .pop()
+            .expect("captured file path has a final component");
+        let parent_relative = components.iter().collect::<PathBuf>();
+        let parent =
+            open_or_create_confined_directory_at(&destination, &parent_relative, &file_display)?;
+        let opened = rustix::fs::openat(
+            &parent,
+            &name,
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map_err(|error| match error {
+            rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+                RunError::PathEscape(file_display)
+            }
+            _ => io::Error::from(error).into(),
+        })?;
+        let opened = fs::File::from(opened);
+        (&opened).write_all(&file.contents)?;
+        opened.set_permissions(file.permissions.clone())?;
+    }
+    for (directory_relative, permissions) in snapshot.directories.iter().rev() {
+        let directory_relative = Path::new(directory_relative);
+        let directory = open_confined_evidence_directory_at(
+            &destination,
+            confined_evidence_components(
+                directory_relative,
+                &display_path.join(directory_relative),
+            )?,
+            &display_path.join(directory_relative),
+        )?;
+        set_confined_fd_permissions(&directory, permissions)?;
+    }
+    set_confined_fd_permissions(&destination, &snapshot.root_permissions)
+}
+
+#[cfg(not(unix))]
+fn write_confined_captured_tree(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+    _snapshot: &CapturedTree,
+) -> Result<(), RunError> {
+    Err(RunError::ConfinedReadUnavailable(
+        root.display_path().join(relative),
+    ))
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)]
+fn capture_confined_tree(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+) -> Result<CapturedTree, RunError> {
+    #[allow(clippy::too_many_lines)]
+    fn visit(
+        directory: &rustix::fd::OwnedFd,
+        display_root: &Path,
+        relative: &Path,
+        directories: &mut BTreeMap<String, fs::Permissions>,
+        files: &mut BTreeMap<String, CapturedFile>,
+        retained_bytes: &mut u64,
+    ) -> Result<(), RunError> {
+        let entries = rustix::fs::Dir::read_from(directory).map_err(io::Error::from)?;
+        for entry in entries {
+            let entry = entry.map_err(io::Error::from)?;
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let name = OsString::from_vec(bytes.to_vec());
+            let entry_relative = relative.join(&name);
+            let entry_display = display_root.join(&entry_relative);
+            let stat =
+                match rustix::fs::statat(directory, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(stat) => stat,
+                    Err(rustix::io::Errno::NOENT) => continue,
+                    Err(error) => return Err(io::Error::from(error).into()),
+                };
+            match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+                rustix::fs::FileType::Directory => {
+                    let opened = rustix::fs::openat(
+                        directory,
+                        &name,
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::CLOEXEC
+                            | rustix::fs::OFlags::DIRECTORY
+                            | rustix::fs::OFlags::NOFOLLOW,
+                        rustix::fs::Mode::empty(),
+                    )
+                    .map_err(|error| match error {
+                        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+                            RunError::PathEscape(entry_display.clone())
+                        }
+                        _ => io::Error::from(error).into(),
+                    })?;
+                    let relative_string = entry_relative
+                        .to_str()
+                        .ok_or_else(|| RunError::UnsupportedWorkspaceEntry(entry_display.clone()))?
+                        .to_owned();
+                    directories.insert(
+                        relative_string,
+                        confined_fd_metadata(&opened)?.permissions(),
+                    );
+                    visit(
+                        &opened,
+                        display_root,
+                        &entry_relative,
+                        directories,
+                        files,
+                        retained_bytes,
+                    )?;
+                }
+                rustix::fs::FileType::RegularFile => {
+                    let opened = rustix::fs::openat(
+                        directory,
+                        &name,
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::CLOEXEC
+                            | rustix::fs::OFlags::NONBLOCK
+                            | rustix::fs::OFlags::NOFOLLOW,
+                        rustix::fs::Mode::empty(),
+                    )
+                    .map_err(|error| match error {
+                        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+                            RunError::PathEscape(entry_display.clone())
+                        }
+                        _ => io::Error::from(error).into(),
+                    })?;
+                    let opened = fs::File::from(opened);
+                    let metadata = opened.metadata()?;
+                    if !metadata.is_file() {
+                        return Err(RunError::PathEscape(entry_display));
+                    }
+                    validate_evidence_file(&entry_display, &metadata, retained_bytes)?;
+                    let capacity = usize::try_from(metadata.len()).map_err(|_| {
+                        RunError::EvidenceLimit("file size does not fit this platform".to_owned())
+                    })?;
+                    let mut contents = Vec::with_capacity(capacity);
+                    opened
+                        .take(MAX_EVIDENCE_FILE_BYTES + 1)
+                        .read_to_end(&mut contents)?;
+                    if contents.len() as u64 > MAX_EVIDENCE_FILE_BYTES {
+                        return Err(RunError::EvidenceLimit(format!(
+                            "{} grew beyond the per-file limit while being read",
+                            entry_display.display()
+                        )));
+                    }
+                    let relative_string = entry_relative
+                        .to_str()
+                        .ok_or_else(|| RunError::UnsupportedWorkspaceEntry(entry_display.clone()))?
+                        .to_owned();
+                    files.insert(
+                        relative_string,
+                        CapturedFile {
+                            contents,
+                            permissions: metadata.permissions(),
+                        },
+                    );
+                }
+                rustix::fs::FileType::Symlink => {
+                    return Err(RunError::PathEscape(entry_display));
+                }
+                _ => return Err(RunError::UnsupportedWorkspaceEntry(entry_display)),
+            }
+        }
+        Ok(())
+    }
+
+    let display_path = root.display_path().join(relative);
+    let directory = open_confined_evidence_directory_at(
+        &root.directory,
+        confined_evidence_components(relative, &display_path)?,
+        &display_path,
+    )?;
+    let root_permissions = confined_fd_metadata(&directory)?.permissions();
+    let mut directories = BTreeMap::new();
+    let mut files = BTreeMap::new();
+    visit(
+        &directory,
+        &display_path,
+        Path::new(""),
+        &mut directories,
+        &mut files,
+        &mut 0,
+    )?;
+    Ok(CapturedTree {
+        root_permissions,
+        directories,
+        files,
+    })
+}
+
+#[cfg(not(unix))]
+fn capture_confined_tree(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+) -> Result<CapturedTree, RunError> {
+    Err(RunError::ConfinedReadUnavailable(
+        root.display_path().join(relative),
+    ))
+}
+
+#[cfg(unix)]
+fn remove_confined_evidence_entry(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+) -> Result<bool, RunError> {
+    fn remove_at(
+        directory: &rustix::fd::OwnedFd,
+        name: &OsStr,
+        display_path: &Path,
+    ) -> Result<bool, RunError> {
+        let stat = match rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        {
+            Ok(stat) => stat,
+            Err(rustix::io::Errno::NOENT) => return Ok(false),
+            Err(error) => return Err(io::Error::from(error).into()),
+        };
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory {
+            let opened = rustix::fs::openat(
+                directory,
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|error| match error {
+                rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+                    RunError::PathEscape(display_path.to_path_buf())
+                }
+                _ => io::Error::from(error).into(),
+            })?;
+            let entries = rustix::fs::Dir::read_from(&opened).map_err(io::Error::from)?;
+            let mut names = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(io::Error::from)?;
+                let bytes = entry.file_name().to_bytes();
+                if bytes != b"." && bytes != b".." {
+                    names.push(OsString::from_vec(bytes.to_vec()));
+                }
+            }
+            for child in names {
+                remove_at(&opened, &child, &display_path.join(&child))?;
+            }
+            rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::REMOVEDIR)
+                .map_err(io::Error::from)?;
+        } else {
+            rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty())
+                .map_err(io::Error::from)?;
+        }
+        Ok(true)
+    }
+
+    let display_path = root.display_path().join(relative);
+    let (directory, name) = open_confined_evidence_parent(root, relative, &display_path)?;
+    remove_at(&directory, &name, &display_path)
+}
+
+#[cfg(not(unix))]
+fn remove_confined_evidence_entry(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+) -> Result<bool, RunError> {
+    Err(RunError::ConfinedReadUnavailable(
+        root.display_path().join(relative),
+    ))
+}
+
+#[cfg(unix)]
+fn write_confined_bytes_atomic(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+    bytes: &[u8],
+) -> Result<(), RunError> {
+    let display_path = root.display_path().join(relative);
+    let (directory, name) = open_confined_evidence_parent(root, relative, &display_path)?;
+    match rustix::fs::statat(&directory, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat)
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                != rustix::fs::FileType::RegularFile =>
+        {
+            return Err(RunError::PathEscape(display_path));
+        }
+        Ok(_) | Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => return Err(io::Error::from(error).into()),
+    }
+    let temporary = OsString::from(format!(".agent-lab-{}-{}.tmp", now_ms(), random_suffix()));
+    let opened = rustix::fs::openat(
+        &directory,
+        &temporary,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .map_err(io::Error::from)?;
+    let write_result = fs::File::from(opened).write_all(bytes);
+    if let Err(error) = write_result {
+        let _ = rustix::fs::unlinkat(&directory, &temporary, rustix::fs::AtFlags::empty());
+        return Err(error.into());
+    }
+    if let Err(error) = rustix::fs::renameat(&directory, &temporary, &directory, &name) {
+        let _ = rustix::fs::unlinkat(&directory, &temporary, rustix::fs::AtFlags::empty());
+        return Err(io::Error::from(error).into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_confined_bytes_atomic(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+    _bytes: &[u8],
+) -> Result<(), RunError> {
+    Err(RunError::ConfinedReadUnavailable(
+        root.display_path().join(relative),
+    ))
+}
+
+fn write_confined_json_atomic(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+    value: &JsonValue,
+) -> Result<(), RunError> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    write_confined_bytes_atomic(root, relative, &bytes)
+}
+
+#[cfg(unix)]
+fn append_confined_bytes(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+    bytes: &[u8],
+) -> Result<(), RunError> {
+    let display_path = root.display_path().join(relative);
+    let (directory, name) = open_confined_evidence_parent(root, relative, &display_path)?;
+    let opened = rustix::fs::openat(
+        &directory,
+        &name,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::APPEND
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .map_err(|error| match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+            RunError::PathEscape(display_path.clone())
+        }
+        _ => io::Error::from(error).into(),
+    })?;
+    let mut file = fs::File::from(opened);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(RunError::PathEscape(display_path));
+    }
+    reject_multiply_linked_file(&display_path, &metadata)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn append_confined_bytes(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+    _bytes: &[u8],
+) -> Result<(), RunError> {
+    Err(RunError::ConfinedReadUnavailable(
+        root.display_path().join(relative),
+    ))
+}
+
+#[cfg(unix)]
+fn remove_confined_evidence_file(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+) -> Result<bool, RunError> {
+    let display_path = root.display_path().join(relative);
+    let (directory, name) = open_confined_evidence_parent(root, relative, &display_path)?;
+    match rustix::fs::unlinkat(&directory, &name, rustix::fs::AtFlags::empty()) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::NOENT) => Ok(false),
+        Err(rustix::io::Errno::ISDIR | rustix::io::Errno::PERM) => {
+            Err(RunError::PathEscape(display_path))
+        }
+        Err(error) => Err(io::Error::from(error).into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn remove_confined_evidence_file(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+) -> Result<bool, RunError> {
+    Err(RunError::ConfinedReadUnavailable(
+        root.display_path().join(relative),
+    ))
+}
+
+#[cfg(unix)]
+fn rename_confined_evidence_file(
+    root: &AgentSessionEvidenceRoot,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), RunError> {
+    let source_display = root.display_path().join(source);
+    let destination_display = root.display_path().join(destination);
+    let mut source_components = confined_evidence_components(source, &source_display)?;
+    let source_name = source_components
+        .pop()
+        .expect("confined evidence source has a final component");
+    let mut destination_components =
+        confined_evidence_components(destination, &destination_display)?;
+    let destination_name = destination_components
+        .pop()
+        .expect("confined evidence destination has a final component");
+    if source_components != destination_components {
+        return Err(RunError::PathEscape(destination_display));
+    }
+    let directory =
+        open_confined_evidence_directory_at(&root.directory, source_components, &source_display)?;
+    rustix::fs::renameat(&directory, &source_name, &directory, &destination_name).map_err(|error| {
+        match error {
+            rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+                RunError::PathEscape(destination_display)
+            }
+            _ => io::Error::from(error).into(),
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn rename_confined_evidence_file(
+    root: &AgentSessionEvidenceRoot,
+    _source: &Path,
+    destination: &Path,
+) -> Result<(), RunError> {
+    Err(RunError::ConfinedReadUnavailable(
+        root.display_path().join(destination),
+    ))
 }
 
 fn read_optional_json(path: &Path) -> Result<Option<JsonValue>, RunError> {
@@ -8101,6 +9208,25 @@ fn read_optional_confined_file(
     relative: &Path,
     display_path: &Path,
 ) -> Result<Option<Vec<u8>>, RunError> {
+    let directory = open_confined_evidence_root(root)?;
+    read_optional_confined_file_at(&directory, relative, display_path)
+}
+
+#[cfg(unix)]
+fn read_optional_agent_evidence_file(
+    root: &AgentSessionEvidenceRoot,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<Option<Vec<u8>>, RunError> {
+    read_optional_confined_file_at(&root.directory, relative, display_path)
+}
+
+#[cfg(unix)]
+fn read_optional_confined_file_at(
+    root: &rustix::fd::OwnedFd,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<Option<Vec<u8>>, RunError> {
     let components = relative
         .components()
         .map(|component| match component {
@@ -8111,20 +9237,14 @@ fn read_optional_confined_file(
     if components.is_empty() {
         return Err(RunError::PathEscape(display_path.to_path_buf()));
     }
-    let mut directory = rustix::fs::open(
-        root,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::CLOEXEC
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW,
-        rustix::fs::Mode::empty(),
-    )
-    .map_err(io::Error::from)?;
+    let mut directory = rustix::io::fcntl_dupfd_cloexec(root, 0).map_err(io::Error::from)?;
     for (index, component) in components.iter().enumerate() {
         let is_file = index + 1 == components.len();
         let mut flags =
             rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW;
-        if !is_file {
+        if is_file {
+            flags |= rustix::fs::OFlags::NONBLOCK;
+        } else {
             flags |= rustix::fs::OFlags::DIRECTORY;
         }
         let opened =
@@ -8170,6 +9290,15 @@ fn read_optional_confined_file(
 #[cfg(not(unix))]
 fn read_optional_confined_file(
     _root: &Path,
+    _relative: &Path,
+    display_path: &Path,
+) -> Result<Option<Vec<u8>>, RunError> {
+    read_optional_confined_file_without_handle_relative_support(display_path)
+}
+
+#[cfg(not(unix))]
+fn read_optional_agent_evidence_file(
+    _root: &AgentSessionEvidenceRoot,
     _relative: &Path,
     display_path: &Path,
 ) -> Result<Option<Vec<u8>>, RunError> {
@@ -8521,7 +9650,9 @@ mod tests {
         }
     }
 
-    fn test_agent_session_state(bundle_dir: PathBuf) -> AgentSessionState {
+    fn test_agent_session_state(bundle_dir: &Path) -> AgentSessionState {
+        let evidence_root = AgentSessionEvidenceRoot::open(bundle_dir.to_path_buf())
+            .expect("evidence root should open");
         let (sender, _) = broadcast::channel(8);
         AgentSessionState {
             summary: Mutex::new(AgentSessionSummary {
@@ -8543,8 +9674,13 @@ mod tests {
             commands: Mutex::new(None),
             lifecycle_cancel: CancellationToken::new(),
             turn_cancel: Mutex::new(None),
+            actor: Mutex::new(AgentActorRegistration {
+                complete: true,
+                handle: None,
+            }),
+            actor_registered: Condvar::new(),
             evidence_error: Mutex::new(None),
-            bundle_dir,
+            evidence_root,
             secret_values: Mutex::new(Vec::new()),
         }
     }
@@ -8625,7 +9761,7 @@ mod tests {
     #[test]
     fn repeated_agent_progress_is_deduplicated_until_the_phase_changes() {
         let root = temporary_root("progress-deduplication");
-        let state = test_agent_session_state(root.clone());
+        let state = test_agent_session_state(&root);
         let payload = || {
             json!({
                 "sessionId": "session-1",
@@ -8667,7 +9803,7 @@ mod tests {
     #[test]
     fn recent_driver_progress_supersedes_adjacent_generic_fallbacks() {
         let root = temporary_root("progress-precedence");
-        let state = test_agent_session_state(root.clone());
+        let state = test_agent_session_state(&root);
         record_agent_event(
             &state,
             "observation.progress",
@@ -8797,7 +9933,7 @@ mod tests {
         let root = temporary_root("malformed-agent-terminal-prevalidation");
         let bundle = root.join("agent-session");
         fs::create_dir_all(bundle.join("turns/turn-1")).unwrap();
-        let session = test_agent_session_state(bundle.clone());
+        let session = test_agent_session_state(&bundle);
         record_agent_event(
             &session,
             "agent.session.ready",
@@ -8881,6 +10017,12 @@ mod tests {
                 ))
                 .unwrap(),
         );
+        assert!(observations.iter().all(|observation| {
+            !matches!(
+                observation,
+                TurnObservation::AssistantDelta(delta) if delta.text.is_empty()
+            )
+        }));
 
         let mut events = vec![observation_ready_event(1)];
         for (index, observation) in observations.iter().enumerate() {
@@ -8940,7 +10082,7 @@ mod tests {
         let bundle = root.join("agent-session");
         fs::create_dir_all(bundle.join("turns/turn-1")).unwrap();
         let secrets = vec![b"credential-token".to_vec()];
-        let session = test_agent_session_state(bundle.clone());
+        let session = test_agent_session_state(&bundle);
         *lock(&session.secret_values) = secrets.clone();
         let mut live = session.sender.subscribe();
         record_agent_event(
@@ -9112,7 +10254,7 @@ mod tests {
             build_agent_turn_presentation_from_events(&events, &terminal_turn, &[]).unwrap();
         write_json_atomic(&presentation_path, &serde_json::to_value(&stored).unwrap()).unwrap();
 
-        let session = test_agent_session_state(bundle);
+        let session = test_agent_session_state(&bundle);
         *lock(&session.events) = events;
         let not_yet_persisted = test_agent_turn(AgentTurnStatus::Running);
         *lock(&session.turns) = vec![not_yet_persisted.clone()];
@@ -9146,7 +10288,7 @@ mod tests {
         let root = temporary_root("failed-partial-agent-projection");
         let bundle = root.join("agent-session");
         fs::create_dir_all(bundle.join("turns/turn-1")).unwrap();
-        let session = test_agent_session_state(bundle.clone());
+        let session = test_agent_session_state(&bundle);
         record_agent_event(
             &session,
             "agent.session.ready",
@@ -9333,7 +10475,7 @@ mod tests {
         .unwrap();
 
         let runs = HashMap::from([("run-events".to_owned(), Arc::clone(&workspace))]);
-        let sessions = load_agent_sessions(&runs).unwrap();
+        let sessions = load_agent_sessions(&runs);
         let session = sessions.get("session-1").unwrap();
         let loaded_turn = lock(&session.turns)[0].clone();
         let presentation =
@@ -9433,7 +10575,7 @@ mod tests {
         fs::write(bundle.join("events.jsonl"), event_log).unwrap();
 
         let runs = HashMap::from([("run-events".to_owned(), Arc::clone(&workspace))]);
-        let sessions = load_agent_sessions(&runs).unwrap();
+        let sessions = load_agent_sessions(&runs);
         let session = sessions.get("session-1").unwrap();
         let turn = lock(&session.turns)[0].clone();
         assert_eq!(turn.status, AgentTurnStatus::Completed);
@@ -9466,7 +10608,7 @@ mod tests {
             let bundle = workspace.bundle_dir.join("agent-sessions/session-1");
             let turn_dir = bundle.join("turns/turn-1");
             fs::create_dir_all(&turn_dir).unwrap();
-            let state = test_agent_session_state(bundle.clone());
+            let state = test_agent_session_state(&bundle);
             lock(&state.summary).workspace_id = "run-events".to_owned();
             persist_agent_session(&state).unwrap();
             record_agent_event(
@@ -9516,7 +10658,7 @@ mod tests {
                 assert!(turn_dir.join("presentation.pending.json").is_file());
                 assert!(
                     repair_terminal_agent_turn_presentations(
-                        &bundle,
+                        &state.evidence_root,
                         &lock(&state.turns),
                         &lock(&state.events),
                     )
@@ -9560,7 +10702,7 @@ mod tests {
             fs::remove_file(&presentation).unwrap();
 
             let runs = HashMap::from([("run-events".to_owned(), Arc::clone(&workspace))]);
-            let sessions = load_agent_sessions(&runs).unwrap();
+            let sessions = load_agent_sessions(&runs);
             let replayed = sessions.get("session-1").unwrap();
             assert_eq!(
                 lock(&replayed.events)
@@ -9755,12 +10897,515 @@ mod tests {
         assert_eq!(round_tripped, expected);
         write_json_atomic(&bundle.join("turns/turn-1/presentation.json"), &serialized).unwrap();
 
-        let state = test_agent_session_state(bundle);
+        let state = test_agent_session_state(&bundle);
         *lock(&state.events) = events;
         let workspace = test_run_state(&root.join("run"));
         let loaded = load_or_build_agent_turn_presentation(&state, &workspace, &turn).unwrap();
 
         assert_eq!(loaded, expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovered_agent_manifest_requires_confined_unique_turn_identities() {
+        let root = temporary_root("agent-manifest-identity-validation");
+        let state = test_agent_session_state(&root);
+        let summary = lock(&state.summary).clone();
+        let valid = AgentSessionManifest {
+            version: AGENT_SESSION_MANIFEST_VERSION,
+            summary: summary.clone(),
+            turns: vec![test_agent_turn(AgentTurnStatus::Failed)],
+        };
+        validate_recovered_agent_manifest(&valid).unwrap();
+
+        for id in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "/tmp/outside",
+            "TURN-1",
+            "turn_1",
+            "turn\\1",
+        ] {
+            let mut manifest = AgentSessionManifest {
+                version: AGENT_SESSION_MANIFEST_VERSION,
+                summary: summary.clone(),
+                turns: vec![test_agent_turn(AgentTurnStatus::Failed)],
+            };
+            manifest.turns[0].id = id.to_owned();
+            assert!(
+                validate_recovered_agent_manifest(&manifest).is_err(),
+                "recovered turn id should be rejected: {id:?}"
+            );
+        }
+
+        let mut mismatched = valid;
+        mismatched.turns[0].session_id = "session-2".to_owned();
+        assert!(validate_recovered_agent_manifest(&mismatched).is_err());
+
+        let mut duplicate = mismatched;
+        duplicate.turns[0]
+            .session_id
+            .clone_from(&duplicate.summary.id);
+        duplicate.turns.push(duplicate.turns[0].clone());
+        assert!(validate_recovered_agent_manifest(&duplicate).is_err());
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_turn_repairs_use_no_follow_handle_relative_operations() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_root("agent-turn-repair-confinement");
+        let bundle = root.join("session");
+        let outside = root.join("outside");
+        fs::create_dir_all(bundle.join("turns")).unwrap();
+        let evidence_root = AgentSessionEvidenceRoot::open(bundle.clone()).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let outside_sentinel = outside.join("sentinel.json");
+        fs::write(&outside_sentinel, b"outside-safe").unwrap();
+        let turn = test_agent_turn(AgentTurnStatus::Failed);
+        let events = vec![event(
+            1,
+            "agent.turn.finished",
+            json!({
+                "turnId": "turn-1",
+                "outcome": "failed",
+                "error": "fixture failure",
+                "workspaceDiff": { "changes": [] },
+            }),
+        )];
+
+        symlink(&outside, bundle.join("turns/turn-1")).unwrap();
+        assert!(matches!(
+            repair_terminal_agent_turn_presentations(
+                &evidence_root,
+                std::slice::from_ref(&turn),
+                &events
+            ),
+            Err(RunError::PathEscape(_))
+        ));
+        assert_eq!(fs::read(&outside_sentinel).unwrap(), b"outside-safe");
+        fs::remove_file(bundle.join("turns/turn-1")).unwrap();
+
+        let turn_dir = bundle.join("turns/turn-1");
+        fs::create_dir(&turn_dir).unwrap();
+        symlink(&outside_sentinel, turn_dir.join("presentation.json")).unwrap();
+        assert!(matches!(
+            repair_terminal_agent_turn_presentations(
+                &evidence_root,
+                std::slice::from_ref(&turn),
+                &events
+            ),
+            Err(RunError::PathEscape(_))
+        ));
+        assert_eq!(fs::read(&outside_sentinel).unwrap(), b"outside-safe");
+        fs::remove_file(turn_dir.join("presentation.json")).unwrap();
+
+        symlink(
+            &outside_sentinel,
+            turn_dir.join("presentation.pending.json"),
+        )
+        .unwrap();
+        fs::hard_link(&outside_sentinel, turn_dir.join("presentation.json.tmp")).unwrap();
+        assert!(
+            repair_terminal_agent_turn_presentations(
+                &evidence_root,
+                std::slice::from_ref(&turn),
+                &events,
+            )
+            .unwrap()
+        );
+        assert!(!turn_dir.join("presentation.pending.json").exists());
+        assert!(turn_dir.join("presentation.json").is_file());
+        assert_eq!(fs::read(&outside_sentinel).unwrap(), b"outside-safe");
+        assert_eq!(
+            fs::read(turn_dir.join("presentation.json.tmp")).unwrap(),
+            b"outside-safe"
+        );
+
+        drop(evidence_root);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_session_root_files_are_never_followed() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_root("agent-session-root-confinement");
+        let workspace = Arc::new(test_run_state(&root.join("run")));
+        let sessions_dir = workspace.bundle_dir.join("agent-sessions");
+        fs::create_dir(&sessions_dir).unwrap();
+        let outside_manifest = root.join("outside-manifest.json");
+        let outside_events = root.join("outside-events.jsonl");
+        fs::write(&outside_events, b"outside-events-safe").unwrap();
+
+        let make_manifest = |id: &str| AgentSessionManifest {
+            version: AGENT_SESSION_MANIFEST_VERSION,
+            summary: AgentSessionSummary {
+                id: id.to_owned(),
+                workspace_id: "run-events".to_owned(),
+                harness_id: "fixture".to_owned(),
+                model_profile_id: "test".to_owned(),
+                model_id: "fixture/test".to_owned(),
+                status: AgentSessionStatus::Closed,
+                active: false,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                turn_count: 0,
+                error: None,
+            },
+            turns: Vec::new(),
+        };
+        write_json_atomic(
+            &outside_manifest,
+            &serde_json::to_value(make_manifest("session-1")).unwrap(),
+        )
+        .unwrap();
+        let manifest_link = sessions_dir.join("session-1");
+        fs::create_dir(&manifest_link).unwrap();
+        symlink(&outside_manifest, manifest_link.join("manifest.json")).unwrap();
+        fs::write(manifest_link.join("events.jsonl"), []).unwrap();
+
+        let events_link = sessions_dir.join("session-2");
+        fs::create_dir(&events_link).unwrap();
+        write_json_atomic(
+            &events_link.join("manifest.json"),
+            &serde_json::to_value(make_manifest("session-2")).unwrap(),
+        )
+        .unwrap();
+        symlink(&outside_events, events_link.join("events.jsonl")).unwrap();
+
+        let runs = HashMap::from([("run-events".to_owned(), workspace)]);
+        assert!(load_agent_sessions(&runs).is_empty());
+        assert_eq!(fs::read(&outside_events).unwrap(), b"outside-events-safe");
+        let retained: AgentSessionManifest =
+            serde_json::from_slice(&fs::read(&outside_manifest).unwrap()).unwrap();
+        assert_eq!(retained.summary.id, "session-1");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_agent_sessions_reject_symlinked_collection() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_root("agent-session-collection-symlink");
+        let workspace = Arc::new(test_run_state(&root.join("run")));
+        let outside = root.join("outside");
+        let outside_session = outside.join("session-1");
+        fs::create_dir_all(outside_session.join("turns")).unwrap();
+        let manifest = AgentSessionManifest {
+            version: AGENT_SESSION_MANIFEST_VERSION,
+            summary: AgentSessionSummary {
+                id: "session-1".to_owned(),
+                workspace_id: "run-events".to_owned(),
+                harness_id: "fixture".to_owned(),
+                model_profile_id: "test".to_owned(),
+                model_id: "fixture/test".to_owned(),
+                status: AgentSessionStatus::Starting,
+                active: true,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                turn_count: 0,
+                error: None,
+            },
+            turns: Vec::new(),
+        };
+        write_json_atomic(
+            &outside_session.join("manifest.json"),
+            &serde_json::to_value(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            outside_session.join("events.jsonl"),
+            b"{\"outside\":\"safe\"}\n",
+        )
+        .unwrap();
+        let manifest_before = fs::read(outside_session.join("manifest.json")).unwrap();
+        let events_before = fs::read(outside_session.join("events.jsonl")).unwrap();
+        symlink(&outside, workspace.bundle_dir.join("agent-sessions")).unwrap();
+
+        let runs = HashMap::from([("run-events".to_owned(), workspace)]);
+        assert!(load_agent_sessions(&runs).is_empty());
+        assert_eq!(
+            fs::read(outside_session.join("manifest.json")).unwrap(),
+            manifest_before
+        );
+        assert_eq!(
+            fs::read(outside_session.join("events.jsonl")).unwrap(),
+            events_before
+        );
+
+        drop(runs);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_session_collection_stays_pinned_across_path_replacement() {
+        let root = temporary_root("agent-session-pinned-collection");
+        let run_dir = root.join("run");
+        let visible = run_dir.join("agent-sessions");
+        let displaced = run_dir.join("displaced-agent-sessions");
+        let replacement = root.join("replacement-agent-sessions");
+        fs::create_dir_all(visible.join("session-original")).unwrap();
+        fs::create_dir_all(replacement.join("session-replacement")).unwrap();
+        fs::write(
+            visible.join("session-original/manifest.json"),
+            b"original-manifest",
+        )
+        .unwrap();
+        fs::write(
+            replacement.join("session-replacement/manifest.json"),
+            b"replacement-manifest",
+        )
+        .unwrap();
+        let state = test_run_state(&run_dir);
+
+        assert_eq!(
+            state.agent_session_directories.session_names().unwrap(),
+            [OsString::from("session-original")]
+        );
+        fs::rename(&visible, &displaced).unwrap();
+        fs::rename(&replacement, &visible).unwrap();
+
+        assert_eq!(
+            state.agent_session_directories.session_names().unwrap(),
+            [OsString::from("session-original")]
+        );
+        let original = state
+            .agent_session_directories
+            .open_session(OsStr::new("session-original"))
+            .unwrap();
+        assert_eq!(
+            read_optional_agent_evidence_file(
+                &original,
+                Path::new("manifest.json"),
+                &visible.join("session-original/manifest.json"),
+            )
+            .unwrap()
+            .unwrap(),
+            b"original-manifest"
+        );
+        let created = state
+            .agent_session_directories
+            .create_session("session-new")
+            .unwrap();
+        assert!(displaced.join("session-new/turns").is_dir());
+        assert!(!visible.join("session-new").exists());
+        assert_eq!(
+            fs::read(visible.join("session-replacement/manifest.json")).unwrap(),
+            b"replacement-manifest"
+        );
+
+        drop(created);
+        drop(original);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_session_evidence_root_stays_pinned_across_path_replacement() {
+        let root = temporary_root("agent-session-pinned-evidence-root");
+        let visible = root.join("session");
+        let displaced = root.join("displaced-session");
+        let replacement = root.join("replacement-session");
+        let turn_relative = Path::new("turns/turn-1");
+        fs::create_dir_all(visible.join(turn_relative)).unwrap();
+        fs::create_dir_all(replacement.join(turn_relative)).unwrap();
+        fs::write(visible.join("manifest.json"), b"original-manifest").unwrap();
+        fs::write(replacement.join("manifest.json"), b"replacement-manifest").unwrap();
+        fs::write(replacement.join("events.jsonl"), b"replacement-events\n").unwrap();
+        fs::write(
+            replacement.join(turn_relative).join("presentation.json"),
+            b"replacement-presentation",
+        )
+        .unwrap();
+        fs::write(replacement.join("remove.me"), b"replacement-remove").unwrap();
+
+        let evidence_root = AgentSessionEvidenceRoot::open(visible.clone()).unwrap();
+        fs::rename(&visible, &displaced).unwrap();
+        fs::rename(&replacement, &visible).unwrap();
+
+        assert_eq!(
+            read_optional_agent_evidence_file(
+                &evidence_root,
+                Path::new("manifest.json"),
+                &visible.join("manifest.json"),
+            )
+            .unwrap()
+            .unwrap(),
+            b"original-manifest"
+        );
+        write_confined_json_atomic(
+            &evidence_root,
+            Path::new("manifest.json"),
+            &json!({ "pinned": true }),
+        )
+        .unwrap();
+        append_confined_bytes(
+            &evidence_root,
+            Path::new("events.jsonl"),
+            b"original-event\n",
+        )
+        .unwrap();
+        let pending = turn_relative.join("presentation.pending.json");
+        let presentation = turn_relative.join("presentation.json");
+        write_confined_bytes_atomic(&evidence_root, &pending, b"original-presentation").unwrap();
+        rename_confined_evidence_file(&evidence_root, &pending, &presentation).unwrap();
+        write_confined_bytes_atomic(&evidence_root, Path::new("remove.me"), b"remove-original")
+            .unwrap();
+        assert!(remove_confined_evidence_file(&evidence_root, Path::new("remove.me")).unwrap());
+
+        assert_eq!(
+            serde_json::from_slice::<JsonValue>(
+                &fs::read(displaced.join("manifest.json")).unwrap()
+            )
+            .unwrap(),
+            json!({ "pinned": true })
+        );
+        assert_eq!(
+            fs::read(visible.join("manifest.json")).unwrap(),
+            b"replacement-manifest"
+        );
+        assert_eq!(
+            fs::read(displaced.join("events.jsonl")).unwrap(),
+            b"original-event\n"
+        );
+        assert_eq!(
+            fs::read(visible.join("events.jsonl")).unwrap(),
+            b"replacement-events\n"
+        );
+        assert_eq!(
+            fs::read(displaced.join(&presentation)).unwrap(),
+            b"original-presentation"
+        );
+        assert_eq!(
+            fs::read(visible.join(&presentation)).unwrap(),
+            b"replacement-presentation"
+        );
+        assert!(!displaced.join("remove.me").exists());
+        assert_eq!(
+            fs::read(visible.join("remove.me")).unwrap(),
+            b"replacement-remove"
+        );
+
+        drop(evidence_root);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_turn_finalization_stays_pinned_across_session_path_replacement() {
+        let root = temporary_root("agent-turn-pinned-finalization");
+        let visible = root.join("session");
+        let displaced = root.join("displaced-session");
+        let replacement = root.join("replacement-session");
+        let workspace = root.join("workspace");
+        let turn_relative = Path::new("turns/turn-1");
+        fs::create_dir_all(visible.join(turn_relative).join("initial")).unwrap();
+        fs::create_dir_all(replacement.join(turn_relative).join("initial")).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        fs::write(
+            visible.join(turn_relative).join("initial/result.txt"),
+            b"before",
+        )
+        .unwrap();
+        fs::write(
+            replacement.join(turn_relative).join("initial/result.txt"),
+            b"replacement-before",
+        )
+        .unwrap();
+        fs::write(
+            replacement.join(turn_relative).join("diff.json"),
+            b"replacement-diff",
+        )
+        .unwrap();
+        fs::write(workspace.join("result.txt"), b"after").unwrap();
+        fs::write(workspace.join("created.txt"), b"created").unwrap();
+        let state = test_agent_session_state(&visible);
+
+        fs::rename(&visible, &displaced).unwrap();
+        fs::rename(&replacement, &visible).unwrap();
+        let diff = finalize_agent_turn_workspace(&state, "turn-1", &workspace, &[]).unwrap();
+
+        assert_eq!(diff["changes"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            fs::read(displaced.join(turn_relative).join("final/result.txt")).unwrap(),
+            b"after"
+        );
+        assert_eq!(
+            fs::read(displaced.join(turn_relative).join("final/created.txt")).unwrap(),
+            b"created"
+        );
+        assert!(
+            serde_json::from_slice::<JsonValue>(
+                &fs::read(displaced.join(turn_relative).join("diff.json")).unwrap()
+            )
+            .unwrap()["changes"]
+                .as_array()
+                .is_some_and(|changes| changes.len() == 2)
+        );
+        assert_eq!(
+            fs::read(visible.join(turn_relative).join("initial/result.txt")).unwrap(),
+            b"replacement-before"
+        );
+        assert_eq!(
+            fs::read(visible.join(turn_relative).join("diff.json")).unwrap(),
+            b"replacement-diff"
+        );
+        assert!(!visible.join(turn_relative).join("final").exists());
+
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_evidence_io_rejects_fifos_without_blocking() {
+        let root = temporary_root("agent-session-fifo-confinement");
+        let evidence_root = AgentSessionEvidenceRoot::open(root.clone()).unwrap();
+        for name in ["manifest.json", "events.jsonl"] {
+            assert!(
+                Command::new("mkfifo")
+                    .arg(root.join(name))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let started = Instant::now();
+        assert!(
+            read_optional_confined_file(
+                &root,
+                Path::new("manifest.json"),
+                &root.join("manifest.json"),
+            )
+            .is_err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a confined evidence read blocked on a FIFO"
+        );
+
+        let started = Instant::now();
+        assert!(
+            append_confined_bytes(&evidence_root, Path::new("events.jsonl"), b"event\n").is_err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a confined evidence append blocked on a FIFO"
+        );
+
+        drop(evidence_root);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -9840,7 +11485,8 @@ mod tests {
         source.extend_from_slice(br#"{"sequence":3,"kind":"truncated"#);
         fs::write(root.join("events.jsonl"), &source).unwrap();
 
-        let recovered = read_agent_events_recovering(&root).unwrap();
+        let evidence_root = AgentSessionEvidenceRoot::open(root.clone()).unwrap();
+        let recovered = read_agent_events_recovering(&evidence_root).unwrap();
         assert_eq!(recovered.len(), 3);
         for (recovered, expected) in recovered.iter().zip(&prefix) {
             assert_eq!(recovered.sequence, expected.sequence);
@@ -9861,6 +11507,7 @@ mod tests {
             serde_json::to_value(&repaired).unwrap(),
             serde_json::to_value(&recovered).unwrap()
         );
+        drop(evidence_root);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -9926,7 +11573,7 @@ mod tests {
             fs::Permissions::from_mode(0o444),
         )
         .unwrap();
-        let state = test_agent_session_state(bundle.clone());
+        let state = test_agent_session_state(&bundle);
 
         finalize_agent_turn_workspace(
             &state,
@@ -10021,10 +11668,21 @@ while IFS= read -r line; do
           complete='## Prior conclusion\n\n`gamma` remained highest at **8**.'
           ;;
       esac
-      sequence=$((sequence + 1))
-      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.delta","payload":{"messageId":"message-%s","text":"%s"}}\n' "$sequence" "$session" "$turn" "$turn" "$first"
-      case "$line" in
-        *wait-for-abort-hostile-partial*)
+	      sequence=$((sequence + 1))
+	      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.delta","payload":{"messageId":"message-%s","text":"%s"}}\n' "$sequence" "$session" "$turn" "$turn" "$first"
+	      case "$line" in
+	        *turn-scoped-failure-with-evidence-error*)
+	          sleep 0.2
+	          sequence=$((sequence + 1))
+	          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"driver.failed","scope":"turn","sessionId":"%s","turnId":"%s","code":"fixture_turn_failed","message":"the fixture rejected this turn"}\n' "$sequence" "$session" "$turn"
+	          continue
+	          ;;
+	        *turn-scoped-failure*)
+	          sequence=$((sequence + 1))
+	          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"driver.failed","scope":"turn","sessionId":"%s","turnId":"%s","code":"fixture_turn_failed","message":"the fixture rejected this turn"}\n' "$sequence" "$session" "$turn"
+	          continue
+	          ;;
+	        *wait-for-abort-hostile-partial*)
           abort_outcome=completed
           continue
           ;;
@@ -10065,6 +11723,458 @@ done
         let mut launch = DriverLaunch::new("/bin/sh");
         launch.args = vec!["-c".into(), script.into()];
         launch
+    }
+
+    #[cfg(unix)]
+    async fn start_interactive_fixture(
+        label: &str,
+        launch: DriverLaunch,
+    ) -> (PathBuf, RunController, RunSummary, AgentSessionSummary) {
+        let root = temporary_root(label);
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![HarnessProfile {
+                id: "fixture".to_owned(),
+                display_name: "Fixture".to_owned(),
+                launch,
+                models: BTreeMap::from([("test".to_owned(), "fixture/test".to_owned())]),
+            }],
+            BTreeMap::from([("test".to_owned(), "Test".to_owned())]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let observed = controller
+                .list_agent_sessions(&explore.id)
+                .into_iter()
+                .find(|candidate| candidate.id == session.id)
+                .unwrap();
+            if observed.status == AgentSessionStatus::Ready && observed.active {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "interactive fixture session did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (root, controller, explore, session)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn turn_scoped_driver_failure_keeps_the_native_session_ready() {
+        let (root, controller, explore, session) =
+            start_interactive_fixture("turn-scoped-driver-failure", interactive_fixture_launch())
+                .await;
+        let failed = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "turn-scoped-failure".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            let turn = detail
+                .turns
+                .iter()
+                .find(|turn| turn.id == failed.id)
+                .unwrap();
+            if turn.status == AgentTurnStatus::Failed
+                && detail.summary.status == AgentSessionStatus::Ready
+            {
+                assert_eq!(turn.outcome.as_deref(), Some("failed"));
+                assert!(
+                    turn.error
+                        .as_deref()
+                        .is_some_and(|error| { error.contains("fixture_turn_failed") })
+                );
+                let terminal = detail
+                    .events
+                    .iter()
+                    .find(|event| {
+                        event.kind == "agent.turn.finished" && event.payload["turnId"] == failed.id
+                    })
+                    .unwrap();
+                assert_eq!(terminal.payload["driverFailure"]["scope"], "turn");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "turn-scoped failure did not terminalize without failing the session"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let recovered = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "the next turn still works".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail
+                .turns
+                .iter()
+                .any(|turn| turn.id == recovered.id && turn.status == AgentTurnStatus::Completed)
+            {
+                assert_eq!(detail.summary.status, AgentSessionStatus::Ready);
+                assert_eq!(detail.summary.turn_count, 2);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "session did not accept a turn after a turn-scoped failure"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        controller.cancel(&explore.id).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn turn_scoped_failure_cannot_finalize_incomplete_capability_evidence() {
+        let (root, controller, explore, session) = start_interactive_fixture(
+            "turn-scoped-failure-evidence-error",
+            interactive_fixture_launch(),
+        )
+        .await;
+        let state = controller.agent_session_state(&session.id).unwrap();
+        let turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "turn-scoped-failure-with-evidence-error".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if lock(&state.events).iter().any(|event| {
+                event.kind == "observation.assistant.delta" && event.payload["turnId"] == turn.id
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "turn did not begin before the injected evidence failure"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        *lock(&state.evidence_error) =
+            Some("injected capability evidence persistence failure".to_owned());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail.summary.status == AgentSessionStatus::Failed {
+                assert!(
+                    detail
+                        .summary
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("capability evidence"))
+                );
+                assert_ne!(
+                    detail.turns[0].summary.outcome.as_deref(),
+                    Some("completed")
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "incomplete capability evidence did not fail the session"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        controller.cancel(&explore.id).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_workspace_joins_session_actors_before_finalization() {
+        let (root, controller, explore, session) = start_interactive_fixture(
+            "workspace-cancel-joins-agents",
+            interactive_fixture_launch(),
+        )
+        .await;
+        let session_state = controller.agent_session_state(&session.id).unwrap();
+        let workspace = controller.state(&explore.id).unwrap();
+
+        controller.cancel(&explore.id).unwrap();
+
+        assert!(lock(&session_state.actor).complete);
+        assert!(lock(&session_state.actor).handle.is_none());
+        assert!(matches!(
+            lock(&session_state.summary).status,
+            AgentSessionStatus::Closed | AgentSessionStatus::Interrupted
+        ));
+        assert!(lock(&workspace.active_agent_session_id).is_none());
+        assert!(workspace.bundle_dir.join("final").is_dir());
+        assert_eq!(lock(&workspace.summary).status, RunStatus::Cancelled);
+
+        lock(&session_state.summary).status = AgentSessionStatus::Ready;
+        assert!(matches!(
+            controller.activate_agent_session(&explore.id, &session.id, WorkbenchOrigin::Nushell),
+            Err(RunError::RunUnavailable(_))
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_cancel_finalizes_after_an_agent_actor_panics() {
+        let root = temporary_root("workspace-cancel-agent-panic");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/driver-is-not-needed-for-exploration"),
+        })
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let workspace = controller.state(&explore.id).unwrap();
+        let session_dir = workspace
+            .bundle_dir
+            .join("agent-sessions")
+            .join("session-panic");
+        fs::create_dir_all(session_dir.join("turns")).unwrap();
+        let session = Arc::new(test_agent_session_state(&session_dir));
+        {
+            let mut summary = lock(&session.summary);
+            summary.id = "session-panic".to_owned();
+            summary.workspace_id.clone_from(&explore.id);
+            summary.status = AgentSessionStatus::Ready;
+            summary.active = true;
+            summary.turn_count = 0;
+        }
+        lock(&session.turns).clear();
+        *lock(&session.actor) = AgentActorRegistration {
+            complete: true,
+            handle: Some(thread::spawn(|| panic!("injected agent actor panic"))),
+        };
+        persist_agent_session(&session).unwrap();
+        lock(&workspace.agent_sessions)
+            .insert("session-panic".to_owned(), Arc::downgrade(&session));
+        lock(&controller.inner.agent_sessions)
+            .insert("session-panic".to_owned(), Arc::clone(&session));
+        *lock(&workspace.active_agent_session_id) = Some("session-panic".to_owned());
+        persist_active_agent_session(&workspace, Some("session-panic")).unwrap();
+
+        let error = controller.cancel(&explore.id).unwrap_err();
+        assert!(error.to_string().contains("actor panicked"));
+
+        let cancelled = controller.get(&explore.id).unwrap();
+        assert_eq!(cancelled.summary.status, RunStatus::Cancelled);
+        assert!(
+            cancelled
+                .summary
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("actor panicked"))
+        );
+        assert_eq!(cancelled.score.unwrap()["cancelled"], true);
+        assert!(workspace.bundle_dir.join("final").is_dir());
+        assert!(lock(&workspace.capabilities).is_empty());
+        assert!(lock(&workspace.active_agent_session_id).is_none());
+        assert!(controller.cancel(&explore.id).is_ok());
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_input_is_serialized_with_turn_finalization_and_reservation_release() {
+        let root = temporary_root("terminal-input-finalization-race");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let workspace = Arc::new(test_run_state(&root.join("workspace-run")));
+        lock(&workspace.summary).status = RunStatus::Exploring;
+        let session_dir = workspace.bundle_dir.join("agent-sessions/session-1");
+        fs::create_dir_all(session_dir.join("turns/turn-1")).unwrap();
+        let session = Arc::new(test_agent_session_state(&session_dir));
+        lock(&session.summary).workspace_id = "run-events".to_owned();
+        *lock(&workspace.active_agent_turn) = Some(AgentTurnAttribution {
+            session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+        });
+        lock(&workspace.agent_sessions).insert("session-1".to_owned(), Arc::downgrade(&session));
+        lock(&controller.inner.runs).insert("run-events".to_owned(), Arc::clone(&workspace));
+        lock(&controller.inner.agent_sessions).insert("session-1".to_owned(), Arc::clone(&session));
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let finalizer_workspace = Arc::clone(&workspace);
+        let finalizer_session = Arc::clone(&session);
+        let finalizer = thread::spawn(move || {
+            let mut reservation =
+                ActiveAgentTurnGuard::new(&finalizer_workspace, "session-1", "turn-1").unwrap();
+            reservation
+                .finish(|| {
+                    locked_tx.send(()).unwrap();
+                    thread::sleep(Duration::from_millis(100));
+                    assert!(
+                        lock(&finalizer_session.turns)[0]
+                            .human_intervention_at_ms
+                            .is_none()
+                    );
+                    persist_agent_turn_terminal_state(
+                        &finalizer_session,
+                        "turn-1",
+                        AgentTurnStatus::Completed,
+                        Some("completed"),
+                        None,
+                    )
+                })
+                .unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        controller.note_terminal_input("run-events").unwrap();
+        finalizer.join().unwrap();
+
+        let turn = &lock(&session.turns)[0];
+        assert_eq!(turn.status, AgentTurnStatus::Completed);
+        assert!(turn.human_intervention_at_ms.is_none());
+        assert!(lock(&workspace.active_agent_turn).is_none());
+        assert!(
+            lock(&session.events)
+                .iter()
+                .all(|event| event.kind != "agent.turn.human-intervention")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn activation_event_failure_rolls_back_durable_and_in_memory_selection() {
+        let root = temporary_root("agent-activation-rollback");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new_with_harnesses(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data,
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let workspace = Arc::new(test_run_state(&root.join("workspace-run")));
+        lock(&workspace.summary).status = RunStatus::Exploring;
+        lock(&controller.inner.runs).insert("run-events".to_owned(), Arc::clone(&workspace));
+        record_event(&workspace, "test.ready", json!({})).unwrap();
+
+        let make_session = |id: &str| {
+            let bundle = workspace.bundle_dir.join("agent-sessions").join(id);
+            fs::create_dir_all(bundle.join("turns")).unwrap();
+            let state = Arc::new(test_agent_session_state(&bundle));
+            {
+                let mut summary = lock(&state.summary);
+                summary.id = id.to_owned();
+                summary.workspace_id = "run-events".to_owned();
+                summary.status = AgentSessionStatus::Ready;
+            }
+            lock(&state.turns).clear();
+            state
+        };
+        let previous = make_session("session-previous");
+        let target = make_session("session-target");
+        for state in [&previous, &target] {
+            let id = lock(&state.summary).id.clone();
+            lock(&workspace.agent_sessions).insert(id.clone(), Arc::downgrade(state));
+            lock(&controller.inner.agent_sessions).insert(id, Arc::clone(state));
+        }
+        *lock(&workspace.active_agent_session_id) = Some("session-previous".to_owned());
+        persist_active_agent_session(&workspace, Some("session-previous")).unwrap();
+
+        let event_log = workspace.bundle_dir.join("events.jsonl");
+        fs::remove_file(&event_log).unwrap();
+        fs::create_dir(&event_log).unwrap();
+        assert!(
+            controller
+                .activate_agent_session("run-events", "session-target", WorkbenchOrigin::Nushell,)
+                .is_err()
+        );
+
+        assert_eq!(
+            lock(&workspace.active_agent_session_id).as_deref(),
+            Some("session-previous")
+        );
+        let durable = read_optional_json(&workspace.bundle_dir.join("active-agent-session.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable["sessionId"], "session-previous");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -10324,6 +12434,8 @@ totalScore = 11
             sender,
             cancel: CancellationToken::new(),
             bundle_dir: root.to_path_buf(),
+            agent_session_directories: AgentSessionDirectoryAnchor::open(root.to_path_buf())
+                .unwrap(),
             workspace,
             output: "result.json".into(),
             initial_snapshot,
@@ -10891,8 +13003,13 @@ sleep 30
             commands: Mutex::new(None),
             lifecycle_cancel: CancellationToken::new(),
             turn_cancel: Mutex::new(None),
+            actor: Mutex::new(AgentActorRegistration {
+                complete: true,
+                handle: None,
+            }),
+            actor_registered: Condvar::new(),
             evidence_error: Mutex::new(None),
-            bundle_dir: session_dir,
+            evidence_root: AgentSessionEvidenceRoot::open(session_dir.clone()).unwrap(),
             secret_values: Mutex::new(Vec::new()),
         });
         lock(&workspace.agent_sessions).insert("session-1".to_owned(), Arc::downgrade(&session));
@@ -11752,9 +13869,10 @@ sleep 30
         );
         let state = controller.agent_session_state(&sessions[0].id).unwrap();
         assert!(lock(&state.commands).is_none());
-        let manifest: AgentSessionManifest =
-            serde_json::from_slice(&fs::read(state.bundle_dir.join("manifest.json")).unwrap())
-                .unwrap();
+        let manifest: AgentSessionManifest = serde_json::from_slice(
+            &fs::read(state.evidence_root.display_path().join("manifest.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(manifest.summary.status, AgentSessionStatus::Failed);
         assert!(
             lock(&state.events)
@@ -12075,11 +14193,8 @@ sleep 30
                 .count(),
             4
         );
-        let bundle = controller
-            .agent_session_state(&session.id)
-            .unwrap()
-            .bundle_dir
-            .clone();
+        let session_state = controller.agent_session_state(&session.id).unwrap();
+        let bundle = session_state.evidence_root.display_path().to_path_buf();
         let evidence = fs::read_to_string(bundle.join("manifest.json")).unwrap()
             + &fs::read_to_string(bundle.join("events.jsonl")).unwrap();
         assert!(!evidence.contains("turn-secret"));
@@ -12318,11 +14433,8 @@ sleep 30
             .turns[0]
             .presentation
             .clone();
-        let bundle = controller
-            .agent_session_state(&session.id)
-            .unwrap()
-            .bundle_dir
-            .clone();
+        let session_state = controller.agent_session_state(&session.id).unwrap();
+        let bundle = session_state.evidence_root.display_path().to_path_buf();
         drop(controller);
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -13756,6 +15868,7 @@ fi
             sender,
             cancel: CancellationToken::new(),
             bundle_dir: root.clone(),
+            agent_session_directories: AgentSessionDirectoryAnchor::open(root.clone()).unwrap(),
             workspace: root.join("workspace"),
             output: "result.json".into(),
             initial_snapshot: Some(snapshot_tree(&root.join("initial")).unwrap()),

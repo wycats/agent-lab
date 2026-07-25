@@ -835,6 +835,13 @@ test('an active turn can be cancelled from compact progress without polling', as
 });
 
 test('agent answers render constrained Markdown and retain inspectable source', async ({ page }) => {
+  const terminalFramesSent: string[] = [];
+  page.on('websocket', (socket) => {
+    if (!/\/api\/terminal(?:\?|$)/.test(socket.url())) return;
+    socket.on('framesent', ({ payload }) => {
+      if (typeof payload === 'string') terminalFramesSent.push(payload);
+    });
+  });
   const firstMessage = [
     '# Findings',
     '',
@@ -906,6 +913,9 @@ test('agent answers render constrained Markdown and retain inspectable source', 
 
   await page.goto('/');
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const terminalInput = page.locator('[data-testid="terminal"] textarea');
+  const terminalCanvas = page.locator('[data-testid="terminal"] canvas');
+  await expect(terminalInput).toBeFocused();
   await page.getByLabel('Default harness').selectOption('v0');
   await submit(page, 'agent "Summarize the workspace"');
 
@@ -941,8 +951,6 @@ test('agent answers render constrained Markdown and retain inspectable source', 
   expect(resourceRequests).toEqual([]);
   expect(await page.evaluate(() => (window as Window & { agentMarkdownXss?: boolean }).agentMarkdownXss)).toBeUndefined();
 
-  const terminalInput = page.locator('[data-testid="terminal"] textarea');
-  const terminalCanvas = page.locator('[data-testid="terminal"] canvas');
   await terminalCanvas.evaluate((canvas) => (canvas.dataset.markdownSessionProbe = 'same-canvas'));
   authoritative = true;
   await submit(page, 'agent "Confirm the conclusion"');
@@ -961,6 +969,31 @@ test('agent answers render constrained Markdown and retain inspectable source', 
   await expect(presentation.getByRole('button', { name: 'Source' })).toHaveAttribute('aria-pressed', 'true');
   await presentation.getByRole('button', { name: 'Rendered' }).click();
   await expect(answer.getByRole('heading', { name: 'Findings', level: 3 })).toBeVisible();
+
+  await terminalCanvas.click({ position: { x: 10, y: 10 } });
+  await expect(terminalInput).toBeFocused();
+  const humanInputBeforePaste = terminalFramesSent.filter(
+    (frame) => frame === JSON.stringify({ type: 'human_input' })
+  ).length;
+  await terminalInput.evaluate((input) => {
+    const clipboard = new DataTransfer();
+    clipboard.setData('text/plain', '40 + 2');
+    input.dispatchEvent(
+      new ClipboardEvent('paste', {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: clipboard
+      })
+    );
+  });
+  await expect.poll(
+    () =>
+      terminalFramesSent.filter(
+        (frame) => frame === JSON.stringify({ type: 'human_input' })
+      ).length
+  ).toBe(humanInputBeforePaste + 1);
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('terminal-text')).toContainText('42');
 
   // Keep the persistent e2e workbench neutral for the catalog walkthrough that follows.
   await submit(page, 'agent close');

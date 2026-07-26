@@ -1283,7 +1283,7 @@ fn catalog_evaluator(scenario: &ScenarioManifest) -> EvaluationEvaluator {
                 .map(|source| (*source).to_owned())
                 .collect(),
             output_path: scenario.output.clone(),
-            require_schema: true,
+            require_schema: scenario.assertions.require_schema,
         },
     }
 }
@@ -1614,6 +1614,34 @@ fn load_definitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_evaluator_preserves_the_scenario_schema_requirement() {
+        let scenario = ScenarioManifest {
+            version: 1,
+            id: "catalog".to_owned(),
+            title: "Catalog".to_owned(),
+            description: "test".to_owned(),
+            question: "How does the harness produce the expected catalog artifact?".to_owned(),
+            seed: "catalog/workspace".into(),
+            prompt: "Write the catalog artifact".to_owned(),
+            output: "result.json".into(),
+            limits: ScenarioLimits {
+                max_duration_ms: 1,
+                max_command_count: 1,
+                max_orchestrator_invocations: 1,
+                max_tool_invocations: 1,
+            },
+            assertions: CatalogAssertions {
+                active_names: vec!["alpha".to_owned(), "gamma".to_owned()],
+                total_score: 11,
+                required_capability_sources: vec!["catalog".to_owned(), "analysis".to_owned()],
+                require_schema: false,
+            },
+        };
+
+        assert!(!catalog_evaluator(&scenario).parameters.require_schema);
+    }
 
     #[test]
     fn catalog_revision_rejects_unreviewed_evaluator_code() {

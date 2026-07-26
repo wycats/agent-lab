@@ -778,7 +778,6 @@ struct RunState {
     agent_session_directories: AgentSessionDirectoryAnchor,
     workspace: PathBuf,
     workspace_evidence_root: WorkspaceEvidenceRoot,
-    output: PathBuf,
     initial_snapshot: Option<BTreeMap<String, Vec<u8>>>,
     capabilities: Mutex<Vec<CapabilityEndpoint>>,
     secret_values: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -2893,13 +2892,15 @@ impl RunController {
         } else {
             build_review(&summary, &events)
         };
+        let assembly = lock(&state.assembly).clone();
+        let output_path = &assembly.scenario.output;
         let output_result = if summary.status.is_finished() {
             read_optional_confined_run_json(
                 &state.agent_session_directories,
-                &Path::new("final").join(&state.output),
+                &Path::new("final").join(output_path),
             )
         } else {
-            read_optional_workspace_json(&state.workspace_evidence_root, &state.output)
+            read_optional_workspace_json(&state.workspace_evidence_root, output_path)
         };
         let secret_values = lock(&state.secret_values).clone();
         let (output, output_error) = match output_result {
@@ -2911,7 +2912,7 @@ impl RunController {
         };
         Ok(RunDetail {
             summary,
-            assembly: lock(&state.assembly).clone(),
+            assembly,
             review,
             events,
             score,
@@ -3288,7 +3289,6 @@ impl RunController {
             agent_session_directories,
             workspace,
             workspace_evidence_root,
-            output: scenario.output.clone(),
             initial_snapshot: Some(initial_snapshot),
             capabilities: Mutex::new(Vec::new()),
             secret_values: Arc::new(Mutex::new(driver_secret_values(&self.inner.driver))),
@@ -3839,12 +3839,7 @@ impl RunController {
             if let Some(scenario) = &state.scenario_override {
                 lock(&self.inner.scenario_overrides).insert(prepared.id.clone(), scenario.clone());
                 if let Ok(run_state) = self.state(&prepared.id) {
-                    let mut assembly = lock(&run_state.assembly);
-                    assembly.question.clone_from(&scenario.prompt);
-                    assembly.limits = scenario.limits.clone();
-                    assembly.scenario.output.clone_from(&scenario.output);
-                    drop(assembly);
-                    persist_assembly(&run_state)?;
+                    apply_run_scenario_override(&run_state, scenario)?;
                 }
             }
             set_evaluation_arm(&state, index, Some(prepared.id.clone()), "starting")?;
@@ -4063,7 +4058,6 @@ impl RunController {
             agent_session_directories,
             workspace,
             workspace_evidence_root,
-            output: scenario.output.clone(),
             initial_snapshot: Some(initial_snapshot),
             capabilities: Mutex::new(Vec::new()),
             secret_values: Arc::new(Mutex::new(driver_secret_values(&self.inner.driver))),
@@ -8056,6 +8050,19 @@ fn persist_assembly(state: &RunState) -> Result<(), RunError> {
     )
 }
 
+fn apply_run_scenario_override(
+    state: &RunState,
+    scenario: &ScenarioManifest,
+) -> Result<(), RunError> {
+    {
+        let mut assembly = lock(&state.assembly);
+        assembly.question.clone_from(&scenario.prompt);
+        assembly.limits = scenario.limits.clone();
+        assembly.scenario.output.clone_from(&scenario.output);
+    }
+    persist_assembly(state)
+}
+
 fn persist_selection(state: &RunState) -> Result<(), RunError> {
     write_confined_run_json_atomic(
         &state.agent_session_directories,
@@ -9201,7 +9208,6 @@ fn load_run_bundle(
         assembly.scenario.output.clone_from(&scenario.output);
     }
     assembly.scenario.output = workspace_relative_path(&assembly.scenario.output)?;
-    let output = assembly.scenario.output.clone();
     let initial_snapshot = (summary.status == RunStatus::Exploring)
         .then(|| {
             capture_confined_run_tree(&agent_session_directories, Path::new("initial"))
@@ -9239,7 +9245,6 @@ fn load_run_bundle(
         agent_session_directories,
         workspace,
         workspace_evidence_root,
-        output,
         initial_snapshot,
         capabilities: Mutex::new(Vec::new()),
         secret_values: Arc::new(Mutex::new(Vec::new())),
@@ -16038,6 +16043,56 @@ done
         }
     }
 
+    #[tokio::test]
+    async fn scenario_output_override_drives_live_and_final_evidence_lookup() {
+        let root = temporary_root("scenario-output-override");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/bin/false"),
+        })
+        .unwrap();
+        let prepared = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = controller.state(&prepared.id).unwrap();
+        let mut scenario = controller.inner.scenarios["catalog"].clone();
+        scenario.output = "revised-result.json".into();
+        apply_run_scenario_override(&state, &scenario).unwrap();
+
+        fs::write(
+            state.workspace.join("revised-result.json"),
+            br#"{"source":"workspace"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            controller.get(&prepared.id).unwrap().output,
+            Some(json!({ "source": "workspace" }))
+        );
+
+        fs::create_dir_all(state.bundle_dir.join("final")).unwrap();
+        fs::write(
+            state.bundle_dir.join("final/revised-result.json"),
+            br#"{"source":"final"}"#,
+        )
+        .unwrap();
+        lock(&state.summary).status = RunStatus::Passed;
+        let detail = controller.get(&prepared.id).unwrap();
+        assert_eq!(detail.assembly.scenario.output, scenario.output);
+        assert_eq!(detail.output, Some(json!({ "source": "final" })));
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -19148,7 +19203,6 @@ totalScore = 11
             agent_session_directories,
             workspace,
             workspace_evidence_root,
-            output: "result.json".into(),
             initial_snapshot,
             capabilities: Mutex::new(Vec::new()),
             secret_values: Arc::new(Mutex::new(Vec::new())),
@@ -23429,7 +23483,6 @@ fi
             agent_session_directories,
             workspace: root.join("workspace"),
             workspace_evidence_root,
-            output: "result.json".into(),
             initial_snapshot: Some(snapshot_tree(&root.join("initial")).unwrap()),
             capabilities: Mutex::new(vec![CapabilityEndpoint {
                 id: "catalog".to_owned(),

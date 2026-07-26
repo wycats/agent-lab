@@ -46,6 +46,14 @@ use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, sync::broadcast};
 use tokio_util::sync::CancellationToken;
 
+mod promotion;
+pub use promotion::{
+    CreateEvaluationDraftRequest, EvaluationDefinitionDetail, EvaluationDefinitionSummary,
+    EvaluationDraftDetail, EvaluationDraftSummary, EvaluationExecutionStatus, EvaluationRevision,
+    EvaluationRevisionUpdate, EvaluationValidationAttempt, SaveEvaluationDraftRequest,
+    StartDefinitionEvaluationRequest, UpdateEvaluationDraftRequest, ValidationAssertionStatus,
+};
+
 const DRIVER_POLL: Duration = Duration::from_millis(250);
 // The extracted v0 adapter loads the production agent module graph before it
 // can announce readiness. A cold TypeScript process can take over a minute on
@@ -82,7 +90,7 @@ pub struct ScenarioManifest {
     pub assertions: CatalogAssertions,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[allow(clippy::struct_field_names)]
 pub struct ScenarioLimits {
@@ -97,6 +105,21 @@ pub struct ScenarioLimits {
 pub struct CatalogAssertions {
     pub active_names: Vec<String>,
     pub total_score: i64,
+    #[serde(default = "default_catalog_required_capability_sources")]
+    pub required_capability_sources: Vec<String>,
+    #[serde(default = "default_true")]
+    pub require_schema: bool,
+}
+
+fn default_catalog_required_capability_sources() -> Vec<String> {
+    CATALOG_REQUIRED_SOURCES
+        .iter()
+        .map(|source| (*source).to_owned())
+        .collect()
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -273,6 +296,16 @@ pub enum AgentTurnStatus {
     Intervened,
     Failed,
     Cancelled,
+}
+
+impl AgentTurnStatus {
+    #[must_use]
+    pub fn is_finished(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Intervened | Self::Failed | Self::Cancelled
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -468,6 +501,10 @@ pub struct EvaluationSummary {
     pub model_profile_id: String,
     pub source_workspace_id: String,
     pub source_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_revision_id: Option<String>,
     pub harness_ids: Vec<String>,
     pub arms: Vec<EvaluationArmSummary>,
     pub status: EvaluationStatus,
@@ -615,7 +652,7 @@ pub struct WorkspaceAssembly {
     pub change_tracking: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityAssembly {
     pub id: String,
@@ -678,6 +715,8 @@ struct ControllerInner {
     scenario_transition_lock: tokio::sync::Mutex<()>,
     evaluations_dir: PathBuf,
     evaluations: Arc<Mutex<HashMap<String, Arc<EvaluationState>>>>,
+    promotion: promotion::PromotionStore,
+    scenario_overrides: Mutex<HashMap<String, ScenarioManifest>>,
     workbench_grants: Mutex<HashMap<String, String>>,
     agent_sessions: Mutex<HashMap<String, Arc<AgentSessionState>>>,
 }
@@ -811,6 +850,8 @@ struct EvaluationState {
     bundle_directories: Arc<AgentSessionDirectoryAnchor>,
     evidence_quarantined: AtomicBool,
     replay_failed: bool,
+    scenario_override: Option<ScenarioManifest>,
+    capability_recipe: Option<Vec<CapabilityAssembly>>,
 }
 
 struct PendingEvaluationBundle {
@@ -1740,6 +1781,7 @@ impl RunController {
         let evaluations_dir = data_dir.join("evaluations");
         fs::create_dir_all(&evaluations_dir)?;
         let evaluations_dir = fs::canonicalize(evaluations_dir)?;
+        let promotion = promotion::PromotionStore::load(&data_dir)?;
         let scenarios = load_scenarios(&scenarios_dir)?;
         if scenarios.is_empty() {
             return Err(RunError::InvalidScenario(
@@ -1814,6 +1856,8 @@ impl RunController {
                 scenario_transition_lock: tokio::sync::Mutex::new(()),
                 evaluations_dir,
                 evaluations: Arc::new(Mutex::new(evaluations)),
+                promotion,
+                scenario_overrides: Mutex::new(HashMap::new()),
                 workbench_grants: Mutex::new(HashMap::new()),
                 agent_sessions: Mutex::new(agent_sessions),
             }),
@@ -3318,11 +3362,10 @@ impl RunController {
             if summary.status != RunStatus::Exploring {
                 return Err(RunError::RunUnavailable(id.to_owned()));
             }
-            let scenario = self
-                .inner
-                .scenarios
-                .get(&summary.scenario_id)
+            let scenario = lock(&self.inner.scenario_overrides)
+                .get(id)
                 .cloned()
+                .or_else(|| self.inner.scenarios.get(&summary.scenario_id).cloned())
                 .ok_or_else(|| RunError::UnknownScenario(summary.scenario_id.clone()))?;
             let previous_summary = summary.clone();
             summary.model_id.clone_from(&model_id);
@@ -3572,6 +3615,7 @@ impl RunController {
         }
         let (source_snapshot, source_assembly) =
             self.validate_evaluation_request(&request, &source)?;
+        let capability_recipe = source_assembly.capability_sources.clone();
         let _producer_lifecycle = lock(&source.producer_lifecycle);
         if source.evidence_quarantined.load(Ordering::Acquire) {
             return Err(RunError::UnknownRun(request.source_workspace_id));
@@ -3600,6 +3644,8 @@ impl RunController {
             model_profile_id: request.model_profile_id,
             source_workspace_id: request.source_workspace_id,
             source_revision,
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: request.harness_ids.clone(),
             arms: request
                 .harness_ids
@@ -3625,6 +3671,8 @@ impl RunController {
             bundle_directories,
             evidence_quarantined: AtomicBool::new(false),
             replay_failed: false,
+            scenario_override: None,
+            capability_recipe: Some(capability_recipe),
         });
         write_confined_run_json_atomic(
             &state.bundle_directories,
@@ -3754,11 +3802,50 @@ impl RunController {
                     continue;
                 }
             };
+            if let Some(expected) = &state.capability_recipe {
+                let actual = self
+                    .state(&prepared.id)
+                    .map(|run| lock(&run.assembly).capability_sources.clone());
+                if let Err(error) = actual.and_then(|actual| {
+                    (actual == *expected).then_some(()).ok_or_else(|| {
+                        RunError::EvidencePersistence(format!(
+                            "capability recipe mismatch: expected {}, found {}",
+                            serde_json::to_string(expected).unwrap_or_default(),
+                            serde_json::to_string(&actual).unwrap_or_default()
+                        ))
+                    })
+                }) {
+                    let _ = self.cancel(&prepared.id);
+                    set_evaluation_arm(&state, index, Some(prepared.id.clone()), "failed")?;
+                    record_evaluation_event(
+                        &state,
+                        "evaluation.arm.finished",
+                        json!({
+                            "harnessId": harness_id,
+                            "runId": prepared.id,
+                            "status": "failed",
+                            "error": error.to_string(),
+                        }),
+                    )?;
+                    continue;
+                }
+            }
             let producer_lifecycle = lock(&state.producer_lifecycle);
             if state.evidence_quarantined.load(Ordering::Acquire) {
                 drop(producer_lifecycle);
                 quarantine_evaluation_evidence(&self.inner.runs, &state);
                 return Ok(());
+            }
+            if let Some(scenario) = &state.scenario_override {
+                lock(&self.inner.scenario_overrides).insert(prepared.id.clone(), scenario.clone());
+                if let Ok(run_state) = self.state(&prepared.id) {
+                    let mut assembly = lock(&run_state.assembly);
+                    assembly.question.clone_from(&scenario.prompt);
+                    assembly.limits = scenario.limits.clone();
+                    assembly.scenario.output.clone_from(&scenario.output);
+                    drop(assembly);
+                    persist_assembly(&run_state)?;
+                }
             }
             set_evaluation_arm(&state, index, Some(prepared.id.clone()), "starting")?;
             record_evaluation_event(
@@ -7105,9 +7192,11 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
         })
         .filter_map(|event| event.payload["source"].as_str().map(str::to_owned))
         .collect::<std::collections::BTreeSet<_>>();
-    let capability_evidence_complete = CATALOG_REQUIRED_SOURCES
+    let capability_evidence_complete = scenario
+        .assertions
+        .required_capability_sources
         .iter()
-        .all(|source| capability_sources_used.contains(*source));
+        .all(|source| capability_sources_used.contains(source));
     let analysis_result = catalog_analysis_result(&lock(&state.events));
     let catalog_analysis_composed = analysis_result.is_some();
     let analysis_result_matches = analysis_result
@@ -7115,7 +7204,7 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
         .is_some_and(|expected| output.as_ref() == Some(expected));
     Ok(json!({
         "passed": output.is_some()
-            && schema_valid
+            && (!scenario.assertions.require_schema || schema_valid)
             && names_match
             && score_matches
             && capability_evidence_complete
@@ -7130,7 +7219,8 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
         "expectedTotalScore": scenario.assertions.total_score,
         "scoreMatches": score_matches,
         "capabilitySourcesUsed": capability_sources_used,
-        "expectedCapabilitySources": CATALOG_REQUIRED_SOURCES,
+        "expectedCapabilitySources": scenario.assertions.required_capability_sources,
+        "schemaRequired": scenario.assertions.require_schema,
         "capabilityEvidenceComplete": capability_evidence_complete,
         "catalogAnalysisComposed": catalog_analysis_composed,
         "analysisResultMatches": analysis_result_matches,
@@ -9397,6 +9487,8 @@ fn load_evaluation_bundle(
         bundle_directories,
         evidence_quarantined: AtomicBool::new(false),
         replay_failed,
+        scenario_override: None,
+        capability_recipe: None,
     });
     if interrupted {
         persist_evaluation(&state)?;
@@ -11168,7 +11260,9 @@ fn create_confined_directory_at(
     let name = components
         .pop()
         .expect("confined directory path has a final component");
-    let parent = open_confined_evidence_directory_at(root_directory, components, &display_path)?;
+    let parent_relative = components.iter().collect::<PathBuf>();
+    let parent =
+        open_or_create_confined_directory_at(root_directory, &parent_relative, &display_path)?;
     rustix::fs::mkdirat(
         &parent,
         &name,
@@ -12902,6 +12996,8 @@ pub enum RunError {
     ModelAccessUnavailable(String),
     #[error("invalid run request: {0}")]
     InvalidRequest(String),
+    #[error("conflicting run request: {0}")]
+    Conflict(String),
     #[error("invalid scenario: {0}")]
     InvalidScenario(String),
     #[error("path escapes its configured root: {0}")]
@@ -12936,7 +13032,7 @@ impl From<RunError> for (StatusCode, String) {
             RunError::UnknownRun(_)
             | RunError::UnknownScenario(_)
             | RunError::UnknownAgentSession(_) => StatusCode::NOT_FOUND,
-            RunError::RunUnavailable(_) => StatusCode::CONFLICT,
+            RunError::RunUnavailable(_) | RunError::Conflict(_) => StatusCode::CONFLICT,
             RunError::ModelAccessUnavailable(_) => StatusCode::PRECONDITION_FAILED,
             RunError::InvalidRequest(_)
             | RunError::InvalidScenario(_)
@@ -12959,7 +13055,27 @@ fn _assert_send_sync() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    #[cfg(unix)]
+    use rmcp::{
+        ClientHandler, ServiceExt,
+        model::CallToolRequestParams,
+        transport::{
+            StreamableHttpClientTransport,
+            streamable_http_client::StreamableHttpClientTransportConfig,
+        },
+    };
+    #[cfg(unix)]
+    use serde_json::Map;
+
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct PromotionMcpClient;
+
+    #[cfg(unix)]
+    impl ClientHandler for PromotionMcpClient {}
 
     fn event(sequence: u64, kind: &str, payload: JsonValue) -> RunEvent {
         RunEvent {
@@ -15686,6 +15802,532 @@ done
     }
 
     #[cfg(unix)]
+    fn promotion_fixture_launch() -> DriverLaunch {
+        let script = r#"
+sequence=1
+workspace=
+printf '%s\n' '{"protocolVersion":1,"sequence":1,"causedBy":null,"type":"driver.ready","driver":{"name":"promotion-fixture","version":"1","revision":null,"features":["streaming","turn-observations-v1"]}}'
+while IFS= read -r line; do
+  session=$(printf '%s' "$line" | sed -E 's/.*"sessionId":"([^"]+)".*/\1/')
+  case "$line" in
+    *'"type":"session.open"'*)
+      workspace=$(printf '%s' "$line" | sed -E 's/.*"workspaceRoot":"([^"]+)".*/\1/')
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"session.opened","sessionId":"%s","processId":4242}\n' "$sequence" "$session"
+      ;;
+    *'"type":"turn.start"'*)
+      turn=$(printf '%s' "$line" | sed -E 's/.*"turnId":"([^"]+)".*/\1/')
+      case "$line" in
+        *'"mode":"interactive"'*)
+          sequence=$((sequence + 1))
+          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.completed","payload":{"messageId":"answer-%s","text":"Catalog finding: Alpha and gamma are active."}}\n' "$sequence" "$session" "$turn" "$turn"
+          ;;
+        *)
+          printf '%s\n' '{"active":[{"name":"alpha","active":true,"score":3},{"name":"gamma","active":true,"score":8}],"activeCount":2,"totalScore":11}' > "$workspace/result.json"
+          sequence=$((sequence + 1))
+          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"mcp.tool.completed","payload":{"actor":"agent","source":"catalog","name":"list","isError":false,"result":{"items":[{"name":"alpha","score":3,"active":true},{"name":"beta","score":5,"active":false},{"name":"gamma","score":8,"active":true}]}}}\n' "$sequence" "$session" "$turn"
+          sequence=$((sequence + 1))
+          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"mcp.tool.completed","payload":{"actor":"agent","source":"analysis","name":"summarize","isError":false,"result":{"active":[{"name":"alpha","score":3},{"name":"gamma","score":8}],"totalScore":11}}}\n' "$sequence" "$session" "$turn"
+          sequence=$((sequence + 1))
+          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"workspace.changed","payload":{"path":"result.json","kind":"created"}}\n' "$sequence" "$session" "$turn"
+          ;;
+      esac
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.finished","sessionId":"%s","turnId":"%s","outcome":"completed","evidence":{"fixture":true}}\n' "$sequence" "$session" "$turn"
+      ;;
+    *'"type":"turn.abort"'*)
+      turn=$(printf '%s' "$line" | sed -E 's/.*"turnId":"([^"]+)".*/\1/')
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.finished","sessionId":"%s","turnId":"%s","outcome":"aborted","evidence":{"fixture":true}}\n' "$sequence" "$session" "$turn"
+      ;;
+    *'"type":"session.close"'*)
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"session.closed","sessionId":"%s"}\n' "$sequence" "$session"
+      exit 0
+      ;;
+  esac
+done
+"#;
+        let mut launch = DriverLaunch::new("/bin/sh");
+        launch.args = vec!["-c".into(), script.into()];
+        launch
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_validation(
+        controller: &RunController,
+        draft_id: &str,
+        attempt_id: &str,
+    ) -> EvaluationValidationAttempt {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let draft = controller.evaluation_draft(draft_id).unwrap();
+            let attempt = draft
+                .validations
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .unwrap();
+            if matches!(
+                attempt.execution_status,
+                EvaluationExecutionStatus::Complete
+                    | EvaluationExecutionStatus::Inconclusive
+                    | EvaluationExecutionStatus::Cancelled
+                    | EvaluationExecutionStatus::Intervened
+            ) {
+                return attempt.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "evaluation validation did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn call_promotion_capability(
+        endpoint: &CapabilityEndpoint,
+        tool: &str,
+        arguments: Map<String, JsonValue>,
+    ) -> JsonValue {
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(endpoint.agent_url.as_str())
+                .auth_header(&endpoint.agent_token),
+        );
+        let service = PromotionMcpClient.serve(transport).await.unwrap();
+        let result = service
+            .peer()
+            .call_tool(CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        service.cancel().await.unwrap();
+        result
+    }
+
+    #[cfg(unix)]
+    async fn exercise_catalog_capabilities(controller: &RunController, run_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let capabilities = loop {
+            if let Some(state) = lock(&controller.inner.runs).get(run_id).cloned() {
+                let capabilities = lock(&state.capabilities).clone();
+                if capabilities.len() == 2 {
+                    break capabilities;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "evaluation run capabilities did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let catalog = capabilities
+            .iter()
+            .find(|capability| capability.id == "catalog")
+            .unwrap();
+        let analysis = capabilities
+            .iter()
+            .find(|capability| capability.id == "analysis")
+            .unwrap();
+        let catalog_result = call_promotion_capability(catalog, "list", Map::new()).await;
+        let items = catalog_result["items"].as_array().unwrap().clone();
+        call_promotion_capability(
+            analysis,
+            "summarize",
+            json!({ "items": items }).as_object().unwrap().clone(),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    async fn exercise_validation_capabilities(
+        controller: &RunController,
+        draft_id: &str,
+        attempt_id: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let run_id = loop {
+            let draft = controller.evaluation_draft(draft_id).unwrap();
+            if let Some(run_id) = draft
+                .validations
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .and_then(|attempt| attempt.run_id.clone())
+            {
+                break run_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "validation did not allocate its run"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        exercise_catalog_capabilities(controller, &run_id).await;
+    }
+
+    #[cfg(unix)]
+    async fn exercise_evaluation_capabilities(controller: &RunController, evaluation_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut exercised = BTreeSet::new();
+        loop {
+            let evaluation = controller.get_evaluation(evaluation_id).unwrap();
+            for run_id in evaluation
+                .summary
+                .arms
+                .iter()
+                .filter_map(|arm| arm.run_id.as_deref())
+            {
+                if exercised.insert(run_id.to_owned()) {
+                    exercise_catalog_capabilities(controller, run_id).await;
+                }
+            }
+            if evaluation.summary.status.is_finished() {
+                assert_eq!(exercised.len(), 2);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "definition evaluation did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_evaluation(
+        controller: &RunController,
+        evaluation_id: &str,
+    ) -> EvaluationDetail {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let detail = controller.get_evaluation(evaluation_id).unwrap();
+            if !matches!(
+                detail.summary.status,
+                EvaluationStatus::Queued | EvaluationStatus::Running
+            ) {
+                return detail;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "definition evaluation did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_agent_session_closed(
+        controller: &RunController,
+        workspace_id: &str,
+        session_id: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if controller
+                .agent_session(workspace_id, session_id)
+                .unwrap()
+                .summary
+                .status
+                == AgentSessionStatus::Closed
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "agent session did not close");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn manual_evaluation_promotion_retains_revisions_failures_modes_and_replay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("manual-evaluation-promotion");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        fs::set_permissions(
+            scenarios.join("catalog/workspace/README.md"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/bin/false"),
+        };
+        let harnesses = || {
+            ["v0", "eve"]
+                .into_iter()
+                .map(|id| HarnessProfile {
+                    id: id.to_owned(),
+                    display_name: id.to_owned(),
+                    launch: promotion_fixture_launch(),
+                    models: BTreeMap::from([("test".to_owned(), format!("fixture/{id}"))]),
+                })
+                .collect::<Vec<_>>()
+        };
+        let models = BTreeMap::from([("test".to_owned(), "Test".to_owned())]);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let observed = controller
+                .list_agent_sessions(&explore.id)
+                .into_iter()
+                .find(|candidate| candidate.id == session.id)
+                .unwrap();
+            if observed.status == AgentSessionStatus::Ready && observed.active {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source session did not start");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "Explain the active catalog".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            let observed = detail
+                .turns
+                .iter()
+                .find(|candidate| candidate.id == turn.id)
+                .unwrap();
+            if observed.status == AgentTurnStatus::Completed {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source turn did not finish");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let draft = controller
+            .create_evaluation_draft(
+                &explore.id,
+                CreateEvaluationDraftRequest {
+                    session_id: Some(session.id.clone()),
+                    from_turn_id: turn.id.clone(),
+                    through_turn_id: turn.id.clone(),
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let first = draft.revisions.first().unwrap();
+        assert!(first.source.source_digest.starts_with("sha256:"));
+        let copied_source = data
+            .join("evaluation-library/drafts")
+            .join(&draft.summary.id)
+            .join("revisions")
+            .join(&first.id)
+            .join("source/README.md");
+        assert_eq!(
+            fs::metadata(copied_source).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+
+        let mut failing_evaluator = first.evaluator.clone();
+        failing_evaluator.parameters.active_names = vec!["not-the-catalog".to_owned()];
+        let failed_revision = controller
+            .update_evaluation_draft(
+                &draft.summary.id,
+                UpdateEvaluationDraftRequest {
+                    base_revision_id: first.id.clone(),
+                    name: Some("Catalog regression".to_owned()),
+                    revision: EvaluationRevisionUpdate {
+                        evaluator: Some(failing_evaluator),
+                        ..EvaluationRevisionUpdate::default()
+                    },
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let failed_revision_id = failed_revision.summary.current_revision_id.clone();
+        assert_ne!(failed_revision_id, first.id);
+        assert!(matches!(
+            controller.update_evaluation_draft(
+                &draft.summary.id,
+                UpdateEvaluationDraftRequest {
+                    base_revision_id: first.id.clone(),
+                    name: None,
+                    revision: EvaluationRevisionUpdate::default(),
+                },
+                WorkbenchOrigin::Nushell,
+            ),
+            Err(RunError::Conflict(_))
+        ));
+
+        let failed_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&failed_revision_id))
+            .unwrap();
+        exercise_validation_capabilities(&controller, &draft.summary.id, &failed_attempt.id).await;
+        let failed_attempt =
+            wait_for_validation(&controller, &draft.summary.id, &failed_attempt.id).await;
+        assert_eq!(
+            failed_attempt.execution_status,
+            EvaluationExecutionStatus::Complete
+        );
+        assert_eq!(
+            failed_attempt.assertion_status,
+            ValidationAssertionStatus::Failed
+        );
+        let saved_failure = controller
+            .save_evaluation_draft(
+                &draft.summary.id,
+                SaveEvaluationDraftRequest {
+                    revision_id: Some(failed_revision_id.clone()),
+                    name: None,
+                },
+            )
+            .unwrap();
+        assert!(saved_failure.summary.saved);
+        assert!(saved_failure.summary.definition_id.is_none());
+
+        let corrected = controller
+            .update_evaluation_draft(
+                &draft.summary.id,
+                UpdateEvaluationDraftRequest {
+                    base_revision_id: failed_revision_id,
+                    name: None,
+                    revision: EvaluationRevisionUpdate {
+                        evaluator: Some(first.evaluator.clone()),
+                        ..EvaluationRevisionUpdate::default()
+                    },
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let passing_revision_id = corrected.summary.current_revision_id.clone();
+        let passing_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        exercise_validation_capabilities(&controller, &draft.summary.id, &passing_attempt.id).await;
+        let passing_attempt =
+            wait_for_validation(&controller, &draft.summary.id, &passing_attempt.id).await;
+        assert_eq!(
+            passing_attempt.execution_status,
+            EvaluationExecutionStatus::Complete
+        );
+        assert_eq!(
+            passing_attempt.assertion_status,
+            ValidationAssertionStatus::Passed
+        );
+        let promoted = controller
+            .save_evaluation_draft(
+                &draft.summary.id,
+                SaveEvaluationDraftRequest {
+                    revision_id: Some(passing_revision_id.clone()),
+                    name: Some("Catalog regression".to_owned()),
+                },
+            )
+            .unwrap();
+        let definition_id = promoted.summary.definition_id.clone().unwrap();
+        let definition = controller.evaluation_definition(&definition_id).unwrap();
+        assert_eq!(definition.summary.revision_id, passing_revision_id);
+
+        controller
+            .close_agent_session(&explore.id, &session.id)
+            .unwrap();
+        wait_for_agent_session_closed(&controller, &explore.id, &session.id).await;
+        let evaluation = controller
+            .start_workbench_definition_evaluation(
+                &explore.id,
+                &definition_id,
+                StartDefinitionEvaluationRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        assert!(
+            lock(&controller.state(&explore.id).unwrap().events)
+                .iter()
+                .any(|event| {
+                    event.kind == "workbench.evaluation.started"
+                        && event.payload["origin"] == "nushell"
+                        && event.payload["definitionId"] == definition_id
+                        && event.payload["evaluationId"] == evaluation.id
+                })
+        );
+        exercise_evaluation_capabilities(&controller, &evaluation.id).await;
+        let evaluation = wait_for_evaluation(&controller, &evaluation.id).await;
+        assert_eq!(evaluation.summary.status, EvaluationStatus::Passed);
+        assert_eq!(
+            evaluation.summary.definition_id.as_deref(),
+            Some(definition_id.as_str())
+        );
+        assert!(
+            evaluation
+                .summary
+                .arms
+                .iter()
+                .all(|arm| arm.status == "passed")
+        );
+
+        drop(controller);
+        let reopened =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        let reopened_draft = reopened.evaluation_draft(&draft.summary.id).unwrap();
+        assert_eq!(reopened_draft.revisions.len(), 3);
+        assert_eq!(reopened_draft.validations.len(), 2);
+        assert_eq!(
+            reopened
+                .evaluation_definition(&definition_id)
+                .unwrap()
+                .summary
+                .revision_id,
+            passing_revision_id
+        );
+        assert_eq!(
+            reopened
+                .get_evaluation(&evaluation.summary.id)
+                .unwrap()
+                .summary
+                .definition_id
+                .as_deref(),
+            Some(definition_id.as_str())
+        );
+
+        drop(reopened);
+        fs::write(
+            data.join("evaluation-library/definitions")
+                .join(&definition_id)
+                .join("source/README.md"),
+            b"tampered definition source",
+        )
+        .unwrap();
+        let after_tamper =
+            RunController::new_with_harnesses(config(), harnesses(), models).unwrap();
+        assert!(after_tamper.evaluation_definition(&definition_id).is_err());
+        assert!(after_tamper.evaluation_draft(&draft.summary.id).is_ok());
+
+        drop(after_tamper);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
     async fn prepare_interactive_fixture(
         label: &str,
         launch: DriverLaunch,
@@ -16381,7 +17023,7 @@ done
                 WorkbenchOrigin::Nushell,
             )
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let observed = controller
                 .list_agent_sessions(&explore.id)
@@ -18434,6 +19076,8 @@ totalScore = 11
             assertions: CatalogAssertions {
                 active_names: vec!["alpha".to_owned(), "gamma".to_owned()],
                 total_score: 11,
+                required_capability_sources: default_catalog_required_capability_sources(),
+                require_schema: true,
             },
         }
     }
@@ -19833,6 +20477,8 @@ sleep 30
             model_profile_id: "haiku".to_owned(),
             source_workspace_id: "source-workspace".to_owned(),
             source_revision: "source-revision".to_owned(),
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: Vec::new(),
             arms: Vec::new(),
             status: EvaluationStatus::Running,
@@ -19851,6 +20497,8 @@ sleep 30
             bundle_directories,
             evidence_quarantined: AtomicBool::new(false),
             replay_failed: false,
+            scenario_override: None,
+            capability_recipe: None,
         });
         lock(&controller.inner.evaluations).insert(evaluation_id.to_owned(), state.clone());
         let (history, receiver) = controller.subscribe_evaluation(evaluation_id).unwrap();
@@ -22253,6 +22901,8 @@ fi
             model_profile_id: "haiku".to_owned(),
             source_workspace_id: "run-explore".to_owned(),
             source_revision: "revision-1".to_owned(),
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
             arms: vec![
                 EvaluationArmSummary {
@@ -22322,6 +22972,8 @@ fi
             model_profile_id: "haiku".to_owned(),
             source_workspace_id: "run-explore".to_owned(),
             source_revision: "revision-1".to_owned(),
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
             arms: Vec::new(),
             status: EvaluationStatus::Passed,
@@ -23775,6 +24427,8 @@ fi
             model_profile_id: "test".to_owned(),
             source_workspace_id: "run-events".to_owned(),
             source_revision: "concurrent-evaluation-source".to_owned(),
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: Vec::new(),
             arms: Vec::new(),
             status: EvaluationStatus::Running,
@@ -23798,6 +24452,8 @@ fi
             bundle_directories,
             evidence_quarantined: AtomicBool::new(false),
             replay_failed: false,
+            scenario_override: None,
+            capability_recipe: None,
         });
         lock(&controller.inner.evaluations).insert(evaluation_id.to_owned(), evaluation.clone());
         let mut lagged_receiver = evaluation.sender.subscribe();
@@ -23975,6 +24631,8 @@ fi
             model_profile_id: "test".to_owned(),
             source_workspace_id: "run-events".to_owned(),
             source_revision: "revision-before-secret".to_owned(),
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: vec!["fixture-a".to_owned(), "fixture-b".to_owned()],
             arms: vec![
                 EvaluationArmSummary {
@@ -24010,6 +24668,8 @@ fi
             bundle_directories,
             evidence_quarantined: AtomicBool::new(false),
             replay_failed: false,
+            scenario_override: None,
+            capability_recipe: None,
         });
         lock(&controller.inner.evaluations).insert(evaluation_id.to_owned(), evaluation.clone());
 
@@ -24104,6 +24764,8 @@ fi
             model_profile_id: "test".to_owned(),
             source_workspace_id: "source-workspace".to_owned(),
             source_revision: SOURCE_REVISION.to_owned(),
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: vec!["fixture".to_owned()],
             arms: vec![EvaluationArmSummary {
                 harness_id: "fixture".to_owned(),
@@ -24126,6 +24788,8 @@ fi
             bundle_directories,
             evidence_quarantined: AtomicBool::new(false),
             replay_failed: false,
+            scenario_override: None,
+            capability_recipe: None,
         });
         lock(&controller.inner.evaluations).insert(evaluation_id.to_owned(), evaluation.clone());
 

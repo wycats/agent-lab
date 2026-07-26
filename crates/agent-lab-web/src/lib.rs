@@ -34,13 +34,17 @@ pub use runs::{
     AgentAssistantMessage, AgentPresentationCompleteness, AgentPresentationCompletenessSummary,
     AgentSessionDetail, AgentSessionStatus, AgentSessionSummary, AgentTurnActivity,
     AgentTurnCompletionIndex, AgentTurnCompletionRef, AgentTurnDetail, AgentTurnPresentation,
-    AgentTurnStatus, AgentTurnSummary, CompareWorkbenchRequest, EvaluationDetail, EvaluationStatus,
-    EvaluationSummary, HarnessMetadata, HarnessProfile, ModelAccessProvider, ModelAccessSnapshot,
-    ModelAccessStatus, ModelProfileMetadata, PrepareRunRequest, RunController, RunControllerConfig,
-    RunDetail, RunError, RunEvent, RunStatus, RunSummary, ScenarioManifest,
-    StartAgentSessionRequest, StartAgentTurnRequest, StartEvaluationRequest,
-    StartPreparedRunRequest, StartRunRequest, TerminalBinding, TerminalCapabilityBinding,
-    UpdateWorkbenchSelectionRequest, WorkbenchOrigin, WorkbenchSelection, WorkbenchSnapshot,
+    AgentTurnStatus, AgentTurnSummary, CompareWorkbenchRequest, CreateEvaluationDraftRequest,
+    EvaluationDefinitionDetail, EvaluationDefinitionSummary, EvaluationDetail,
+    EvaluationDraftDetail, EvaluationDraftSummary, EvaluationExecutionStatus, EvaluationRevision,
+    EvaluationRevisionUpdate, EvaluationStatus, EvaluationSummary, EvaluationValidationAttempt,
+    HarnessMetadata, HarnessProfile, ModelAccessProvider, ModelAccessSnapshot, ModelAccessStatus,
+    ModelProfileMetadata, PrepareRunRequest, RunController, RunControllerConfig, RunDetail,
+    RunError, RunEvent, RunStatus, RunSummary, SaveEvaluationDraftRequest, ScenarioManifest,
+    StartAgentSessionRequest, StartAgentTurnRequest, StartDefinitionEvaluationRequest,
+    StartEvaluationRequest, StartPreparedRunRequest, StartRunRequest, TerminalBinding,
+    TerminalCapabilityBinding, UpdateEvaluationDraftRequest, UpdateWorkbenchSelectionRequest,
+    ValidationAssertionStatus, WorkbenchOrigin, WorkbenchSelection, WorkbenchSnapshot,
 };
 
 const DEFAULT_COLS: u16 = 100;
@@ -428,6 +432,7 @@ pub fn app(config: ServerConfig, provider: Arc<dyn SessionProvider>) -> Router {
 }
 
 /// Build the browser application with the optional scenario run controller.
+#[allow(clippy::too_many_lines)]
 pub fn app_with_runs(
     config: ServerConfig,
     provider: Arc<dyn SessionProvider>,
@@ -491,6 +496,42 @@ pub fn app_with_runs(
             get(agent_session_events),
         )
         .route(
+            "/api/workbench/{workspace_id}/evaluation-drafts",
+            get(list_workbench_evaluation_drafts).post(create_evaluation_draft),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluation-drafts/{draft_id}",
+            get(get_workbench_evaluation_draft).patch(update_evaluation_draft),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluation-drafts/{draft_id}/validate",
+            post(validate_evaluation_draft),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluation-drafts/{draft_id}/save",
+            post(save_evaluation_draft),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluation-drafts/{draft_id}/events",
+            get(evaluation_draft_events),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluation-drafts/{draft_id}/validations/{validation_id}/cancel",
+            post(cancel_evaluation_validation),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluation-definitions",
+            get(list_workbench_evaluation_definitions),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluation-definitions/{definition_id}",
+            get(get_workbench_evaluation_definition),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluation-definitions/{definition_id}/run",
+            post(run_workbench_evaluation_definition),
+        )
+        .route(
             "/api/workbench/{workspace_id}/evaluations/{evaluation_id}",
             get(get_workbench_evaluation),
         )
@@ -509,6 +550,17 @@ pub fn app_with_runs(
         .route("/api/evaluations/{id}", get(get_evaluation))
         .route("/api/evaluations/{id}/cancel", post(cancel_evaluation))
         .route("/api/evaluations/{id}/events", get(evaluation_events))
+        .route("/api/evaluation-drafts", get(list_evaluation_drafts))
+        .route("/api/evaluation-drafts/{id}", get(get_evaluation_draft))
+        .route("/api/evaluation-definitions", get(list_evaluation_definitions))
+        .route(
+            "/api/evaluation-definitions/{id}",
+            get(get_evaluation_definition),
+        )
+        .route(
+            "/api/evaluation-definitions/{id}/run",
+            post(run_evaluation_definition),
+        )
         .fallback_service(assets)
         .layer(SetResponseHeaderLayer::if_not_present(
             header::X_FRAME_OPTIONS,
@@ -1007,6 +1059,326 @@ fn agent_session_event_stream(
             }
         },
     )
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidateEvaluationDraftRequest {
+    #[serde(default)]
+    revision_id: Option<String>,
+}
+
+async fn list_workbench_evaluation_drafts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    Json(
+        runs.list_evaluation_drafts()
+            .into_iter()
+            .filter(|draft| draft.workspace_id == workspace_id)
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
+}
+
+async fn create_evaluation_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<CreateEvaluationDraftRequest>,
+) -> Response {
+    let Some((runs, origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.create_evaluation_draft(&workspace_id, request, origin) {
+        Ok(draft) => (StatusCode::CREATED, Json(draft)).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn get_workbench_evaluation_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, draft_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.evaluation_draft(&draft_id) {
+        Ok(draft) if draft.summary.workspace_id == workspace_id => Json(draft).into_response(),
+        Ok(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn update_evaluation_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, draft_id)): AxumPath<(String, String)>,
+    Json(request): Json<UpdateEvaluationDraftRequest>,
+) -> Response {
+    let Some((runs, origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if runs
+        .evaluation_draft(&draft_id)
+        .is_ok_and(|draft| draft.summary.workspace_id != workspace_id)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match runs.update_evaluation_draft(&draft_id, request, origin) {
+        Ok(draft) => Json(draft).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn validate_evaluation_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, draft_id)): AxumPath<(String, String)>,
+    Json(request): Json<ValidateEvaluationDraftRequest>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if !runs
+        .evaluation_draft(&draft_id)
+        .is_ok_and(|draft| draft.summary.workspace_id == workspace_id)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match runs.start_evaluation_validation(&draft_id, request.revision_id.as_deref()) {
+        Ok(attempt) => (StatusCode::ACCEPTED, Json(attempt)).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn save_evaluation_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, draft_id)): AxumPath<(String, String)>,
+    Json(request): Json<SaveEvaluationDraftRequest>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if !runs
+        .evaluation_draft(&draft_id)
+        .is_ok_and(|draft| draft.summary.workspace_id == workspace_id)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match runs.save_evaluation_draft(&draft_id, request) {
+        Ok(draft) => Json(draft).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn cancel_evaluation_validation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, draft_id, validation_id)): AxumPath<(String, String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if !runs
+        .evaluation_draft(&draft_id)
+        .is_ok_and(|draft| draft.summary.workspace_id == workspace_id)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match runs.cancel_evaluation_validation(&draft_id, &validation_id) {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn evaluation_draft_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, draft_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if !runs
+        .evaluation_draft(&draft_id)
+        .is_ok_and(|draft| draft.summary.workspace_id == workspace_id)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Ok((history, receiver)) = runs.subscribe_evaluation_draft(&draft_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let stream = evaluation_draft_event_stream(runs, draft_id, history, receiver)
+        .map(|event| {
+            Event::default()
+                .id(event.sequence.to_string())
+                .event(&event.kind)
+                .json_data(event)
+        })
+        .take_until(state.config.shutdown.cancelled_owned());
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
+async fn list_workbench_evaluation_definitions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let definitions = runs
+        .list_evaluation_definitions()
+        .into_iter()
+        .filter_map(|summary| {
+            runs.evaluation_definition(&summary.id)
+                .ok()
+                .filter(|definition| definition.revision.source.workspace_id == workspace_id)
+                .map(|_| summary)
+        })
+        .collect::<Vec<_>>();
+    Json(definitions).into_response()
+}
+
+async fn get_workbench_evaluation_definition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, definition_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.evaluation_definition(&definition_id) {
+        Ok(definition) if definition.revision.source.workspace_id == workspace_id => {
+            Json(definition).into_response()
+        }
+        Ok(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn run_workbench_evaluation_definition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, definition_id)): AxumPath<(String, String)>,
+    Json(request): Json<StartDefinitionEvaluationRequest>,
+) -> Response {
+    let Some((runs, origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.start_workbench_definition_evaluation(&workspace_id, &definition_id, request, origin)
+    {
+        Ok(evaluation) => (StatusCode::CREATED, Json(evaluation)).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+fn evaluation_draft_event_stream(
+    runs: RunController,
+    id: String,
+    history: Vec<RunEvent>,
+    receiver: tokio::sync::broadcast::Receiver<RunEvent>,
+) -> impl futures_util::Stream<Item = RunEvent> {
+    futures_util::stream::unfold(
+        (VecDeque::from(history), receiver, runs, id, 0_u64),
+        |(mut pending, mut receiver, runs, id, mut last_sequence)| async move {
+            loop {
+                if !pending.is_empty() {
+                    let Ok(current) = runs.evaluation_draft_events_after(&id, last_sequence) else {
+                        return None;
+                    };
+                    pending = VecDeque::from(current);
+                }
+                if let Some(event) = pending.pop_front() {
+                    if event_is_after_history(&event, last_sequence) {
+                        last_sequence = event.sequence;
+                        return Some((event, (pending, receiver, runs, id, last_sequence)));
+                    }
+                    continue;
+                }
+                match receiver.recv().await {
+                    Ok(event) => pending.push_back(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let Ok(events) = runs.evaluation_draft_events_after(&id, last_sequence)
+                        else {
+                            return None;
+                        };
+                        pending.extend(events);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
+}
+
+async fn list_evaluation_drafts(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    Json(runs.list_evaluation_drafts()).into_response()
+}
+
+async fn get_evaluation_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.evaluation_draft(&id) {
+        Ok(draft) => Json(draft).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn list_evaluation_definitions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    Json(runs.list_evaluation_definitions()).into_response()
+}
+
+async fn get_evaluation_definition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.evaluation_definition(&id) {
+        Ok(definition) => Json(definition).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn run_evaluation_definition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<StartDefinitionEvaluationRequest>,
+) -> Response {
+    let Some(runs) = authorized_runs(&state, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.start_definition_evaluation(&id, request) {
+        Ok(evaluation) => (StatusCode::CREATED, Json(evaluation)).into_response(),
+        Err(error) => run_error_response(error),
+    }
 }
 
 async fn get_workbench_evaluation(

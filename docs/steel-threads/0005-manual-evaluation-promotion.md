@@ -1,6 +1,7 @@
 # Steel thread 0005: Manual evaluation promotion
 
 - Status: demonstrated locally
+- Timebox: one implementation and acceptance slice, capped at five working days
 
 ## Hypothesis
 
@@ -24,32 +25,33 @@ existing paired-evaluation controller.
 
 ## Evidence
 
-A local real-model v0 turn used the catalog and analysis capabilities to create
-and verify the expected `result.json`. The turn became a draft whose source
-revision and pre-turn workspace were copied into revision-owned storage.
+The public conformance walkthrough uses neutral synthetic external drivers and
+the checked-in catalog and analysis sources. A deterministic completed turn
+became a draft whose source revision, pre-turn workspace, file modes,
+capability revisions, and source event sequences were copied into
+revision-owned storage.
 
-The builder changed the expected active names to an intentionally incorrect
-value. That revision replayed to completion: schema, score, capability-use,
+The test changed the expected active names to an intentionally incorrect value.
+That revision replayed to completion: schema, score, capability-use,
 composition, and analysis-consistency checks passed, while the name assertion
 failed with actual values `alpha` and `gamma`. Agent Lab retained this as a
 complete failed validation rather than treating it as an infrastructure error.
 
-The builder corrected the names through a structured Nushell pipeline, creating
-a new immutable revision. Its replay passed every catalog assertion. Explicit
-save promoted that exact revision into a local definition.
+The test then corrected the names through the same structured revision
+contract. Its replay passed every catalog assertion, and explicit save promoted
+that exact revision into a local definition. Two synthetic harness profiles ran
+the saved definition sequentially from independent copies of the same stored
+revision. Both produced the expected active items, count 2, and total score 11;
+the paired result retained each profile's native events separately.
 
-The saved definition then ran v0 followed by Eve with the shared Haiku 4.5
-profile. Both arms started from the same stored revision, used the catalog and
-analysis sources, produced the expected active items, count 2, and total score
-11, and passed the task-specific scorer. The paired result preserved each
-harness's native events and reported usage separately.
-
-After a locald restart, the browser reopened the draft with its revision and
-validation history, the saved definition, and the paired evaluation entirely
-from stored evidence. A scan of manifests, events, transcripts, logs, and
-bundles found no credential or workspace-control token markers. Live evidence,
-credentials, and private adapter code remain local; deterministic fixtures
-cover the public contracts.
+Controller restart coverage reopens the draft with its revision and validation
+history, the saved definition, and the paired evaluation entirely from stored
+evidence. Failure coverage retains assertion failures, repairs interrupted
+validations, rejects stale edits, rolls back failed publication, preserves file
+modes, and quarantines credential-contaminated evidence. Browser coverage
+exercises the shared editor, validation history, save, rerun, and offline
+reopening. Private adapter observations remain in their owning repositories and
+are not evidence for this public thread.
 
 ## Conclusion
 

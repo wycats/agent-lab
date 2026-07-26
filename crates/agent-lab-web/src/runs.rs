@@ -16256,21 +16256,67 @@ done
         failing_evaluator.parameters.active_names = vec!["not-the-catalog".to_owned()];
         let mut validation_limits = first.limits.clone();
         validation_limits.max_duration_ms = 10_000;
+        let failing_update = UpdateEvaluationDraftRequest {
+            base_revision_id: first.id.clone(),
+            name: Some("Catalog regression".to_owned()),
+            revision: EvaluationRevisionUpdate {
+                task: Some(first.task.clone()),
+                evaluator: Some(failing_evaluator),
+                measurements: Some(first.measurements.clone()),
+                limits: Some(validation_limits),
+            },
+        };
+        let draft_root = data
+            .join("evaluation-library/drafts")
+            .join(&draft.summary.id);
+        let draft_manifest = draft_root.join("manifest.json");
+        let manifest_before_failed_edit = fs::read(&draft_manifest).unwrap();
+        fs::remove_file(&draft_manifest).unwrap();
+        fs::create_dir(&draft_manifest).unwrap();
+        assert!(
+            controller
+                .update_evaluation_draft(
+                    &draft.summary.id,
+                    failing_update.clone(),
+                    WorkbenchOrigin::Browser,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            controller
+                .evaluation_draft(&draft.summary.id)
+                .unwrap()
+                .summary
+                .current_revision_id,
+            first.id
+        );
+        fs::remove_dir(&draft_manifest).unwrap();
+        fs::write(&draft_manifest, manifest_before_failed_edit).unwrap();
+        let draft_events = draft_root.join("events.jsonl");
+        let events_before_failed_edit = fs::read(&draft_events).unwrap();
+        fs::remove_file(&draft_events).unwrap();
+        fs::create_dir(&draft_events).unwrap();
+        assert!(
+            controller
+                .update_evaluation_draft(
+                    &draft.summary.id,
+                    failing_update.clone(),
+                    WorkbenchOrigin::Browser,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            controller
+                .evaluation_draft(&draft.summary.id)
+                .unwrap()
+                .summary
+                .current_revision_id,
+            first.id
+        );
+        fs::remove_dir(&draft_events).unwrap();
+        fs::write(&draft_events, events_before_failed_edit).unwrap();
         let failed_revision = controller
-            .update_evaluation_draft(
-                &draft.summary.id,
-                UpdateEvaluationDraftRequest {
-                    base_revision_id: first.id.clone(),
-                    name: Some("Catalog regression".to_owned()),
-                    revision: EvaluationRevisionUpdate {
-                        task: Some(first.task.clone()),
-                        evaluator: Some(failing_evaluator),
-                        measurements: Some(first.measurements.clone()),
-                        limits: Some(validation_limits),
-                    },
-                },
-                WorkbenchOrigin::Browser,
-            )
+            .update_evaluation_draft(&draft.summary.id, failing_update, WorkbenchOrigin::Browser)
             .unwrap();
         let failed_revision_id = failed_revision.summary.current_revision_id.clone();
         assert_ne!(failed_revision_id, first.id);
@@ -16297,6 +16343,40 @@ done
             Err(RunError::Conflict(_))
         ));
 
+        let manifest_before_failed_validation = fs::read(&draft_manifest).unwrap();
+        fs::remove_file(&draft_manifest).unwrap();
+        fs::create_dir(&draft_manifest).unwrap();
+        assert!(
+            controller
+                .start_evaluation_validation(&draft.summary.id, Some(&failed_revision_id))
+                .is_err()
+        );
+        assert!(
+            controller
+                .evaluation_draft(&draft.summary.id)
+                .unwrap()
+                .validations
+                .is_empty()
+        );
+        fs::remove_dir(&draft_manifest).unwrap();
+        fs::write(&draft_manifest, manifest_before_failed_validation).unwrap();
+        let events_before_failed_validation = fs::read(&draft_events).unwrap();
+        fs::remove_file(&draft_events).unwrap();
+        fs::create_dir(&draft_events).unwrap();
+        assert!(
+            controller
+                .start_evaluation_validation(&draft.summary.id, Some(&failed_revision_id))
+                .is_err()
+        );
+        assert!(
+            controller
+                .evaluation_draft(&draft.summary.id)
+                .unwrap()
+                .validations
+                .is_empty()
+        );
+        fs::remove_dir(&draft_events).unwrap();
+        fs::write(&draft_events, events_before_failed_validation).unwrap();
         let failed_attempt = controller
             .start_evaluation_validation(&draft.summary.id, Some(&failed_revision_id))
             .unwrap();
@@ -16352,6 +16432,28 @@ done
             passing_attempt.assertion_status,
             ValidationAssertionStatus::Passed
         );
+        let (validation_pre_start, validation_resume) =
+            controller.install_validation_before_start_hook();
+        let cancelled_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        validation_pre_start.wait().await;
+        controller
+            .cancel_evaluation_validation(&draft.summary.id, &cancelled_attempt.id)
+            .unwrap();
+        validation_resume.wait().await;
+        let cancelled_attempt =
+            wait_for_validation(&controller, &draft.summary.id, &cancelled_attempt.id).await;
+        assert_eq!(
+            cancelled_attempt.execution_status,
+            EvaluationExecutionStatus::Cancelled
+        );
+        let cancelled_run = cancelled_attempt.run_id.as_deref().unwrap();
+        assert!(
+            lock(&controller.state(cancelled_run).unwrap().events)
+                .iter()
+                .all(|event| event.kind != "driver.starting")
+        );
         let definition_root = data.join("evaluation-library/definitions");
         fs::set_permissions(&definition_root, fs::Permissions::from_mode(0o500)).unwrap();
         assert!(
@@ -16370,9 +16472,6 @@ done
         let rolled_back = controller.evaluation_draft(&draft.summary.id).unwrap();
         assert!(rolled_back.summary.definition_id.is_none());
         assert!(controller.list_evaluation_definitions().is_empty());
-        let draft_root = data
-            .join("evaluation-library/drafts")
-            .join(&draft.summary.id);
         fs::set_permissions(&draft_root, fs::Permissions::from_mode(0o500)).unwrap();
         assert!(
             controller
@@ -16496,6 +16595,29 @@ done
             .unwrap();
         assert!(!edited_after_promotion.summary.saved);
         assert!(edited_after_promotion.summary.definition_id.is_none());
+        let historical_promotion = controller
+            .save_evaluation_draft(
+                &draft.summary.id,
+                SaveEvaluationDraftRequest {
+                    revision_id: Some(passing_revision_id.clone()),
+                    name: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            historical_promotion.summary.current_revision_id,
+            edited_after_promotion.summary.current_revision_id
+        );
+        assert_eq!(historical_promotion.summary.status, "ready");
+        assert!(!historical_promotion.summary.saved);
+        assert_eq!(
+            historical_promotion.summary.definition_id.as_deref(),
+            Some(definition_id.as_str())
+        );
+        assert_eq!(
+            historical_promotion.summary.promoted_revision_id.as_deref(),
+            Some(passing_revision_id.as_str())
+        );
 
         let interrupted_validation_id = format!("validation-recovery-{}", random_suffix());
         let interrupted_validation = EvaluationValidationAttempt {
@@ -16524,7 +16646,7 @@ done
             RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
         let reopened_draft = reopened.evaluation_draft(&draft.summary.id).unwrap();
         assert_eq!(reopened_draft.revisions.len(), 4);
-        assert_eq!(reopened_draft.validations.len(), 3);
+        assert_eq!(reopened_draft.validations.len(), 4);
         let recovered_validation = reopened_draft
             .validations
             .iter()

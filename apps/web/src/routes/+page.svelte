@@ -225,6 +225,10 @@
         (definition) => definition.id === selectedDraft?.summary.definitionId
       )
     : undefined;
+  $: selectedDraftRevisionIsPromoted = Boolean(
+    selectedDraftRevision &&
+      selectedDraft?.summary.promotedRevisionId === selectedDraftRevision.id
+  );
   $: scenarioSwitchBlocked = preparing ||
     running ||
     agentSessionLifecycleActive;
@@ -933,8 +937,8 @@
 
   async function loadEvaluationLibrary(workspaceId: string): Promise<void> {
     const [drafts, definitions] = await Promise.all([
-      runClient.evaluationDrafts(workspaceId),
-      runClient.evaluationDefinitions(workspaceId)
+      runClient.evaluationLibraryDrafts(),
+      runClient.evaluationLibraryDefinitions()
     ]);
     if (workspaceId !== loadedWorkbenchId) return;
     evaluationDrafts = drafts;
@@ -977,7 +981,7 @@
     openVersion = draftOpenVersion
   ): Promise<EvaluationDraftDetail | undefined> {
     try {
-      const draft = await runClient.evaluationDraft(workspaceId, draftId);
+      const draft = await runClient.evaluationLibraryDraft(draftId);
       if (openVersion !== draftOpenVersion) {
         return undefined;
       }
@@ -985,8 +989,7 @@
       hydrateDraftForm(draft, hydrate);
       await loadEvaluationLibrary(workspaceId);
       if (draft.summary.definitionId) {
-        selectedDefinition = await runClient.evaluationDefinition(
-          workspaceId,
+        selectedDefinition = await runClient.evaluationLibraryDefinition(
           draft.summary.definitionId
         );
       }
@@ -1014,7 +1017,7 @@
     definitionId: string
   ): Promise<void> {
     try {
-      selectedDefinition = await runClient.evaluationDefinition(workspaceId, definitionId);
+      selectedDefinition = await runClient.evaluationLibraryDefinition(definitionId);
       await openEvaluationDraft(workspaceId, selectedDefinition.summary.draftId);
     } catch (error) {
       actionError = message(error);
@@ -1141,8 +1144,7 @@
       hydrateDraftForm(draft, true);
       await loadEvaluationLibrary(draft.summary.workspaceId);
       if (draft.summary.definitionId) {
-        selectedDefinition = await runClient.evaluationDefinition(
-          draft.summary.workspaceId,
+        selectedDefinition = await runClient.evaluationLibraryDefinition(
           draft.summary.definitionId
         );
       }
@@ -1154,7 +1156,7 @@
   }
 
   async function runDraftDefinition(): Promise<void> {
-    if (!selectedDraft?.summary.definitionId) return;
+    if (!selectedDraft?.summary.definitionId || !selectedDraftRevisionIsPromoted) return;
     draftBusy = true;
     actionError = '';
     try {
@@ -2706,7 +2708,7 @@
                   >
                     Save to library
                   </button>
-                  {#if selectedDraft.summary.definitionId}
+                  {#if selectedDraft.summary.definitionId && selectedDraftRevisionIsPromoted}
                     <button
                       type="button"
                       disabled={draftBusy ||
@@ -3002,7 +3004,7 @@
                 <span class="history-status" data-status={draft.status}></span>
                 <span>
                   <strong>{draft.name}</strong>
-                  <small>{shortId(draft.currentRevisionId)}{draft.definitionId ? ' · runnable' : ''}</small>
+                  <small>{shortId(draft.currentRevisionId)}{draft.definitionId && draft.promotedRevisionId === draft.currentRevisionId ? ' · runnable' : ''}</small>
                 </span>
                 <em>{draft.saved ? 'saved' : draft.status}</em>
               </button>

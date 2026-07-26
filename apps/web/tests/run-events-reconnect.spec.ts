@@ -318,10 +318,10 @@ test('evaluation library reads remain global when the active workspace changes',
 
   try {
     const client = createRunClient();
-    await client.evaluationDrafts('alternate-workspace');
-    await client.evaluationDraft('alternate-workspace', 'draft-1');
-    await client.evaluationDefinitions('alternate-workspace');
-    await client.evaluationDefinition('alternate-workspace', 'definition-1');
+    await client.evaluationLibraryDrafts();
+    await client.evaluationLibraryDraft('draft-1');
+    await client.evaluationLibraryDefinitions();
+    await client.evaluationLibraryDefinition('definition-1');
     expect(requested).toEqual([
       '/api/evaluation-drafts',
       '/api/evaluation-drafts/draft-1',

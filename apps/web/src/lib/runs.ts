@@ -361,6 +361,7 @@ export interface EvaluationDraftSummary {
   status: string;
   saved: boolean;
   definitionId?: string;
+  promotedRevisionId?: string;
   createdAtMs: number;
   updatedAtMs: number;
 }
@@ -525,12 +526,12 @@ export interface RunClient {
     onEvent: (event: RunEvent) => void | Promise<void>,
     onReset?: (reset: RunEventStreamReset) => number | Promise<number>
   ): AbortController;
-  evaluationDrafts(workspaceId: string): Promise<EvaluationDraftSummary[]>;
+  evaluationLibraryDrafts(): Promise<EvaluationDraftSummary[]>;
   createEvaluationDraft(
     workspaceId: string,
     input: { sessionId?: string; fromTurnId: string; throughTurnId: string }
   ): Promise<EvaluationDraftDetail>;
-  evaluationDraft(workspaceId: string, draftId: string): Promise<EvaluationDraftDetail>;
+  evaluationLibraryDraft(draftId: string): Promise<EvaluationDraftDetail>;
   updateEvaluationDraft(
     workspaceId: string,
     draftId: string,
@@ -555,11 +556,8 @@ export interface RunClient {
     draftId: string,
     onEvent: (event: RunEvent) => void | Promise<void>
   ): AbortController;
-  evaluationDefinitions(workspaceId: string): Promise<EvaluationDefinitionSummary[]>;
-  evaluationDefinition(
-    workspaceId: string,
-    definitionId: string
-  ): Promise<EvaluationDefinitionDetail>;
+  evaluationLibraryDefinitions(): Promise<EvaluationDefinitionSummary[]>;
+  evaluationLibraryDefinition(definitionId: string): Promise<EvaluationDefinitionDetail>;
   runEvaluationDefinition(
     workspaceId: string,
     definitionId: string,
@@ -818,13 +816,16 @@ export function createRunClient(): RunClient {
       const path = `/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}/events`;
       return reconnectingRunEvents(path, onEvent, onReset);
     },
-    evaluationDrafts: (_workspaceId) => request('/api/evaluation-drafts'),
+    // Library reads are intentionally process-scoped so saved work remains
+    // inspectable while the builder explores another scenario. Mutations and
+    // event streams remain authorized through their owning workspace.
+    evaluationLibraryDrafts: () => request('/api/evaluation-drafts'),
     createEvaluationDraft: (workspaceId, input) =>
       request(`/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts`, {
         method: 'POST',
         body: JSON.stringify(input)
       }),
-    evaluationDraft: (_workspaceId, draftId) =>
+    evaluationLibraryDraft: (draftId) =>
       request(`/api/evaluation-drafts/${encodeURIComponent(draftId)}`),
     updateEvaluationDraft: (workspaceId, draftId, input) =>
       request(
@@ -845,8 +846,8 @@ export function createRunClient(): RunClient {
       const path = `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts/${encodeURIComponent(draftId)}/events`;
       return reconnectingRunEvents(path, onEvent);
     },
-    evaluationDefinitions: (_workspaceId) => request('/api/evaluation-definitions'),
-    evaluationDefinition: (_workspaceId, definitionId) =>
+    evaluationLibraryDefinitions: () => request('/api/evaluation-definitions'),
+    evaluationLibraryDefinition: (definitionId) =>
       request(`/api/evaluation-definitions/${encodeURIComponent(definitionId)}`),
     runEvaluationDefinition: (workspaceId, definitionId, input = {}) =>
       request(

@@ -115,6 +115,8 @@ pub struct EvaluationDraftSummary {
     pub status: String,
     pub saved: bool,
     pub definition_id: Option<String>,
+    #[serde(default)]
+    pub promoted_revision_id: Option<String>,
     pub created_at_ms: u128,
     pub updated_at_ms: u128,
 }
@@ -205,6 +207,14 @@ pub(super) struct PromotionStore {
     drafts: Mutex<HashMap<String, Arc<PromotionDraftState>>>,
     definitions: Mutex<HashMap<String, Arc<PromotionDefinitionState>>>,
     secret_values: Mutex<Vec<Vec<u8>>>,
+    #[cfg(test)]
+    validation_before_start_hook: Mutex<Option<ValidationBeforeStartHook>>,
+}
+
+#[cfg(test)]
+struct ValidationBeforeStartHook {
+    reached: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
 }
 
 struct PromotionDraftState {
@@ -234,6 +244,8 @@ impl PromotionStore {
             drafts: Mutex::new(drafts),
             definitions: Mutex::new(definitions),
             secret_values: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            validation_before_start_hook: Mutex::new(None),
         })
     }
 
@@ -491,6 +503,7 @@ impl RunController {
             status: revision_status(&revision).to_owned(),
             saved: false,
             definition_id: None,
+            promoted_revision_id: None,
             created_at_ms,
             updated_at_ms: created_at_ms,
         };
@@ -563,23 +576,16 @@ impl RunController {
         origin: WorkbenchOrigin,
     ) -> Result<EvaluationDraftDetail, RunError> {
         let state = self.promotion_draft_state(id)?;
+        let event_commit = lock(&state.event_commit);
         let mut detail = lock(&state.detail);
-        if detail.summary.current_revision_id != request.base_revision_id {
+        let previous_detail = detail.clone();
+        if previous_detail.summary.current_revision_id != request.base_revision_id {
             return Err(RunError::Conflict(format!(
                 "stale evaluation draft revision: expected {}, received {}",
-                detail.summary.current_revision_id, request.base_revision_id
+                previous_detail.summary.current_revision_id, request.base_revision_id
             )));
         }
-        let current = detail
-            .revisions
-            .iter()
-            .find(|revision| revision.id == detail.summary.current_revision_id)
-            .cloned()
-            .ok_or_else(|| {
-                RunError::EvidencePersistence(format!(
-                    "draft {id} has no current evaluation revision"
-                ))
-            })?;
+        let current = current_draft_revision(&previous_detail, id)?;
         let mut next = current.clone();
         let confirms_manual_authoring = request.revision.task.is_some()
             && request.revision.evaluator.is_some()
@@ -608,6 +614,8 @@ impl RunController {
             || next.evaluator != current.evaluator
             || next.measurements != current.measurements
             || next.blocking_issues != current.blocking_issues;
+        let mut next_detail = previous_detail.clone();
+        let mut created_revision_path = None;
         if material_change {
             let revision_id = format!("revision-{}-{}", now_ms(), random_suffix());
             let source = capture_confined_run_tree(
@@ -618,34 +626,49 @@ impl RunController {
             next.previous_revision_id = Some(current.id);
             next.created_at_ms = now_ms();
             validate_revision(&next)?;
+            let revision_path = PathBuf::from("revisions").join(&revision_id);
             write_confined_run_captured_tree(
                 &state.anchor,
-                &PathBuf::from("revisions").join(&revision_id).join("source"),
+                &revision_path.join("source"),
                 &source,
             )?;
-            detail.summary.current_revision_id = revision_id;
-            revision_status(&next).clone_into(&mut detail.summary.status);
-            detail.summary.saved = false;
-            detail.summary.definition_id = None;
-            detail.revisions.push(next);
+            created_revision_path = Some(revision_path);
+            next_detail.summary.current_revision_id = revision_id;
+            revision_status(&next).clone_into(&mut next_detail.summary.status);
+            next_detail.summary.saved = false;
+            next_detail.summary.definition_id = None;
+            next_detail.summary.promoted_revision_id = None;
+            next_detail.revisions.push(next);
         }
         if let Some(name) = request.name {
-            detail.summary.name = name;
+            next_detail.summary.name = name;
         }
-        detail.summary.updated_at_ms = now_ms();
-        drop(detail);
-        persist_draft(&state)?;
-        record_draft_event(
-            &state,
-            "evaluation-draft.revised",
-            json!({
+        next_detail.summary.updated_at_ms = now_ms();
+        let event = RunEvent {
+            sequence: next_detail.events.len() as u64 + 1,
+            at_ms: now_ms(),
+            kind: "evaluation-draft.revised".to_owned(),
+            payload: json!({
                 "draftId": id,
-                "revisionId": lock(&state.detail).summary.current_revision_id,
+                "revisionId": next_detail.summary.current_revision_id,
                 "origin": origin,
                 "materialChange": material_change,
             }),
+            progress: None,
+        };
+        next_detail.events.push(event.clone());
+        persist_draft_transition(
+            &state,
+            &previous_detail,
+            &next_detail,
+            &event,
+            created_revision_path.as_deref(),
         )?;
-        Ok(lock(&state.detail).clone())
+        *detail = next_detail.clone();
+        drop(detail);
+        drop(event_commit);
+        let _ = state.sender.send(event);
+        Ok(next_detail)
     }
 
     /// Queue one validation replay for an immutable draft revision.
@@ -659,11 +682,13 @@ impl RunController {
         revision_id: Option<&str>,
     ) -> Result<EvaluationValidationAttempt, RunError> {
         let state = self.promotion_draft_state(draft_id)?;
+        let event_commit = lock(&state.event_commit);
         let mut detail = lock(&state.detail);
+        let previous_detail = detail.clone();
         let revision_id = revision_id
-            .unwrap_or(&detail.summary.current_revision_id)
+            .unwrap_or(&previous_detail.summary.current_revision_id)
             .to_owned();
-        let revision = detail
+        let revision = previous_detail
             .revisions
             .iter()
             .find(|revision| revision.id == revision_id)
@@ -677,7 +702,7 @@ impl RunController {
                 revision.blocking_issues.join("; ")
             )));
         }
-        if detail.validations.iter().any(|attempt| {
+        if previous_detail.validations.iter().any(|attempt| {
             attempt.revision_id == revision_id && !attempt.execution_status.is_finished()
         }) {
             return Err(RunError::InvalidRequest(
@@ -698,21 +723,33 @@ impl RunController {
             error: None,
             score: None,
         };
-        detail.validations.push(attempt.clone());
-        detail.summary.updated_at_ms = now_ms();
-        drop(detail);
         let cancel = CancellationToken::new();
         lock(&state.validation_cancels).insert(attempt.id.clone(), cancel.clone());
-        persist_draft(&state)?;
-        record_draft_event(
-            &state,
-            "evaluation-validation.created",
-            json!({
+        let mut next_detail = previous_detail.clone();
+        next_detail.validations.push(attempt.clone());
+        next_detail.summary.updated_at_ms = now_ms();
+        let event = RunEvent {
+            sequence: next_detail.events.len() as u64 + 1,
+            at_ms: now_ms(),
+            kind: "evaluation-validation.created".to_owned(),
+            payload: json!({
                 "draftId": draft_id,
                 "revisionId": revision_id,
                 "validationId": attempt.id,
             }),
-        )?;
+            progress: None,
+        };
+        next_detail.events.push(event.clone());
+        if let Err(error) =
+            persist_draft_transition(&state, &previous_detail, &next_detail, &event, None)
+        {
+            lock(&state.validation_cancels).remove(&attempt.id);
+            return Err(error);
+        }
+        *detail = next_detail;
+        drop(detail);
+        drop(event_commit);
+        let _ = state.sender.send(event);
         let controller = self.clone();
         let state_for_task = state;
         let attempt_id = attempt.id.clone();
@@ -784,7 +821,6 @@ impl RunController {
             validate_display_name(&name)?;
             next_detail.summary.name = name;
         }
-        next_detail.summary.saved = true;
         let passing = next_detail.validations.iter().any(|attempt| {
             attempt.revision_id == revision_id
                 && attempt.execution_status == EvaluationExecutionStatus::Complete
@@ -811,10 +847,14 @@ impl RunController {
                 &self.inner.promotion,
                 prepared,
             )?);
-            next_detail.summary.definition_id = Some(definition_id);
-            "promoted".clone_into(&mut next_detail.summary.status);
-        } else {
-            "saved-draft".clone_into(&mut next_detail.summary.status);
+            apply_saved_revision_status(
+                &mut next_detail,
+                draft_id,
+                &revision_id,
+                Some(definition_id),
+            )?;
+        } else if next_detail.summary.current_revision_id == revision_id {
+            apply_saved_revision_status(&mut next_detail, draft_id, &revision_id, None)?;
         }
         next_detail.summary.updated_at_ms = now_ms();
         if let Err(error) = persist_draft_detail(&state, &next_detail) {
@@ -1135,6 +1175,20 @@ impl RunController {
     }
 
     #[cfg(test)]
+    pub(super) fn install_validation_before_start_hook(
+        &self,
+    ) -> (Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>) {
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        *lock(&self.inner.promotion.validation_before_start_hook) =
+            Some(ValidationBeforeStartHook {
+                reached: reached.clone(),
+                resume: resume.clone(),
+            });
+        (reached, resume)
+    }
+
+    #[cfg(test)]
     pub(super) fn inject_stale_validation_manifest_for_recovery_test(
         &self,
         draft_id: &str,
@@ -1184,6 +1238,7 @@ impl RunController {
         committed_draft.summary.saved = true;
         committed_draft.summary.status = "promoted".to_owned();
         committed_draft.summary.definition_id = Some(definition_id.clone());
+        committed_draft.summary.promoted_revision_id = Some(revision_id.to_owned());
         committed_draft.summary.updated_at_ms = now_ms();
         persist_draft_detail(&state, &committed_draft)?;
         Ok(definition_id)
@@ -1269,7 +1324,21 @@ impl RunController {
         update_validation_attempt(state, attempt_id, |attempt| {
             attempt.run_id = Some(prepared.id.clone());
         })?;
-        persist_draft(state)?;
+        if let Err(error) = persist_draft(state) {
+            lock(&self.inner.scenario_overrides).remove(&prepared.id);
+            let _ = self.cancel(&prepared.id);
+            return Err(error);
+        }
+        #[cfg(test)]
+        self.wait_for_validation_before_start_test_hook().await;
+        if self.cancel_validation_before_start_if_requested(
+            state,
+            attempt_id,
+            &prepared.id,
+            &cancel,
+        )? {
+            return Ok(());
+        }
         if let Err(error) = self.start_prepared(
             &prepared.id,
             &StartPreparedRunRequest {
@@ -1328,6 +1397,40 @@ impl RunController {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    #[cfg(test)]
+    async fn wait_for_validation_before_start_test_hook(&self) {
+        let validation_before_start_hook =
+            { lock(&self.inner.promotion.validation_before_start_hook).take() };
+        if let Some(hook) = validation_before_start_hook {
+            hook.reached.wait().await;
+            hook.resume.wait().await;
+        }
+    }
+
+    fn cancel_validation_before_start_if_requested(
+        &self,
+        state: &PromotionDraftState,
+        attempt_id: &str,
+        prepared_id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<bool, RunError> {
+        if !cancel.is_cancelled() {
+            return Ok(false);
+        }
+        let cancellation = self.cancel(prepared_id);
+        lock(&self.inner.scenario_overrides).remove(prepared_id);
+        cancellation?;
+        update_validation_attempt(state, attempt_id, |attempt| {
+            attempt.execution_status = EvaluationExecutionStatus::Cancelled;
+            attempt.assertion_status = ValidationAssertionStatus::NotEvaluated;
+            attempt.finished_at_ms = Some(now_ms());
+            attempt.error = None;
+            attempt.score = None;
+        })?;
+        persist_draft(state)?;
+        Ok(true)
     }
 
     async fn prepare_promotion_run(
@@ -1497,6 +1600,55 @@ fn revision_status(revision: &EvaluationRevision) -> &'static str {
     }
 }
 
+fn current_draft_revision(
+    detail: &EvaluationDraftDetail,
+    draft_id: &str,
+) -> Result<EvaluationRevision, RunError> {
+    detail
+        .revisions
+        .iter()
+        .find(|revision| revision.id == detail.summary.current_revision_id)
+        .cloned()
+        .ok_or_else(|| {
+            RunError::EvidencePersistence(format!(
+                "draft {draft_id} has no current evaluation revision"
+            ))
+        })
+}
+
+fn apply_saved_revision_status(
+    detail: &mut EvaluationDraftDetail,
+    draft_id: &str,
+    revision_id: &str,
+    definition_id: Option<String>,
+) -> Result<(), RunError> {
+    let is_current = detail.summary.current_revision_id == revision_id;
+    detail.summary.saved = is_current;
+    detail.summary.definition_id = definition_id;
+    detail.summary.promoted_revision_id = detail
+        .summary
+        .definition_id
+        .as_ref()
+        .map(|_| revision_id.to_owned());
+    if detail.summary.definition_id.is_some() && is_current {
+        "promoted".clone_into(&mut detail.summary.status);
+    } else if detail.summary.definition_id.is_none() && is_current {
+        "saved-draft".clone_into(&mut detail.summary.status);
+    } else {
+        let current = detail
+            .revisions
+            .iter()
+            .find(|revision| revision.id == detail.summary.current_revision_id)
+            .ok_or_else(|| {
+                RunError::EvidencePersistence(format!(
+                    "draft {draft_id} has no current evaluation revision"
+                ))
+            })?;
+        detail.summary.status = revision_status(current).to_owned();
+    }
+    Ok(())
+}
+
 fn scenario_for_revision(revision: &EvaluationRevision) -> Result<ScenarioManifest, RunError> {
     validate_revision(revision)?;
     Ok(ScenarioManifest {
@@ -1574,6 +1726,39 @@ fn persist_draft_detail(
         Path::new("manifest.json"),
         &serde_json::to_value(detail)?,
     )
+}
+
+fn persist_draft_transition(
+    state: &PromotionDraftState,
+    previous_detail: &EvaluationDraftDetail,
+    next_detail: &EvaluationDraftDetail,
+    event: &RunEvent,
+    created_revision_path: Option<&Path>,
+) -> Result<(), RunError> {
+    let mut event_line = serde_json::to_vec(event)?;
+    event_line.push(b'\n');
+    let cleanup_revision = || {
+        if let Some(path) = created_revision_path {
+            let _ = remove_confined_run_entry(&state.anchor, path);
+        }
+    };
+    if let Err(error) = persist_draft_detail(state, next_detail) {
+        cleanup_revision();
+        return Err(error);
+    }
+    if let Err(error) =
+        append_confined_run_bytes(&state.anchor, Path::new("events.jsonl"), &event_line)
+    {
+        let rollback = persist_draft_detail(state, previous_detail);
+        cleanup_revision();
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(RunError::EvidencePersistence(format!(
+                "{error}; restoring the previous draft also failed: {rollback}"
+            ))),
+        };
+    }
+    Ok(())
 }
 
 struct PendingDefinitionPublication {
@@ -1907,6 +2092,12 @@ fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>,
         if detail.summary.id != entry.file_name().to_string_lossy() {
             continue;
         }
+        if detail.summary.promoted_revision_id.is_none()
+            && detail.summary.status == "promoted"
+            && detail.summary.definition_id.is_some()
+        {
+            detail.summary.promoted_revision_id = Some(detail.summary.current_revision_id.clone());
+        }
         match load_draft_event_evidence(&anchor, &entry.path()) {
             Ok(Some(events)) => detail.events = events,
             Ok(None) => {}
@@ -2027,7 +2218,7 @@ fn load_definitions(
                 .map(|draft| lock(&draft.detail).summary.clone())
                 .is_some_and(|draft| {
                     draft.definition_id.as_deref() == Some(&transaction.definition_id)
-                        && draft.current_revision_id == transaction.revision_id
+                        && draft.promoted_revision_id.as_deref() == Some(&transaction.revision_id)
                 });
             if transaction.committed || draft_committed {
                 let _ = remove_confined_run_entry(

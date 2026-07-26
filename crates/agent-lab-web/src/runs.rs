@@ -16254,6 +16254,8 @@ done
 
         let mut failing_evaluator = first.evaluator.clone();
         failing_evaluator.parameters.active_names = vec!["not-the-catalog".to_owned()];
+        let mut validation_limits = first.limits.clone();
+        validation_limits.max_duration_ms = 10_000;
         let failed_revision = controller
             .update_evaluation_draft(
                 &draft.summary.id,
@@ -16264,7 +16266,7 @@ done
                         task: Some(first.task.clone()),
                         evaluator: Some(failing_evaluator),
                         measurements: Some(first.measurements.clone()),
-                        limits: None,
+                        limits: Some(validation_limits),
                     },
                 },
                 WorkbenchOrigin::Browser,

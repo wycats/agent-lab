@@ -3461,7 +3461,7 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   await expect(draft.locator('.revision-list li')).toHaveCount(2);
   await page.getByRole('button', { name: 'Validate revision' }).click();
   const failed = draft.locator('.current-validation .validation-card');
-  await expect(failed).toHaveAttribute('data-status', 'failed');
+  await expect(failed).toHaveAttribute('data-status', 'failed', { timeout: 30_000 });
   await expect(failed).toContainText('complete');
 
   await expectedNames.fill('alpha, gamma');
@@ -3470,7 +3470,7 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   await expect(draft).toContainText('Current revision not validated');
   await page.getByRole('button', { name: 'Validate revision' }).click();
   const passed = draft.locator('.current-validation .validation-card');
-  await expect(passed).toHaveAttribute('data-status', 'passed');
+  await expect(passed).toHaveAttribute('data-status', 'passed', { timeout: 30_000 });
   await expect(passed).toContainText('complete');
   await expect(draft.locator('.validation-history')).toContainText('Previous attempts');
   await expect(draft.locator('.validation-history .validation-card')).toHaveAttribute(

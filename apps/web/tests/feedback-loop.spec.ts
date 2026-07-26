@@ -3384,6 +3384,85 @@ test('a paired harness evaluation streams, compares, and reopens', async ({ page
   await page.unrouteAll({ behavior: 'wait' });
 });
 
+test('a completed turn becomes a revised, validated, saved, and rerunnable evaluation', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await page.getByLabel('Default harness').selectOption('v0');
+  await expect(page.getByLabel('Default model')).toHaveValue('fixture');
+
+  await submit(page, 'agent "Explain the active catalog as a reusable task"');
+  const session = page.getByTestId('interactive-agent-session');
+  const turn = session.getByTestId('session-turn').last();
+  await expect(turn).toHaveAttribute('data-status', 'completed');
+
+  await submit(
+    page,
+    'let turn = (agent turn | get turnId); lab evaluation new --from $turn --through $turn | get id'
+  );
+  await expect(page.getByTestId('evaluation-draft-view')).toBeVisible();
+  await expect(page.locator('[data-testid="terminal"] textarea')).toBeFocused();
+  await page.getByRole('button', { name: 'Session' }).click();
+  await turn.getByRole('button', { name: 'Make evaluation' }).dblclick();
+
+  const draft = page.getByTestId('evaluation-draft-view');
+  await expect(draft).toBeVisible();
+  await expect(page.locator('.draft-history .history-list button')).toHaveCount(2);
+  await expect(page.locator('.run-heading')).toContainText('Evaluation draft');
+  await expect(draft).toContainText('Owned by revision');
+  await expect(draft).toContainText('catalog-v2');
+  await expect(draft).toContainText('analysis-v1');
+
+  const expectedNames = page.getByLabel('Expected active names');
+  await expectedNames.fill('not-the-catalog');
+  await page.getByRole('button', { name: 'Create revision' }).click();
+  await expect(draft.locator('.revision-list li')).toHaveCount(2);
+  await page.getByRole('button', { name: 'Validate revision' }).click();
+  const failed = draft.locator('.current-validation .validation-card');
+  await expect(failed).toHaveAttribute('data-status', 'failed');
+  await expect(failed).toContainText('complete');
+
+  await expectedNames.fill('alpha, gamma');
+  await page.getByRole('button', { name: 'Create revision' }).click();
+  await expect(draft.locator('.revision-list li')).toHaveCount(3);
+  await expect(draft).toContainText('Current revision not validated');
+  await page.getByRole('button', { name: 'Validate revision' }).click();
+  const passed = draft.locator('.current-validation .validation-card');
+  await expect(passed).toHaveAttribute('data-status', 'passed');
+  await expect(passed).toContainText('complete');
+  await expect(draft.locator('.validation-history')).toContainText('Previous attempts');
+  await expect(draft.locator('.validation-history .validation-card')).toHaveAttribute(
+    'data-status',
+    'failed'
+  );
+  await expect(draft.locator('.validation-card')).toHaveCount(2);
+
+  await page.getByRole('button', { name: 'Save to library' }).click();
+  await expect(page.locator('.run-heading .run-status')).toHaveText('promoted');
+  await expect(page.getByRole('button', { name: 'Run comparison' })).toBeVisible();
+  await page.getByRole('button', { name: 'Run comparison' }).click();
+  const evaluation = page.getByTestId('evaluation-view');
+  await expect(evaluation.locator('.run-status')).toHaveText('passed');
+  await expect(evaluation.locator('.paired-result')).toContainText('Same evaluated artifact');
+
+  await page.reload();
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const savedDraft = page.locator('.draft-history .history-list button').filter({
+    hasText: 'runnable'
+  }).first();
+  await expect(savedDraft).toContainText('saved');
+  await savedDraft.click();
+  await expect(page.getByTestId('evaluation-draft-view').locator('.validation-card')).toHaveCount(2);
+  await expect(page.getByTestId('evaluation-draft-view')).toContainText('Owned by revision');
+
+  await submit(
+    page,
+    'lab evaluation run (lab evaluation definitions | first | get id) v0 eve --model fixture'
+  );
+  await expect(page.getByTestId('evaluation-view')).toBeVisible();
+  await expect(page.getByTestId('evaluation-view').locator('.run-status')).toHaveText('passed');
+  await expect(page.locator('[data-testid="terminal"] textarea')).toBeFocused();
+});
+
 test('stacked surfaces keep their scroll owners inside the viewport', async ({ page }) => {
   await page.setViewportSize({ width: 824, height: 639 });
   await page.goto('/');

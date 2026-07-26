@@ -52,6 +52,11 @@ pub struct ComparisonStream {
     pub receiver: mpsc::Receiver<Result<JsonValue, WorkbenchError>>,
 }
 
+pub struct ValidationStream {
+    pub attempt: JsonValue,
+    pub receiver: mpsc::Receiver<Result<JsonValue, WorkbenchError>>,
+}
+
 pub struct AgentTurnStream {
     pub session: JsonValue,
     pub turn: JsonValue,
@@ -133,6 +138,219 @@ impl WorkbenchBridge {
             "/api/workbench/{}/agent-sessions",
             self.inner.workspace_id
         ))
+    }
+
+    /// List evaluation drafts attached to this workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the controller request fails or is malformed.
+    pub fn evaluation_drafts(&self) -> Result<JsonValue, WorkbenchError> {
+        self.get_json(&format!(
+            "/api/workbench/{}/evaluation-drafts",
+            self.inner.workspace_id
+        ))
+    }
+
+    /// Return one evaluation draft attached to this workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the controller request fails or is malformed.
+    pub fn evaluation_draft(&self, draft_id: &str) -> Result<JsonValue, WorkbenchError> {
+        self.get_json(&format!(
+            "/api/workbench/{}/evaluation-drafts/{draft_id}",
+            self.inner.workspace_id
+        ))
+    }
+
+    /// Create an evaluation draft from a stable turn span.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the controller rejects the span or the response is malformed.
+    pub fn create_evaluation_draft(
+        &self,
+        session_id: Option<&str>,
+        from_turn_id: &str,
+        through_turn_id: &str,
+    ) -> Result<JsonValue, WorkbenchError> {
+        self.post_json(
+            &format!(
+                "/api/workbench/{}/evaluation-drafts",
+                self.inner.workspace_id
+            ),
+            &json!({
+                "sessionId": session_id,
+                "fromTurnId": from_turn_id,
+                "throughTurnId": through_turn_id,
+            }),
+        )
+    }
+
+    /// Submit an optimistic edit and create a new immutable revision when material.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the base revision is stale or the controller request fails.
+    pub fn update_evaluation_draft(
+        &self,
+        draft_id: &str,
+        value: &JsonValue,
+    ) -> Result<JsonValue, WorkbenchError> {
+        self.patch_json(
+            &format!(
+                "/api/workbench/{}/evaluation-drafts/{draft_id}",
+                self.inner.workspace_id
+            ),
+            value,
+        )
+    }
+
+    /// Start validation and stream either its projection or raw events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation cannot start or its response is malformed.
+    pub fn validate_evaluation_draft(
+        &self,
+        draft_id: &str,
+        revision_id: Option<&str>,
+        raw: bool,
+    ) -> Result<ValidationStream, WorkbenchError> {
+        let attempt = self.post_json(
+            &format!(
+                "/api/workbench/{}/evaluation-drafts/{draft_id}/validate",
+                self.inner.workspace_id
+            ),
+            &json!({ "revisionId": revision_id }),
+        )?;
+        let validation_id = attempt
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| WorkbenchError::Malformed("validation response has no id".to_owned()))?
+            .to_owned();
+        let (sender, receiver) = mpsc::channel();
+        let bridge = self.clone();
+        let draft_id = draft_id.to_owned();
+        thread::Builder::new()
+            .name("agent-lab-validation-stream".to_owned())
+            .spawn(move || {
+                if let Err(error) =
+                    bridge.stream_evaluation_validation(&draft_id, &validation_id, raw, &sender)
+                {
+                    let _ = sender.send(Err(WorkbenchError::Request(format!(
+                        "{error}; validation {validation_id} remains available on draft {draft_id}"
+                    ))));
+                }
+            })
+            .map_err(|error| WorkbenchError::Request(error.to_string()))?;
+        Ok(ValidationStream { attempt, receiver })
+    }
+
+    /// Retain a draft revision and promote it when that exact revision has passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the controller rejects the revision or request.
+    pub fn save_evaluation_draft(
+        &self,
+        draft_id: &str,
+        revision_id: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<JsonValue, WorkbenchError> {
+        self.post_json(
+            &format!(
+                "/api/workbench/{}/evaluation-drafts/{draft_id}/save",
+                self.inner.workspace_id
+            ),
+            &json!({ "revisionId": revision_id, "name": name }),
+        )
+    }
+
+    /// List saved runnable evaluation definitions for this workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the controller request fails or is malformed.
+    pub fn evaluation_definitions(&self) -> Result<JsonValue, WorkbenchError> {
+        self.get_json(&format!(
+            "/api/workbench/{}/evaluation-definitions",
+            self.inner.workspace_id
+        ))
+    }
+
+    /// Return one saved evaluation definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the controller request fails or is malformed.
+    pub fn evaluation_definition(&self, definition_id: &str) -> Result<JsonValue, WorkbenchError> {
+        self.get_json(&format!(
+            "/api/workbench/{}/evaluation-definitions/{definition_id}",
+            self.inner.workspace_id
+        ))
+    }
+
+    /// Start a paired run from an immutable evaluation definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the definition, harnesses, model, or response is invalid.
+    pub fn run_evaluation_definition(
+        &self,
+        definition_id: &str,
+        harness_ids: &[String],
+        model_profile_id: Option<String>,
+    ) -> Result<ComparisonStream, WorkbenchError> {
+        let mut body = Map::new();
+        if !harness_ids.is_empty() {
+            body.insert("harnessIds".to_owned(), json!(harness_ids));
+        }
+        if let Some(model_profile_id) = model_profile_id {
+            body.insert("modelProfileId".to_owned(), json!(model_profile_id));
+        }
+        let evaluation = self.post_json(
+            &format!(
+                "/api/workbench/{}/evaluation-definitions/{definition_id}/run",
+                self.inner.workspace_id
+            ),
+            &JsonValue::Object(body),
+        )?;
+        let evaluation_id = evaluation
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                WorkbenchError::Malformed("definition run response has no id".to_owned())
+            })?
+            .to_owned();
+        let (sender, receiver) = mpsc::channel();
+        let bridge = self.clone();
+        let initial = evaluation.clone();
+        thread::Builder::new()
+            .name("agent-lab-definition-evaluation-stream".to_owned())
+            .spawn(move || {
+                if sender
+                    .send(Ok(milestone(
+                        "comparison-created",
+                        &evaluation_id,
+                        &initial,
+                    )))
+                    .is_err()
+                {
+                    return;
+                }
+                if let Err(error) = bridge.stream_evaluation(&evaluation_id, false, &sender) {
+                    let _ = sender.send(Err(WorkbenchError::Request(format!(
+                        "{error}; evaluation {evaluation_id} continues and can be reopened"
+                    ))));
+                }
+            })
+            .map_err(|error| WorkbenchError::Request(error.to_string()))?;
+        Ok(ComparisonStream {
+            evaluation,
+            receiver,
+        })
     }
 
     /// Read one persistent agent session.
@@ -525,6 +743,26 @@ impl WorkbenchBridge {
             });
     }
 
+    pub fn cancel_evaluation_validation(&self, draft_id: &str, validation_id: &str) {
+        let bridge = self.clone();
+        let draft_id = draft_id.to_owned();
+        let validation_id = validation_id.to_owned();
+        let _ = thread::Builder::new()
+            .name("agent-lab-validation-cancel".to_owned())
+            .spawn(move || {
+                let _ = bridge
+                    .request(
+                        reqwest::Method::POST,
+                        &format!(
+                            "/api/workbench/{}/evaluation-drafts/{draft_id}/validations/{validation_id}/cancel",
+                            bridge.inner.workspace_id
+                        ),
+                    )
+                    .timeout(Duration::from_secs(10))
+                    .send();
+            });
+    }
+
     fn stream_agent_turn(
         &self,
         session_id: &str,
@@ -673,12 +911,90 @@ impl WorkbenchBridge {
         Ok(())
     }
 
+    fn stream_evaluation_validation(
+        &self,
+        draft_id: &str,
+        validation_id: &str,
+        raw: bool,
+        sender: &mpsc::Sender<Result<JsonValue, WorkbenchError>>,
+    ) -> Result<(), WorkbenchError> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &format!(
+                    "/api/workbench/{}/evaluation-drafts/{draft_id}/events",
+                    self.inner.workspace_id
+                ),
+            )
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| WorkbenchError::Request(error.to_string()))?;
+        for line in BufReader::new(response).lines() {
+            let line = line.map_err(|error| WorkbenchError::Request(error.to_string()))?;
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let event: JsonValue = serde_json::from_str(data.trim())
+                .map_err(|error| WorkbenchError::Malformed(error.to_string()))?;
+            let kind = event.get("type").and_then(JsonValue::as_str).unwrap_or("");
+            let payload = event.get("payload").unwrap_or(&JsonValue::Null);
+            if payload.get("validationId").and_then(JsonValue::as_str) != Some(validation_id)
+                && payload.get("id").and_then(JsonValue::as_str) != Some(validation_id)
+            {
+                continue;
+            }
+            if raw
+                && sender
+                    .send(Ok(json!({
+                        "type": "validation-event",
+                        "draftId": draft_id,
+                        "validationId": validation_id,
+                        "event": event,
+                    })))
+                    .is_err()
+            {
+                return Ok(());
+            }
+            if kind == "evaluation-validation.finished" {
+                if !raw {
+                    let draft = self.evaluation_draft(draft_id)?;
+                    let attempt = draft
+                        .get("validations")
+                        .and_then(JsonValue::as_array)
+                        .and_then(|attempts| {
+                            attempts.iter().find(|attempt| {
+                                attempt.get("id").and_then(JsonValue::as_str) == Some(validation_id)
+                            })
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            WorkbenchError::Malformed(format!(
+                                "draft {draft_id} has no completed validation {validation_id}"
+                            ))
+                        })?;
+                    let _ = sender.send(Ok(json!({
+                        "type": "validation-attempt",
+                        "attempt": attempt,
+                    })));
+                }
+                return Ok(());
+            }
+        }
+        Err(WorkbenchError::Request(
+            "evaluation draft event stream ended before validation completion".to_owned(),
+        ))
+    }
+
     fn get_json(&self, path: &str) -> Result<JsonValue, WorkbenchError> {
         self.request_json(reqwest::Method::GET, path, None)
     }
 
     fn post_json(&self, path: &str, body: &JsonValue) -> Result<JsonValue, WorkbenchError> {
         self.request_json(reqwest::Method::POST, path, Some(body.clone()))
+    }
+
+    fn patch_json(&self, path: &str, body: &JsonValue) -> Result<JsonValue, WorkbenchError> {
+        self.request_json(reqwest::Method::PATCH, path, Some(body.clone()))
     }
 
     fn request_json(

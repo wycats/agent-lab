@@ -5,13 +5,40 @@
   import AgentSessionLiveStatus from '$lib/AgentSessionLiveStatus.svelte';
   import AssistantMarkdown from '$lib/AssistantMarkdown.svelte';
   import { projectAgentSessionLiveStatus } from '$lib/agent-live-status';
-  import { agentTurnActivityDetail, createRunClient, type AgentSessionDetail, type AgentSessionSummary, type AgentTurnActivityPresentation, type AgentTurnMessagePresentation, type AgentTurnSummary, type EvaluationComparisonArm, type EvaluationDetail, type EvaluationSummary, type HarnessMetadata, type ModelAccessSnapshot, type ModelProfileMetadata, type RunDetail, type RunEvent, type RunEventStreamReset, type RunReviewStep, type RunSummary, type ScenarioManifest, type WorkbenchSelection } from '$lib/runs';
+  import {
+    agentTurnActivityDetail,
+    createRunClient,
+    type AgentSessionDetail,
+    type AgentSessionSummary,
+    type AgentTurnActivityPresentation,
+    type AgentTurnMessagePresentation,
+    type AgentTurnSummary,
+    type EvaluationComparisonArm,
+    type EvaluationDefinitionDetail,
+    type EvaluationDefinitionSummary,
+    type EvaluationDetail,
+    type EvaluationDraftDetail,
+    type EvaluationDraftSummary,
+    type EvaluationRevision,
+    type EvaluationSummary,
+    type EvaluationValidationAttempt,
+    type HarnessMetadata,
+    type ModelAccessSnapshot,
+    type ModelProfileMetadata,
+    type RunDetail,
+    type RunEvent,
+    type RunEventStreamReset,
+    type RunReviewStep,
+    type RunSummary,
+    type ScenarioManifest,
+    type WorkbenchSelection
+  } from '$lib/runs';
   import { createGhosttySurface } from '$lib/terminal/ghostty';
   import { connectSession } from '$lib/terminal/session';
   import type { BrowserSession, ConnectionState, SessionEvent } from '$lib/terminal/session';
   import type { TerminalSurface } from '$lib/terminal/surface';
 
-  type Tab = 'agent' | 'workspace' | 'editor' | 'evidence' | 'evaluation';
+  type Tab = 'agent' | 'workspace' | 'editor' | 'evidence' | 'draft' | 'evaluation';
   type AgentInspectionMode = 'session' | 'run';
   type AgentSessionReconcileTarget = {
     workspaceId: string;
@@ -65,6 +92,7 @@
   let exploreEventStream: AbortController | undefined;
   let inspectionEventStream: AbortController | undefined;
   let evaluationRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let draftEventStream: AbortController | undefined;
   let agentSessionEventStream: AbortController | undefined;
   let agentSessionEventFlushTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingAgentSessionEvents: RunEvent[] = [];
@@ -92,6 +120,10 @@
   let modelAccess: ModelAccessSnapshot[] = [];
   let runs: RunSummary[] = [];
   let evaluations: EvaluationSummary[] = [];
+  let evaluationDrafts: EvaluationDraftSummary[] = [];
+  let evaluationDefinitions: EvaluationDefinitionSummary[] = [];
+  let selectedDraft: EvaluationDraftDetail | undefined;
+  let selectedDefinition: EvaluationDefinitionDetail | undefined;
   let selectedEvaluation: EvaluationDetail | undefined;
   let activeAgentSession: AgentSessionDetail | undefined;
   let agentSessions: AgentSessionSummary[] = [];
@@ -114,6 +146,20 @@
   let starting = false;
   let fixtureOnly = false;
   let comparing = false;
+  let draftBusy = false;
+  let draftName = '';
+  let draftTask = '';
+  let draftActiveNames = '';
+  let draftTotalScore = 0;
+  let draftRequiredCapabilities = '';
+  let draftOutputPath = 'result.json';
+  let draftRequireSchema = true;
+  let draftMaxDurationMs = 0;
+  let draftMaxCommandCount = 0;
+  let draftMaxOrchestratorInvocations = 0;
+  let draftMaxToolInvocations = 0;
+  let draftMeasurements = '';
+  let hydratedDraftRevisionKey = '';
   let agentTurnCancelling = false;
 
   $: activeExplore = exploreRun?.summary ??
@@ -130,6 +176,26 @@
   $: agentSessionLifecycleActive =
     agentSessions.some((summary) => !agentSessionIsHistorical(summary)) ||
     Boolean(activeAgentSession && !agentSessionIsHistorical(activeAgentSession.summary));
+  $: selectedDraftRevision = selectedDraft
+    ? selectedDraft.revisions.find(
+        (revision) => revision.id === selectedDraft?.summary.currentRevisionId
+      )
+    : undefined;
+  $: selectedDraftValidation = selectedDraftRevision && selectedDraft
+    ? [...selectedDraft.validations]
+        .reverse()
+        .find((attempt) => attempt.revisionId === selectedDraftRevision?.id)
+    : undefined;
+  $: previousDraftValidations = selectedDraft
+    ? [...selectedDraft.validations]
+        .reverse()
+        .filter((attempt) => attempt.id !== selectedDraftValidation?.id)
+    : [];
+  $: selectedDraftDefinition = selectedDraft?.summary.definitionId
+    ? evaluationDefinitions.find(
+        (definition) => definition.id === selectedDraft?.summary.definitionId
+      )
+    : undefined;
   $: scenarioSwitchBlocked = preparing ||
     running ||
     agentSessionLifecycleActive;
@@ -271,6 +337,7 @@
     applyWorkbenchSelection(workbench.selection);
     modelAccess = workbench.modelAccess;
     mergeAgentSessionSnapshot(id, workbench.agentSessions);
+    await loadEvaluationLibrary(id);
     const session = workbench.activeAgentSession?.active
       ? workbench.activeAgentSession
       : workbench.replayAgentSession;
@@ -792,6 +859,257 @@
     comparisonHarnessIds = selection.comparisonHarnessIds;
   }
 
+  function commaSeparated(values: string[]): string {
+    return values.join(', ');
+  }
+
+  function parseCommaSeparated(value: string): string[] {
+    return value
+      .split(',')
+      .map((part) => part.trim())
+      .filter((part, index, all) => part.length > 0 && all.indexOf(part) === index);
+  }
+
+  function hydrateDraftForm(draft: EvaluationDraftDetail, force = false): void {
+    const revision = draft.revisions.find(
+      (candidate) => candidate.id === draft.summary.currentRevisionId
+    );
+    if (!revision) return;
+    const key = `${draft.summary.id}:${revision.id}`;
+    if (!force && hydratedDraftRevisionKey === key) return;
+    hydratedDraftRevisionKey = key;
+    draftName = draft.summary.name;
+    draftTask = revision.task;
+    draftActiveNames = commaSeparated(revision.evaluator.parameters.activeNames);
+    draftTotalScore = revision.evaluator.parameters.totalScore;
+    draftRequiredCapabilities = commaSeparated(
+      revision.evaluator.parameters.requiredCapabilitySources
+    );
+    draftOutputPath = revision.evaluator.parameters.outputPath;
+    draftRequireSchema = revision.evaluator.parameters.requireSchema;
+    draftMaxDurationMs = revision.limits.maxDurationMs;
+    draftMaxCommandCount = revision.limits.maxCommandCount;
+    draftMaxOrchestratorInvocations = revision.limits.maxOrchestratorInvocations;
+    draftMaxToolInvocations = revision.limits.maxToolInvocations;
+    draftMeasurements = commaSeparated(revision.measurements);
+  }
+
+  async function loadEvaluationLibrary(workspaceId: string): Promise<void> {
+    const [drafts, definitions] = await Promise.all([
+      runClient.evaluationDrafts(workspaceId),
+      runClient.evaluationDefinitions(workspaceId)
+    ]);
+    evaluationDrafts = drafts;
+    evaluationDefinitions = definitions;
+  }
+
+  function watchEvaluationDraft(workspaceId: string, draftId: string): void {
+    draftEventStream?.abort();
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+    draftEventStream = runClient.evaluationDraftEvents(workspaceId, draftId, () => {
+      if (refreshTimer !== undefined) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = undefined;
+        void refreshEvaluationDraft(workspaceId, draftId);
+      }, 50);
+    });
+  }
+
+  async function refreshEvaluationDraft(
+    workspaceId: string,
+    draftId: string,
+    hydrate = false
+  ): Promise<EvaluationDraftDetail | undefined> {
+    try {
+      const draft = await runClient.evaluationDraft(workspaceId, draftId);
+      selectedDraft = draft;
+      hydrateDraftForm(draft, hydrate);
+      await loadEvaluationLibrary(workspaceId);
+      if (draft.summary.definitionId) {
+        selectedDefinition = await runClient.evaluationDefinition(
+          workspaceId,
+          draft.summary.definitionId
+        );
+      }
+      return draft;
+    } catch (error) {
+      actionError = message(error);
+      return undefined;
+    }
+  }
+
+  async function openEvaluationDraft(
+    workspaceId: string,
+    draftId: string,
+    reveal = true
+  ): Promise<void> {
+    const draft = await refreshEvaluationDraft(workspaceId, draftId, true);
+    if (!draft) return;
+    if (reveal) activeTab = 'draft';
+    watchEvaluationDraft(workspaceId, draftId);
+  }
+
+  async function openEvaluationDefinition(
+    workspaceId: string,
+    definitionId: string
+  ): Promise<void> {
+    try {
+      selectedDefinition = await runClient.evaluationDefinition(workspaceId, definitionId);
+      await openEvaluationDraft(workspaceId, selectedDefinition.summary.draftId);
+    } catch (error) {
+      actionError = message(error);
+    }
+  }
+
+  async function makeEvaluation(turn: AgentTurnSummary): Promise<void> {
+    const agentSession = activeAgentSession;
+    if (
+      draftBusy ||
+      !agentSession ||
+      turn.status === 'queued' ||
+      turn.status === 'running'
+    ) return;
+    draftBusy = true;
+    actionError = '';
+    try {
+      const draft = await runClient.createEvaluationDraft(
+        agentSession.summary.workspaceId,
+        {
+          sessionId: agentSession.summary.id,
+          fromTurnId: turn.id,
+          throughTurnId: turn.id
+        }
+      );
+      selectedDraft = draft;
+      hydrateDraftForm(draft, true);
+      await loadEvaluationLibrary(agentSession.summary.workspaceId);
+      activeTab = 'draft';
+      watchEvaluationDraft(agentSession.summary.workspaceId, draft.summary.id);
+    } catch (error) {
+      actionError = message(error);
+    } finally {
+      draftBusy = false;
+    }
+  }
+
+  function draftRevisionUpdate(revision: EvaluationRevision) {
+    return {
+      baseRevisionId: revision.id,
+      name: draftName.trim() || undefined,
+      revision: {
+        task: draftTask,
+        limits: {
+          maxDurationMs: Number(draftMaxDurationMs),
+          maxCommandCount: Number(draftMaxCommandCount),
+          maxOrchestratorInvocations: Number(draftMaxOrchestratorInvocations),
+          maxToolInvocations: Number(draftMaxToolInvocations)
+        },
+        evaluator: {
+          id: revision.evaluator.id,
+          version: revision.evaluator.version,
+          parameters: {
+            activeNames: parseCommaSeparated(draftActiveNames),
+            totalScore: Number(draftTotalScore),
+            requiredCapabilitySources: parseCommaSeparated(draftRequiredCapabilities),
+            outputPath: draftOutputPath.trim(),
+            requireSchema: draftRequireSchema
+          }
+        },
+        measurements: parseCommaSeparated(draftMeasurements)
+      }
+    };
+  }
+
+  async function createDraftRevision(): Promise<EvaluationDraftDetail | undefined> {
+    if (!selectedDraft || !selectedDraftRevision) return undefined;
+    draftBusy = true;
+    actionError = '';
+    try {
+      const draft = await runClient.updateEvaluationDraft(
+        selectedDraft.summary.workspaceId,
+        selectedDraft.summary.id,
+        draftRevisionUpdate(selectedDraftRevision)
+      );
+      selectedDraft = draft;
+      hydrateDraftForm(draft, true);
+      await loadEvaluationLibrary(draft.summary.workspaceId);
+      return draft;
+    } catch (error) {
+      actionError = message(error);
+      return undefined;
+    } finally {
+      draftBusy = false;
+    }
+  }
+
+  async function validateDraft(): Promise<void> {
+    if (!selectedDraft || !selectedDraftRevision) return;
+    draftBusy = true;
+    actionError = '';
+    try {
+      await runClient.validateEvaluationDraft(
+        selectedDraft.summary.workspaceId,
+        selectedDraft.summary.id,
+        selectedDraftRevision.id
+      );
+      await refreshEvaluationDraft(
+        selectedDraft.summary.workspaceId,
+        selectedDraft.summary.id
+      );
+    } catch (error) {
+      actionError = message(error);
+    } finally {
+      draftBusy = false;
+    }
+  }
+
+  async function saveDraftDefinition(): Promise<void> {
+    if (!selectedDraft || !selectedDraftRevision) return;
+    draftBusy = true;
+    actionError = '';
+    try {
+      const draft = await runClient.saveEvaluationDraft(
+        selectedDraft.summary.workspaceId,
+        selectedDraft.summary.id,
+        {
+          revisionId: selectedDraftRevision.id,
+          name: draftName.trim() || undefined
+        }
+      );
+      selectedDraft = draft;
+      hydrateDraftForm(draft, true);
+      await loadEvaluationLibrary(draft.summary.workspaceId);
+      if (draft.summary.definitionId) {
+        selectedDefinition = await runClient.evaluationDefinition(
+          draft.summary.workspaceId,
+          draft.summary.definitionId
+        );
+      }
+    } catch (error) {
+      actionError = message(error);
+    } finally {
+      draftBusy = false;
+    }
+  }
+
+  async function runDraftDefinition(): Promise<void> {
+    if (!selectedDraft?.summary.definitionId) return;
+    draftBusy = true;
+    actionError = '';
+    try {
+      const summary = await runClient.runEvaluationDefinition(
+        selectedDraft.summary.workspaceId,
+        selectedDraft.summary.definitionId
+      );
+      evaluations = [summary, ...evaluations.filter((item) => item.id !== summary.id)];
+      await openEvaluation(summary.id);
+    } catch (error) {
+      actionError = message(error);
+    } finally {
+      draftBusy = false;
+    }
+  }
+
   function mergeAgentSessionSnapshot(
     workspaceId: string,
     snapshot: AgentSessionSummary[]
@@ -1193,6 +1511,17 @@
       ) {
         const evaluationId = (event.payload as { evaluationId: string }).evaluationId;
         void openEvaluation(evaluationId);
+      }
+      if (
+        event.sequence > liveAfterSequence &&
+        event.type === 'workbench.evaluation-draft.created' &&
+        event.payload &&
+        typeof event.payload === 'object' &&
+        (event.payload as { origin?: unknown }).origin === 'nushell' &&
+        typeof (event.payload as { draftId?: unknown }).draftId === 'string'
+      ) {
+        const draftId = (event.payload as { draftId: string }).draftId;
+        void openEvaluationDraft(id, draftId);
       }
       if (
         event.sequence > liveAfterSequence &&
@@ -1683,6 +2012,7 @@
       }
       exploreEventStream?.abort();
       inspectionEventStream?.abort();
+      draftEventStream?.abort();
       agentSessionEventStream?.abort();
       session?.dispose();
       surface?.dispose();
@@ -1694,6 +2024,24 @@
   <title>Agent Lab</title>
   <meta name="description" content="An open workbench for building better agent harnesses" />
 </svelte:head>
+
+{#snippet validationCard(validation: EvaluationValidationAttempt)}
+  <article class="validation-card" data-status={validation.assertionStatus}>
+    <header>
+      <strong>{validation.assertionStatus.replaceAll('-', ' ')}</strong>
+      <span>{validation.executionStatus}</span>
+    </header>
+    <p>{validation.harnessId} · {validation.modelProfileId}</p>
+    {#if validation.error}<p class="turn-error">{validation.error}</p>{/if}
+    {#if validation.score !== undefined}
+      <details>
+        <summary>Score and mismatches</summary>
+        <pre>{pretty(validation.score)}</pre>
+      </details>
+    {/if}
+    <small>{shortId(validation.revisionId)} · {validation.runId ? `run ${shortId(validation.runId)}` : 'no run evidence'}</small>
+  </article>
+{/snippet}
 
 <main>
   <header>
@@ -1821,11 +2169,22 @@
         <button class:active={activeTab === 'workspace'} on:click={() => (activeTab = 'workspace')}>Workspace</button>
         <button class:active={activeTab === 'editor'} on:click={() => (activeTab = 'editor')}>Editor</button>
         <button class:active={activeTab === 'evidence'} on:click={() => (activeTab = 'evidence')}>Evidence</button>
+        {#if selectedDraft || evaluationDrafts.length}
+          <button class:active={activeTab === 'draft'} on:click={() => (activeTab = 'draft')}>Draft</button>
+        {/if}
         <button class:active={activeTab === 'evaluation'} on:click={() => (activeTab = 'evaluation')}>Evaluation</button>
       </nav>
 
       <div class="run-heading">
-        {#if activeTab === 'agent' && showingAgentSession && activeAgentSession}
+        {#if activeTab === 'draft' && selectedDraft}
+          <div>
+            <span class="label">Evaluation draft</span>
+            <strong>{selectedDraft.summary.name}</strong>
+          </div>
+          <span class="run-status" data-status={selectedDraft.summary.status}>
+            {selectedDraft.summary.status}
+          </span>
+        {:else if activeTab === 'agent' && showingAgentSession && activeAgentSession}
           <div>
             <span class="label">{agentSessionHeading}</span>
             <strong>{activeAgentSession.summary.harnessId} · {activeAgentSession.summary.modelProfileId}</strong>
@@ -1954,6 +2313,16 @@
                       {/if}
                       {#if turn.error}<span class="turn-error">{turn.error}</span>{/if}
                     </footer>
+                    {#if turn.status !== 'queued' && turn.status !== 'running'}
+                      <div class="turn-actions">
+                        <button
+                          disabled={draftBusy}
+                          on:click={() => void makeEvaluation(turn)}
+                        >
+                          {draftBusy ? 'Creating evaluation…' : 'Make evaluation'}
+                        </button>
+                      </div>
+                    {/if}
                     <details class="turn-evidence">
                       <summary>Evidence</summary>
                       <dl>
@@ -2172,6 +2541,179 @@
             <span class="label">Score</span>
             <pre>{pretty(selectedRun?.score ?? unavailableRunEvidence?.score)}</pre>
           </section>
+        {:else if activeTab === 'draft'}
+          <section class="draft-view" data-testid="evaluation-draft-view">
+            {#if selectedDraft && selectedDraftRevision}
+              <div class="draft-context">
+                <div>
+                  <span class="label">Captured from</span>
+                  <strong>{selectedDraftRevision.source.turnIds.length} agent {selectedDraftRevision.source.turnIds.length === 1 ? 'turn' : 'turns'}</strong>
+                  <small>{selectedDraftRevision.source.harnessId} · {selectedDraftRevision.source.modelProfileId}</small>
+                </div>
+                <dl>
+                  <div><dt>Starting revision</dt><dd>{selectedDraftRevision.source.sourceRevision}</dd></div>
+                  <div><dt>Session</dt><dd>{shortId(selectedDraftRevision.source.sessionId)}</dd></div>
+                  <div><dt>Snapshot</dt><dd>Owned by revision</dd></div>
+                </dl>
+              </div>
+
+              {#if selectedDraftRevision.blockingIssues.length}
+                <div class="draft-blockers" role="status">
+                  <strong>This draft needs a narrower source span</strong>
+                  <ul>
+                    {#each selectedDraftRevision.blockingIssues as issue}<li>{issue}</li>{/each}
+                  </ul>
+                </div>
+              {/if}
+
+              <form class="draft-form" on:submit|preventDefault={() => void createDraftRevision()}>
+                <label class="wide">
+                  <span>Name</span>
+                  <input bind:value={draftName} autocomplete="off" />
+                </label>
+                <label class="wide">
+                  <span>Standalone task</span>
+                  <textarea bind:value={draftTask} rows="5"></textarea>
+                </label>
+
+                <fieldset class="wide">
+                  <legend>Catalog evaluator · v{selectedDraftRevision.evaluator.version}</legend>
+                  <label>
+                    <span>Expected active names</span>
+                    <input bind:value={draftActiveNames} autocomplete="off" />
+                  </label>
+                  <label>
+                    <span>Total score</span>
+                    <input type="number" bind:value={draftTotalScore} />
+                  </label>
+                  <label>
+                    <span>Required capabilities</span>
+                    <input bind:value={draftRequiredCapabilities} autocomplete="off" />
+                  </label>
+                  <label>
+                    <span>Output path</span>
+                    <input bind:value={draftOutputPath} autocomplete="off" />
+                  </label>
+                  <label class="checkbox">
+                    <input type="checkbox" bind:checked={draftRequireSchema} />
+                    <span>Require the catalog result schema</span>
+                  </label>
+                </fieldset>
+
+                <fieldset class="wide limit-grid">
+                  <legend>Execution limits</legend>
+                  <label><span>Duration (ms)</span><input type="number" min="1" bind:value={draftMaxDurationMs} /></label>
+                  <label><span>Commands</span><input type="number" min="0" bind:value={draftMaxCommandCount} /></label>
+                  <label><span>Orchestrator calls</span><input type="number" min="0" bind:value={draftMaxOrchestratorInvocations} /></label>
+                  <label><span>Tool calls</span><input type="number" min="0" bind:value={draftMaxToolInvocations} /></label>
+                </fieldset>
+
+                <label class="wide">
+                  <span>Tracked measurements</span>
+                  <input bind:value={draftMeasurements} autocomplete="off" />
+                </label>
+
+                <div class="draft-actions wide">
+                  <button class="primary" type="submit" disabled={draftBusy}>
+                    {draftBusy ? 'Working…' : 'Create revision'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={draftBusy || selectedDraftRevision.blockingIssues.length > 0}
+                    on:click={() => void validateDraft()}
+                  >
+                    Validate revision
+                  </button>
+                  <button
+                    type="button"
+                    disabled={draftBusy}
+                    on:click={() => void saveDraftDefinition()}
+                  >
+                    Save to library
+                  </button>
+                  {#if selectedDraft.summary.definitionId}
+                    <button
+                      type="button"
+                      disabled={draftBusy || !comparisonModelAccessReady}
+                      on:click={() => void runDraftDefinition()}
+                    >
+                      Run comparison
+                    </button>
+                  {/if}
+                </div>
+              </form>
+
+              <div class="draft-review-grid">
+                <section>
+                  <div class="draft-section-heading">
+                    <span class="label">Current validation</span>
+                    {#if selectedDraftValidation}
+                      <span class="validation-outcome" data-status={selectedDraftValidation.assertionStatus}>
+                        {selectedDraftValidation.executionStatus} · {selectedDraftValidation.assertionStatus}
+                      </span>
+                    {:else if selectedDraft.validations.length}
+                      <span class="validation-outcome" data-status="stale">Current revision not validated</span>
+                    {/if}
+                  </div>
+                  {#if selectedDraftValidation}
+                    <div class="current-validation">
+                      {@render validationCard(selectedDraftValidation)}
+                    </div>
+                  {:else}
+                    <p class="draft-empty">Validate this revision to replay it from the captured starting state.</p>
+                  {/if}
+
+                  {#if previousDraftValidations.length}
+                    <details class="validation-history">
+                      <summary>
+                        <span>Previous attempts</span>
+                        <strong>{previousDraftValidations.length}</strong>
+                      </summary>
+                      <div>
+                        {#each previousDraftValidations as validation}
+                          {@render validationCard(validation)}
+                        {/each}
+                      </div>
+                    </details>
+                  {/if}
+                </section>
+
+                <section>
+                  <div class="draft-section-heading">
+                    <span class="label">Revision history</span>
+                    <span>{selectedDraft.revisions.length}</span>
+                  </div>
+                  <ol class="revision-list">
+                    {#each [...selectedDraft.revisions].reverse() as revision}
+                      <li class:current={revision.id === selectedDraft.summary.currentRevisionId}>
+                        <strong>{shortId(revision.id)}</strong>
+                        <span>{revision.task}</span>
+                        <small>{revision.previousRevisionId ? `from ${shortId(revision.previousRevisionId)}` : 'captured source'}</small>
+                      </li>
+                    {/each}
+                  </ol>
+                </section>
+              </div>
+
+              <details class="draft-source">
+                <summary>Captured source and capabilities</summary>
+                <dl>
+                  <div><dt>Source digest</dt><dd>{selectedDraftRevision.source.sourceDigest}</dd></div>
+                  <div><dt>Evidence events</dt><dd>{selectedDraftRevision.source.sourceEventSequences.join(', ') || 'none reported'}</dd></div>
+                </dl>
+                <ul>
+                  {#each Object.entries(selectedDraftRevision.source.capabilityRevisions) as [source, revision]}
+                    <li><strong>{source}</strong><span>{revision}</span></li>
+                  {/each}
+                </ul>
+              </details>
+            {:else}
+              <div class="empty-state">
+                <strong>No evaluation draft selected</strong>
+                <p>Open a completed agent turn and choose Make evaluation, or create one with <code>lab evaluation new</code>.</p>
+              </div>
+            {/if}
+          </section>
         {:else}
           <section class="evaluation" data-testid="evaluation-view">
             {#if selectedEvaluation}
@@ -2368,6 +2910,39 @@
             {:else}<p>No evaluations yet.</p>{/each}
           </div>
         </div>
+        <div class="history draft-history">
+          <div class="history-title">
+            <span class="label">Evaluation library</span>
+            <span>{evaluationDrafts.length} drafts · {evaluationDefinitions.length} saved</span>
+          </div>
+          <div class="history-list">
+            {#each evaluationDrafts as draft}
+              <button
+                class:selected={selectedDraft?.summary.id === draft.id}
+                on:click={() => void openEvaluationDraft(draft.workspaceId, draft.id)}
+              >
+                <span class="history-status" data-status={draft.status}></span>
+                <span>
+                  <strong>{draft.name}</strong>
+                  <small>{shortId(draft.currentRevisionId)}{draft.definitionId ? ' · runnable' : ''}</small>
+                </span>
+                <em>{draft.saved ? 'saved' : draft.status}</em>
+              </button>
+            {:else}
+              <p>No evaluation drafts yet.</p>
+            {/each}
+            {#each evaluationDefinitions as definition}
+              <button on:click={() => void openEvaluationDefinition(activeExplore?.id ?? '', definition.id)}>
+                <span class="history-status" data-status="passed"></span>
+                <span>
+                  <strong>{definition.name}</strong>
+                  <small>Definition · {shortId(definition.revisionId)}</small>
+                </span>
+                <em>runnable</em>
+              </button>
+            {/each}
+          </div>
+        </div>
       </div>
     </aside>
   </section>
@@ -2521,6 +3096,9 @@
   .turn-activity small { display: block; margin-top: 3px; color: #687870; font-family: var(--font-mono); font-size: 0.54rem; }
   .turn-summary { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 12px 0 0 56px; color: #6f7e76; font-family: var(--font-mono); font-size: 0.54rem; }
   .turn-summary .turn-error { color: #d98d92; }
+  .turn-actions { display: flex; justify-content: flex-end; margin: 10px 0 0 56px; }
+  .turn-actions button { padding: 6px 9px; border: 1px solid #34463d; border-radius: 5px; color: #a5b8ae; font-size: 0.6rem; }
+  .turn-actions button:not(:disabled):hover { border-color: #567261; color: #d0d9d4; background: #121c17; }
   .turn-evidence { margin: 10px 0 0 56px; border-top: 1px solid #1f2b26; }
   .turn-evidence > summary { padding: 8px 0 0; color: #718078; font-size: 0.59rem; }
   .turn-evidence > dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 12px; margin: 10px 0; }
@@ -2587,6 +3165,66 @@
   .empty-state { max-width: 370px; padding: 34px 20px; color: #7c8a83; }
   .empty-state strong { color: #bbc5c0; font-size: 0.82rem; }
   .empty-state p { font-size: 0.73rem; line-height: 1.55; }
+  .draft-view { padding: 18px; }
+  .draft-context { display: grid; grid-template-columns: minmax(0, 1fr) minmax(210px, 0.9fr); gap: 14px; padding: 12px; border: 1px solid #293832; border-radius: 7px; background: #0a100e; }
+  .draft-context > div { display: grid; align-content: start; gap: 4px; min-width: 0; }
+  .draft-context strong { overflow: hidden; color: #c8d2cd; font-size: 0.76rem; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
+  .draft-context small { color: #718078; font-family: var(--font-mono); font-size: 0.56rem; }
+  .draft-context dl { display: grid; gap: 6px; margin: 0; }
+  .draft-context dl > div { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; }
+  .draft-context dt { color: #65746c; font-size: 0.54rem; text-transform: uppercase; }
+  .draft-context dd { overflow: hidden; margin: 0; color: #95a39b; font-family: var(--font-mono); font-size: 0.56rem; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+  .draft-blockers { margin-top: 10px; padding: 10px 12px; border: 1px solid #695532; border-radius: 7px; color: #c8a968; background: #1c1810; }
+  .draft-blockers strong { font-size: 0.68rem; }
+  .draft-blockers ul { margin: 6px 0 0; padding-left: 18px; color: #a78c58; font-size: 0.62rem; line-height: 1.45; }
+  .draft-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; margin-top: 14px; }
+  .draft-form .wide { grid-column: 1 / -1; }
+  .draft-form input:not([type="checkbox"]), .draft-form textarea { width: 100%; min-width: 0; border: 1px solid #293832; border-radius: 6px; padding: 8px 9px; color: #c9d3ce; background: #0a100e; font: 0.66rem/1.45 var(--font-mono); outline: none; }
+  .draft-form textarea { resize: vertical; }
+  .draft-form input:focus, .draft-form textarea:focus { border-color: #567261; box-shadow: 0 0 0 1px #344d40; }
+  .draft-form fieldset { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 11px; margin: 0; padding: 11px; border: 1px solid #25342d; border-radius: 7px; }
+  .draft-form legend { padding: 0 5px; color: #829189; font-size: 0.6rem; font-weight: 630; }
+  .draft-form .checkbox { display: flex; grid-column: 1 / -1; align-items: center; gap: 7px; color: #8d9b94; font-size: 0.63rem; }
+  .draft-form .checkbox input { accent-color: #91b976; }
+  .draft-actions { display: flex; flex-wrap: wrap; gap: 7px; padding-top: 2px; }
+  .draft-actions button { min-height: 30px; padding: 0 10px; border: 1px solid #34463d; border-radius: 6px; color: #a5b8ae; font-size: 0.62rem; }
+  .draft-actions button.primary { border-color: #91b976; color: #101710; }
+  .draft-review-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
+  .draft-review-grid > section { min-width: 0; padding: 11px; border: 1px solid #25342d; border-radius: 7px; background: #0b1210; }
+  .draft-section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 8px; color: #6c7a73; font-size: 0.57rem; }
+  .validation-outcome { color: #87958e; font-family: var(--font-mono); text-transform: capitalize; }
+  .validation-outcome[data-status="passed"] { color: #a8c994; }
+  .validation-outcome[data-status="failed"] { color: #d98d92; }
+  .validation-outcome[data-status="stale"] { color: #d1a85e; }
+  .validation-card { display: grid; gap: 5px; padding: 9px; border: 1px solid #27362f; border-left: 2px solid #5b6d63; border-radius: 5px; background: #0a100e; }
+  .validation-card + .validation-card { margin-top: 7px; }
+  .validation-card[data-status="passed"] { border-left-color: #91b976; }
+  .validation-card[data-status="failed"] { border-left-color: #d26d73; }
+  .validation-card > header { display: flex; justify-content: space-between; gap: 9px; margin: 0; }
+  .validation-card > header strong { color: #c3cdc8; font-size: 0.67rem; font-weight: 550; text-transform: capitalize; }
+  .validation-card > header span, .validation-card small { color: #68776f; font-family: var(--font-mono); font-size: 0.53rem; }
+  .validation-card p { margin: 0; color: #829189; font-size: 0.6rem; }
+  .validation-card summary { color: #8f9d95; font-size: 0.59rem; cursor: pointer; }
+  .validation-card pre { max-height: 160px; }
+  .validation-history { margin-top: 9px; border-top: 1px solid #25342d; padding-top: 8px; }
+  .validation-history > summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #7f8e86; font-size: 0.59rem; cursor: pointer; list-style-position: inside; }
+  .validation-history > summary strong { color: #65736c; font-family: var(--font-mono); font-size: 0.53rem; font-weight: 500; }
+  .validation-history > div { margin-top: 8px; }
+  .draft-empty { margin: 14px 0; color: #65736c; font-size: 0.63rem; line-height: 1.45; }
+  .revision-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+  .revision-list li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 8px; padding: 8px; border: 1px solid #24312c; border-radius: 5px; }
+  .revision-list li.current { border-color: #496151; background: #101a15; }
+  .revision-list strong { color: #8ea097; font-family: var(--font-mono); font-size: 0.56rem; }
+  .revision-list span { overflow: hidden; color: #aab6b0; font-size: 0.62rem; text-overflow: ellipsis; white-space: nowrap; }
+  .revision-list small { grid-column: 2; color: #5f6e66; font-size: 0.52rem; }
+  .draft-source { margin-top: 12px; padding: 10px 11px; border: 1px solid #25332d; border-radius: 7px; }
+  .draft-source summary { color: #97a59e; font-size: 0.63rem; cursor: pointer; }
+  .draft-source dl { display: grid; gap: 7px; margin: 10px 0; }
+  .draft-source dl > div, .draft-source li { display: flex; justify-content: space-between; gap: 10px; }
+  .draft-source dt, .draft-source dd, .draft-source li { color: #6f7d76; font-family: var(--font-mono); font-size: 0.54rem; }
+  .draft-source dd { overflow-wrap: anywhere; margin: 0; text-align: right; }
+  .draft-source ul { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+  .draft-source li strong { color: #95a39b; font-weight: 540; }
   .evaluation { padding: 18px; }
   .evaluation-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
   .evaluation-heading > div { display: grid; gap: 4px; min-width: 0; }
@@ -2652,9 +3290,9 @@
   .native-replays > div { display: flex; flex-wrap: wrap; gap: 7px; }
   .native-replays button { padding: 6px 9px; border: 1px solid #34463d; border-radius: 5px; color: #9bb0a5; font-size: 0.6rem; }
   .native-replays button:not(:disabled):hover { border-color: #567261; color: #c3d1ca; }
-  .histories { min-block-size: 0; max-block-size: min(190px, 25dvb); overflow: auto; overscroll-behavior-block: contain; border-top: 1px solid #27342f; scrollbar-color: #405048 transparent; scrollbar-gutter: stable; }
+  .histories { min-block-size: 0; max-block-size: min(230px, 28dvb); overflow: auto; overscroll-behavior-block: contain; border-top: 1px solid #27342f; scrollbar-color: #405048 transparent; scrollbar-gutter: stable; }
   .history { display: grid; grid-template-rows: auto auto; }
-  .evaluation-history { border-top: 1px solid #202c27; }
+  .evaluation-history, .draft-history { border-top: 1px solid #202c27; }
   .history-title { display: flex; justify-content: space-between; padding: 10px 16px 6px; color: #596760; font-size: 0.65rem; }
   .history-list { min-block-size: 0; padding: 0 7px 7px; }
   .history-list button { display: grid; grid-template-columns: 7px minmax(0, 1fr) auto; align-items: center; gap: 9px; width: 100%; padding: 8px 9px; border-radius: 5px; text-align: left; }
@@ -2680,5 +3318,7 @@
     .terminal-panel { height: clamp(400px, calc(100dvh - 167px), 620px); }
     .review-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .review-metrics > div:nth-child(4) { border-left: 0; }
+    .draft-context, .draft-review-grid, .draft-form fieldset { grid-template-columns: 1fr; }
+    .draft-form fieldset > * { grid-column: 1; }
   }
 </style>

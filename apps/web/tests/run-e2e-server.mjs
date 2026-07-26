@@ -10,6 +10,10 @@ const runId = process.env.AGENT_LAB_WEB_E2E_RUN_ID;
 if (!runId || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(runId)) {
   throw new Error('AGENT_LAB_WEB_E2E_RUN_ID must be a UUID');
 }
+const port = Number(process.env.AGENT_LAB_WEB_E2E_PORT);
+if (!Number.isSafeInteger(port) || port < 1024 || port > 65_535) {
+  throw new Error('AGENT_LAB_WEB_E2E_PORT must be a valid unprivileged TCP port');
+}
 const dataDir = join(tmpdir(), `agent-lab-web-e2e-${runId}`);
 mkdirSync(dataDir);
 let child;
@@ -67,7 +71,7 @@ if (buildCode !== 0) {
 }
 
 const server = start(join(repoRoot, 'target/debug/agent-lab-web'), [
-  '--port', '4173',
+  '--port', String(port),
   '--data', dataDir,
   '--harness-config', 'apps/web/tests/fixtures/harnesses.toml'
 ]);

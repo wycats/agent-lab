@@ -42,7 +42,8 @@ use crate::{
     bridge::BridgeError,
     value::{json_to_nu, json_to_nu_tool_result, nu_record_to_json, nu_to_json},
     workbench::{
-        AgentTurnOutput, AgentTurnStream, ComparisonStream, WorkbenchBridge, WorkbenchError,
+        AgentTurnOutput, AgentTurnStream, ComparisonStream, ValidationStream, WorkbenchBridge,
+        WorkbenchError,
     },
 };
 
@@ -390,6 +391,30 @@ impl NushellHost {
         working_set.add_decl(Box::new(LabEvaluationCommand {
             bridge: bridge.clone(),
         }));
+        working_set.add_decl(Box::new(LabEvaluationNewCommand {
+            bridge: bridge.clone(),
+        }));
+        working_set.add_decl(Box::new(LabEvaluationDraftsCommand {
+            bridge: bridge.clone(),
+        }));
+        working_set.add_decl(Box::new(LabEvaluationDraftCommand {
+            bridge: bridge.clone(),
+        }));
+        working_set.add_decl(Box::new(LabEvaluationValidateCommand {
+            bridge: bridge.clone(),
+        }));
+        working_set.add_decl(Box::new(LabEvaluationSaveCommand {
+            bridge: bridge.clone(),
+        }));
+        working_set.add_decl(Box::new(LabEvaluationDefinitionsCommand {
+            bridge: bridge.clone(),
+        }));
+        working_set.add_decl(Box::new(LabEvaluationDefinitionCommand {
+            bridge: bridge.clone(),
+        }));
+        working_set.add_decl(Box::new(LabEvaluationRunCommand {
+            bridge: bridge.clone(),
+        }));
         working_set.add_decl(Box::new(AgentCommand {
             bridge: bridge.clone(),
             session_ids: self.workbench_sessions.clone(),
@@ -705,6 +730,7 @@ impl NushellHost {
                 self.workbench_models.clone(),
                 self.workbench_sessions.clone(),
                 self.workbench_turns.clone(),
+                self.workbench.clone(),
             )))
             .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
             .with_edit_mode(Box::new(Emacs::new(keybindings)))
@@ -1449,6 +1475,7 @@ struct AgentLabCompleter {
     workbench_models: Vec<String>,
     workbench_sessions: Arc<RwLock<Vec<String>>>,
     workbench_turns: Arc<RwLock<Vec<String>>>,
+    workbench: Option<WorkbenchBridge>,
 }
 
 fn workbench_ids(snapshot: &serde_json::Value, key: &str) -> Vec<String> {
@@ -2800,6 +2827,612 @@ impl Command for LabEvaluationCommand {
 }
 
 #[derive(Clone)]
+struct LabEvaluationNewCommand {
+    bridge: WorkbenchBridge,
+}
+
+impl Command for LabEvaluationNewCommand {
+    fn name(&self) -> &'static str {
+        "lab evaluation new"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::Record(Vec::new().into()))
+            .named("from", SyntaxShape::String, "first source turn", None)
+            .named("through", SyntaxShape::String, "last source turn", None)
+            .named("session", SyntaxShape::String, "source agent session", None)
+    }
+
+    fn description(&self) -> &'static str {
+        "Create an editable evaluation draft from a contiguous span of durable turns"
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let from = call
+            .get_flag::<String>(engine_state, stack, "from")?
+            .ok_or_else(|| {
+                shell_error(
+                    "Missing source turn",
+                    "provide both --from and --through".to_owned(),
+                    call.head,
+                )
+            })?;
+        let through = call
+            .get_flag::<String>(engine_state, stack, "through")?
+            .ok_or_else(|| {
+                shell_error(
+                    "Missing source turn",
+                    "provide both --from and --through".to_owned(),
+                    call.head,
+                )
+            })?;
+        let session = call.get_flag::<String>(engine_state, stack, "session")?;
+        let draft = self
+            .bridge
+            .create_evaluation_draft(session.as_deref(), &from, &through)
+            .map_err(|error| {
+                shell_error(
+                    "Evaluation draft creation failed",
+                    error.to_string(),
+                    call.head,
+                )
+            })?;
+        Ok(json_to_nu(draft_shell_record(&draft)?, call.head).into_pipeline_data())
+    }
+}
+
+#[derive(Clone)]
+struct LabEvaluationDraftsCommand {
+    bridge: WorkbenchBridge,
+}
+
+impl Command for LabEvaluationDraftsCommand {
+    fn name(&self) -> &'static str {
+        "lab evaluation drafts"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::Table(Vec::new().into()))
+    }
+
+    fn description(&self) -> &'static str {
+        "List evaluation drafts owned by this workbench"
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let drafts = self.bridge.evaluation_drafts().map_err(|error| {
+            shell_error(
+                "Evaluation draft request failed",
+                error.to_string(),
+                call.head,
+            )
+        })?;
+        Ok(json_to_nu(drafts, call.head).into_pipeline_data())
+    }
+}
+
+#[derive(Clone)]
+struct LabEvaluationDraftCommand {
+    bridge: WorkbenchBridge,
+}
+
+impl Command for LabEvaluationDraftCommand {
+    fn name(&self) -> &'static str {
+        "lab evaluation draft"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::Record(Vec::new().into()))
+            .required(
+                "draft-id",
+                SyntaxShape::String,
+                "evaluation draft to inspect",
+            )
+    }
+
+    fn description(&self) -> &'static str {
+        "Inspect one editable evaluation draft"
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let draft_id = call.req::<String>(engine_state, stack, 0)?;
+        let draft = self.bridge.evaluation_draft(&draft_id).map_err(|error| {
+            shell_error(
+                "Evaluation draft request failed",
+                error.to_string(),
+                call.head,
+            )
+        })?;
+        Ok(json_to_nu(draft_shell_record(&draft)?, call.head).into_pipeline_data())
+    }
+}
+
+#[derive(Clone)]
+struct LabEvaluationValidateCommand {
+    bridge: WorkbenchBridge,
+}
+
+impl Command for LabEvaluationValidateCommand {
+    fn name(&self) -> &'static str {
+        "lab evaluation validate"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Any, Type::Any)
+            .optional(
+                "draft-id",
+                SyntaxShape::String,
+                "draft to validate; omit when piping a draft record",
+            )
+            .switch("raw", "stream attributable validation events", None)
+    }
+
+    fn description(&self) -> &'static str {
+        "Replay an exact evaluation draft revision and retain its validation evidence"
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let positional = call.opt::<String>(engine_state, stack, 0)?;
+        let piped = structured_agent_input(input, call.head)?;
+        let (draft_id, revision_id) =
+            resolve_draft_operation(&self.bridge, positional, piped, call.head)?;
+        let raw = call.has_flag(engine_state, stack, "raw")?;
+        let validation = self
+            .bridge
+            .validate_evaluation_draft(&draft_id, revision_id.as_deref(), raw)
+            .map_err(|error| {
+                shell_error("Evaluation validation failed", error.to_string(), call.head)
+            })?;
+        let validation_id = validation
+            .attempt
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        if raw {
+            let stream = ValidationValueStream {
+                validation,
+                bridge: self.bridge.clone(),
+                draft_id,
+                validation_id,
+                signals: engine_state.signals().clone(),
+                span: call.head,
+                finished: false,
+            };
+            return Ok(ListStream::new(stream, call.head, Signals::empty()).into());
+        }
+        loop {
+            if engine_state.signals().interrupted() {
+                self.bridge
+                    .cancel_evaluation_validation(&draft_id, &validation_id);
+                return Err(shell_error(
+                    "Evaluation validation cancelled",
+                    format!("validation {validation_id} remains durable on draft {draft_id}"),
+                    call.head,
+                ));
+            }
+            match validation.receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ok(value)) if value["type"].as_str() == Some("validation-attempt") => {
+                    return Ok(json_to_nu(value["attempt"].clone(), call.head).into_pipeline_data());
+                }
+                Ok(Ok(_)) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(Err(error)) => {
+                    return Err(shell_error(
+                        "Evaluation validation stream failed",
+                        error.to_string(),
+                        call.head,
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(shell_error(
+                        "Evaluation validation stream failed",
+                        format!("validation {validation_id} can be reopened on draft {draft_id}"),
+                        call.head,
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LabEvaluationSaveCommand {
+    bridge: WorkbenchBridge,
+}
+
+impl Command for LabEvaluationSaveCommand {
+    fn name(&self) -> &'static str {
+        "lab evaluation save"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Any, Type::Record(Vec::new().into()))
+            .optional(
+                "draft-id",
+                SyntaxShape::String,
+                "draft to save; omit when piping a draft record",
+            )
+            .named("name", SyntaxShape::String, "library display name", None)
+    }
+
+    fn description(&self) -> &'static str {
+        "Save an exact draft revision and promote it when that revision passed validation"
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let positional = call.opt::<String>(engine_state, stack, 0)?;
+        let piped = structured_agent_input(input, call.head)?;
+        let (draft_id, revision_id) =
+            resolve_draft_operation(&self.bridge, positional, piped, call.head)?;
+        let name = call.get_flag::<String>(engine_state, stack, "name")?;
+        let draft = self
+            .bridge
+            .save_evaluation_draft(&draft_id, revision_id.as_deref(), name.as_deref())
+            .map_err(|error| shell_error("Evaluation save failed", error.to_string(), call.head))?;
+        Ok(json_to_nu(draft_shell_record(&draft)?, call.head).into_pipeline_data())
+    }
+}
+
+#[derive(Clone)]
+struct LabEvaluationDefinitionsCommand {
+    bridge: WorkbenchBridge,
+}
+
+impl Command for LabEvaluationDefinitionsCommand {
+    fn name(&self) -> &'static str {
+        "lab evaluation definitions"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::Table(Vec::new().into()))
+    }
+
+    fn description(&self) -> &'static str {
+        "List runnable evaluation definitions in the local library"
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let definitions = self.bridge.evaluation_definitions().map_err(|error| {
+            shell_error(
+                "Evaluation definition request failed",
+                error.to_string(),
+                call.head,
+            )
+        })?;
+        Ok(json_to_nu(definitions, call.head).into_pipeline_data())
+    }
+}
+
+#[derive(Clone)]
+struct LabEvaluationDefinitionCommand {
+    bridge: WorkbenchBridge,
+}
+
+impl Command for LabEvaluationDefinitionCommand {
+    fn name(&self) -> &'static str {
+        "lab evaluation definition"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::Record(Vec::new().into()))
+            .required(
+                "definition-id",
+                SyntaxShape::String,
+                "evaluation definition to inspect",
+            )
+    }
+
+    fn description(&self) -> &'static str {
+        "Inspect one runnable evaluation definition"
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let definition_id = call.req::<String>(engine_state, stack, 0)?;
+        let definition = self
+            .bridge
+            .evaluation_definition(&definition_id)
+            .map_err(|error| {
+                shell_error(
+                    "Evaluation definition request failed",
+                    error.to_string(),
+                    call.head,
+                )
+            })?;
+        Ok(json_to_nu(definition, call.head).into_pipeline_data())
+    }
+}
+
+#[derive(Clone)]
+struct LabEvaluationRunCommand {
+    bridge: WorkbenchBridge,
+}
+
+impl Command for LabEvaluationRunCommand {
+    fn name(&self) -> &'static str {
+        "lab evaluation run"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::Table(Vec::new().into()))
+            .required(
+                "definition-id",
+                SyntaxShape::String,
+                "saved definition to run",
+            )
+            .rest(
+                "harnesses",
+                SyntaxShape::String,
+                "exactly two harness ids; defaults to the shared pair",
+            )
+            .named("model", SyntaxShape::String, "model profile override", None)
+    }
+
+    fn description(&self) -> &'static str {
+        "Run a saved evaluation definition through a controlled harness pair"
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let definition_id = call.req::<String>(engine_state, stack, 0)?;
+        let harnesses = call.rest::<String>(engine_state, stack, 1)?;
+        if !harnesses.is_empty() && harnesses.len() != 2 {
+            return Err(shell_error(
+                "Invalid evaluation run",
+                "provide exactly two harness ids or omit both to use the shared selection"
+                    .to_owned(),
+                call.head,
+            ));
+        }
+        let model = call.get_flag::<String>(engine_state, stack, "model")?;
+        let comparison = self
+            .bridge
+            .run_evaluation_definition(&definition_id, &harnesses, model)
+            .map_err(|error| shell_error("Evaluation run failed", error.to_string(), call.head))?;
+        let evaluation_id = comparison
+            .evaluation
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let stream = WorkbenchValueStream {
+            comparison,
+            bridge: self.bridge.clone(),
+            evaluation_id,
+            signals: engine_state.signals().clone(),
+            span: call.head,
+            finished: false,
+        };
+        Ok(ListStream::new(stream, call.head, Signals::empty()).into())
+    }
+}
+
+fn draft_shell_record(detail: &JsonValue) -> Result<JsonValue, ShellError> {
+    let summary = detail.get("summary").ok_or_else(|| {
+        shell_error(
+            "Evaluation draft response was malformed",
+            "draft has no summary".to_owned(),
+            Span::unknown(),
+        )
+    })?;
+    let current_revision_id = summary
+        .get("currentRevisionId")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            shell_error(
+                "Evaluation draft response was malformed",
+                "draft has no current revision id".to_owned(),
+                Span::unknown(),
+            )
+        })?;
+    let revision = detail
+        .get("revisions")
+        .and_then(JsonValue::as_array)
+        .and_then(|revisions| {
+            revisions.iter().find(|revision| {
+                revision.get("id").and_then(JsonValue::as_str) == Some(current_revision_id)
+            })
+        })
+        .ok_or_else(|| {
+            shell_error(
+                "Evaluation draft response was malformed",
+                "draft has no current revision".to_owned(),
+                Span::unknown(),
+            )
+        })?;
+    Ok(json!({
+        "type": "evaluation-draft",
+        "id": summary["id"],
+        "name": summary["name"],
+        "status": summary["status"],
+        "baseRevisionId": current_revision_id,
+        "task": revision["task"],
+        "source": revision["source"],
+        "limits": revision["limits"],
+        "evaluator": revision["evaluator"],
+        "measurements": revision["measurements"],
+        "blockingIssues": revision["blockingIssues"],
+        "validations": detail["validations"],
+        "definitionId": summary["definitionId"],
+        "saved": summary["saved"],
+    }))
+}
+
+fn resolve_draft_operation(
+    bridge: &WorkbenchBridge,
+    positional: Option<String>,
+    piped: Option<JsonValue>,
+    span: Span,
+) -> Result<(String, Option<String>), ShellError> {
+    match (positional, piped) {
+        (Some(_), Some(_)) => Err(shell_error(
+            "Ambiguous evaluation draft",
+            "provide a draft id or pipe one draft record, not both".to_owned(),
+            span,
+        )),
+        (None, None) => Err(shell_error(
+            "Missing evaluation draft",
+            "provide a draft id or pipe one draft record".to_owned(),
+            span,
+        )),
+        (Some(draft_id), None) => Ok((draft_id, None)),
+        (None, Some(value)) => {
+            let draft_id = value.get("id").and_then(JsonValue::as_str).ok_or_else(|| {
+                shell_error(
+                    "Invalid evaluation draft",
+                    "piped draft has no id".to_owned(),
+                    span,
+                )
+            })?;
+            let base_revision_id = value
+                .get("baseRevisionId")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    shell_error(
+                        "Invalid evaluation draft",
+                        "piped draft has no baseRevisionId".to_owned(),
+                        span,
+                    )
+                })?;
+            let updated = bridge
+                .update_evaluation_draft(
+                    draft_id,
+                    &json!({
+                        "baseRevisionId": base_revision_id,
+                        "name": value.get("name"),
+                        "revision": {
+                            "task": value.get("task"),
+                            "limits": value.get("limits"),
+                            "evaluator": value.get("evaluator"),
+                            "measurements": value.get("measurements"),
+                        }
+                    }),
+                )
+                .map_err(|error| {
+                    shell_error("Evaluation draft update failed", error.to_string(), span)
+                })?;
+            let revision_id = updated
+                .get("summary")
+                .and_then(|summary| summary.get("currentRevisionId"))
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned);
+            Ok((draft_id.to_owned(), revision_id))
+        }
+    }
+}
+
+struct ValidationValueStream {
+    validation: ValidationStream,
+    bridge: WorkbenchBridge,
+    draft_id: String,
+    validation_id: String,
+    signals: Signals,
+    span: Span,
+    finished: bool,
+}
+
+impl Iterator for ValidationValueStream {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.signals.interrupted() {
+                self.bridge
+                    .cancel_evaluation_validation(&self.draft_id, &self.validation_id);
+                self.finished = true;
+                return None;
+            }
+            match self
+                .validation
+                .receiver
+                .recv_timeout(Duration::from_millis(100))
+            {
+                Ok(Ok(value)) => return Some(json_to_nu(value, self.span)),
+                Ok(Err(error)) => {
+                    self.finished = true;
+                    return Some(Value::error(
+                        shell_error(
+                            "Evaluation validation stream failed",
+                            error.to_string(),
+                            self.span,
+                        ),
+                        self.span,
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.finished = true;
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ValidationValueStream {
+    fn drop(&mut self) {
+        if !self.finished && self.signals.interrupted() {
+            self.bridge
+                .cancel_evaluation_validation(&self.draft_id, &self.validation_id);
+        }
+    }
+}
+
+#[derive(Clone)]
 struct LabCompareCommand {
     bridge: WorkbenchBridge,
 }
@@ -2984,6 +3617,7 @@ impl AgentLabCompleter {
         workbench_models: Vec<String>,
         workbench_sessions: Arc<RwLock<Vec<String>>>,
         workbench_turns: Arc<RwLock<Vec<String>>>,
+        workbench: Option<WorkbenchBridge>,
     ) -> Self {
         let mut commands = engine_state
             .get_decls_sorted(false)
@@ -3003,7 +3637,40 @@ impl AgentLabCompleter {
             workbench_models,
             workbench_sessions,
             workbench_turns,
+            workbench,
         }
+    }
+
+    fn evaluation_draft_ids(&self) -> Vec<String> {
+        self.workbench
+            .as_ref()
+            .and_then(|bridge| bridge.evaluation_drafts().ok())
+            .and_then(|drafts| drafts.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|draft| {
+                draft
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    fn evaluation_definition_ids(&self) -> Vec<String> {
+        self.workbench
+            .as_ref()
+            .and_then(|bridge| bridge.evaluation_definitions().ok())
+            .and_then(|definitions| definitions.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|definition| {
+                definition
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
     }
 }
 
@@ -3025,6 +3692,7 @@ mod tests {
                 "agent-turn-1".to_owned(),
                 "agent-turn-2".to_owned(),
             ])),
+            workbench: None,
         }
     }
 
@@ -3339,6 +4007,32 @@ mod tests {
     }
 
     #[test]
+    fn evaluation_completion_distinguishes_source_ids_harnesses_models_and_flags() {
+        assert_eq!(
+            completion_values("lab evaluation new --from agent-turn-"),
+            ["agent-turn-1", "agent-turn-2"]
+        );
+        assert_eq!(
+            completion_values("lab evaluation new --through agent-turn-"),
+            ["agent-turn-1", "agent-turn-2"]
+        );
+        assert_eq!(
+            completion_values("lab evaluation new --session agent-session-"),
+            ["agent-session-1"]
+        );
+        assert_eq!(completion_values("lab evaluation validate --r"), ["--raw"]);
+        assert_eq!(completion_values("lab evaluation save --n"), ["--name"]);
+        assert_eq!(
+            completion_values("lab evaluation run definition-1 --model h"),
+            ["haiku-4.5"]
+        );
+        assert_eq!(
+            completion_values("lab evaluation run definition-1 v"),
+            ["v0"]
+        );
+    }
+
+    #[test]
     fn agent_completion_exposes_the_two_explicit_stream_projections() {
         assert_eq!(completion_values("agent 'prompt' --s"), ["--stream"]);
         assert_eq!(completion_values("agent 'prompt' --r"), ["--raw"]);
@@ -3396,6 +4090,7 @@ mod tests {
             workbench_models: Vec::new(),
             workbench_sessions: sessions.clone(),
             workbench_turns: Arc::new(RwLock::new(Vec::new())),
+            workbench: None,
         };
         replace_session_ids(&sessions, vec!["agent-session-2".to_owned()]);
 
@@ -3418,6 +4113,7 @@ mod tests {
             workbench_models: Vec::new(),
             workbench_sessions: Arc::new(RwLock::new(Vec::new())),
             workbench_turns: turns.clone(),
+            workbench: None,
         };
         replace_turn_ids(
             &turns,
@@ -4388,6 +5084,167 @@ impl Completer for AgentLabCompleter {
                     })
                     .collect();
             }
+        }
+
+        if let Some(arguments) = prefix.strip_prefix("lab evaluation new ") {
+            let value_start = arguments.rfind(' ').map_or(0, |index| index + 1);
+            let value_prefix = &arguments[value_start..];
+            let replace_start = replace_start + "lab evaluation new ".len() + value_start;
+            let prior = arguments[..value_start]
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            if value_prefix.starts_with('-') {
+                return ["--from", "--through", "--session"]
+                    .into_iter()
+                    .filter(|flag| flag.starts_with(value_prefix) && *flag != value_prefix)
+                    .map(|flag| Suggestion {
+                        value: flag.to_owned(),
+                        description: Some("evaluation source option".to_owned()),
+                        span: ReedlineSpan::new(replace_start, pos),
+                        append_whitespace: true,
+                        ..Suggestion::default()
+                    })
+                    .collect();
+            }
+            let (values, description) = match prior.last().copied() {
+                Some("--from" | "--through") => {
+                    (turn_ids(&self.workbench_turns), "Durable Agent Lab turn")
+                }
+                Some("--session") => (session_ids(&self.workbench_sessions), "Agent Lab session"),
+                _ => return Vec::new(),
+            };
+            return values
+                .into_iter()
+                .filter(|value| value.starts_with(value_prefix) && value.as_str() != value_prefix)
+                .map(|value| Suggestion {
+                    value,
+                    description: Some(description.to_owned()),
+                    span: ReedlineSpan::new(replace_start, pos),
+                    append_whitespace: true,
+                    ..Suggestion::default()
+                })
+                .collect();
+        }
+
+        let draft_command = [
+            "lab evaluation draft ",
+            "lab evaluation validate ",
+            "lab evaluation save ",
+        ]
+        .into_iter()
+        .find(|command| prefix.starts_with(command));
+        if let Some(command) = draft_command {
+            let arguments = &prefix[command.len()..];
+            let value_start = arguments.rfind(' ').map_or(0, |index| index + 1);
+            let value_prefix = &arguments[value_start..];
+            let replace_start = replace_start + command.len() + value_start;
+            if value_prefix.starts_with('-') {
+                let flags: &[&str] = if command == "lab evaluation validate " {
+                    &["--raw"]
+                } else if command == "lab evaluation save " {
+                    &["--name"]
+                } else {
+                    &[]
+                };
+                return flags
+                    .iter()
+                    .filter(|flag| flag.starts_with(value_prefix) && **flag != value_prefix)
+                    .map(|flag| Suggestion {
+                        value: (*flag).to_owned(),
+                        description: Some("evaluation draft option".to_owned()),
+                        span: ReedlineSpan::new(replace_start, pos),
+                        append_whitespace: true,
+                        ..Suggestion::default()
+                    })
+                    .collect();
+            }
+            if value_start > 0 {
+                return Vec::new();
+            }
+            return self
+                .evaluation_draft_ids()
+                .into_iter()
+                .filter(|id| id.starts_with(value_prefix) && id.as_str() != value_prefix)
+                .map(|id| Suggestion {
+                    value: id,
+                    description: Some("Evaluation draft".to_owned()),
+                    span: ReedlineSpan::new(replace_start, pos),
+                    append_whitespace: true,
+                    ..Suggestion::default()
+                })
+                .collect();
+        }
+
+        if let Some(arguments) = prefix.strip_prefix("lab evaluation definition ") {
+            let replace_start = replace_start + "lab evaluation definition ".len();
+            return self
+                .evaluation_definition_ids()
+                .into_iter()
+                .filter(|id| id.starts_with(arguments) && id.as_str() != arguments)
+                .map(|id| Suggestion {
+                    value: id,
+                    description: Some("Runnable evaluation definition".to_owned()),
+                    span: ReedlineSpan::new(replace_start, pos),
+                    append_whitespace: true,
+                    ..Suggestion::default()
+                })
+                .collect();
+        }
+
+        if let Some(arguments) = prefix.strip_prefix("lab evaluation run ") {
+            let value_start = arguments.rfind(' ').map_or(0, |index| index + 1);
+            let value_prefix = &arguments[value_start..];
+            let replace_start = replace_start + "lab evaluation run ".len() + value_start;
+            let prior = arguments[..value_start]
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            if prior.is_empty() && !value_prefix.starts_with('-') {
+                return self
+                    .evaluation_definition_ids()
+                    .into_iter()
+                    .filter(|id| id.starts_with(value_prefix) && id.as_str() != value_prefix)
+                    .map(|id| Suggestion {
+                        value: id,
+                        description: Some("Runnable evaluation definition".to_owned()),
+                        span: ReedlineSpan::new(replace_start, pos),
+                        append_whitespace: true,
+                        ..Suggestion::default()
+                    })
+                    .collect();
+            }
+            if value_prefix.starts_with('-') {
+                return ["--model"]
+                    .into_iter()
+                    .filter(|flag| flag.starts_with(value_prefix) && *flag != value_prefix)
+                    .map(|flag| Suggestion {
+                        value: flag.to_owned(),
+                        description: Some("evaluation run option".to_owned()),
+                        span: ReedlineSpan::new(replace_start, pos),
+                        append_whitespace: true,
+                        ..Suggestion::default()
+                    })
+                    .collect();
+            }
+            let values = if prior.last() == Some(&"--model") {
+                &self.workbench_models
+            } else {
+                &self.workbench_harnesses
+            };
+            return values
+                .iter()
+                .filter(|value| {
+                    value.starts_with(value_prefix)
+                        && value.as_str() != value_prefix
+                        && !prior.contains(&value.as_str())
+                })
+                .map(|value| Suggestion {
+                    value: value.clone(),
+                    description: Some("Evaluation run selection".to_owned()),
+                    span: ReedlineSpan::new(replace_start, pos),
+                    append_whitespace: true,
+                    ..Suggestion::default()
+                })
+                .collect();
         }
 
         if let Some(arguments) = prefix.strip_prefix("lab compare ") {

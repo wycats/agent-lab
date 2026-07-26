@@ -15855,6 +15855,10 @@ while IFS= read -r line; do
           printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.completed","payload":{"messageId":"answer-%s","text":"Catalog finding: Alpha and gamma are active."}}\n' "$sequence" "$session" "$turn" "$turn"
           ;;
         *)
+          while [ ! -e "$workspace/.agent-lab-promotion-capabilities-ready" ]; do
+            sleep 0.01
+          done
+          rm -f "$workspace/.agent-lab-promotion-capabilities-ready"
           printf '%s\n' '{"active":[{"name":"alpha","active":true,"score":3},{"name":"gamma","active":true,"score":8}],"activeCount":2,"totalScore":11}' > "$workspace/result.json"
           sequence=$((sequence + 1))
           printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"mcp.tool.completed","payload":{"actor":"agent","source":"catalog","name":"list","isError":false,"result":{"items":[{"name":"alpha","score":3,"active":true},{"name":"beta","score":5,"active":false},{"name":"gamma","score":8,"active":true}]}}}\n' "$sequence" "$session" "$turn"
@@ -15941,11 +15945,11 @@ done
     #[cfg(unix)]
     async fn exercise_catalog_capabilities(controller: &RunController, run_id: &str) {
         let deadline = Instant::now() + Duration::from_secs(3);
-        let capabilities = loop {
+        let (state, capabilities) = loop {
             if let Some(state) = lock(&controller.inner.runs).get(run_id).cloned() {
                 let capabilities = lock(&state.capabilities).clone();
                 if capabilities.len() == 2 {
-                    break capabilities;
+                    break (state, capabilities);
                 }
             }
             assert!(
@@ -15970,6 +15974,13 @@ done
             json!({ "items": items }).as_object().unwrap().clone(),
         )
         .await;
+        fs::write(
+            state
+                .workspace
+                .join(".agent-lab-promotion-capabilities-ready"),
+            b"ready",
+        )
+        .unwrap();
     }
 
     #[cfg(unix)]

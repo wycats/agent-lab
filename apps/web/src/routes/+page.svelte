@@ -187,6 +187,29 @@
   $: manualDraftAuthoringPending = selectedDraftRevision?.blockingIssues.some((issue) =>
     issue.includes('review and confirm the suggested task')
   ) ?? false;
+  $: draftMaterialEditsPending = selectedDraftRevision
+    ? draftTask !== selectedDraftRevision.task ||
+      !sameStringList(
+        parseCommaSeparated(draftActiveNames),
+        selectedDraftRevision.evaluator.parameters.activeNames
+      ) ||
+      Number(draftTotalScore) !== selectedDraftRevision.evaluator.parameters.totalScore ||
+      !sameStringList(
+        parseCommaSeparated(draftRequiredCapabilities),
+        selectedDraftRevision.evaluator.parameters.requiredCapabilitySources
+      ) ||
+      draftOutputPath.trim() !== selectedDraftRevision.evaluator.parameters.outputPath ||
+      draftRequireSchema !== selectedDraftRevision.evaluator.parameters.requireSchema ||
+      Number(draftMaxDurationMs) !== selectedDraftRevision.limits.maxDurationMs ||
+      Number(draftMaxCommandCount) !== selectedDraftRevision.limits.maxCommandCount ||
+      Number(draftMaxOrchestratorInvocations) !==
+        selectedDraftRevision.limits.maxOrchestratorInvocations ||
+      Number(draftMaxToolInvocations) !== selectedDraftRevision.limits.maxToolInvocations ||
+      !sameStringList(
+        parseCommaSeparated(draftMeasurements),
+        selectedDraftRevision.measurements
+      )
+    : false;
   $: selectedDraftValidation = selectedDraftRevision && selectedDraft
     ? [...selectedDraft.validations]
         .reverse()
@@ -880,6 +903,10 @@
       .filter((part, index, all) => part.length > 0 && all.indexOf(part) === index);
   }
 
+  function sameStringList(left: string[], right: string[]): boolean {
+    return left.length === right.length && left.every((value, index) => value === right[index]);
+  }
+
   function hydrateDraftForm(draft: EvaluationDraftDetail, force = false): void {
     const revision = draft.revisions.find(
       (candidate) => candidate.id === draft.summary.currentRevisionId
@@ -934,7 +961,7 @@
     draftEventStream?.abort();
     if (draftRefreshTimer !== undefined) clearTimeout(draftRefreshTimer);
     draftEventStream = runClient.evaluationDraftEvents(workspaceId, draftId, () => {
-      if (workspaceId !== loadedWorkbenchId || openVersion !== draftOpenVersion) return;
+      if (openVersion !== draftOpenVersion) return;
       if (draftRefreshTimer !== undefined) clearTimeout(draftRefreshTimer);
       draftRefreshTimer = setTimeout(() => {
         draftRefreshTimer = undefined;
@@ -951,7 +978,7 @@
   ): Promise<EvaluationDraftDetail | undefined> {
     try {
       const draft = await runClient.evaluationDraft(workspaceId, draftId);
-      if (workspaceId !== loadedWorkbenchId || openVersion !== draftOpenVersion) {
+      if (openVersion !== draftOpenVersion) {
         return undefined;
       }
       selectedDraft = draft;
@@ -2653,20 +2680,28 @@
                   <input bind:value={draftMeasurements} autocomplete="off" />
                 </label>
 
+                {#if draftMaterialEditsPending}
+                  <p class="draft-suggestion wide">
+                    Create a revision to make these edits part of the evaluation evidence.
+                  </p>
+                {/if}
+
                 <div class="draft-actions wide">
                   <button class="primary" type="submit" disabled={draftBusy}>
                     {draftBusy ? 'Working…' : 'Create revision'}
                   </button>
                   <button
                     type="button"
-                    disabled={draftBusy || selectedDraftRevision.blockingIssues.length > 0}
+                    disabled={draftBusy ||
+                      draftMaterialEditsPending ||
+                      selectedDraftRevision.blockingIssues.length > 0}
                     on:click={() => void validateDraft()}
                   >
                     Validate revision
                   </button>
                   <button
                     type="button"
-                    disabled={draftBusy}
+                    disabled={draftBusy || draftMaterialEditsPending}
                     on:click={() => void saveDraftDefinition()}
                   >
                     Save to library
@@ -2674,7 +2709,9 @@
                   {#if selectedDraft.summary.definitionId}
                     <button
                       type="button"
-                      disabled={draftBusy || !comparisonModelAccessReady}
+                      disabled={draftBusy ||
+                        draftMaterialEditsPending ||
+                        !comparisonModelAccessReady}
                       on:click={() => void runDraftDefinition()}
                     >
                       Run comparison

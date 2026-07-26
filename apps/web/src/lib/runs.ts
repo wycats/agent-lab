@@ -818,17 +818,14 @@ export function createRunClient(): RunClient {
       const path = `/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}/events`;
       return reconnectingRunEvents(path, onEvent, onReset);
     },
-    evaluationDrafts: (workspaceId) =>
-      request(`/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts`),
+    evaluationDrafts: (_workspaceId) => request('/api/evaluation-drafts'),
     createEvaluationDraft: (workspaceId, input) =>
       request(`/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts`, {
         method: 'POST',
         body: JSON.stringify(input)
       }),
-    evaluationDraft: (workspaceId, draftId) =>
-      request(
-        `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts/${encodeURIComponent(draftId)}`
-      ),
+    evaluationDraft: (_workspaceId, draftId) =>
+      request(`/api/evaluation-drafts/${encodeURIComponent(draftId)}`),
     updateEvaluationDraft: (workspaceId, draftId, input) =>
       request(
         `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts/${encodeURIComponent(draftId)}`,
@@ -848,12 +845,9 @@ export function createRunClient(): RunClient {
       const path = `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts/${encodeURIComponent(draftId)}/events`;
       return reconnectingRunEvents(path, onEvent);
     },
-    evaluationDefinitions: (workspaceId) =>
-      request(`/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-definitions`),
-    evaluationDefinition: (workspaceId, definitionId) =>
-      request(
-        `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-definitions/${encodeURIComponent(definitionId)}`
-      ),
+    evaluationDefinitions: (_workspaceId) => request('/api/evaluation-definitions'),
+    evaluationDefinition: (_workspaceId, definitionId) =>
+      request(`/api/evaluation-definitions/${encodeURIComponent(definitionId)}`),
     runEvaluationDefinition: (workspaceId, definitionId, input = {}) =>
       request(
         `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-definitions/${encodeURIComponent(definitionId)}/run`,

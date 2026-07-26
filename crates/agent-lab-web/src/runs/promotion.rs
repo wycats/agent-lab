@@ -7,6 +7,7 @@ use super::*;
 const PROMOTION_SCHEMA_VERSION: u32 = 1;
 const CATALOG_EVALUATOR_ID: &str = "catalog-to-file";
 const CATALOG_EVALUATOR_VERSION: u32 = 1;
+const DEFINITION_PUBLICATION_TRANSACTION: &str = "publication.pending.json";
 const MANUAL_AUTHORING_BLOCKER: &str =
     "review and confirm the suggested task, assertions, and measurements";
 
@@ -203,6 +204,7 @@ pub(super) struct PromotionStore {
     root: PathBuf,
     drafts: Mutex<HashMap<String, Arc<PromotionDraftState>>>,
     definitions: Mutex<HashMap<String, Arc<PromotionDefinitionState>>>,
+    secret_values: Mutex<Vec<Vec<u8>>>,
 }
 
 struct PromotionDraftState {
@@ -211,6 +213,7 @@ struct PromotionDraftState {
     sender: broadcast::Sender<RunEvent>,
     event_commit: Mutex<()>,
     validation_cancels: Mutex<HashMap<String, CancellationToken>>,
+    evidence_quarantined: AtomicBool,
 }
 
 struct PromotionDefinitionState {
@@ -225,11 +228,12 @@ impl PromotionStore {
         fs::create_dir_all(root.join("definitions"))?;
         let root = fs::canonicalize(root)?;
         let drafts = load_drafts(&root.join("drafts"))?;
-        let definitions = load_definitions(&root.join("definitions"))?;
+        let definitions = load_definitions(&root.join("definitions"), &drafts)?;
         Ok(Self {
             root,
             drafts: Mutex::new(drafts),
             definitions: Mutex::new(definitions),
+            secret_values: Mutex::new(Vec::new()),
         })
     }
 
@@ -239,6 +243,44 @@ impl PromotionStore {
 
     fn definition_root(&self) -> PathBuf {
         self.root.join("definitions")
+    }
+
+    pub(super) fn quarantine_contaminated_evidence(&self, secrets: &[Vec<u8>]) -> bool {
+        extend_secret_values(&self.secret_values, secrets.iter().cloned());
+        let all_secrets = lock(&self.secret_values).clone();
+        let drafts = lock(&self.drafts).values().cloned().collect::<Vec<_>>();
+        let definitions = lock(&self.definitions)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut contaminated = false;
+        for state in drafts {
+            if confined_bundle_contains_protected_data(&state.anchor, &all_secrets).unwrap_or(true)
+            {
+                contaminated = true;
+                state.evidence_quarantined.store(true, Ordering::Release);
+                for cancel in lock(&state.validation_cancels).values() {
+                    cancel.cancel();
+                }
+                let id = lock(&state.detail).summary.id.clone();
+                if !quarantine_run_bundle(&state.anchor, &id) {
+                    let _ = remove_confined_run_entry(&state.anchor, Path::new("manifest.json"));
+                }
+                lock(&self.drafts).remove(&id);
+            }
+        }
+        for state in definitions {
+            if confined_bundle_contains_protected_data(&state.anchor, &all_secrets).unwrap_or(true)
+            {
+                contaminated = true;
+                let id = state.detail.summary.id.clone();
+                if !quarantine_run_bundle(&state.anchor, &id) {
+                    let _ = remove_confined_run_entry(&state.anchor, Path::new("manifest.json"));
+                }
+                lock(&self.definitions).remove(&id);
+            }
+        }
+        contaminated
     }
 }
 
@@ -466,6 +508,15 @@ impl RunController {
             &PathBuf::from("revisions").join(&revision_id).join("source"),
             &snapshot,
         )?;
+        let known_secrets = lock(&self.inner.promotion.secret_values);
+        if !known_secrets.is_empty()
+            && confined_bundle_contains_protected_data(&anchor, &known_secrets).unwrap_or(true)
+        {
+            let _ = quarantine_run_bundle(&anchor, &id);
+            return Err(RunError::EvidencePersistence(
+                PROTECTED_WORKSPACE_PATH_ERROR.to_owned(),
+            ));
+        }
         let (sender, _) = broadcast::channel(128);
         let state = Arc::new(PromotionDraftState {
             detail: Mutex::new(detail),
@@ -473,6 +524,7 @@ impl RunController {
             sender,
             event_commit: Mutex::new(()),
             validation_cancels: Mutex::new(HashMap::new()),
+            evidence_quarantined: AtomicBool::new(false),
         });
         persist_draft(&state)?;
         record_draft_event(
@@ -486,6 +538,7 @@ impl RunController {
             }),
         )?;
         lock(&self.inner.promotion.drafts).insert(id.clone(), state);
+        drop(known_secrets);
         record_event(
             &workspace,
             "workbench.evaluation-draft.created",
@@ -715,10 +768,11 @@ impl RunController {
         let state = self.promotion_draft_state(draft_id)?;
         let mut detail = lock(&state.detail);
         let previous_detail = detail.clone();
+        let mut next_detail = previous_detail.clone();
         let revision_id = request
             .revision_id
-            .unwrap_or_else(|| detail.summary.current_revision_id.clone());
-        let revision = detail
+            .unwrap_or_else(|| next_detail.summary.current_revision_id.clone());
+        let revision = next_detail
             .revisions
             .iter()
             .find(|revision| revision.id == revision_id)
@@ -728,15 +782,15 @@ impl RunController {
             })?;
         if let Some(name) = request.name {
             validate_display_name(&name)?;
-            detail.summary.name = name;
+            next_detail.summary.name = name;
         }
-        detail.summary.saved = true;
-        let passing = detail.validations.iter().any(|attempt| {
+        next_detail.summary.saved = true;
+        let passing = next_detail.validations.iter().any(|attempt| {
             attempt.revision_id == revision_id
                 && attempt.execution_status == EvaluationExecutionStatus::Complete
                 && attempt.assertion_status == ValidationAssertionStatus::Passed
         });
-        let mut pending_definition = None;
+        let mut publication = None;
         if passing {
             let existing = lock(&self.inner.promotion.definitions)
                 .values()
@@ -745,37 +799,44 @@ impl RunController {
                         && definition.detail.summary.revision_id == revision_id
                 })
                 .cloned();
-            let publication = prepare_definition_publication(
+            let prepared = prepare_definition_publication(
                 &state,
                 draft_id,
                 revision,
                 existing,
-                &detail.summary.name,
+                &next_detail.summary.name,
             )?;
-            let definition_id = publication.detail.summary.id.clone();
-            pending_definition = Some(publication);
-            detail.summary.definition_id = Some(definition_id);
-            "promoted".clone_into(&mut detail.summary.status);
+            let definition_id = prepared.detail.summary.id.clone();
+            publication = Some(begin_definition_publication(
+                &self.inner.promotion,
+                prepared,
+            )?);
+            next_detail.summary.definition_id = Some(definition_id);
+            "promoted".clone_into(&mut next_detail.summary.status);
         } else {
-            "saved-draft".clone_into(&mut detail.summary.status);
+            "saved-draft".clone_into(&mut next_detail.summary.status);
         }
-        detail.summary.updated_at_ms = now_ms();
-        if let Err(error) = persist_draft_detail(&state, &detail) {
-            *detail = previous_detail;
-            return Err(error);
+        next_detail.summary.updated_at_ms = now_ms();
+        if let Err(error) = persist_draft_detail(&state, &next_detail) {
+            return rollback_definition_after_draft_failure(
+                &self.inner.promotion,
+                publication,
+                error,
+            );
         }
-        if let Some(publication) = pending_definition
-            && let Err(error) = publish_definition(&self.inner.promotion, publication)
+        if let Some(publication) = publication
+            && let Err(error) = commit_definition_publication(&self.inner.promotion, &publication)
         {
-            let rollback = persist_draft_detail(&state, &previous_detail);
-            *detail = previous_detail;
-            return match rollback {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(RunError::EvidencePersistence(format!(
-                    "definition publication failed ({error}); draft rollback failed ({rollback_error})"
-                ))),
-            };
+            let draft_rollback = persist_draft_detail(&state, &previous_detail);
+            let definition_rollback =
+                rollback_definition_publication(&self.inner.promotion, publication);
+            return combine_publication_rollback_errors(
+                &error,
+                draft_rollback,
+                definition_rollback,
+            );
         }
+        *detail = next_detail;
         drop(detail);
         record_draft_event(
             &state,
@@ -1061,10 +1122,16 @@ impl RunController {
     }
 
     fn promotion_draft_state(&self, id: &str) -> Result<Arc<PromotionDraftState>, RunError> {
-        lock(&self.inner.promotion.drafts)
+        let state = lock(&self.inner.promotion.drafts)
             .get(id)
             .cloned()
-            .ok_or_else(|| RunError::InvalidRequest(format!("unknown evaluation draft: {id}")))
+            .ok_or_else(|| RunError::InvalidRequest(format!("unknown evaluation draft: {id}")))?;
+        if state.evidence_quarantined.load(Ordering::Acquire) {
+            return Err(RunError::InvalidRequest(format!(
+                "unknown evaluation draft: {id}"
+            )));
+        }
+        Ok(state)
     }
 
     #[cfg(test)]
@@ -1083,6 +1150,43 @@ impl RunController {
             serde_json::to_value(validation)?,
         )?;
         write_confined_run_json_atomic(&state.anchor, Path::new("manifest.json"), &stale_manifest)
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_definition_publication_after_draft_commit_for_recovery_test(
+        &self,
+        draft_id: &str,
+        revision_id: &str,
+        name: &str,
+    ) -> Result<String, RunError> {
+        let state = self.promotion_draft_state(draft_id)?;
+        let detail = lock(&state.detail).clone();
+        let revision = detail
+            .revisions
+            .iter()
+            .find(|revision| revision.id == revision_id)
+            .cloned()
+            .ok_or_else(|| {
+                RunError::InvalidRequest(format!("unknown evaluation revision: {revision_id}"))
+            })?;
+        let existing = lock(&self.inner.promotion.definitions)
+            .values()
+            .find(|definition| {
+                definition.detail.summary.draft_id == draft_id
+                    && definition.detail.summary.revision_id == revision_id
+            })
+            .cloned();
+        let prepared = prepare_definition_publication(&state, draft_id, revision, existing, name)?;
+        let definition_id = prepared.detail.summary.id.clone();
+        let _publication = begin_definition_publication(&self.inner.promotion, prepared)?;
+        let mut committed_draft = detail;
+        committed_draft.summary.name = name.to_owned();
+        committed_draft.summary.saved = true;
+        committed_draft.summary.status = "promoted".to_owned();
+        committed_draft.summary.definition_id = Some(definition_id.clone());
+        committed_draft.summary.updated_at_ms = now_ms();
+        persist_draft_detail(&state, &committed_draft)?;
+        Ok(definition_id)
     }
 
     async fn execute_evaluation_validation(
@@ -1459,6 +1563,12 @@ fn persist_draft_detail(
     state: &PromotionDraftState,
     detail: &EvaluationDraftDetail,
 ) -> Result<(), RunError> {
+    if state.evidence_quarantined.load(Ordering::Acquire) {
+        return Err(RunError::InvalidRequest(format!(
+            "unknown evaluation draft: {}",
+            detail.summary.id
+        )));
+    }
     write_confined_run_json_atomic(
         &state.anchor,
         Path::new("manifest.json"),
@@ -1468,8 +1578,24 @@ fn persist_draft_detail(
 
 struct PendingDefinitionPublication {
     detail: EvaluationDefinitionDetail,
-    existing_anchor: Option<Arc<AgentSessionDirectoryAnchor>>,
+    existing: Option<Arc<PromotionDefinitionState>>,
     source: Option<CapturedTree>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DefinitionPublicationTransaction {
+    definition_id: String,
+    draft_id: String,
+    revision_id: String,
+    committed: bool,
+    previous_detail: Option<EvaluationDefinitionDetail>,
+}
+
+struct BegunDefinitionPublication {
+    detail: EvaluationDefinitionDetail,
+    anchor: Arc<AgentSessionDirectoryAnchor>,
+    transaction: DefinitionPublicationTransaction,
 }
 
 fn prepare_definition_publication(
@@ -1484,7 +1610,7 @@ fn prepare_definition_publication(
         name.clone_into(&mut detail.summary.name);
         return Ok(PendingDefinitionPublication {
             detail,
-            existing_anchor: Some(existing.anchor.clone()),
+            existing: Some(existing),
             source: None,
         });
     }
@@ -1504,18 +1630,22 @@ fn prepare_definition_publication(
             },
             revision,
         },
-        existing_anchor: None,
+        existing: None,
         source: Some(source),
     })
 }
 
-fn publish_definition(
+fn begin_definition_publication(
     store: &PromotionStore,
     publication: PendingDefinitionPublication,
-) -> Result<(), RunError> {
+) -> Result<BegunDefinitionPublication, RunError> {
     let definition_id = publication.detail.summary.id.clone();
-    let anchor = if let Some(anchor) = publication.existing_anchor {
-        anchor
+    let previous_detail = publication
+        .existing
+        .as_ref()
+        .map(|existing| existing.detail.clone());
+    let anchor = if let Some(existing) = publication.existing {
+        existing.anchor.clone()
     } else {
         let directory = confined_child(&store.definition_root(), &definition_id)?;
         fs::create_dir(&directory)?;
@@ -1531,19 +1661,126 @@ fn publish_definition(
         )?;
         anchor
     };
+    let secrets = lock(&store.secret_values).clone();
+    if !secrets.is_empty()
+        && confined_bundle_contains_protected_data(&anchor, &secrets).unwrap_or(true)
+    {
+        let _ = quarantine_run_bundle(&anchor, &definition_id);
+        return Err(RunError::EvidencePersistence(
+            PROTECTED_WORKSPACE_PATH_ERROR.to_owned(),
+        ));
+    }
+    let transaction = DefinitionPublicationTransaction {
+        definition_id,
+        draft_id: publication.detail.summary.draft_id.clone(),
+        revision_id: publication.detail.summary.revision_id.clone(),
+        committed: false,
+        previous_detail,
+    };
+    write_confined_run_json_atomic(
+        &anchor,
+        Path::new(DEFINITION_PUBLICATION_TRANSACTION),
+        &serde_json::to_value(&transaction)?,
+    )?;
     write_confined_run_json_atomic(
         &anchor,
         Path::new("manifest.json"),
         &serde_json::to_value(&publication.detail)?,
     )?;
+    Ok(BegunDefinitionPublication {
+        detail: publication.detail,
+        anchor,
+        transaction,
+    })
+}
+
+fn commit_definition_publication(
+    store: &PromotionStore,
+    publication: &BegunDefinitionPublication,
+) -> Result<(), RunError> {
+    let known_secrets = lock(&store.secret_values);
+    if !known_secrets.is_empty()
+        && confined_bundle_contains_protected_data(&publication.anchor, &known_secrets)
+            .unwrap_or(true)
+    {
+        return Err(RunError::EvidencePersistence(
+            PROTECTED_WORKSPACE_PATH_ERROR.to_owned(),
+        ));
+    }
+    let mut transaction = publication.transaction.clone();
+    transaction.committed = true;
+    write_confined_run_json_atomic(
+        &publication.anchor,
+        Path::new(DEFINITION_PUBLICATION_TRANSACTION),
+        &serde_json::to_value(&transaction)?,
+    )?;
+    let _ = remove_confined_run_entry(
+        &publication.anchor,
+        Path::new(DEFINITION_PUBLICATION_TRANSACTION),
+    );
     lock(&store.definitions).insert(
-        definition_id.clone(),
+        publication.detail.summary.id.clone(),
         Arc::new(PromotionDefinitionState {
-            detail: publication.detail,
-            anchor,
+            detail: publication.detail.clone(),
+            anchor: publication.anchor.clone(),
         }),
     );
+    drop(known_secrets);
     Ok(())
+}
+
+fn rollback_definition_publication(
+    store: &PromotionStore,
+    publication: BegunDefinitionPublication,
+) -> Result<(), RunError> {
+    if let Some(previous_detail) = publication.transaction.previous_detail {
+        write_confined_run_json_atomic(
+            &publication.anchor,
+            Path::new("manifest.json"),
+            &serde_json::to_value(&previous_detail)?,
+        )?;
+        remove_confined_run_entry(
+            &publication.anchor,
+            Path::new(DEFINITION_PUBLICATION_TRANSACTION),
+        )?;
+    } else {
+        lock(&store.definitions).remove(&publication.detail.summary.id);
+        if !quarantine_run_bundle(&publication.anchor, &publication.detail.summary.id) {
+            let _ = remove_confined_run_entry(&publication.anchor, Path::new("manifest.json"));
+        }
+    }
+    Ok(())
+}
+
+fn rollback_definition_after_draft_failure(
+    store: &PromotionStore,
+    publication: Option<BegunDefinitionPublication>,
+    error: RunError,
+) -> Result<EvaluationDraftDetail, RunError> {
+    let Some(publication) = publication else {
+        return Err(error);
+    };
+    match rollback_definition_publication(store, publication) {
+        Ok(()) => Err(error),
+        Err(rollback) => Err(RunError::EvidencePersistence(format!(
+            "{error}; definition rollback also failed: {rollback}"
+        ))),
+    }
+}
+
+fn combine_publication_rollback_errors(
+    error: &RunError,
+    draft_rollback: Result<(), RunError>,
+    definition_rollback: Result<(), RunError>,
+) -> Result<EvaluationDraftDetail, RunError> {
+    let mut failures = vec![error.to_string()];
+    if let Err(error) = draft_rollback {
+        failures.push(format!("draft rollback failed: {error}"));
+    }
+    if let Err(error) = definition_rollback {
+        failures.push(format!("definition rollback failed: {error}"));
+    }
+    Err(RunError::EvidencePersistence(failures.join("; ")))
 }
 
 fn record_draft_event(
@@ -1551,6 +1788,12 @@ fn record_draft_event(
     kind: &str,
     payload: JsonValue,
 ) -> Result<(), RunError> {
+    if state.evidence_quarantined.load(Ordering::Acquire) {
+        return Err(RunError::InvalidRequest(format!(
+            "unknown evaluation draft: {}",
+            lock(&state.detail).summary.id
+        )));
+    }
     let _commit = lock(&state.event_commit);
     let event = {
         let mut detail = lock(&state.detail);
@@ -1645,6 +1888,11 @@ fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>,
                 continue;
             }
         };
+        if confined_run_quarantine_marker_exists(&anchor).unwrap_or(true)
+            || confined_external_quarantine_tombstone_exists(&anchor).unwrap_or(true)
+        {
+            continue;
+        }
         let Some(manifest) = read_optional_confined_run_file(&anchor, Path::new("manifest.json"))?
         else {
             continue;
@@ -1700,6 +1948,7 @@ fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>,
             sender,
             event_commit: Mutex::new(()),
             validation_cancels: Mutex::new(HashMap::new()),
+            evidence_quarantined: AtomicBool::new(false),
         });
         if recovered_validations.is_empty() {
             persist_draft(&state)?;
@@ -1720,6 +1969,7 @@ fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>,
 
 fn load_definitions(
     root: &Path,
+    drafts: &HashMap<String, Arc<PromotionDraftState>>,
 ) -> Result<HashMap<String, Arc<PromotionDefinitionState>>, RunError> {
     let mut definitions = HashMap::new();
     for entry in fs::read_dir(root)? {
@@ -1736,17 +1986,67 @@ fn load_definitions(
                 continue;
             }
         };
+        if confined_run_quarantine_marker_exists(&anchor).unwrap_or(true)
+            || confined_external_quarantine_tombstone_exists(&anchor).unwrap_or(true)
+        {
+            continue;
+        }
+        let transaction = match read_optional_confined_run_file(
+            &anchor,
+            Path::new(DEFINITION_PUBLICATION_TRANSACTION),
+        )? {
+            Some(bytes) => match serde_json::from_slice::<DefinitionPublicationTransaction>(&bytes)
+            {
+                Ok(transaction) => Some(transaction),
+                Err(error) => {
+                    tracing::warn!(
+                        bundle = %entry.path().display(),
+                        %error,
+                        "quarantining definition with malformed publication transaction"
+                    );
+                    let _ = quarantine_run_bundle(&anchor, &entry.file_name().to_string_lossy());
+                    continue;
+                }
+            },
+            None => None,
+        };
         let Some(manifest) = read_optional_confined_run_file(&anchor, Path::new("manifest.json"))?
         else {
             continue;
         };
-        let detail: EvaluationDefinitionDetail = match serde_json::from_slice(&manifest) {
+        let mut detail: EvaluationDefinitionDetail = match serde_json::from_slice(&manifest) {
             Ok(detail) => detail,
             Err(error) => {
                 tracing::warn!(bundle = %entry.path().display(), %error, "skipping malformed evaluation definition");
                 continue;
             }
         };
+        if let Some(transaction) = transaction {
+            let draft_committed = drafts
+                .get(&transaction.draft_id)
+                .map(|draft| lock(&draft.detail).summary.clone())
+                .is_some_and(|draft| {
+                    draft.definition_id.as_deref() == Some(&transaction.definition_id)
+                        && draft.current_revision_id == transaction.revision_id
+                });
+            if transaction.committed || draft_committed {
+                let _ = remove_confined_run_entry(
+                    &anchor,
+                    Path::new(DEFINITION_PUBLICATION_TRANSACTION),
+                );
+            } else if let Some(previous_detail) = transaction.previous_detail {
+                detail = previous_detail;
+                write_confined_run_json_atomic(
+                    &anchor,
+                    Path::new("manifest.json"),
+                    &serde_json::to_value(&detail)?,
+                )?;
+                remove_confined_run_entry(&anchor, Path::new(DEFINITION_PUBLICATION_TRANSACTION))?;
+            } else {
+                let _ = quarantine_run_bundle(&anchor, &entry.file_name().to_string_lossy());
+                continue;
+            }
+        }
         let source_is_valid = capture_confined_run_tree(&anchor, Path::new("source"))
             .and_then(|snapshot| {
                 verify_captured_source_revision(

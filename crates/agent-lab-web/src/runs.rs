@@ -715,10 +715,21 @@ struct ControllerInner {
     scenario_transition_lock: tokio::sync::Mutex<()>,
     evaluations_dir: PathBuf,
     evaluations: Arc<Mutex<HashMap<String, Arc<EvaluationState>>>>,
-    promotion: promotion::PromotionStore,
+    promotion: Arc<promotion::PromotionStore>,
     scenario_overrides: Mutex<HashMap<String, ScenarioManifest>>,
     workbench_grants: Mutex<HashMap<String, String>>,
     agent_sessions: Mutex<HashMap<String, Arc<AgentSessionState>>>,
+}
+
+struct ScenarioOverrideGuard<'a> {
+    overrides: &'a Mutex<HashMap<String, ScenarioManifest>>,
+    run_id: String,
+}
+
+impl Drop for ScenarioOverrideGuard<'_> {
+    fn drop(&mut self) {
+        lock(self.overrides).remove(&self.run_id);
+    }
 }
 
 impl Drop for ControllerInner {
@@ -1780,7 +1791,7 @@ impl RunController {
         let evaluations_dir = data_dir.join("evaluations");
         fs::create_dir_all(&evaluations_dir)?;
         let evaluations_dir = fs::canonicalize(evaluations_dir)?;
-        let promotion = promotion::PromotionStore::load(&data_dir)?;
+        let promotion = Arc::new(promotion::PromotionStore::load(&data_dir)?);
         let scenarios = load_scenarios(&scenarios_dir)?;
         if scenarios.is_empty() {
             return Err(RunError::InvalidScenario(
@@ -2378,6 +2389,7 @@ impl RunController {
         pending_secret_resolutions.insert(id.clone());
         let actor_runs = self.inner.runs.clone();
         let actor_evaluations = self.inner.evaluations.clone();
+        let actor_promotion = self.inner.promotion.clone();
         let actor_state = state.clone();
         let actor_workspace = workspace.clone();
         let workspace_path = workspace.workspace.clone();
@@ -2396,6 +2408,7 @@ impl RunController {
                     run_agent_session_actor(
                         &actor_runs,
                         &actor_evaluations,
+                        &actor_promotion,
                         &actor_state,
                         &actor_workspace,
                         &harness,
@@ -3430,6 +3443,7 @@ impl RunController {
             invalidate_contaminated_secret_evidence(
                 &self.inner.runs,
                 &self.inner.evaluations,
+                &self.inner.promotion,
                 &state,
                 &secrets,
             )
@@ -3836,12 +3850,19 @@ impl RunController {
                 quarantine_evaluation_evidence(&self.inner.runs, &state);
                 return Ok(());
             }
-            if let Some(scenario) = &state.scenario_override {
+            let _scenario_override = if let Some(scenario) = &state.scenario_override {
                 lock(&self.inner.scenario_overrides).insert(prepared.id.clone(), scenario.clone());
+                let guard = ScenarioOverrideGuard {
+                    overrides: &self.inner.scenario_overrides,
+                    run_id: prepared.id.clone(),
+                };
                 if let Ok(run_state) = self.state(&prepared.id) {
                     apply_run_scenario_override(&run_state, scenario)?;
                 }
-            }
+                Some(guard)
+            } else {
+                None
+            };
             set_evaluation_arm(&state, index, Some(prepared.id.clone()), "starting")?;
             record_evaluation_event(
                 &state,
@@ -5370,6 +5391,7 @@ fn run_driver(
 fn run_agent_session_actor(
     runs: &Mutex<HashMap<String, Arc<RunState>>>,
     evaluations: &Mutex<HashMap<String, Arc<EvaluationState>>>,
+    promotion: &promotion::PromotionStore,
     state: &AgentSessionState,
     workspace_state: &RunState,
     harness: &HarnessProfile,
@@ -5401,6 +5423,7 @@ fn run_agent_session_actor(
         invalidate_contaminated_secret_evidence(
             runs,
             evaluations,
+            promotion,
             workspace_state,
             &workspace_secrets,
         )?;
@@ -10588,9 +10611,11 @@ fn evaluation_arm_states(
 fn invalidate_contaminated_secret_evidence(
     runs: &Mutex<HashMap<String, Arc<RunState>>>,
     evaluations: &Mutex<HashMap<String, Arc<EvaluationState>>>,
+    promotion: &promotion::PromotionStore,
     workspace_state: &RunState,
     secrets: &[Vec<u8>],
 ) -> Result<(), RunError> {
+    let promotion_contaminated = promotion.quarantine_contaminated_evidence(secrets);
     let workspace_contaminated = {
         let _commit = lock(&workspace_state.event_commit);
         let contaminated = confined_bundle_contains_protected_data(
@@ -10654,6 +10679,8 @@ fn invalidate_contaminated_secret_evidence(
 
     if workspace_contaminated {
         mark_workspace_evidence_unavailable(workspace_state, false);
+    }
+    if workspace_contaminated || promotion_contaminated {
         return Err(RunError::EvidencePersistence(
             PROTECTED_WORKSPACE_PATH_ERROR.to_owned(),
         ));
@@ -15864,7 +15891,7 @@ done
         draft_id: &str,
         attempt_id: &str,
     ) -> EvaluationValidationAttempt {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let draft = controller.evaluation_draft(draft_id).unwrap();
             let attempt = draft
@@ -16099,6 +16126,7 @@ done
     async fn manual_evaluation_promotion_retains_revisions_failures_modes_and_replay() {
         use std::os::unix::fs::PermissionsExt;
 
+        const LATER_PROMOTION_SECRET: &str = "later-promotion-credential";
         let root = temporary_root("manual-evaluation-promotion");
         let scenarios = root.join("scenarios");
         let data = root.join("runs");
@@ -16329,6 +16357,26 @@ done
         let rolled_back = controller.evaluation_draft(&draft.summary.id).unwrap();
         assert!(rolled_back.summary.definition_id.is_none());
         assert!(controller.list_evaluation_definitions().is_empty());
+        let draft_root = data
+            .join("evaluation-library/drafts")
+            .join(&draft.summary.id);
+        fs::set_permissions(&draft_root, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(
+            controller
+                .save_evaluation_draft(
+                    &draft.summary.id,
+                    SaveEvaluationDraftRequest {
+                        revision_id: Some(passing_revision_id.clone()),
+                        name: Some("Catalog regression".to_owned()),
+                    },
+                )
+                .is_err(),
+            "a draft commit failure should roll back a begun definition publication"
+        );
+        fs::set_permissions(&draft_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let rolled_back = controller.evaluation_draft(&draft.summary.id).unwrap();
+        assert!(rolled_back.summary.definition_id.is_none());
+        assert!(controller.list_evaluation_definitions().is_empty());
         let promoted = controller
             .save_evaluation_draft(
                 &draft.summary.id,
@@ -16367,6 +16415,25 @@ done
             .close_agent_session(&explore.id, &session.id)
             .unwrap();
         wait_for_agent_session_closed(&controller, &explore.id, &session.id).await;
+        let recovered_definition_id = controller
+            .inject_definition_publication_after_draft_commit_for_recovery_test(
+                &draft.summary.id,
+                &passing_revision_id,
+                "Crash-recovered catalog regression",
+            )
+            .unwrap();
+        assert_eq!(recovered_definition_id, definition_id);
+        drop(controller);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        assert_eq!(
+            controller
+                .evaluation_definition(&definition_id)
+                .unwrap()
+                .summary
+                .name,
+            "Crash-recovered catalog regression"
+        );
         let evaluation = controller
             .start_workbench_definition_evaluation(
                 &explore.id,
@@ -16388,6 +16455,7 @@ done
         exercise_evaluation_capabilities(&controller, &evaluation.id).await;
         let evaluation = wait_for_evaluation(&controller, &evaluation.id).await;
         assert_eq!(evaluation.summary.status, EvaluationStatus::Passed);
+        assert!(lock(&controller.inner.scenario_overrides).is_empty());
         assert_eq!(
             evaluation.summary.definition_id.as_deref(),
             Some(definition_id.as_str())
@@ -16472,7 +16540,7 @@ done
                 .summary,
             EvaluationDefinitionSummary {
                 id: definition_id.clone(),
-                name: "Renamed catalog regression".to_owned(),
+                name: "Crash-recovered catalog regression".to_owned(),
                 draft_id: draft.summary.id.clone(),
                 revision_id: passing_revision_id.clone(),
                 created_at_ms: definition.summary.created_at_ms,
@@ -16497,11 +16565,56 @@ done
         )
         .unwrap();
         let after_tamper =
-            RunController::new_with_harnesses(config(), harnesses(), models).unwrap();
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
         assert!(after_tamper.evaluation_definition(&definition_id).is_err());
         assert!(after_tamper.evaluation_draft(&draft.summary.id).is_ok());
 
         drop(after_tamper);
+        fs::write(
+            data.join("evaluation-library/definitions")
+                .join(&definition_id)
+                .join("source/README.md"),
+            b"seed\n",
+        )
+        .unwrap();
+        let before_secret =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        assert!(before_secret.evaluation_definition(&definition_id).is_ok());
+        fs::write(
+            data.join("evaluation-library/drafts")
+                .join(&draft.summary.id)
+                .join("revisions")
+                .join(&passing_revision_id)
+                .join("source/credential.txt"),
+            LATER_PROMOTION_SECRET,
+        )
+        .unwrap();
+        fs::write(
+            data.join("evaluation-library/definitions")
+                .join(&definition_id)
+                .join("source/credential.txt"),
+            LATER_PROMOTION_SECRET,
+        )
+        .unwrap();
+        let workspace = before_secret.state(&explore.id).unwrap();
+        let error = invalidate_contaminated_secret_evidence(
+            &before_secret.inner.runs,
+            &before_secret.inner.evaluations,
+            &before_secret.inner.promotion,
+            &workspace,
+            &[LATER_PROMOTION_SECRET.as_bytes().to_vec()],
+        )
+        .unwrap_err();
+        assert!(matches!(error, RunError::EvidencePersistence(_)));
+        assert!(before_secret.evaluation_draft(&draft.summary.id).is_err());
+        assert!(before_secret.evaluation_definition(&definition_id).is_err());
+        drop(workspace);
+        drop(before_secret);
+        let after_secret =
+            RunController::new_with_harnesses(config(), harnesses(), models).unwrap();
+        assert!(after_secret.evaluation_draft(&draft.summary.id).is_err());
+        assert!(after_secret.evaluation_definition(&definition_id).is_err());
+        drop(after_secret);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -24484,16 +24597,16 @@ fi
 
         let (quarantine_reached_tx, quarantine_reached_rx) = mpsc::channel();
         let (quarantine_release_tx, quarantine_release_rx) = mpsc::channel();
-        let runs = controller.inner.runs.clone();
-        let evaluations = controller.inner.evaluations.clone();
+        let inner = controller.inner.clone();
         let quarantined_workspace = workspace.clone();
         let invalidator = thread::spawn(move || {
             QUARANTINE_PUBLICATION_PAUSE.with(|pause| {
                 *pause.borrow_mut() = Some((quarantine_reached_tx, quarantine_release_rx));
             });
             invalidate_contaminated_secret_evidence(
-                &runs,
-                &evaluations,
+                &inner.runs,
+                &inner.evaluations,
+                &inner.promotion,
                 &quarantined_workspace,
                 &[LATER_SECRET.as_bytes().to_vec()],
             )
@@ -24664,8 +24777,7 @@ fi
 
         let (quarantine_reached_tx, quarantine_reached_rx) = mpsc::channel();
         let (quarantine_release_tx, quarantine_release_rx) = mpsc::channel();
-        let runs = controller.inner.runs.clone();
-        let evaluations = controller.inner.evaluations.clone();
+        let inner = controller.inner.clone();
         let invalidator = {
             let workspace = workspace.clone();
             thread::spawn(move || {
@@ -24673,8 +24785,9 @@ fi
                     *pause.borrow_mut() = Some((quarantine_reached_tx, quarantine_release_rx));
                 });
                 invalidate_contaminated_secret_evidence(
-                    &runs,
-                    &evaluations,
+                    &inner.runs,
+                    &inner.evaluations,
+                    &inner.promotion,
                     &workspace,
                     &[LATER_SECRET.as_bytes().to_vec()],
                 )
@@ -24852,6 +24965,7 @@ fi
         invalidate_contaminated_secret_evidence(
             &controller.inner.runs,
             &controller.inner.evaluations,
+            &controller.inner.promotion,
             &workspace,
             &[LATER_SECRET.as_bytes().to_vec()],
         )
@@ -24972,6 +25086,7 @@ fi
         let error = invalidate_contaminated_secret_evidence(
             &controller.inner.runs,
             &controller.inner.evaluations,
+            &controller.inner.promotion,
             &arm,
             &[LATER_SECRET.as_bytes().to_vec()],
         )

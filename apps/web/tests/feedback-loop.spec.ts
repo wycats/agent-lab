@@ -3437,7 +3437,7 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
     staleDraftRequested = resolve;
   });
   await page.route(
-    new RegExp(`/api/workbench/[^/]+/evaluation-drafts/${otherDraftId}$`),
+    new RegExp(`/api/evaluation-drafts/${otherDraftId}$`),
     async (route) => {
       const response = await route.fetch();
       staleDraftRequested?.();
@@ -3457,6 +3457,8 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
 
   const expectedNames = page.getByLabel('Expected active names');
   await expectedNames.fill('not-the-catalog');
+  await expect(page.getByRole('button', { name: 'Validate revision' })).toBeDisabled();
+  await expect(draft).toContainText('Create a revision to make these edits');
   await page.getByRole('button', { name: 'Create revision' }).click();
   await expect(draft.locator('.revision-list li')).toHaveCount(2);
   await page.getByRole('button', { name: 'Validate revision' }).click();

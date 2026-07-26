@@ -288,6 +288,51 @@ test('successful accepted responses preserve their JSON resource', async () => {
   }
 });
 
+test('evaluation library reads remain global when the active workspace changes', async () => {
+  const nativeFetch = globalThis.fetch;
+  const requested: string[] = [];
+
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url,
+      'http://127.0.0.1'
+    );
+    if (url.pathname === '/api/session-token') {
+      return Response.json({ token: 'test-token' });
+    }
+    requested.push(url.pathname);
+    if (url.pathname === '/api/evaluation-drafts') return Response.json([]);
+    if (url.pathname === '/api/evaluation-drafts/draft-1') {
+      return Response.json({ summary: { id: 'draft-1' } });
+    }
+    if (url.pathname === '/api/evaluation-definitions') return Response.json([]);
+    if (url.pathname === '/api/evaluation-definitions/definition-1') {
+      return Response.json({ summary: { id: 'definition-1' } });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  try {
+    const client = createRunClient();
+    await client.evaluationDrafts('alternate-workspace');
+    await client.evaluationDraft('alternate-workspace', 'draft-1');
+    await client.evaluationDefinitions('alternate-workspace');
+    await client.evaluationDefinition('alternate-workspace', 'definition-1');
+    expect(requested).toEqual([
+      '/api/evaluation-drafts',
+      '/api/evaluation-drafts/draft-1',
+      '/api/evaluation-definitions',
+      '/api/evaluation-definitions/definition-1'
+    ]);
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
 test('a healthy server epoch change does not replay already reconciled workbench side effects', async () => {
   const nativeFetch = globalThis.fetch;
   const prepared = {

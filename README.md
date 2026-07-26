@@ -143,7 +143,7 @@ starting state:
 ```nu
 let draft = (lab evaluation new --from <turn-id> --through <turn-id>)
 lab evaluation draft $draft.id
-lab evaluation validate $draft.id
+let validation = ($draft | lab evaluation validate)
 let saved = (lab evaluation save $draft.id --name "Catalog result")
 lab evaluation run $saved.definitionId v0 eve --model haiku-4-5
 ```

@@ -95,6 +95,7 @@
   let draftEventStream: AbortController | undefined;
   let draftRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let loadedWorkbenchId: string | undefined;
+  let draftOpenVersion = 0;
   let agentSessionEventStream: AbortController | undefined;
   let agentSessionEventFlushTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingAgentSessionEvents: RunEvent[] = [];
@@ -183,6 +184,9 @@
         (revision) => revision.id === selectedDraft?.summary.currentRevisionId
       )
     : undefined;
+  $: manualDraftAuthoringPending = selectedDraftRevision?.blockingIssues.some((issue) =>
+    issue.includes('review and confirm the suggested task')
+  ) ?? false;
   $: selectedDraftValidation = selectedDraftRevision && selectedDraft
     ? [...selectedDraft.validations]
         .reverse()
@@ -911,6 +915,7 @@
   }
 
   function clearEvaluationDraftSelection(): void {
+    draftOpenVersion += 1;
     draftEventStream?.abort();
     draftEventStream = undefined;
     if (draftRefreshTimer !== undefined) {
@@ -921,15 +926,19 @@
     selectedDefinition = undefined;
   }
 
-  function watchEvaluationDraft(workspaceId: string, draftId: string): void {
+  function watchEvaluationDraft(
+    workspaceId: string,
+    draftId: string,
+    openVersion = draftOpenVersion
+  ): void {
     draftEventStream?.abort();
     if (draftRefreshTimer !== undefined) clearTimeout(draftRefreshTimer);
     draftEventStream = runClient.evaluationDraftEvents(workspaceId, draftId, () => {
-      if (workspaceId !== loadedWorkbenchId) return;
+      if (workspaceId !== loadedWorkbenchId || openVersion !== draftOpenVersion) return;
       if (draftRefreshTimer !== undefined) clearTimeout(draftRefreshTimer);
       draftRefreshTimer = setTimeout(() => {
         draftRefreshTimer = undefined;
-        void refreshEvaluationDraft(workspaceId, draftId);
+        void refreshEvaluationDraft(workspaceId, draftId, false, openVersion);
       }, 50);
     });
   }
@@ -937,11 +946,14 @@
   async function refreshEvaluationDraft(
     workspaceId: string,
     draftId: string,
-    hydrate = false
+    hydrate = false,
+    openVersion = draftOpenVersion
   ): Promise<EvaluationDraftDetail | undefined> {
     try {
       const draft = await runClient.evaluationDraft(workspaceId, draftId);
-      if (workspaceId !== loadedWorkbenchId) return undefined;
+      if (workspaceId !== loadedWorkbenchId || openVersion !== draftOpenVersion) {
+        return undefined;
+      }
       selectedDraft = draft;
       hydrateDraftForm(draft, hydrate);
       await loadEvaluationLibrary(workspaceId);
@@ -963,10 +975,11 @@
     draftId: string,
     reveal = true
   ): Promise<void> {
-    const draft = await refreshEvaluationDraft(workspaceId, draftId, true);
+    const openVersion = ++draftOpenVersion;
+    const draft = await refreshEvaluationDraft(workspaceId, draftId, true, openVersion);
     if (!draft) return;
     if (reveal) activeTab = 'draft';
-    watchEvaluationDraft(workspaceId, draftId);
+    watchEvaluationDraft(workspaceId, draftId, openVersion);
   }
 
   async function openEvaluationDefinition(
@@ -1000,11 +1013,12 @@
           throughTurnId: turn.id
         }
       );
+      const openVersion = ++draftOpenVersion;
       selectedDraft = draft;
       hydrateDraftForm(draft, true);
       await loadEvaluationLibrary(agentSession.summary.workspaceId);
       activeTab = 'draft';
-      watchEvaluationDraft(agentSession.summary.workspaceId, draft.summary.id);
+      watchEvaluationDraft(agentSession.summary.workspaceId, draft.summary.id, openVersion);
     } catch (error) {
       actionError = message(error);
     } finally {
@@ -2580,7 +2594,7 @@
 
               {#if selectedDraftRevision.blockingIssues.length}
                 <div class="draft-blockers" role="status">
-                  <strong>This draft needs a narrower source span</strong>
+                  <strong>This draft is incomplete</strong>
                   <ul>
                     {#each selectedDraftRevision.blockingIssues as issue}<li>{issue}</li>{/each}
                   </ul>
@@ -2588,6 +2602,11 @@
               {/if}
 
               <form class="draft-form" on:submit|preventDefault={() => void createDraftRevision()}>
+                {#if manualDraftAuthoringPending}
+                  <p class="draft-suggestion wide">
+                    The selected turn and scenario supplied these starting suggestions. Review or edit them, then create a revision to confirm the evaluation you want to run.
+                  </p>
+                {/if}
                 <label class="wide">
                   <span>Name</span>
                   <input bind:value={draftName} autocomplete="off" />
@@ -2940,6 +2959,7 @@
             {#each evaluationDrafts as draft}
               <button
                 class:selected={selectedDraft?.summary.id === draft.id}
+                data-draft-id={draft.id}
                 on:click={() => void openEvaluationDraft(draft.workspaceId, draft.id)}
               >
                 <span class="history-status" data-status={draft.status}></span>

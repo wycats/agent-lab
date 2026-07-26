@@ -3411,6 +3411,49 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   await expect(draft).toContainText('Owned by revision');
   await expect(draft).toContainText('catalog-v2');
   await expect(draft).toContainText('analysis-v1');
+  await expect(draft).toContainText('starting suggestions');
+  await expect(page.getByRole('button', { name: 'Validate revision' })).toBeDisabled();
+
+  const draftButtons = page.locator('.draft-history .history-list button[data-draft-id]');
+  const selectedDraftButton = page.locator(
+    '.draft-history .history-list button.selected[data-draft-id]'
+  );
+  const selectedDraftId = await selectedDraftButton.getAttribute('data-draft-id');
+  if (!selectedDraftId) throw new Error('selected draft identity is unavailable');
+  const draftIds = await draftButtons.evaluateAll((buttons) =>
+    buttons.map((button) => button.getAttribute('data-draft-id'))
+  );
+  const otherDraftId = draftIds.find((id) => id !== selectedDraftId);
+  if (!otherDraftId) throw new Error('second draft identity is unavailable');
+  const otherDraftButton = page.locator(
+    `.draft-history .history-list button[data-draft-id="${otherDraftId}"]`
+  );
+  let releaseStaleDraft: (() => void) | undefined;
+  let staleDraftRequested: (() => void) | undefined;
+  const staleDraftGate = new Promise<void>((resolve) => {
+    releaseStaleDraft = resolve;
+  });
+  const staleDraftSeen = new Promise<void>((resolve) => {
+    staleDraftRequested = resolve;
+  });
+  await page.route(
+    new RegExp(`/api/workbench/[^/]+/evaluation-drafts/${otherDraftId}$`),
+    async (route) => {
+      const response = await route.fetch();
+      staleDraftRequested?.();
+      await staleDraftGate;
+      await route.fulfill({ response });
+    }
+  );
+  const staleOpen = otherDraftButton.click();
+  await staleDraftSeen;
+  await selectedDraftButton.click();
+  releaseStaleDraft?.();
+  await staleOpen;
+  await expect(
+    page.locator(`.draft-history button[data-draft-id="${selectedDraftId}"]`)
+  ).toHaveClass(/selected/);
+  await page.unrouteAll({ behavior: 'wait' });
 
   const expectedNames = page.getByLabel('Expected active names');
   await expectedNames.fill('not-the-catalog');

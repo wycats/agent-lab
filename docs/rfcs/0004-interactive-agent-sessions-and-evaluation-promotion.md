@@ -463,7 +463,11 @@ bound one contiguous span. When they are omitted, the proposal agent may
 suggest the span. `new` always requires both bounds and constructs an incomplete,
 editable draft directly from that evidence span without starting a
 `ProposalSession`. It fills the captured state, capability, and provenance
-fields, while leaving task, assertion, and measurement authoring to the builder.
+fields. The selected turn prompt and scenario may seed explicitly labelled
+task, assertion, and measurement suggestions, but the draft remains incomplete
+until the builder confirms or edits those fields by creating a revision.
+That confirmation, rather than the presence of suggested values, is what makes
+the manual draft eligible for validation.
 
 `propose` returns the full draft record as structured data. `validate` and
 `save` require exactly one draft source: either the positional draft identity

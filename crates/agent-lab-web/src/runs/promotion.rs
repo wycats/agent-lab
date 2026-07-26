@@ -7,6 +7,8 @@ use super::*;
 const PROMOTION_SCHEMA_VERSION: u32 = 1;
 const CATALOG_EVALUATOR_ID: &str = "catalog-to-file";
 const CATALOG_EVALUATOR_VERSION: u32 = 1;
+const MANUAL_AUTHORING_BLOCKER: &str =
+    "review and confirm the suggested task, assertions, and measurements";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -383,6 +385,7 @@ impl RunController {
                 "selected turns cross capability revisions; narrow the source span".to_owned(),
             );
         }
+        blocking_issues.push(MANUAL_AUTHORING_BLOCKER.to_owned());
         let presentations = selected
             .iter()
             .map(|turn| {
@@ -411,7 +414,7 @@ impl RunController {
             draft_id: id.clone(),
             previous_revision_id: None,
             created_at_ms,
-            task: scenario.prompt.clone(),
+            task: first.prompt.clone(),
             source: EvaluationSourceProvenance {
                 workspace_id: workspace_id.to_owned(),
                 session_id: session_summary.id,
@@ -525,6 +528,9 @@ impl RunController {
                 ))
             })?;
         let mut next = current.clone();
+        let confirms_manual_authoring = request.revision.task.is_some()
+            && request.revision.evaluator.is_some()
+            && request.revision.measurements.is_some();
         if let Some(task) = request.revision.task {
             next.task = task;
         }
@@ -537,13 +543,18 @@ impl RunController {
         if let Some(measurements) = request.revision.measurements {
             next.measurements = measurements;
         }
+        if confirms_manual_authoring {
+            next.blocking_issues
+                .retain(|issue| issue != MANUAL_AUTHORING_BLOCKER);
+        }
         if let Some(name) = &request.name {
             validate_display_name(name)?;
         }
         let material_change = next.task != current.task
             || next.limits != current.limits
             || next.evaluator != current.evaluator
-            || next.measurements != current.measurements;
+            || next.measurements != current.measurements
+            || next.blocking_issues != current.blocking_issues;
         if material_change {
             let revision_id = format!("revision-{}-{}", now_ms(), random_suffix());
             let source = capture_confined_run_tree(
@@ -561,6 +572,8 @@ impl RunController {
             )?;
             detail.summary.current_revision_id = revision_id;
             revision_status(&next).clone_into(&mut detail.summary.status);
+            detail.summary.saved = false;
+            detail.summary.definition_id = None;
             detail.revisions.push(next);
         }
         if let Some(name) = request.name {
@@ -701,6 +714,7 @@ impl RunController {
     ) -> Result<EvaluationDraftDetail, RunError> {
         let state = self.promotion_draft_state(draft_id)?;
         let mut detail = lock(&state.detail);
+        let previous_detail = detail.clone();
         let revision_id = request
             .revision_id
             .unwrap_or_else(|| detail.summary.current_revision_id.clone());
@@ -722,6 +736,7 @@ impl RunController {
                 && attempt.execution_status == EvaluationExecutionStatus::Complete
                 && attempt.assertion_status == ValidationAssertionStatus::Passed
         });
+        let mut pending_definition = None;
         if passing {
             let existing = lock(&self.inner.promotion.definitions)
                 .values()
@@ -730,51 +745,38 @@ impl RunController {
                         && definition.detail.summary.revision_id == revision_id
                 })
                 .cloned();
-            let definition_id = if let Some(existing) = existing {
-                update_definition_name(&self.inner.promotion, &existing, &detail.summary.name)?
-            } else {
-                let definition_id = format!("definition-{}-{}", now_ms(), random_suffix());
-                let directory =
-                    confined_child(&self.inner.promotion.definition_root(), &definition_id)?;
-                fs::create_dir(&directory)?;
-                let anchor = Arc::new(AgentSessionDirectoryAnchor::open(directory)?);
-                let source = capture_confined_run_tree(
-                    &state.anchor,
-                    &PathBuf::from("revisions").join(&revision_id).join("source"),
-                )?;
-                write_confined_run_captured_tree(&anchor, Path::new("source"), &source)?;
-                let definition = EvaluationDefinitionDetail {
-                    summary: EvaluationDefinitionSummary {
-                        id: definition_id.clone(),
-                        name: detail.summary.name.clone(),
-                        draft_id: draft_id.to_owned(),
-                        revision_id: revision_id.clone(),
-                        created_at_ms: now_ms(),
-                    },
-                    revision,
-                };
-                write_confined_run_json_atomic(
-                    &anchor,
-                    Path::new("manifest.json"),
-                    &serde_json::to_value(&definition)?,
-                )?;
-                lock(&self.inner.promotion.definitions).insert(
-                    definition_id.clone(),
-                    Arc::new(PromotionDefinitionState {
-                        detail: definition,
-                        anchor,
-                    }),
-                );
-                definition_id
-            };
+            let publication = prepare_definition_publication(
+                &state,
+                draft_id,
+                revision,
+                existing,
+                &detail.summary.name,
+            )?;
+            let definition_id = publication.detail.summary.id.clone();
+            pending_definition = Some(publication);
             detail.summary.definition_id = Some(definition_id);
             "promoted".clone_into(&mut detail.summary.status);
         } else {
             "saved-draft".clone_into(&mut detail.summary.status);
         }
         detail.summary.updated_at_ms = now_ms();
+        if let Err(error) = persist_draft_detail(&state, &detail) {
+            *detail = previous_detail;
+            return Err(error);
+        }
+        if let Some(publication) = pending_definition
+            && let Err(error) = publish_definition(&self.inner.promotion, publication)
+        {
+            let rollback = persist_draft_detail(&state, &previous_detail);
+            *detail = previous_detail;
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(RunError::EvidencePersistence(format!(
+                    "definition publication failed ({error}); draft rollback failed ({rollback_error})"
+                ))),
+            };
+        }
         drop(detail);
-        persist_draft(&state)?;
         record_draft_event(
             &state,
             "evaluation-draft.saved",
@@ -1066,18 +1068,21 @@ impl RunController {
     }
 
     #[cfg(test)]
-    pub(super) fn inject_validation_for_recovery_test(
+    pub(super) fn inject_stale_validation_manifest_for_recovery_test(
         &self,
         draft_id: &str,
         validation: EvaluationValidationAttempt,
     ) -> Result<(), RunError> {
         let state = self.promotion_draft_state(draft_id)?;
         lock(&state.detail).validations.push(validation.clone());
+        persist_draft(&state)?;
+        let stale_manifest = serde_json::to_value(lock(&state.detail).clone())?;
         record_draft_event(
             &state,
             "evaluation-validation.created",
             serde_json::to_value(validation)?,
-        )
+        )?;
+        write_confined_run_json_atomic(&state.anchor, Path::new("manifest.json"), &stale_manifest)
     }
 
     async fn execute_evaluation_validation(
@@ -1293,10 +1298,7 @@ fn catalog_evaluator(scenario: &ScenarioManifest) -> EvaluationEvaluator {
         parameters: CatalogEvaluatorParameters {
             active_names: scenario.assertions.active_names.clone(),
             total_score: scenario.assertions.total_score,
-            required_capability_sources: CATALOG_REQUIRED_SOURCES
-                .iter()
-                .map(|source| (*source).to_owned())
-                .collect(),
+            required_capability_sources: scenario.assertions.required_capability_sources.clone(),
             output_path: scenario.output.clone(),
             require_schema: scenario.assertions.require_schema,
         },
@@ -1350,13 +1352,9 @@ fn validate_revision(revision: &EvaluationRevision) -> Result<(), RunError> {
         ));
     }
     validate_workspace_relative_path(&revision.evaluator.parameters.output_path)?;
-    if revision.limits.max_duration_ms == 0
-        || revision.limits.max_command_count == 0
-        || revision.limits.max_orchestrator_invocations == 0
-        || revision.limits.max_tool_invocations == 0
-    {
+    if revision.limits.max_duration_ms == 0 {
         return Err(RunError::InvalidRequest(
-            "evaluation limits must all be greater than zero".to_owned(),
+            "evaluation duration limit must be greater than zero".to_owned(),
         ));
     }
     Ok(())
@@ -1454,6 +1452,13 @@ fn verify_capability_recipe(
 
 fn persist_draft(state: &PromotionDraftState) -> Result<(), RunError> {
     let detail = lock(&state.detail).clone();
+    persist_draft_detail(state, &detail)
+}
+
+fn persist_draft_detail(
+    state: &PromotionDraftState,
+    detail: &EvaluationDraftDetail,
+) -> Result<(), RunError> {
     write_confined_run_json_atomic(
         &state.anchor,
         Path::new("manifest.json"),
@@ -1461,27 +1466,84 @@ fn persist_draft(state: &PromotionDraftState) -> Result<(), RunError> {
     )
 }
 
-fn update_definition_name(
-    store: &PromotionStore,
-    existing: &Arc<PromotionDefinitionState>,
+struct PendingDefinitionPublication {
+    detail: EvaluationDefinitionDetail,
+    existing_anchor: Option<Arc<AgentSessionDirectoryAnchor>>,
+    source: Option<CapturedTree>,
+}
+
+fn prepare_definition_publication(
+    draft: &PromotionDraftState,
+    draft_id: &str,
+    revision: EvaluationRevision,
+    existing: Option<Arc<PromotionDefinitionState>>,
     name: &str,
-) -> Result<String, RunError> {
-    let mut definition = existing.detail.clone();
-    name.clone_into(&mut definition.summary.name);
-    write_confined_run_json_atomic(
-        &existing.anchor,
-        Path::new("manifest.json"),
-        &serde_json::to_value(&definition)?,
+) -> Result<PendingDefinitionPublication, RunError> {
+    if let Some(existing) = existing {
+        let mut detail = existing.detail.clone();
+        name.clone_into(&mut detail.summary.name);
+        return Ok(PendingDefinitionPublication {
+            detail,
+            existing_anchor: Some(existing.anchor.clone()),
+            source: None,
+        });
+    }
+    let definition_id = format!("definition-{}-{}", now_ms(), random_suffix());
+    let source = capture_confined_run_tree(
+        &draft.anchor,
+        &PathBuf::from("revisions").join(&revision.id).join("source"),
     )?;
-    let definition_id = definition.summary.id.clone();
+    Ok(PendingDefinitionPublication {
+        detail: EvaluationDefinitionDetail {
+            summary: EvaluationDefinitionSummary {
+                id: definition_id,
+                name: name.to_owned(),
+                draft_id: draft_id.to_owned(),
+                revision_id: revision.id.clone(),
+                created_at_ms: now_ms(),
+            },
+            revision,
+        },
+        existing_anchor: None,
+        source: Some(source),
+    })
+}
+
+fn publish_definition(
+    store: &PromotionStore,
+    publication: PendingDefinitionPublication,
+) -> Result<(), RunError> {
+    let definition_id = publication.detail.summary.id.clone();
+    let anchor = if let Some(anchor) = publication.existing_anchor {
+        anchor
+    } else {
+        let directory = confined_child(&store.definition_root(), &definition_id)?;
+        fs::create_dir(&directory)?;
+        let anchor = Arc::new(AgentSessionDirectoryAnchor::open(directory)?);
+        write_confined_run_captured_tree(
+            &anchor,
+            Path::new("source"),
+            &publication.source.ok_or_else(|| {
+                RunError::EvidencePersistence(
+                    "new evaluation definition has no source snapshot".to_owned(),
+                )
+            })?,
+        )?;
+        anchor
+    };
+    write_confined_run_json_atomic(
+        &anchor,
+        Path::new("manifest.json"),
+        &serde_json::to_value(&publication.detail)?,
+    )?;
     lock(&store.definitions).insert(
         definition_id.clone(),
         Arc::new(PromotionDefinitionState {
-            detail: definition,
-            anchor: existing.anchor.clone(),
+            detail: publication.detail,
+            anchor,
         }),
     );
-    Ok(definition_id)
+    Ok(())
 }
 
 fn record_draft_event(
@@ -1528,6 +1590,45 @@ fn update_validation_attempt(
     Ok(())
 }
 
+fn load_draft_event_evidence(
+    anchor: &AgentSessionDirectoryAnchor,
+    bundle: &Path,
+) -> Result<Option<Vec<RunEvent>>, RunError> {
+    let Some(source) = read_optional_confined_run_file(anchor, Path::new("events.jsonl"))? else {
+        return Ok(None);
+    };
+    let events = match parse_events(&source) {
+        Ok(events)
+            if events
+                .iter()
+                .enumerate()
+                .all(|(index, event)| event.sequence == index as u64 + 1) =>
+        {
+            events
+        }
+        Ok(_) => {
+            tracing::warn!(
+                bundle = %bundle.display(),
+                "skipping evaluation draft with non-sequential event evidence"
+            );
+            return Err(RunError::EvidencePersistence(
+                "evaluation draft event evidence is non-sequential".to_owned(),
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(
+                bundle = %bundle.display(),
+                %error,
+                "skipping evaluation draft with malformed event evidence"
+            );
+            return Err(RunError::EvidencePersistence(format!(
+                "evaluation draft event evidence is malformed: {error}"
+            )));
+        }
+    };
+    Ok(Some(events))
+}
+
 fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>, RunError> {
     let mut drafts = HashMap::new();
     for entry in fs::read_dir(root)? {
@@ -1557,6 +1658,11 @@ fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>,
         };
         if detail.summary.id != entry.file_name().to_string_lossy() {
             continue;
+        }
+        match load_draft_event_evidence(&anchor, &entry.path()) {
+            Ok(Some(events)) => detail.events = events,
+            Ok(None) => {}
+            Err(_) => continue,
         }
         let snapshots_are_valid = detail.revisions.iter().all(|revision| {
             capture_confined_run_tree(
@@ -1685,12 +1791,17 @@ mod tests {
             assertions: CatalogAssertions {
                 active_names: vec!["alpha".to_owned(), "gamma".to_owned()],
                 total_score: 11,
-                required_capability_sources: vec!["catalog".to_owned(), "analysis".to_owned()],
+                required_capability_sources: vec!["catalog".to_owned()],
                 require_schema: false,
             },
         };
 
-        assert!(!catalog_evaluator(&scenario).parameters.require_schema);
+        let evaluator = catalog_evaluator(&scenario);
+        assert!(!evaluator.parameters.require_schema);
+        assert_eq!(
+            evaluator.parameters.required_capability_sources,
+            vec!["catalog"]
+        );
     }
 
     #[test]
@@ -1739,6 +1850,12 @@ mod tests {
         assert!(validate_revision(&revision).is_err());
         revision.evaluator.id = CATALOG_EVALUATOR_ID.to_owned();
         assert!(validate_revision(&revision).is_ok());
+        revision.limits.max_command_count = 0;
+        revision.limits.max_orchestrator_invocations = 0;
+        revision.limits.max_tool_invocations = 0;
+        assert!(validate_revision(&revision).is_ok());
+        revision.limits.max_duration_ms = 0;
+        assert!(validate_revision(&revision).is_err());
     }
 
     #[test]

@@ -16193,6 +16193,14 @@ done
             )
             .unwrap();
         let first = draft.revisions.first().unwrap();
+        assert_eq!(first.task, "Explain the active catalog");
+        assert_eq!(draft.summary.status, "incomplete");
+        assert!(
+            first
+                .blocking_issues
+                .iter()
+                .any(|issue| issue.contains("review and confirm the suggested task"))
+        );
         assert!(first.source.source_digest.starts_with("sha256:"));
         let copied_source = data
             .join("evaluation-library/drafts")
@@ -16214,8 +16222,10 @@ done
                     base_revision_id: first.id.clone(),
                     name: Some("Catalog regression".to_owned()),
                     revision: EvaluationRevisionUpdate {
+                        task: Some(first.task.clone()),
                         evaluator: Some(failing_evaluator),
-                        ..EvaluationRevisionUpdate::default()
+                        measurements: Some(first.measurements.clone()),
+                        limits: None,
                     },
                 },
                 WorkbenchOrigin::Browser,
@@ -16223,6 +16233,16 @@ done
             .unwrap();
         let failed_revision_id = failed_revision.summary.current_revision_id.clone();
         assert_ne!(failed_revision_id, first.id);
+        assert_eq!(failed_revision.summary.status, "ready");
+        assert!(
+            failed_revision
+                .revisions
+                .last()
+                .unwrap()
+                .blocking_issues
+                .iter()
+                .all(|issue| !issue.contains("review and confirm the suggested task"))
+        );
         assert!(matches!(
             controller.update_evaluation_draft(
                 &draft.summary.id,
@@ -16291,6 +16311,24 @@ done
             passing_attempt.assertion_status,
             ValidationAssertionStatus::Passed
         );
+        let definition_root = data.join("evaluation-library/definitions");
+        fs::set_permissions(&definition_root, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(
+            controller
+                .save_evaluation_draft(
+                    &draft.summary.id,
+                    SaveEvaluationDraftRequest {
+                        revision_id: Some(passing_revision_id.clone()),
+                        name: Some("Catalog regression".to_owned()),
+                    },
+                )
+                .is_err(),
+            "a definition publication failure should fail the save"
+        );
+        fs::set_permissions(&definition_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let rolled_back = controller.evaluation_draft(&draft.summary.id).unwrap();
+        assert!(rolled_back.summary.definition_id.is_none());
+        assert!(controller.list_evaluation_definitions().is_empty());
         let promoted = controller
             .save_evaluation_draft(
                 &draft.summary.id,
@@ -16361,6 +16399,22 @@ done
                 .iter()
                 .all(|arm| arm.status == "passed")
         );
+        let edited_after_promotion = controller
+            .update_evaluation_draft(
+                &draft.summary.id,
+                UpdateEvaluationDraftRequest {
+                    base_revision_id: passing_revision_id.clone(),
+                    name: None,
+                    revision: EvaluationRevisionUpdate {
+                        measurements: Some(vec!["duration".to_owned()]),
+                        ..EvaluationRevisionUpdate::default()
+                    },
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        assert!(!edited_after_promotion.summary.saved);
+        assert!(edited_after_promotion.summary.definition_id.is_none());
 
         let interrupted_validation_id = format!("validation-recovery-{}", random_suffix());
         let interrupted_validation = EvaluationValidationAttempt {
@@ -16378,14 +16432,17 @@ done
             score: None,
         };
         controller
-            .inject_validation_for_recovery_test(&draft.summary.id, interrupted_validation)
+            .inject_stale_validation_manifest_for_recovery_test(
+                &draft.summary.id,
+                interrupted_validation,
+            )
             .unwrap();
 
         drop(controller);
         let reopened =
             RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
         let reopened_draft = reopened.evaluation_draft(&draft.summary.id).unwrap();
-        assert_eq!(reopened_draft.revisions.len(), 3);
+        assert_eq!(reopened_draft.revisions.len(), 4);
         assert_eq!(reopened_draft.validations.len(), 3);
         let recovered_validation = reopened_draft
             .validations

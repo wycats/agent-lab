@@ -16303,6 +16303,27 @@ done
         let definition_id = promoted.summary.definition_id.clone().unwrap();
         let definition = controller.evaluation_definition(&definition_id).unwrap();
         assert_eq!(definition.summary.revision_id, passing_revision_id);
+        let renamed = controller
+            .save_evaluation_draft(
+                &draft.summary.id,
+                SaveEvaluationDraftRequest {
+                    revision_id: Some(passing_revision_id.clone()),
+                    name: Some("Renamed catalog regression".to_owned()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            renamed.summary.definition_id.as_deref(),
+            Some(definition_id.as_str())
+        );
+        assert_eq!(
+            controller
+                .evaluation_definition(&definition_id)
+                .unwrap()
+                .summary
+                .name,
+            "Renamed catalog regression"
+        );
 
         controller
             .close_agent_session(&explore.id, &session.id)
@@ -16341,19 +16362,64 @@ done
                 .all(|arm| arm.status == "passed")
         );
 
+        let interrupted_validation_id = format!("validation-recovery-{}", random_suffix());
+        let interrupted_validation = EvaluationValidationAttempt {
+            id: interrupted_validation_id.clone(),
+            draft_id: draft.summary.id.clone(),
+            revision_id: passing_revision_id.clone(),
+            execution_status: EvaluationExecutionStatus::Running,
+            assertion_status: ValidationAssertionStatus::NotEvaluated,
+            harness_id: "v0".to_owned(),
+            model_profile_id: "test".to_owned(),
+            run_id: None,
+            started_at_ms: now_ms(),
+            finished_at_ms: None,
+            error: None,
+            score: None,
+        };
+        controller
+            .inject_validation_for_recovery_test(&draft.summary.id, interrupted_validation)
+            .unwrap();
+
         drop(controller);
         let reopened =
             RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
         let reopened_draft = reopened.evaluation_draft(&draft.summary.id).unwrap();
         assert_eq!(reopened_draft.revisions.len(), 3);
-        assert_eq!(reopened_draft.validations.len(), 2);
+        assert_eq!(reopened_draft.validations.len(), 3);
+        let recovered_validation = reopened_draft
+            .validations
+            .iter()
+            .find(|attempt| attempt.id == interrupted_validation_id)
+            .unwrap();
+        assert_eq!(
+            recovered_validation.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            recovered_validation.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(
+            reopened_draft.events.iter().any(|event| {
+                event.kind == "evaluation-validation.finished"
+                    && event.payload["id"] == interrupted_validation_id
+                    && event.payload["executionStatus"] == "inconclusive"
+            }),
+            "recovery should make the terminal validation outcome observable"
+        );
         assert_eq!(
             reopened
                 .evaluation_definition(&definition_id)
                 .unwrap()
-                .summary
-                .revision_id,
-            passing_revision_id
+                .summary,
+            EvaluationDefinitionSummary {
+                id: definition_id.clone(),
+                name: "Renamed catalog regression".to_owned(),
+                draft_id: draft.summary.id.clone(),
+                revision_id: passing_revision_id.clone(),
+                created_at_ms: definition.summary.created_at_ms,
+            }
         );
         assert_eq!(
             reopened

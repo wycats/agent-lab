@@ -244,6 +244,50 @@ test('a new server epoch reconciles authoritative terminal history before resett
   }
 });
 
+test('successful accepted responses preserve their JSON resource', async () => {
+  const nativeFetch = globalThis.fetch;
+  const attempt = {
+    id: 'validation-1',
+    draftId: 'draft-1',
+    revisionId: 'revision-1',
+    executionStatus: 'queued',
+    assertionStatus: 'not-evaluated',
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    startedAtMs: 1
+  } as const;
+
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url,
+      'http://127.0.0.1'
+    );
+    if (url.pathname === '/api/session-token') {
+      return Response.json({ token: 'test-token' });
+    }
+    if (
+      url.pathname ===
+      '/api/workbench/workspace-1/evaluation-drafts/draft-1/validate'
+    ) {
+      expect(init?.method).toBe('POST');
+      return Response.json(attempt, { status: 202 });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  try {
+    await expect(
+      createRunClient().validateEvaluationDraft('workspace-1', 'draft-1', 'revision-1')
+    ).resolves.toEqual(attempt);
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
 test('a healthy server epoch change does not replay already reconciled workbench side effects', async () => {
   const nativeFetch = globalThis.fetch;
   const prepared = {

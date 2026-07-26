@@ -731,7 +731,7 @@ impl RunController {
                 })
                 .cloned();
             let definition_id = if let Some(existing) = existing {
-                existing.detail.summary.id.clone()
+                update_definition_name(&self.inner.promotion, &existing, &detail.summary.name)?
             } else {
                 let definition_id = format!("definition-{}-{}", now_ms(), random_suffix());
                 let directory =
@@ -1063,6 +1063,21 @@ impl RunController {
             .get(id)
             .cloned()
             .ok_or_else(|| RunError::InvalidRequest(format!("unknown evaluation draft: {id}")))
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_validation_for_recovery_test(
+        &self,
+        draft_id: &str,
+        validation: EvaluationValidationAttempt,
+    ) -> Result<(), RunError> {
+        let state = self.promotion_draft_state(draft_id)?;
+        lock(&state.detail).validations.push(validation.clone());
+        record_draft_event(
+            &state,
+            "evaluation-validation.created",
+            serde_json::to_value(validation)?,
+        )
     }
 
     async fn execute_evaluation_validation(
@@ -1446,6 +1461,29 @@ fn persist_draft(state: &PromotionDraftState) -> Result<(), RunError> {
     )
 }
 
+fn update_definition_name(
+    store: &PromotionStore,
+    existing: &Arc<PromotionDefinitionState>,
+    name: &str,
+) -> Result<String, RunError> {
+    let mut definition = existing.detail.clone();
+    name.clone_into(&mut definition.summary.name);
+    write_confined_run_json_atomic(
+        &existing.anchor,
+        Path::new("manifest.json"),
+        &serde_json::to_value(&definition)?,
+    )?;
+    let definition_id = definition.summary.id.clone();
+    lock(&store.definitions).insert(
+        definition_id.clone(),
+        Arc::new(PromotionDefinitionState {
+            detail: definition,
+            anchor: existing.anchor.clone(),
+        }),
+    );
+    Ok(definition_id)
+}
+
 fn record_draft_event(
     state: &PromotionDraftState,
     kind: &str,
@@ -1538,6 +1576,7 @@ fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>,
             tracing::warn!(bundle = %entry.path().display(), "skipping evaluation draft with missing or mismatched revision source");
             continue;
         }
+        let mut recovered_validations = Vec::new();
         for validation in &mut detail.validations {
             if !validation.execution_status.is_finished() {
                 validation.execution_status = EvaluationExecutionStatus::Inconclusive;
@@ -1545,6 +1584,7 @@ fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>,
                 validation.finished_at_ms = Some(now_ms());
                 validation.error =
                     Some("controller stopped before validation finalized".to_owned());
+                recovered_validations.push(validation.clone());
             }
         }
         let (sender, _) = broadcast::channel(128);
@@ -1555,7 +1595,17 @@ fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>,
             event_commit: Mutex::new(()),
             validation_cancels: Mutex::new(HashMap::new()),
         });
-        persist_draft(&state)?;
+        if recovered_validations.is_empty() {
+            persist_draft(&state)?;
+        } else {
+            for validation in recovered_validations {
+                record_draft_event(
+                    &state,
+                    "evaluation-validation.finished",
+                    serde_json::to_value(validation)?,
+                )?;
+            }
+        }
         let id = lock(&state.detail).summary.id.clone();
         drafts.insert(id, state);
     }

@@ -93,6 +93,8 @@
   let inspectionEventStream: AbortController | undefined;
   let evaluationRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let draftEventStream: AbortController | undefined;
+  let draftRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let loadedWorkbenchId: string | undefined;
   let agentSessionEventStream: AbortController | undefined;
   let agentSessionEventFlushTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingAgentSessionEvents: RunEvent[] = [];
@@ -334,6 +336,10 @@
 
   async function loadWorkbench(id: string): Promise<void> {
     const workbench = await runClient.workbench(id);
+    if (loadedWorkbenchId !== undefined && loadedWorkbenchId !== id) {
+      clearEvaluationDraftSelection();
+    }
+    loadedWorkbenchId = id;
     applyWorkbenchSelection(workbench.selection);
     modelAccess = workbench.modelAccess;
     mergeAgentSessionSnapshot(id, workbench.agentSessions);
@@ -899,17 +905,30 @@
       runClient.evaluationDrafts(workspaceId),
       runClient.evaluationDefinitions(workspaceId)
     ]);
+    if (workspaceId !== loadedWorkbenchId) return;
     evaluationDrafts = drafts;
     evaluationDefinitions = definitions;
   }
 
+  function clearEvaluationDraftSelection(): void {
+    draftEventStream?.abort();
+    draftEventStream = undefined;
+    if (draftRefreshTimer !== undefined) {
+      clearTimeout(draftRefreshTimer);
+      draftRefreshTimer = undefined;
+    }
+    selectedDraft = undefined;
+    selectedDefinition = undefined;
+  }
+
   function watchEvaluationDraft(workspaceId: string, draftId: string): void {
     draftEventStream?.abort();
-    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+    if (draftRefreshTimer !== undefined) clearTimeout(draftRefreshTimer);
     draftEventStream = runClient.evaluationDraftEvents(workspaceId, draftId, () => {
-      if (refreshTimer !== undefined) clearTimeout(refreshTimer);
-      refreshTimer = setTimeout(() => {
-        refreshTimer = undefined;
+      if (workspaceId !== loadedWorkbenchId) return;
+      if (draftRefreshTimer !== undefined) clearTimeout(draftRefreshTimer);
+      draftRefreshTimer = setTimeout(() => {
+        draftRefreshTimer = undefined;
         void refreshEvaluationDraft(workspaceId, draftId);
       }, 50);
     });
@@ -922,6 +941,7 @@
   ): Promise<EvaluationDraftDetail | undefined> {
     try {
       const draft = await runClient.evaluationDraft(workspaceId, draftId);
+      if (workspaceId !== loadedWorkbenchId) return undefined;
       selectedDraft = draft;
       hydrateDraftForm(draft, hydrate);
       await loadEvaluationLibrary(workspaceId);
@@ -2013,6 +2033,7 @@
       exploreEventStream?.abort();
       inspectionEventStream?.abort();
       draftEventStream?.abort();
+      if (draftRefreshTimer !== undefined) clearTimeout(draftRefreshTimer);
       agentSessionEventStream?.abort();
       session?.dispose();
       surface?.dispose();

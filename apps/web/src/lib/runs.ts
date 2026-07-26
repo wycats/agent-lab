@@ -599,8 +599,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     }
     throw new Error(message);
   }
-  if (response.status === 202 || response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  if (response.status === 204) return undefined as T;
+  const body = await response.text();
+  if (body.length === 0) return undefined as T;
+  return JSON.parse(body) as T;
 }
 
 async function streamEvents(

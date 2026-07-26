@@ -15832,7 +15832,7 @@ while IFS= read -r line; do
           sequence=$((sequence + 1))
           printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"mcp.tool.completed","payload":{"actor":"agent","source":"catalog","name":"list","isError":false,"result":{"items":[{"name":"alpha","score":3,"active":true},{"name":"beta","score":5,"active":false},{"name":"gamma","score":8,"active":true}]}}}\n' "$sequence" "$session" "$turn"
           sequence=$((sequence + 1))
-          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"mcp.tool.completed","payload":{"actor":"agent","source":"analysis","name":"summarize","isError":false,"result":{"active":[{"name":"alpha","score":3},{"name":"gamma","score":8}],"totalScore":11}}}\n' "$sequence" "$session" "$turn"
+	          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"mcp.tool.completed","payload":{"actor":"agent","source":"analysis","name":"summarize","isError":false,"arguments":{"items":[{"name":"alpha","score":3,"active":true},{"name":"beta","score":5,"active":false},{"name":"gamma","score":8,"active":true}]},"result":{"active":[{"name":"alpha","active":true,"score":3},{"name":"gamma","active":true,"score":8}],"activeCount":2,"totalScore":11}}}\n' "$sequence" "$session" "$turn"
           sequence=$((sequence + 1))
           printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"workspace.changed","payload":{"path":"result.json","kind":"created"}}\n' "$sequence" "$session" "$turn"
           ;;

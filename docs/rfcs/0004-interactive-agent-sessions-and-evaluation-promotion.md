@@ -1,6 +1,7 @@
 # RFC 0004: Interactive agent sessions and evaluation promotion
 
 - Status: Provisional
+- Evidence: [steel thread 0005](../steel-threads/0005-manual-evaluation-promotion.md)
 
 ## Summary
 
@@ -41,21 +42,22 @@ It is not a prerequisite for the agent to discover or invoke capabilities.
 Agent Lab records each turn against its workspace revision and the capability
 projection the controller supplied.
 
-When an interaction reveals behavior worth preserving, Agent Lab should use a
-separate, identified `ProposalSession` to propose an editable evaluation draft.
+When an interaction reveals behavior worth preserving, the builder can now
+create an editable evaluation draft directly from one or more stable turns.
 The draft relates a standalone task, controlled starting state, capabilities,
 assertions, and measurements back to the source turns and evidence. The
-builder reviews the proposal, replays it from its captured starting state, and
-explicitly saves it. A later evaluation may exercise the same definition with
-different harnesses or models.
+builder reviews it, replays it from its captured starting state, and explicitly
+saves a passing revision. A later evaluation may exercise the same definition
+with different harnesses or models.
 
-The proposal is intentionally provisional. Its first steel thread must prove
-the interaction and evidence lifecycle before Agent Lab stabilizes storage or
-wire contracts.
+An attributable `ProposalSession` remains the next assistance layer. It should
+help choose a meaningful turn span and draft the editable resource while
+preserving the manual path and the identities demonstrated here.
 
 ## Implementation status
 
-This milestone implements the interactive-session substrate:
+This milestone implements the interactive-session and manual-promotion
+substrate:
 
 - workspace-scoped, multi-turn harness-native sessions and explicit session
   lifecycle commands;
@@ -65,12 +67,19 @@ This milestone implements the interactive-session substrate:
 - answer-first `agent-answer` records, terminal Markdown, streaming and raw
   modes, and durable turn reopening; and
 - a synchronized browser Session view with live progress and
-  **Rendered**/**Source** presentation.
+  **Rendered**/**Source** presentation;
+- editable draft revisions derived from stable turn spans and revision-owned
+  pre-turn snapshots;
+- reviewed `catalog-to-file@1` validation with distinct execution and
+  assertion outcomes;
+- retained failed validations, explicit promotion of an exactly validated
+  revision, and a local definition library; and
+- definition reruns through the existing paired v0/Eve evaluation machinery,
+  with durable browser and Nushell reopening after restart.
 
-Evaluation proposal, editing, validation, local-library saving, portable
-definitions, and rerunning a promoted definition remain proposed. The command,
-resource, and browser contracts for that part of this RFC are design targets,
-not implemented product surfaces.
+AI-assisted proposal drafting through a separate `ProposalSession` remains
+proposed. General assertion languages, repository export, and repeated
+statistical claims also remain outside the demonstrated boundary.
 
 ## Motivation
 
@@ -693,9 +702,8 @@ harnesses but receives only this orientation:
 
 The walkthrough is:
 
-Steps 1-5 exercise the implemented interactive-session substrate. Steps 6-10
-describe the proposed promotion boundary and remain required before this RFC's
-complete steel thread can be claimed.
+Steps 1-5 exercise the interactive-session substrate. Steps 6-10 describe the
+manual promotion boundary demonstrated by steel thread 0005.
 
 1. Run `agent "Find the active catalog items and explain what matters"` without
    pipeline input. A real harness discovers the catalog capability, and the
@@ -710,16 +718,13 @@ complete steel thread can be claimed.
    turns that have no pipeline input.
 5. Create a second session, switch between sessions, and reopen the first with
    its conversation and evidence intact.
-6. Choose **Compare this turn** and run the other harness from the captured
-   pre-turn state. Identify at least one meaningful behavioral difference from
-   the normalized presentations while retaining both native event streams.
-7. Choose **Make evaluation**. Use a separately identified proposal session to
-   produce an editable draft from the meaningful turn span.
-8. Review and edit the same draft through Nushell and the browser, replay it
-   from the captured state, retain one failed validation, and produce a passing
-   current revision.
-9. Explicitly save and reopen the portable definition, then run it with another
-   harness or model without rewriting the task.
+6. Choose **Make evaluation** on a stable turn and create an editable draft
+   from its durable pre-turn state and capability recipe.
+7. Review and edit the same draft through Nushell and the browser.
+8. Replay it from the captured state, retain one complete failed validation,
+   revise the evaluator parameters, and produce a passing current revision.
+9. Explicitly save and reopen the portable definition, then run it through v0
+   and Eve without rewriting the task.
 10. Verify provenance, redaction, cancellation, process-tree cleanup, bounded
     retention, terminal reconnection, and offline replay.
 
@@ -728,21 +733,23 @@ coaching, the participant should be able to explain what the agent answered,
 what the harness invoked or changed, one cross-harness difference, and what the
 saved evaluation preserved.
 
-Deterministic external drivers should establish session, projection, proposal,
-validation, failure, and recovery contracts. One real-model catalog
-demonstration, including origin validation and one paired variant run,
-establishes that the interaction survives contact with actual harnesses. The
-steel thread is complete only after the visible walkthrough succeeds.
+Deterministic external drivers establish session, projection, validation,
+failure, and recovery contracts. One real-model catalog demonstration,
+including a retained assertion failure, corrected passing revision, explicit
+promotion, and paired variant run, establishes that the interaction survives
+contact with actual harnesses. The visible walkthrough completed locally; its
+public-safe evidence is summarized in steel thread 0005.
 
 ## Boundaries
 
-This RFC's complete proposed boundary extends the implemented interactive
-sessions with evaluation drafts, bounded validation attempts sufficient to
-demonstrate a failed draft and a passing current revision, local versioned
-saving, and one paired variant run.
+This RFC's demonstrated manual boundary extends interactive sessions with
+evaluation drafts, bounded validation attempts sufficient to retain a failed
+revision and pass a corrected revision, local versioned saving, and one paired
+variant run.
 
 The following work remains available for subsequent evidence:
 
+- attributable AI-assisted proposal drafting;
 - a general assertion or evaluator language;
 - repeated trials and statistical quality claims;
 - cross-harness checkpoint or conversation portability;
@@ -751,22 +758,16 @@ The following work remains available for subsequent evidence:
 - code-server diagnostics and broader editor capabilities;
 - a universal operation registry or agent SDK.
 
-## Unresolved implementation questions
+## Remaining implementation questions
 
-The steel thread should answer a small set of mechanical questions without
-changing the product contract:
+The manual steel thread answered the initial snapshot, evaluator, revision,
+validation, and local-library questions. The next slices should answer:
 
-- Which snapshot representation preserves pre-turn state with acceptable
-  storage and startup cost?
-- Which minimal evaluator reference and parameter shape can express the
-  catalog result without implying a general assertion language?
 - Which normalized assistant, capability, native-action, workspace-effect, and
   usage observations must an adapter supply, and how should incomplete
   projections remain visible?
-- Which action details belong in the conversation by default, and which belong
-  behind evidence disclosure?
-- How should proposal and validation progress remain readable and composable
-  without replacing their useful result with lifecycle records?
+- How should proposal progress remain readable and composable without replacing
+  its useful draft with lifecycle records?
 - Which local definition layout supports later repository export without
   freezing that export format prematurely?
 
@@ -780,7 +781,6 @@ provisional interaction contract for the promotion step.
 revision of this proposal after implementation.
 
 [RFC 0003](0003-first-evidence-backed-architecture.md) records the demonstrated
-controller, driver, capability, surface, and evidence boundaries. This RFC
-uses those boundaries without changing RFC 0003's Candidate conclusions. Once
-the steel thread is complete, its observations should update both RFCs before
-this proposal advances.
+controller, driver, capability, surface, and evidence boundaries. Manual
+promotion now adds revision-owned snapshots, distinct validation attempts, and
+portable definitions without changing RFC 0003's Candidate status.

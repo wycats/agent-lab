@@ -1,7 +1,7 @@
 # RFC 0003: First evidence-backed architecture
 
 - Status: Candidate
-- Evidence: [steel thread 0001](../steel-threads/0001-nushell-mcp-session.md), [steel thread 0002](../steel-threads/0002-external-agent-driver.md), [steel thread 0003](../steel-threads/0003-catalog-feedback-loop.md), [steel thread 0004](../steel-threads/0004-two-harness-workbench.md)
+- Evidence: [steel thread 0001](../steel-threads/0001-nushell-mcp-session.md), [steel thread 0002](../steel-threads/0002-external-agent-driver.md), [steel thread 0003](../steel-threads/0003-catalog-feedback-loop.md), [steel thread 0004](../steel-threads/0004-two-harness-workbench.md), [steel thread 0005](../steel-threads/0005-manual-evaluation-promotion.md)
 
 ## Summary
 
@@ -10,7 +10,7 @@ independent capability sources, execution hosts, agent drivers, and human
 surfaces. It should not be a shell runtime, MCP framework, v0 extraction, or
 universal virtual machine.
 
-The first four steel threads support a hybrid product shape. Embedded Nushell
+The first five steel threads support a hybrid product shape. Embedded Nushell
 is the first rich human surface because it preserves structured exploration,
 state, pipelines, and dynamically discovered commands. A just-bash-backed v0
 host is the first bounded agent execution host because it is small, in-process,
@@ -232,15 +232,32 @@ availability remains an adapter fact rather than a zero value. The live bundle
 is local-only; the public repository retains synthetic fixtures and this
 summary.
 
+### Manual evaluation-promotion evidence
+
+The manual promotion slice demonstrates that evaluation identity can be layered
+over durable run evidence without embedding one harness's loop in the
+controller. A draft owns immutable revisions; each revision owns its sanitized
+pre-turn workspace, capability recipe, task, limits, and reviewed evaluator
+parameters. Validation attempts bind to exactly one revision and distinguish
+execution integrity from assertion outcome.
+
+One local real-model catalog turn became a draft with three revisions. The
+first edited revision completed normally and retained an intentional catalog
+name mismatch as a failed assertion. A corrected revision passed, was
+explicitly promoted into a local definition, and then ran through v0 and Eve
+from the same stored starting state. Both arms produced the expected artifact
+and reopened after a locald restart. The public repository retains deterministic
+fixtures and a summarized record rather than the live bundle.
+
 ## What remains provisional
 
 - The JSON Lines message names and schemas are experimental.
 - Completion currently covers the workbench harnesses, model profiles, and
   command flags; broader capability-driven completion remains provisional.
 - Capability events do not yet have a first-class public envelope.
-- Promotion from exploration into an editable evaluation is not implemented;
-  [RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md)
-  proposes the product and evidence contract for that boundary.
+- AI-assisted proposal drafting is not implemented; the demonstrated manual
+  path in [RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md)
+  provides the resource and validation contract it should target.
 - Interactive sessions do not yet have idle eviction, reported effective
   session bounds, per-turn model-access refresh, or adapter-acknowledged
   capability revisions.
@@ -257,19 +274,19 @@ the current adapters into a framework now.
 ## Architecture consequence
 
 The v0 and Eve result demonstrates that the public controller can coordinate
-two real harnesses without owning either loop. The workbench still needs to
-promote an exploratory agent session into an editable, replayable evaluation.
-Once that product-flow thread is complete, the next architecture experiment can
-pressure a richer capability projection inside the same loop rather than
-inventing separate evaluation machinery.
+two real harnesses without owning either loop. Manual promotion now demonstrates
+that an exploratory turn can become an editable, replayable evaluation using
+the same controller, evidence, and surface boundaries. The next architecture
+experiment can pressure a richer capability projection inside this loop rather
+than inventing separate evaluation machinery.
 
 ## Next architecture-validation boundary
 
-Use the demonstrated interactive-session substrate to complete evaluation
-promotion as proposed in
-[RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md). Then
-build one real VS Code/code-server diagnostic adapter behind the public
-diagnostic snapshot contract. The extension uses
+Add the attributable `ProposalSession` described in
+[RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md) over the
+demonstrated manual draft contract. Then build one real VS Code/code-server
+diagnostic adapter behind the public diagnostic snapshot contract. The
+extension uses
 `vscode.languages.getDiagnostics()` and a bounded local transport. It must
 prove workspace binding, pending and settled revisions, cancellation, timeout,
 extension restart, no-listener behavior, and a repair followed by a settled

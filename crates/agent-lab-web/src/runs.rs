@@ -16271,6 +16271,7 @@ done
         failing_evaluator.parameters.active_names = vec!["not-the-catalog".to_owned()];
         let mut validation_limits = first.limits.clone();
         validation_limits.max_duration_ms = 10_000;
+        validation_limits.max_tool_invocations = 2;
         let failing_update = UpdateEvaluationDraftRequest {
             base_revision_id: first.id.clone(),
             name: Some("Catalog regression".to_owned()),

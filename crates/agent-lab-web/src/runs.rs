@@ -3365,6 +3365,12 @@ impl RunController {
                 "finish or cancel the active agent turn before running the harness".to_owned(),
             ));
         }
+        if self.has_active_evaluation_proposal(id) {
+            return Err(RunError::InvalidRequest(
+                "finish or cancel the active evaluation proposal before running the harness"
+                    .to_owned(),
+            ));
+        }
         if lock(&self.inner.agent_sessions).values().any(|session| {
             lock(&session.summary).workspace_id == id
                 && matches!(
@@ -16464,6 +16470,7 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn proposal_reserves_turns_and_cancellation_wins_before_draft_publication() {
         let marker_root = temporary_root("proposal-publication-cancellation-markers");
         let close_marker = marker_root.join("close-started");
@@ -16543,11 +16550,36 @@ done
             RunError::InvalidRequest(message) if message.contains("active evaluation proposal")
         ));
 
+        controller
+            .fail_next_proposal_terminal_event_persist(&proposal.id)
+            .unwrap();
+        let (prefix, mut proposal_events) = controller
+            .subscribe_evaluation_proposal(&proposal.id)
+            .unwrap();
+        assert!(
+            prefix
+                .iter()
+                .all(|event| event.kind != "evaluation-proposal.finished")
+        );
         controller.cancel_evaluation_proposal(&proposal.id).unwrap();
         fs::write(&close_release, []).unwrap();
         let proposal = wait_for_proposal(&controller, &proposal.id).await;
         assert_eq!(proposal.summary.status, EvaluationProposalStatus::Cancelled);
         assert!(proposal.summary.draft_id.is_none());
+        let fallback = tokio::time::timeout(Duration::from_secs(2), proposal_events.recv())
+            .await
+            .expect("terminal fallback was not published")
+            .expect("proposal event stream closed before terminal fallback");
+        assert_eq!(fallback.kind, "evaluation-proposal.finished");
+        assert_eq!(fallback.payload["status"], "cancelled");
+        assert_eq!(fallback.payload["durable"], false);
+        assert!(
+            proposal
+                .events
+                .iter()
+                .all(|event| event.kind != "evaluation-proposal.finished"),
+            "the injected persistence failure should leave only the transient terminal fallback"
+        );
         assert!(
             controller.list_evaluation_drafts().is_empty(),
             "an accepted cancellation before publication must not create a seed draft"
@@ -16678,6 +16710,23 @@ printf '%s\n' '{{"status":"ready","source":"test","environment":{{"TOKEN":"propo
             assert!(Instant::now() < deadline, "source turn did not finish");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        controller
+            .close_agent_session(&explore.id, &session.id)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if controller
+                .agent_session(&explore.id, &session.id)
+                .unwrap()
+                .summary
+                .status
+                == AgentSessionStatus::Closed
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source session did not close");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         fs::remove_file(&resolver_release).unwrap();
         fs::remove_file(&resolver_started).unwrap();
@@ -16724,6 +16773,25 @@ printf '%s\n' '{{"status":"ready","source":"test","environment":{{"TOKEN":"propo
             controller.list_evaluation_proposals().len(),
             1,
             "a pending credential resolution must reject proposal startup before evidence is built"
+        );
+        let blocked_prepared_run = controller
+            .start_prepared(
+                &explore.id,
+                &StartPreparedRunRequest {
+                    model_id: None,
+                    harness_id: Some("fixture".to_owned()),
+                    model_profile_id: Some("test".to_owned()),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            blocked_prepared_run,
+            RunError::InvalidRequest(message) if message.contains("active evaluation proposal")
+        ));
+        assert_eq!(
+            controller.get(&explore.id).unwrap().summary.status,
+            RunStatus::Exploring,
+            "an active proposal must retain ownership of the Explore workspace"
         );
         let blocked_turn = controller
             .start_agent_turn(

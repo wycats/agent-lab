@@ -351,6 +351,8 @@ struct PromotionProposalState {
     completion_commit: Mutex<()>,
     cancel: CancellationToken,
     evidence_quarantined: AtomicBool,
+    #[cfg(test)]
+    fail_next_terminal_event_persist: AtomicBool,
 }
 
 struct ProposalExecution {
@@ -747,6 +749,8 @@ impl RunController {
             completion_commit: Mutex::new(()),
             cancel: CancellationToken::new(),
             evidence_quarantined: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_terminal_event_persist: AtomicBool::new(false),
         });
         persist_proposal(&state)?;
         write_confined_run_json_atomic(&state.anchor, Path::new("source.json"), &source_input)?;
@@ -1303,7 +1307,7 @@ impl RunController {
             Ok((candidate, driver)) => {
                 if state.cancel.is_cancelled() {
                     let message = "evaluation proposal was cancelled";
-                    let _ = finish_proposal(
+                    let _ = finish_proposal_with_terminal_fallback(
                         state,
                         EvaluationProposalStatus::Cancelled,
                         Some(candidate),
@@ -1355,7 +1359,7 @@ impl RunController {
                 });
                 match draft_result {
                     Ok(draft) => {
-                        let _ = finish_proposal(
+                        let _ = finish_proposal_with_terminal_fallback(
                             state,
                             EvaluationProposalStatus::Complete,
                             Some(candidate),
@@ -1376,7 +1380,7 @@ impl RunController {
                     Err(error) => {
                         let secrets = lock(&self.inner.promotion.secret_values).clone();
                         let message = redact_string(&error.to_string(), &secrets);
-                        let _ = finish_proposal(
+                        let _ = finish_proposal_with_terminal_fallback(
                             state,
                             EvaluationProposalStatus::Failed,
                             Some(candidate),
@@ -1405,7 +1409,13 @@ impl RunController {
                 };
                 let secrets = lock(&self.inner.promotion.secret_values).clone();
                 let message = redact_string(&error.to_string(), &secrets);
-                let _ = finish_proposal(state, status, None, None, Some(&message));
+                let _ = finish_proposal_with_terminal_fallback(
+                    state,
+                    status,
+                    None,
+                    None,
+                    Some(&message),
+                );
                 let _ = record_event(
                     &execution.workspace,
                     "workbench.evaluation-proposal.finished",
@@ -1428,6 +1438,17 @@ impl RunController {
                 let summary = lock(&proposal.detail).summary.clone();
                 summary.workspace_id == workspace_id && !summary.status.is_finished()
             })
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_proposal_terminal_event_persist(
+        &self,
+        proposal_id: &str,
+    ) -> Result<(), RunError> {
+        self.promotion_proposal_state(proposal_id)?
+            .fail_next_terminal_event_persist
+            .store(true, Ordering::Release);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3679,6 +3700,18 @@ fn record_proposal_event(
         *detail = previous;
         return Err(error);
     }
+    #[cfg(test)]
+    if kind == "evaluation-proposal.finished"
+        && state
+            .fail_next_terminal_event_persist
+            .swap(false, Ordering::AcqRel)
+    {
+        *detail = previous;
+        persist_proposal_detail(state, &detail)?;
+        return Err(RunError::EvidencePersistence(
+            "injected terminal proposal event persistence failure".to_owned(),
+        ));
+    }
     let mut line = serde_json::to_vec(&event)?;
     line.push(b'\n');
     if let Err(error) = append_confined_run_bytes(&state.anchor, Path::new("events.jsonl"), &line) {
@@ -3752,6 +3785,36 @@ fn finish_proposal(
         }),
     )?;
     Ok(())
+}
+
+fn finish_proposal_with_terminal_fallback(
+    state: &PromotionProposalState,
+    status: EvaluationProposalStatus,
+    candidate: Option<EvaluationProposalCandidate>,
+    draft_id: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), RunError> {
+    let result = finish_proposal(state, status, candidate, draft_id, error);
+    if result.is_err() {
+        let detail = lock(&state.detail);
+        let event = RunEvent {
+            sequence: detail.events.len() as u64 + 1,
+            at_ms: now_ms(),
+            kind: "evaluation-proposal.finished".to_owned(),
+            payload: json!({
+                "proposalId": detail.summary.id,
+                "draftId": draft_id,
+                "status": status,
+                "error": error,
+                "durable": false,
+                "persistenceError": "terminal proposal evidence could not be persisted",
+            }),
+            progress: None,
+        };
+        drop(detail);
+        let _ = state.sender.send(event);
+    }
+    result
 }
 
 fn persist_draft_detail(
@@ -4446,6 +4509,8 @@ fn load_proposals(
             completion_commit: Mutex::new(()),
             cancel: CancellationToken::new(),
             evidence_quarantined: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_terminal_event_persist: AtomicBool::new(false),
         });
         if needs_terminal_event {
             let summary = lock(&state.detail).summary.clone();

@@ -16434,6 +16434,34 @@ done
             ValidationAssertionStatus::Passed
         );
         let passing_validation_run_id = passing_attempt.run_id.clone().unwrap();
+        controller.fail_next_validation_assembly_persist();
+        let failed_assembly_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        let failed_assembly_attempt =
+            wait_for_validation(&controller, &draft.summary.id, &failed_assembly_attempt.id).await;
+        assert_eq!(
+            failed_assembly_attempt.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            failed_assembly_attempt.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(failed_assembly_attempt.run_id.is_none());
+        assert!(
+            failed_assembly_attempt.error.as_deref().is_some_and(
+                |error| error.contains("injected validation assembly persistence failure")
+            )
+        );
+        assert!(lock(&controller.inner.scenario_overrides).is_empty());
+        assert!(
+            controller
+                .list()
+                .into_iter()
+                .filter(|run| run.id != explore.id)
+                .all(|run| run.status.is_finished())
+        );
         let (validation_pre_start, validation_resume) =
             controller.install_validation_before_start_hook();
         let cancelled_attempt = controller
@@ -16524,6 +16552,16 @@ done
                 .name,
             "Renamed catalog regression"
         );
+        let saved_event = controller
+            .evaluation_draft(&draft.summary.id)
+            .unwrap()
+            .events
+            .into_iter()
+            .rev()
+            .find(|event| event.kind == "evaluation-draft.saved")
+            .unwrap();
+        assert_eq!(saved_event.payload["revisionId"], passing_revision_id);
+        assert_eq!(saved_event.payload["definitionId"], definition_id);
         let explore_state = controller.state(&explore.id).unwrap();
         let library_changes = lock(&explore_state.events)
             .iter()
@@ -16661,7 +16699,7 @@ done
             RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
         let reopened_draft = reopened.evaluation_draft(&draft.summary.id).unwrap();
         assert_eq!(reopened_draft.revisions.len(), 4);
-        assert_eq!(reopened_draft.validations.len(), 4);
+        assert_eq!(reopened_draft.validations.len(), 5);
         let recovered_validation = reopened_draft
             .validations
             .iter()
@@ -16704,6 +16742,62 @@ done
                 .definition_id
                 .as_deref(),
             Some(definition_id.as_str())
+        );
+        let mut base_revision_id = reopened_draft.summary.current_revision_id.clone();
+        for index in reopened_draft.revisions.len()..promotion::MAX_EVALUATION_DRAFT_REVISIONS {
+            let revised = reopened
+                .update_evaluation_draft(
+                    &draft.summary.id,
+                    UpdateEvaluationDraftRequest {
+                        base_revision_id,
+                        name: None,
+                        revision: EvaluationRevisionUpdate {
+                            task: Some(format!("Bounded revision {index}")),
+                            ..EvaluationRevisionUpdate::default()
+                        },
+                    },
+                    WorkbenchOrigin::Browser,
+                )
+                .unwrap();
+            base_revision_id = revised.summary.current_revision_id;
+        }
+        let at_revision_limit = reopened.evaluation_draft(&draft.summary.id).unwrap();
+        assert_eq!(
+            at_revision_limit.revisions.len(),
+            promotion::MAX_EVALUATION_DRAFT_REVISIONS
+        );
+        let revision_directories_before = fs::read_dir(
+            data.join("evaluation-library/drafts")
+                .join(&draft.summary.id)
+                .join("revisions"),
+        )
+        .unwrap()
+        .count();
+        let error = reopened
+            .update_evaluation_draft(
+                &draft.summary.id,
+                UpdateEvaluationDraftRequest {
+                    base_revision_id,
+                    name: None,
+                    revision: EvaluationRevisionUpdate {
+                        task: Some("One revision too many".to_owned()),
+                        ..EvaluationRevisionUpdate::default()
+                    },
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap_err();
+        assert!(matches!(error, RunError::InvalidRequest(_)));
+        assert!(error.to_string().contains("retain at most"));
+        assert_eq!(
+            fs::read_dir(
+                data.join("evaluation-library/drafts")
+                    .join(&draft.summary.id)
+                    .join("revisions"),
+            )
+            .unwrap()
+            .count(),
+            revision_directories_before
         );
         let captured_harness_id = reopened_draft
             .revisions

@@ -3484,6 +3484,13 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   await page.getByRole('button', { name: 'Save to library' }).click();
   await expect(page.locator('.run-heading .run-status')).toHaveText('promoted');
   await expect(page.getByRole('button', { name: 'Run comparison' })).toBeVisible();
+  const promotedTask = await page.getByLabel('Standalone task').inputValue();
+  await page.getByLabel('Standalone task').fill('A later draft revision');
+  await page.getByRole('button', { name: 'Create revision' }).click();
+  await expect(page.getByTestId('evaluation-draft-view')).toContainText(
+    'Current revision not validated'
+  );
+  await expect(page.getByRole('button', { name: 'Run comparison' })).toHaveCount(0);
 
   const definitionButton = page.locator(
     '.draft-history .history-list button[data-definition-id]'
@@ -3517,9 +3524,10 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
     page.locator(`.draft-history button[data-draft-id="${otherDraftId}"]`)
   ).toHaveClass(/selected/);
   await page.unrouteAll({ behavior: 'wait' });
-  await page
-    .locator(`.draft-history button[data-draft-id="${selectedDraftId}"]`)
-    .click();
+  await definitionButton.click();
+  await expect(page.getByTestId('evaluation-draft-view')).toContainText('Saved definition');
+  await expect(page.getByLabel('Standalone task')).toHaveValue(promotedTask);
+  await expect(page.getByLabel('Standalone task')).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Run comparison' })).toBeVisible();
 
   await page.getByRole('button', { name: 'Run comparison' }).click();
@@ -3529,11 +3537,13 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
 
   await page.reload();
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
-  const savedDraft = page.locator('.draft-history .history-list button').filter({
-    hasText: 'runnable'
-  }).first();
-  await expect(savedDraft).toContainText('saved');
-  await savedDraft.click();
+  const savedDefinition = page.locator(
+    '.draft-history .history-list button[data-definition-id]'
+  ).first();
+  await expect(savedDefinition).toContainText('runnable');
+  await savedDefinition.click();
+  await expect(page.getByTestId('evaluation-draft-view')).toContainText('Saved definition');
+  await expect(page.getByLabel('Standalone task')).toHaveValue(promotedTask);
   await expect(page.getByTestId('evaluation-draft-view').locator('.validation-card')).toHaveCount(2);
   await expect(page.getByTestId('evaluation-draft-view')).toContainText('Owned by revision');
 

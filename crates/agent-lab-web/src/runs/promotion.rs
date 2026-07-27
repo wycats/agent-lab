@@ -8,6 +8,7 @@ const PROMOTION_SCHEMA_VERSION: u32 = 1;
 const CATALOG_EVALUATOR_ID: &str = "catalog-to-file";
 const CATALOG_EVALUATOR_VERSION: u32 = 1;
 const DEFINITION_PUBLICATION_TRANSACTION: &str = "publication.pending.json";
+pub(super) const MAX_EVALUATION_DRAFT_REVISIONS: usize = 32;
 const MANUAL_AUTHORING_BLOCKER: &str =
     "review and confirm the suggested task, assertions, and measurements";
 
@@ -207,6 +208,9 @@ pub(super) struct PromotionStore {
     drafts: Mutex<HashMap<String, Arc<PromotionDraftState>>>,
     definitions: Mutex<HashMap<String, Arc<PromotionDefinitionState>>>,
     secret_values: Mutex<Vec<Vec<u8>>>,
+    evidence_lifecycle: Mutex<()>,
+    #[cfg(test)]
+    fail_next_validation_assembly_persist: AtomicBool,
     #[cfg(test)]
     validation_before_start_hook: Mutex<Option<ValidationBeforeStartHook>>,
 }
@@ -244,6 +248,9 @@ impl PromotionStore {
             drafts: Mutex::new(drafts),
             definitions: Mutex::new(definitions),
             secret_values: Mutex::new(Vec::new()),
+            evidence_lifecycle: Mutex::new(()),
+            #[cfg(test)]
+            fail_next_validation_assembly_persist: AtomicBool::new(false),
             #[cfg(test)]
             validation_before_start_hook: Mutex::new(None),
         })
@@ -262,6 +269,7 @@ impl PromotionStore {
         runs: &Mutex<HashMap<String, Arc<RunState>>>,
         secrets: &[Vec<u8>],
     ) -> bool {
+        let _evidence_lifecycle = lock(&self.evidence_lifecycle);
         extend_secret_values(&self.secret_values, secrets.iter().cloned());
         let all_secrets = lock(&self.secret_values).clone();
         let drafts = lock(&self.drafts).values().cloned().collect::<Vec<_>>();
@@ -636,6 +644,11 @@ impl RunController {
         let mut next_detail = previous_detail.clone();
         let mut created_revision_path = None;
         if material_change {
+            if previous_detail.revisions.len() >= MAX_EVALUATION_DRAFT_REVISIONS {
+                return Err(RunError::InvalidRequest(format!(
+                    "evaluation drafts retain at most {MAX_EVALUATION_DRAFT_REVISIONS} revisions"
+                )));
+            }
             let revision_id = format!("revision-{}-{}", now_ms(), random_suffix());
             let source = capture_confined_run_tree(
                 &state.anchor,
@@ -823,7 +836,9 @@ impl RunController {
         draft_id: &str,
         request: SaveEvaluationDraftRequest,
     ) -> Result<EvaluationDraftDetail, RunError> {
+        let evidence_lifecycle = lock(&self.inner.promotion.evidence_lifecycle);
         let state = self.promotion_draft_state(draft_id)?;
+        let event_commit = lock(&state.event_commit);
         let mut detail = lock(&state.detail);
         let previous_detail = detail.clone();
         let mut next_detail = previous_detail.clone();
@@ -878,7 +893,21 @@ impl RunController {
             apply_saved_revision_status(&mut next_detail, draft_id, &revision_id, None)?;
         }
         next_detail.summary.updated_at_ms = now_ms();
-        if let Err(error) = persist_draft_detail(&state, &next_detail) {
+        let event = RunEvent {
+            sequence: next_detail.events.len() as u64 + 1,
+            at_ms: now_ms(),
+            kind: "evaluation-draft.saved".to_owned(),
+            payload: json!({
+                "draftId": draft_id,
+                "revisionId": revision_id,
+                "definitionId": next_detail.summary.definition_id,
+            }),
+            progress: None,
+        };
+        next_detail.events.push(event.clone());
+        if let Err(error) =
+            persist_draft_transition(&state, &previous_detail, &next_detail, &event, None)
+        {
             return rollback_definition_after_draft_failure(
                 &self.inner.promotion,
                 publication,
@@ -888,7 +917,7 @@ impl RunController {
         if let Some(publication) = publication
             && let Err(error) = commit_definition_publication(&self.inner.promotion, &publication)
         {
-            let draft_rollback = persist_draft_detail(&state, &previous_detail);
+            let draft_rollback = rollback_draft_transition(&state, &previous_detail);
             let definition_rollback =
                 rollback_definition_publication(&self.inner.promotion, publication);
             return combine_publication_rollback_errors(
@@ -897,19 +926,14 @@ impl RunController {
                 definition_rollback,
             );
         }
+        let response = next_detail.clone();
         *detail = next_detail;
         drop(detail);
-        record_draft_event(
-            &state,
-            "evaluation-draft.saved",
-            json!({
-                "draftId": draft_id,
-                "revisionId": revision_id,
-                "definitionId": lock(&state.detail).summary.definition_id,
-            }),
-        )?;
+        let _ = state.sender.send(event);
+        drop(event_commit);
+        drop(evidence_lifecycle);
         self.notify_evaluation_library_changed(&state, "saved");
-        Ok(lock(&state.detail).clone())
+        Ok(response)
     }
 
     /// Run a promoted definition through a compatible harness pair.
@@ -1208,6 +1232,14 @@ impl RunController {
                 resume: resume.clone(),
             });
         (reached, resume)
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_validation_assembly_persist(&self) {
+        self.inner
+            .promotion
+            .fail_next_validation_assembly_persist
+            .store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -1532,7 +1564,31 @@ impl RunController {
             assembly.limits = revision.limits.clone();
             assembly.scenario.output.clone_from(&scenario.output);
         }
-        persist_assembly(&state)?;
+        #[cfg(test)]
+        let persist_result = if self
+            .inner
+            .promotion
+            .fail_next_validation_assembly_persist
+            .swap(false, Ordering::AcqRel)
+        {
+            Err(RunError::EvidencePersistence(
+                "injected validation assembly persistence failure".to_owned(),
+            ))
+        } else {
+            persist_assembly(&state)
+        };
+        #[cfg(not(test))]
+        let persist_result = persist_assembly(&state);
+        if let Err(error) = persist_result {
+            lock(&self.inner.scenario_overrides).remove(&prepared.id);
+            let cleanup = self.cancel(&prepared.id);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(RunError::EvidencePersistence(format!(
+                    "{error}; prepared validation cleanup also failed: {cleanup}"
+                ))),
+            };
+        }
         Ok(prepared)
     }
 }
@@ -1835,6 +1891,19 @@ fn persist_draft_transition(
         };
     }
     Ok(())
+}
+
+fn rollback_draft_transition(
+    state: &PromotionDraftState,
+    previous_detail: &EvaluationDraftDetail,
+) -> Result<(), RunError> {
+    persist_draft_detail(state, previous_detail)?;
+    let mut events = Vec::new();
+    for event in &previous_detail.events {
+        serde_json::to_writer(&mut events, event)?;
+        events.push(b'\n');
+    }
+    write_confined_run_bytes_atomic(&state.anchor, Path::new("events.jsonl"), &events)
 }
 
 struct PendingDefinitionPublication {

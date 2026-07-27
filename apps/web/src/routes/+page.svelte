@@ -181,7 +181,11 @@
     Boolean(activeAgentSession && !agentSessionIsHistorical(activeAgentSession.summary));
   $: selectedDraftRevision = selectedDraft
     ? selectedDraft.revisions.find(
-        (revision) => revision.id === selectedDraft?.summary.currentRevisionId
+        (revision) => revision.id === (
+          selectedDefinition?.summary.draftId === selectedDraft?.summary.id
+            ? selectedDefinition?.summary.revisionId
+            : selectedDraft?.summary.currentRevisionId
+        )
       )
     : undefined;
   $: manualDraftAuthoringPending = selectedDraftRevision?.blockingIssues.some((issue) =>
@@ -911,8 +915,12 @@
     return left.length === right.length && left.every((value, index) => value === right[index]);
   }
 
-  function hydrateDraftForm(draft: EvaluationDraftDetail, force = false): void {
-    const revision = draft.revisions.find(
+  function hydrateDraftForm(
+    draft: EvaluationDraftDetail,
+    force = false,
+    selectedRevision?: EvaluationRevision
+  ): void {
+    const revision = selectedRevision ?? draft.revisions.find(
       (candidate) => candidate.id === draft.summary.currentRevisionId
     );
     if (!revision) return;
@@ -960,7 +968,8 @@
   function watchEvaluationDraft(
     workspaceId: string,
     draftId: string,
-    openVersion = draftOpenVersion
+    openVersion = draftOpenVersion,
+    selectedRevision?: EvaluationRevision
   ): void {
     draftEventStream?.abort();
     if (draftRefreshTimer !== undefined) clearTimeout(draftRefreshTimer);
@@ -969,7 +978,13 @@
       if (draftRefreshTimer !== undefined) clearTimeout(draftRefreshTimer);
       draftRefreshTimer = setTimeout(() => {
         draftRefreshTimer = undefined;
-        void refreshEvaluationDraft(workspaceId, draftId, false, openVersion);
+        void refreshEvaluationDraft(
+          workspaceId,
+          draftId,
+          false,
+          openVersion,
+          selectedRevision
+        );
       }, 50);
     });
   }
@@ -978,7 +993,8 @@
     workspaceId: string,
     draftId: string,
     hydrate = false,
-    openVersion = draftOpenVersion
+    openVersion = draftOpenVersion,
+    selectedRevision?: EvaluationRevision
   ): Promise<EvaluationDraftDetail | undefined> {
     try {
       const draft = await runClient.evaluationLibraryDraft(draftId);
@@ -986,13 +1002,8 @@
         return undefined;
       }
       selectedDraft = draft;
-      hydrateDraftForm(draft, hydrate);
+      hydrateDraftForm(draft, hydrate, selectedRevision);
       await loadEvaluationLibrary(workspaceId);
-      if (draft.summary.definitionId) {
-        selectedDefinition = await runClient.evaluationLibraryDefinition(
-          draft.summary.definitionId
-        );
-      }
       return draft;
     } catch (error) {
       actionError = message(error);
@@ -1003,13 +1014,21 @@
   async function openEvaluationDraft(
     workspaceId: string,
     draftId: string,
-    reveal = true
+    reveal = true,
+    definition?: EvaluationDefinitionDetail
   ): Promise<void> {
     const openVersion = ++draftOpenVersion;
-    const draft = await refreshEvaluationDraft(workspaceId, draftId, true, openVersion);
+    selectedDefinition = definition;
+    const draft = await refreshEvaluationDraft(
+      workspaceId,
+      draftId,
+      true,
+      openVersion,
+      definition?.revision
+    );
     if (!draft) return;
     if (reveal) activeTab = 'draft';
-    watchEvaluationDraft(workspaceId, draftId, openVersion);
+    watchEvaluationDraft(workspaceId, draftId, openVersion, definition?.revision);
   }
 
   async function openEvaluationDefinition(definitionId: string): Promise<void> {
@@ -1017,10 +1036,11 @@
     try {
       const definition = await runClient.evaluationLibraryDefinition(definitionId);
       if (requestVersion !== draftOpenVersion) return;
-      selectedDefinition = definition;
       await openEvaluationDraft(
         definition.revision.source.workspaceId,
-        definition.summary.draftId
+        definition.summary.draftId,
+        true,
+        definition
       );
     } catch (error) {
       if (requestVersion !== draftOpenVersion) return;
@@ -1048,6 +1068,7 @@
         }
       );
       const openVersion = ++draftOpenVersion;
+      selectedDefinition = undefined;
       selectedDraft = draft;
       hydrateDraftForm(draft, true);
       await loadEvaluationLibrary(agentSession.summary.workspaceId);
@@ -1147,11 +1168,6 @@
       selectedDraft = draft;
       hydrateDraftForm(draft, true);
       await loadEvaluationLibrary(draft.summary.workspaceId);
-      if (draft.summary.definitionId) {
-        selectedDefinition = await runClient.evaluationLibraryDefinition(
-          draft.summary.definitionId
-        );
-      }
     } catch (error) {
       actionError = message(error);
     } finally {
@@ -1160,13 +1176,20 @@
   }
 
   async function runDraftDefinition(): Promise<void> {
-    if (!selectedDraft?.summary.definitionId || !selectedDraftRevisionIsPromoted) return;
+    const definitionId = selectedDefinition?.summary.id ?? selectedDraft?.summary.definitionId;
+    const workspaceId =
+      selectedDefinition?.revision.source.workspaceId ?? selectedDraft?.summary.workspaceId;
+    if (
+      !definitionId ||
+      !workspaceId ||
+      (!selectedDefinition && !selectedDraftRevisionIsPromoted)
+    ) return;
     draftBusy = true;
     actionError = '';
     try {
       const summary = await runClient.runEvaluationDefinition(
-        selectedDraft.summary.workspaceId,
-        selectedDraft.summary.definitionId
+        workspaceId,
+        definitionId
       );
       evaluations = [summary, ...evaluations.filter((item) => item.id !== summary.id)];
       await openEvaluation(summary.id);
@@ -1599,7 +1622,15 @@
         const draftId = (event.payload as { draftId?: unknown }).draftId;
         void loadEvaluationLibrary(id);
         if (typeof draftId === 'string' && selectedDraft?.summary.id === draftId) {
-          void refreshEvaluationDraft(id, draftId);
+          void refreshEvaluationDraft(
+            id,
+            draftId,
+            false,
+            draftOpenVersion,
+            selectedDefinition?.summary.draftId === draftId
+              ? selectedDefinition.revision
+              : undefined
+          );
         }
       }
       if (
@@ -2646,6 +2677,14 @@
                 </div>
               {/if}
 
+              {#if selectedDefinition}
+                <div class="draft-definition-context" role="status">
+                  <span class="label">Saved definition</span>
+                  <strong>{selectedDefinition.summary.name}</strong>
+                  <small>Immutable revision {shortId(selectedDefinition.summary.revisionId)}</small>
+                </div>
+              {/if}
+
               <form class="draft-form" on:submit|preventDefault={() => void createDraftRevision()}>
                 {#if manualDraftAuthoringPending}
                   <p class="draft-suggestion wide">
@@ -2654,48 +2693,48 @@
                 {/if}
                 <label class="wide">
                   <span>Name</span>
-                  <input bind:value={draftName} autocomplete="off" />
+                  <input bind:value={draftName} autocomplete="off" disabled={Boolean(selectedDefinition)} />
                 </label>
                 <label class="wide">
                   <span>Standalone task</span>
-                  <textarea bind:value={draftTask} rows="5"></textarea>
+                  <textarea bind:value={draftTask} rows="5" disabled={Boolean(selectedDefinition)}></textarea>
                 </label>
 
                 <fieldset class="wide">
                   <legend>Catalog evaluator · v{selectedDraftRevision.evaluator.version}</legend>
                   <label>
                     <span>Expected active names</span>
-                    <input bind:value={draftActiveNames} autocomplete="off" />
+                    <input bind:value={draftActiveNames} autocomplete="off" disabled={Boolean(selectedDefinition)} />
                   </label>
                   <label>
                     <span>Total score</span>
-                    <input type="number" bind:value={draftTotalScore} />
+                    <input type="number" bind:value={draftTotalScore} disabled={Boolean(selectedDefinition)} />
                   </label>
                   <label>
                     <span>Required capabilities</span>
-                    <input bind:value={draftRequiredCapabilities} autocomplete="off" />
+                    <input bind:value={draftRequiredCapabilities} autocomplete="off" disabled={Boolean(selectedDefinition)} />
                   </label>
                   <label>
                     <span>Output path</span>
-                    <input bind:value={draftOutputPath} autocomplete="off" />
+                    <input bind:value={draftOutputPath} autocomplete="off" disabled={Boolean(selectedDefinition)} />
                   </label>
                   <label class="checkbox">
-                    <input type="checkbox" bind:checked={draftRequireSchema} />
+                    <input type="checkbox" bind:checked={draftRequireSchema} disabled={Boolean(selectedDefinition)} />
                     <span>Require the catalog result schema</span>
                   </label>
                 </fieldset>
 
                 <fieldset class="wide limit-grid">
                   <legend>Execution limits</legend>
-                  <label><span>Duration (ms)</span><input type="number" min="1" bind:value={draftMaxDurationMs} /></label>
-                  <label><span>Commands</span><input type="number" min="0" bind:value={draftMaxCommandCount} /></label>
-                  <label><span>Orchestrator calls</span><input type="number" min="0" bind:value={draftMaxOrchestratorInvocations} /></label>
-                  <label><span>Tool calls</span><input type="number" min="0" bind:value={draftMaxToolInvocations} /></label>
+                  <label><span>Duration (ms)</span><input type="number" min="1" bind:value={draftMaxDurationMs} disabled={Boolean(selectedDefinition)} /></label>
+                  <label><span>Commands</span><input type="number" min="0" bind:value={draftMaxCommandCount} disabled={Boolean(selectedDefinition)} /></label>
+                  <label><span>Orchestrator calls</span><input type="number" min="0" bind:value={draftMaxOrchestratorInvocations} disabled={Boolean(selectedDefinition)} /></label>
+                  <label><span>Tool calls</span><input type="number" min="0" bind:value={draftMaxToolInvocations} disabled={Boolean(selectedDefinition)} /></label>
                 </fieldset>
 
                 <label class="wide">
                   <span>Tracked measurements</span>
-                  <input bind:value={draftMeasurements} autocomplete="off" />
+                  <input bind:value={draftMeasurements} autocomplete="off" disabled={Boolean(selectedDefinition)} />
                 </label>
 
                 {#if draftMaterialEditsPending}
@@ -2705,12 +2744,13 @@
                 {/if}
 
                 <div class="draft-actions wide">
-                  <button class="primary" type="submit" disabled={draftBusy}>
+                  <button class="primary" type="submit" disabled={draftBusy || Boolean(selectedDefinition)}>
                     {draftBusy ? 'Working…' : 'Create revision'}
                   </button>
                   <button
                     type="button"
                     disabled={draftBusy ||
+                      Boolean(selectedDefinition) ||
                       draftMaterialEditsPending ||
                       selectedDraftRevision.blockingIssues.length > 0}
                     on:click={() => void validateDraft()}
@@ -2719,12 +2759,13 @@
                   </button>
                   <button
                     type="button"
-                    disabled={draftBusy || draftMaterialEditsPending}
+                    disabled={draftBusy || Boolean(selectedDefinition) || draftMaterialEditsPending}
                     on:click={() => void saveDraftDefinition()}
                   >
                     Save to library
                   </button>
-                  {#if selectedDraft.summary.definitionId && selectedDraftRevisionIsPromoted}
+                  {#if selectedDefinition ||
+                    (selectedDraft.summary.definitionId && selectedDraftRevisionIsPromoted)}
                     <button
                       type="button"
                       disabled={draftBusy ||
@@ -3276,6 +3317,9 @@
   .draft-blockers { margin-top: 10px; padding: 10px 12px; border: 1px solid #695532; border-radius: 7px; color: #c8a968; background: #1c1810; }
   .draft-blockers strong { font-size: 0.68rem; }
   .draft-blockers ul { margin: 6px 0 0; padding-left: 18px; color: #a78c58; font-size: 0.62rem; line-height: 1.45; }
+  .draft-definition-context { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: baseline; gap: 10px; margin-top: 10px; padding: 9px 12px; border: 1px solid #466151; border-radius: 7px; background: #0c1511; }
+  .draft-definition-context strong { overflow: hidden; color: #c8d2cd; font-size: 0.68rem; text-overflow: ellipsis; white-space: nowrap; }
+  .draft-definition-context small { color: #8fac9b; font-family: var(--font-mono); font-size: 0.56rem; }
   .draft-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; margin-top: 14px; }
   .draft-form .wide { grid-column: 1 / -1; }
   .draft-form input:not([type="checkbox"]), .draft-form textarea { width: 100%; min-width: 0; border: 1px solid #293832; border-radius: 6px; padding: 8px 9px; color: #c9d3ce; background: #0a100e; font: 0.66rem/1.45 var(--font-mono); outline: none; }

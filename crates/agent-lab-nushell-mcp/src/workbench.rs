@@ -237,12 +237,13 @@ impl WorkbenchBridge {
     }
 
     pub fn cancel_evaluation_proposal(&self, proposal_id: &str) {
-        let _ = self.post_json(
+        let _ = self.request_json_detached(
+            reqwest::Method::POST,
             &format!(
                 "/api/workbench/{}/evaluation-proposals/{proposal_id}/cancel",
                 self.inner.workspace_id
             ),
-            &json!({}),
+            Some(json!({})),
         );
     }
 
@@ -1754,6 +1755,32 @@ mod tests {
         );
         assert_eq!(output[1]["type"], "proposal-finished");
         assert_eq!(output[1]["draft"]["summary"]["id"], "draft-1");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn proposal_cancellation_returns_before_a_delayed_controller_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut request, _) = listener.accept().unwrap();
+            assert_eq!(
+                read_http_request(&request),
+                "POST /api/workbench/workspace-1/evaluation-proposals/proposal-1/cancel HTTP/1.1\r\n"
+            );
+            thread::sleep(Duration::from_millis(300));
+            write_json_response(&mut request, "200 OK", "null");
+        });
+        let bridge =
+            WorkbenchBridge::new(&origin, "workspace-1".to_owned(), "token".to_owned()).unwrap();
+        let started = Instant::now();
+
+        bridge.cancel_evaluation_proposal("proposal-1");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "proposal cancellation must not synchronously wait for the controller"
+        );
         server.join().unwrap();
     }
 }

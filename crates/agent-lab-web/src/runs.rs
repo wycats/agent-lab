@@ -16341,7 +16341,7 @@ done
                 )
                 .unwrap_err()
                 .to_string()
-                .contains("active evaluation proposal")
+                .contains("model access resolution")
         );
         let proposal = wait_for_proposal(&controller, &proposal.id).await;
         assert_eq!(proposal.summary.status, EvaluationProposalStatus::Complete);
@@ -16397,20 +16397,50 @@ done
             .join("proposals")
             .join(&proposal_id)
             .join("events.jsonl");
+        let proposal_manifest = data
+            .join("evaluation-library")
+            .join("proposals")
+            .join(&proposal_id)
+            .join("manifest.json");
+        let mut interrupted_manifest: JsonValue =
+            serde_json::from_slice(&fs::read(&proposal_manifest).unwrap()).unwrap();
+        interrupted_manifest["summary"]["status"] = json!("running");
+        interrupted_manifest["summary"]["draftId"] = JsonValue::Null;
+        interrupted_manifest["summary"]["finishedAtMs"] = JsonValue::Null;
+        interrupted_manifest["summary"]["error"] = JsonValue::Null;
+        interrupted_manifest["candidate"] = JsonValue::Null;
+        interrupted_manifest["events"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|event| event["type"] != "evaluation-proposal.finished");
+        fs::write(
+            &proposal_manifest,
+            serde_json::to_vec_pretty(&interrupted_manifest).unwrap(),
+        )
+        .unwrap();
         let events = fs::read_to_string(&proposal_events).unwrap();
-        let mut lines = events.lines().collect::<Vec<_>>();
-        assert!(
-            lines
-                .pop()
-                .unwrap()
-                .contains("evaluation-proposal.finished")
-        );
+        let terminal_count = events
+            .lines()
+            .filter(|line| line.contains("\"type\":\"evaluation-proposal.finished\""))
+            .count();
+        assert_eq!(terminal_count, 1);
+        let lines = events
+            .lines()
+            .filter(|line| !line.contains("\"type\":\"evaluation-proposal.finished\""))
+            .collect::<Vec<_>>();
         fs::write(&proposal_events, format!("{}\n", lines.join("\n"))).unwrap();
 
         let reopened = RunController::new_with_harnesses(config(), harnesses(), models).unwrap();
         let replay = reopened.evaluation_proposal(&proposal_id).unwrap();
         assert_eq!(replay.summary.status, EvaluationProposalStatus::Complete);
         assert_eq!(replay.summary.draft_id.as_deref(), Some(draft_id));
+        assert_eq!(
+            replay
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.rationale.as_str()),
+            Some("This span captures the complete catalog-to-file behavior.")
+        );
         assert_eq!(
             replay
                 .events
@@ -16483,7 +16513,7 @@ done
                 StartEvaluationProposalRequest {
                     session_id: Some(session.id.clone()),
                     from_turn_id: Some(source_turn.id.clone()),
-                    through_turn_id: Some(source_turn.id),
+                    through_turn_id: Some(source_turn.id.clone()),
                 },
                 WorkbenchOrigin::Browser,
             )
@@ -16657,7 +16687,7 @@ printf '%s\n' '{{"status":"ready","source":"test","environment":{{"TOKEN":"propo
                 StartEvaluationProposalRequest {
                     session_id: Some(session.id.clone()),
                     from_turn_id: Some(source_turn.id.clone()),
-                    through_turn_id: Some(source_turn.id),
+                    through_turn_id: Some(source_turn.id.clone()),
                 },
                 WorkbenchOrigin::Browser,
             )
@@ -16674,6 +16704,26 @@ printf '%s\n' '{{"status":"ready","source":"test","environment":{{"TOKEN":"propo
         assert!(
             lock(&workspace.pending_secret_resolutions).contains(&proposal.id),
             "proposal credential discovery must be registered before its resolver runs"
+        );
+        let blocked_proposal = controller
+            .start_evaluation_proposal(
+                &explore.id,
+                StartEvaluationProposalRequest {
+                    session_id: Some(session.id.clone()),
+                    from_turn_id: Some(source_turn.id.clone()),
+                    through_turn_id: Some(source_turn.id.clone()),
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            blocked_proposal,
+            RunError::RunUnavailable(message) if message.contains("model access resolution")
+        ));
+        assert_eq!(
+            controller.list_evaluation_proposals().len(),
+            1,
+            "a pending credential resolution must reject proposal startup before evidence is built"
         );
         let blocked_turn = controller
             .start_agent_turn(

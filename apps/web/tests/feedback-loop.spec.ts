@@ -3737,6 +3737,91 @@ test('browser-originated proposals synchronize across attached tabs', async ({ p
   await observer.close();
 });
 
+test('terminal proposal failures remain visible after reload', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await page.getByLabel('Default harness').selectOption('v0');
+  await submit(page, 'agent "Explain the active catalog"');
+  const sourceTurn = page
+    .getByTestId('interactive-agent-session')
+    .getByTestId('session-turn')
+    .last();
+  await expect(sourceTurn).toHaveAttribute('data-status', 'completed');
+
+  let workspaceId = '';
+  const failedSummary = () => ({
+    id: 'proposal-ui-failure',
+    workspaceId,
+    sessionId: 'agent-session-ui',
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    modelId: 'fixture/model',
+    status: 'failed',
+    createdAtMs: 1,
+    finishedAtMs: 2,
+    error: 'evaluation proposal returned invalid JSON'
+  });
+  await page.route('**/evaluation-proposals/proposal-ui-failure/events', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: `data: ${JSON.stringify({
+        sequence: 1,
+        atMs: 2,
+        type: 'evaluation-proposal.finished',
+        payload: {
+          proposalId: 'proposal-ui-failure',
+          status: 'failed',
+          error: 'evaluation proposal returned invalid JSON'
+        }
+      })}\n\n`
+    });
+  });
+  await page.route('**/evaluation-proposals/proposal-ui-failure', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ summary: failedSummary(), events: [] })
+    });
+  });
+  await page.route('**/api/workbench/*/evaluation-proposals', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    workspaceId = path.split('/')[3] ?? '';
+    if (route.request().method() === 'POST') {
+      await route.fulfill({
+        status: 202,
+        contentType: 'application/json',
+        body: JSON.stringify({ ...failedSummary(), status: 'queued', finishedAtMs: undefined, error: undefined })
+      });
+    } else {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify([failedSummary()])
+      });
+    }
+  });
+
+  const proposalStarted = page.waitForResponse((response) =>
+    response.request().method() === 'POST' &&
+    response.url().endsWith('/evaluation-proposals')
+  );
+  await sourceTurn.getByRole('button', { name: 'Suggest evaluation' }).click();
+  expect(await (await proposalStarted).json()).toMatchObject({
+    id: 'proposal-ui-failure',
+    status: 'queued'
+  });
+  const failure = page.getByTestId('proposal-status');
+  await expect(failure).toHaveAttribute('data-status', 'failed');
+  await expect(failure).toContainText('Evaluation suggestion failed');
+  await expect(failure).toContainText('invalid JSON');
+
+  await page.reload();
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect(page.getByTestId('proposal-status')).toHaveAttribute('data-status', 'failed');
+  await expect(page.getByTestId('proposal-status')).toContainText('invalid JSON');
+});
+
 test('a shell-originated proposal streams while the shared browser opens its draft', async ({ page }) => {
   await page.goto('/');
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');

@@ -360,8 +360,8 @@ struct ProposalExecution {
     model_access_provider: Option<ModelAccessProvider>,
     limits: ScenarioLimits,
     evaluator: EvaluationEvaluator,
-    source_turn_ids: Vec<String>,
-    source_input: JsonValue,
+    source_turns: Vec<AgentTurnSummary>,
+    turn_task: JsonValue,
     origin: WorkbenchOrigin,
 }
 
@@ -374,7 +374,7 @@ impl PromotionStore {
         let root = fs::canonicalize(root)?;
         let drafts = load_drafts(&root.join("drafts"))?;
         let definitions = load_definitions(&root.join("definitions"), &drafts)?;
-        let proposals = load_proposals(&root.join("proposals"))?;
+        let proposals = load_proposals(&root.join("proposals"), &drafts)?;
         Ok(Self {
             root,
             drafts: Mutex::new(drafts),
@@ -566,6 +566,11 @@ impl RunController {
         // proposal is registered as both an active producer and a pending secret resolution.
         let mut pending_secret_resolutions = lock(&workspace.pending_secret_resolutions);
         let _producer_lifecycle = lock(&workspace.producer_lifecycle);
+        if !pending_secret_resolutions.is_empty() {
+            return Err(RunError::RunUnavailable(
+                "wait for model access resolution to finish".to_owned(),
+            ));
+        }
         if lock(&workspace.summary).status != RunStatus::Exploring {
             return Err(RunError::RunUnavailable(workspace_id.to_owned()));
         }
@@ -634,14 +639,12 @@ impl RunController {
                 .ok_or_else(|| {
                     RunError::InvalidRequest(format!("unknown source turn: {through}"))
                 })?;
-            turns[from..=through].to_vec()
+            let selected = turns[from..=through].to_vec();
+            validate_coherent_proposal_span(&selected).map_err(RunError::InvalidRequest)?;
+            selected
         } else {
             terminal_turns
         };
-        let source_turn_ids = evidence_turns
-            .iter()
-            .map(|turn| turn.id.clone())
-            .collect::<Vec<_>>();
         let source_turns = evidence_turns
             .iter()
             .map(|turn| {
@@ -679,6 +682,14 @@ impl RunController {
                 "proposal source evidence exceeds the {MAX_AGENT_TURN_INPUT_BYTES} byte input limit"
             )));
         }
+        let id = format!("proposal-{}-{}", now_ms(), random_suffix());
+        let turn_task = json!({
+            "mode": "evaluation-proposal",
+            "promptContract": PROPOSAL_PROMPT_CONTRACT,
+            "prompt": proposal_prompt(),
+            "input": source_input,
+        });
+        validate_proposal_turn_command_size(&id, &turn_task)?;
         let harness = self
             .inner
             .harnesses
@@ -693,7 +704,6 @@ impl RunController {
         let model_access_provider = self.model_access_provider_for_harness(&harness)?.cloned();
         let mut limits = scenario.limits;
         limits.max_duration_ms = limits.max_duration_ms.max(PROPOSAL_MIN_DURATION_MS);
-        let id = format!("proposal-{}-{}", now_ms(), random_suffix());
         let directory = confined_child(&self.inner.promotion.proposal_root(), &id)?;
         fs::create_dir(&directory)?;
         fs::create_dir(directory.join("workspace"))?;
@@ -773,8 +783,8 @@ impl RunController {
             model_access_provider,
             limits,
             evaluator,
-            source_turn_ids,
-            source_input,
+            source_turns: evidence_turns,
+            turn_task,
             origin,
         };
         let controller = self.clone();
@@ -1033,12 +1043,7 @@ impl RunController {
                     CommandBody::StartTurn {
                         session_id: session_id.clone(),
                         turn_id: turn_id.clone(),
-                        task: json!({
-                            "mode": "evaluation-proposal",
-                            "promptContract": PROPOSAL_PROMPT_CONTRACT,
-                            "prompt": proposal_prompt(),
-                            "input": execution.source_input,
-                        }),
+                        task: execution.turn_task.clone(),
                         capability_sources: json!([]),
                     },
                 ))?;
@@ -1267,7 +1272,7 @@ impl RunController {
                 };
                 validate_proposal_candidate(
                     &candidate,
-                    &execution.source_turn_ids,
+                    &execution.source_turns,
                     &execution.evaluator,
                     requested_from.as_deref(),
                     requested_through.as_deref(),
@@ -3201,9 +3206,46 @@ fn validate_requested_proposal_span(
     Ok(())
 }
 
+fn validate_coherent_proposal_span(turns: &[AgentTurnSummary]) -> Result<(), String> {
+    let Some(first) = turns.first() else {
+        return Err("evaluation proposal source span must not be empty".to_owned());
+    };
+    if turns.iter().any(|turn| {
+        turn.source_revision != first.source_revision
+            || turn.capability_revisions != first.capability_revisions
+    }) {
+        return Err(
+            "evaluation proposal source turns must share one workspace and capability revision"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_proposal_turn_command_size(
+    proposal_id: &str,
+    turn_task: &JsonValue,
+) -> Result<(), RunError> {
+    let start_record = command(
+        "proposal-start",
+        CommandBody::StartTurn {
+            session_id: format!("proposal-session-{proposal_id}"),
+            turn_id: format!("proposal-turn-{proposal_id}"),
+            task: turn_task.clone(),
+            capability_sources: json!([]),
+        },
+    );
+    if serde_json::to_vec(&start_record)?.len().saturating_add(1) > MAX_DRIVER_RECORD_BYTES {
+        return Err(RunError::InvalidRequest(format!(
+            "proposal source evidence exceeds the {MAX_DRIVER_RECORD_BYTES}-byte driver record limit"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_proposal_candidate(
     candidate: &EvaluationProposalCandidate,
-    source_turn_ids: &[String],
+    source_turns: &[AgentTurnSummary],
     expected_evaluator: &EvaluationEvaluator,
     requested_from: Option<&str>,
     requested_through: Option<&str>,
@@ -3214,18 +3256,18 @@ fn validate_proposal_candidate(
             candidate.schema_version
         )));
     }
-    let from = source_turn_ids
+    let from = source_turns
         .iter()
-        .position(|turn_id| turn_id == &candidate.from_turn_id)
+        .position(|turn| turn.id == candidate.from_turn_id)
         .ok_or_else(|| {
             RunError::Protocol(format!(
                 "evaluation proposal selected unavailable source turn: {}",
                 candidate.from_turn_id
             ))
         })?;
-    let through = source_turn_ids
+    let through = source_turns
         .iter()
-        .position(|turn_id| turn_id == &candidate.through_turn_id)
+        .position(|turn| turn.id == candidate.through_turn_id)
         .ok_or_else(|| {
             RunError::Protocol(format!(
                 "evaluation proposal selected unavailable source turn: {}",
@@ -3237,6 +3279,7 @@ fn validate_proposal_candidate(
             "evaluation proposal selected a reversed source span".to_owned(),
         ));
     }
+    validate_coherent_proposal_span(&source_turns[from..=through]).map_err(RunError::Protocol)?;
     if let (Some(from), Some(through)) = (requested_from, requested_through)
         && (candidate.from_turn_id != from || candidate.through_turn_id != through)
     {
@@ -4252,7 +4295,90 @@ fn recover_unfinalized_validations(
     recovered
 }
 
-fn load_proposals(root: &Path) -> Result<HashMap<String, Arc<PromotionProposalState>>, RunError> {
+fn recover_published_proposal(
+    proposal_id: &str,
+    drafts: &HashMap<String, Arc<PromotionDraftState>>,
+) -> Result<Option<(String, EvaluationProposalCandidate)>, RunError> {
+    let mut recovered = Vec::new();
+    for draft in drafts.values() {
+        let detail = lock(&draft.detail);
+        if let Some(revision) = detail.revisions.iter().find(|revision| {
+            revision
+                .source
+                .proposal
+                .as_ref()
+                .is_some_and(|provenance| provenance.proposal_id == proposal_id)
+        }) {
+            let provenance = revision
+                .source
+                .proposal
+                .as_ref()
+                .expect("the matching proposal provenance was checked");
+            let Some(from_turn_id) = revision.source.turn_ids.first().cloned() else {
+                return Err(RunError::Protocol(format!(
+                    "published proposal revision has no source turns: {proposal_id}"
+                )));
+            };
+            let through_turn_id = revision
+                .source
+                .turn_ids
+                .last()
+                .cloned()
+                .expect("source turns were checked as non-empty");
+            recovered.push((
+                detail.summary.id.clone(),
+                EvaluationProposalCandidate {
+                    schema_version: PROPOSAL_SCHEMA_VERSION,
+                    from_turn_id,
+                    through_turn_id,
+                    task: revision.task.clone(),
+                    evaluator: revision.evaluator.clone(),
+                    measurements: revision.measurements.clone(),
+                    rationale: provenance.rationale.clone(),
+                },
+            ));
+        }
+    }
+    if recovered.len() > 1 {
+        return Err(RunError::Protocol(format!(
+            "proposal publication is attributed to multiple draft revisions: {proposal_id}"
+        )));
+    }
+    Ok(recovered.pop())
+}
+
+fn reconcile_interrupted_proposal(
+    detail: &mut EvaluationProposalDetail,
+    drafts: &HashMap<String, Arc<PromotionDraftState>>,
+) {
+    match recover_published_proposal(&detail.summary.id, drafts) {
+        Ok(Some((draft_id, candidate))) => {
+            detail.summary.status = EvaluationProposalStatus::Complete;
+            detail.summary.draft_id = Some(draft_id);
+            detail.summary.finished_at_ms = Some(now_ms());
+            detail.summary.error = None;
+            detail.candidate = Some(candidate);
+        }
+        Ok(None) => {
+            detail.summary.status = EvaluationProposalStatus::Failed;
+            detail.summary.finished_at_ms = Some(now_ms());
+            detail.summary.error =
+                Some("controller stopped before the proposal session finalized".to_owned());
+        }
+        Err(error) => {
+            detail.summary.status = EvaluationProposalStatus::Failed;
+            detail.summary.finished_at_ms = Some(now_ms());
+            detail.summary.error = Some(format!(
+                "proposal publication could not be reconciled: {error}"
+            ));
+        }
+    }
+}
+
+fn load_proposals(
+    root: &Path,
+    drafts: &HashMap<String, Arc<PromotionDraftState>>,
+) -> Result<HashMap<String, Arc<PromotionProposalState>>, RunError> {
     let mut proposals = HashMap::new();
     for entry in fs::read_dir(root)? {
         let Ok(entry) = entry else {
@@ -4309,10 +4435,7 @@ fn load_proposals(root: &Path) -> Result<HashMap<String, Arc<PromotionProposalSt
         let needs_terminal_event = terminal_event_count == 0;
         let interrupted = !detail.summary.status.is_finished();
         if interrupted {
-            detail.summary.status = EvaluationProposalStatus::Failed;
-            detail.summary.finished_at_ms = Some(now_ms());
-            detail.summary.error =
-                Some("controller stopped before the proposal session finalized".to_owned());
+            reconcile_interrupted_proposal(&mut detail, drafts);
         }
         let (sender, _) = broadcast::channel(128);
         let state = Arc::new(PromotionProposalState {
@@ -4599,13 +4722,32 @@ mod tests {
             measurements: vec!["duration".to_owned(), "capability-calls".to_owned()],
             rationale: "These turns contain the reusable behavior.".to_owned(),
         };
-        let source_turn_ids = vec!["turn-1".to_owned(), "turn-2".to_owned()];
+        let source_turns = ["turn-1", "turn-2"]
+            .into_iter()
+            .map(|id| AgentTurnSummary {
+                id: id.to_owned(),
+                session_id: "session-1".to_owned(),
+                prompt: "prompt".to_owned(),
+                input: None,
+                source_revision: "revision-1".to_owned(),
+                capability_revisions: BTreeMap::from([(
+                    "catalog".to_owned(),
+                    "catalog-revision-1".to_owned(),
+                )]),
+                status: AgentTurnStatus::Completed,
+                started_at_ms: 1,
+                finished_at_ms: Some(2),
+                outcome: Some("completed".to_owned()),
+                error: None,
+                human_intervention_at_ms: None,
+            })
+            .collect::<Vec<_>>();
 
-        validate_proposal_candidate(&candidate, &source_turn_ids, &evaluator, None, None).unwrap();
+        validate_proposal_candidate(&candidate, &source_turns, &evaluator, None, None).unwrap();
 
         candidate.through_turn_id = "turn-3".to_owned();
         assert!(
-            validate_proposal_candidate(&candidate, &source_turn_ids, &evaluator, None, None,)
+            validate_proposal_candidate(&candidate, &source_turns, &evaluator, None, None,)
                 .unwrap_err()
                 .to_string()
                 .contains("unavailable source turn")
@@ -4614,10 +4756,46 @@ mod tests {
         candidate.through_turn_id = "turn-2".to_owned();
         candidate.evaluator.parameters.total_score = 99;
         assert!(
-            validate_proposal_candidate(&candidate, &source_turn_ids, &evaluator, None, None,)
+            validate_proposal_candidate(&candidate, &source_turns, &evaluator, None, None,)
                 .unwrap_err()
                 .to_string()
                 .contains("preserve the reviewed evaluator")
+        );
+
+        candidate.evaluator = evaluator.clone();
+        let mut incompatible_turns = source_turns;
+        incompatible_turns[1].source_revision = "revision-2".to_owned();
+        validate_requested_proposal_span(&incompatible_turns, "turn-1", "turn-2").unwrap();
+        assert!(
+            validate_coherent_proposal_span(&incompatible_turns)
+                .unwrap_err()
+                .contains("must share one workspace and capability revision")
+        );
+        assert!(
+            validate_proposal_candidate(&candidate, &incompatible_turns, &evaluator, None, None,)
+                .unwrap_err()
+                .to_string()
+                .contains("must share one workspace and capability revision")
+        );
+    }
+
+    #[test]
+    fn proposal_input_limit_accounts_for_the_fully_encoded_driver_record() {
+        let source = json!({
+            "turns": ["x".repeat(MAX_AGENT_TURN_INPUT_BYTES - 512)],
+        });
+        assert!(serde_json::to_vec(&source).unwrap().len() <= MAX_AGENT_TURN_INPUT_BYTES);
+        let turn_task = json!({
+            "mode": "evaluation-proposal",
+            "promptContract": PROPOSAL_PROMPT_CONTRACT,
+            "prompt": proposal_prompt(),
+            "input": source,
+        });
+        assert!(
+            validate_proposal_turn_command_size("proposal-1", &turn_task)
+                .unwrap_err()
+                .to_string()
+                .contains("driver record limit")
         );
     }
 

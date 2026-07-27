@@ -998,6 +998,21 @@
         ? 'Preparing proposal agent…'
         : 'Reviewing the selected turns…';
       watchEvaluationProposal(workspaceId, running.id);
+    } else if (!running && !activeProposal) {
+      const latest = proposals[0];
+      const terminalFailure =
+        latest && (latest.status === 'failed' || latest.status === 'cancelled')
+          ? latest
+          : undefined;
+      if (terminalFailure) {
+        activeProposal = terminalFailure;
+        proposalBusy = false;
+        proposalProgress =
+          terminalFailure.error ??
+          (terminalFailure.status === 'cancelled'
+            ? 'Proposal cancelled'
+            : 'Proposal could not produce a draft');
+      }
     }
   }
 
@@ -2604,14 +2619,27 @@
                   onCancel={() => void cancelActiveAgentTurn()}
                 />
               {/if}
-              {#if activeProposal && ['queued', 'running'].includes(activeProposal.status)}
-                <section class="proposal-status" aria-live="polite" data-status={activeProposal.status}>
+              {#if activeProposal && activeProposal.status !== 'complete'}
+                <section
+                  class="proposal-status"
+                  aria-live="polite"
+                  data-status={activeProposal.status}
+                  data-testid="proposal-status"
+                >
                   <span class="proposal-status-marker" aria-hidden="true"></span>
                   <div>
-                    <strong>Shaping an evaluation</strong>
+                    <strong>
+                      {activeProposal.status === 'failed'
+                        ? 'Evaluation suggestion failed'
+                        : activeProposal.status === 'cancelled'
+                          ? 'Evaluation suggestion cancelled'
+                          : 'Shaping an evaluation'}
+                    </strong>
                     <p>{proposalProgress || 'Reviewing the selected turns…'}</p>
                   </div>
-                  <button on:click={() => void cancelProposal()}>Cancel</button>
+                  {#if ['queued', 'running'].includes(activeProposal.status)}
+                    <button on:click={() => void cancelProposal()}>Cancel</button>
+                  {/if}
                 </section>
               {/if}
               <div class="session-turns">
@@ -3549,6 +3577,9 @@
   .proposal-status strong { color: #c6d2cb; font-size: 0.68rem; font-weight: 580; }
   .proposal-status p { margin: 2px 0 0; color: #819188; font-size: 0.61rem; line-height: 1.4; }
   .proposal-status button { padding: 5px 7px; color: #8fa099; font-size: 0.57rem; }
+  .proposal-status[data-status='failed'] { border-color: #68423f; background: #1a1211; }
+  .proposal-status[data-status='failed'] .proposal-status-marker { animation: none; border-color: #c67a72; background: #c67a72; }
+  .proposal-status[data-status='cancelled'] .proposal-status-marker { animation: none; border-color: #8fa099; background: #8fa099; }
   @keyframes proposal-spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) {
     .proposal-status-marker { animation: none; border-color: #789d6b; background: #789d6b; }

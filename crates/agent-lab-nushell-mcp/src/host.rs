@@ -3605,17 +3605,26 @@ impl Iterator for ProposalValueStream {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.signals.interrupted() {
-                self.bridge.cancel_evaluation_proposal(&self.proposal_id);
                 self.finished = true;
-                return Some(Value::error(
-                    shell_error(
-                        "Evaluation proposal cancelled",
+                let request = self.bridge.cancel_evaluation_proposal(&self.proposal_id);
+                let (title, detail) = match request {
+                    Ok(()) => (
+                        "Evaluation proposal cancellation requested",
                         format!(
-                            "proposal {} remains durable and can be reopened",
+                            "Agent Lab is confirming cancellation for proposal {}; reopen it to inspect the durable outcome",
                             self.proposal_id
                         ),
-                        self.span,
                     ),
+                    Err(error) => (
+                        "Evaluation proposal cancellation request failed",
+                        format!(
+                            "{error}; proposal {} remains durable and can be reopened or cancelled again",
+                            self.proposal_id
+                        ),
+                    ),
+                };
+                return Some(Value::error(
+                    shell_error(title, detail, self.span),
                     self.span,
                 ));
             }
@@ -3658,7 +3667,7 @@ impl Iterator for ProposalValueStream {
 impl Drop for ProposalValueStream {
     fn drop(&mut self) {
         if !self.finished && self.signals.interrupted() {
-            self.bridge.cancel_evaluation_proposal(&self.proposal_id);
+            let _ = self.bridge.cancel_evaluation_proposal(&self.proposal_id);
         }
     }
 }

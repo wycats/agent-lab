@@ -236,15 +236,21 @@ impl WorkbenchBridge {
         Ok(ProposalStream { proposal, receiver })
     }
 
-    pub fn cancel_evaluation_proposal(&self, proposal_id: &str) {
-        let _ = self.request_json_detached(
+    /// Request proposal cancellation without waiting for the controller's terminal response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the detached request worker cannot be started.
+    pub fn cancel_evaluation_proposal(&self, proposal_id: &str) -> Result<(), WorkbenchError> {
+        self.request_json_detached(
             reqwest::Method::POST,
             &format!(
                 "/api/workbench/{}/evaluation-proposals/{proposal_id}/cancel",
                 self.inner.workspace_id
             ),
             Some(json!({})),
-        );
+        )
+        .map(|_| ())
     }
 
     /// Submit an optimistic edit and create a new immutable revision when material.
@@ -1775,7 +1781,7 @@ mod tests {
             WorkbenchBridge::new(&origin, "workspace-1".to_owned(), "token".to_owned()).unwrap();
         let started = Instant::now();
 
-        bridge.cancel_evaluation_proposal("proposal-1");
+        bridge.cancel_evaluation_proposal("proposal-1").unwrap();
 
         assert!(
             started.elapsed() < Duration::from_millis(100),

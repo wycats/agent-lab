@@ -1116,6 +1116,7 @@
     if (
       draftBusy ||
       !agentSession ||
+      agentSession.summary.status === 'running' ||
       turn.status === 'queued' ||
       turn.status === 'running'
     ) return;
@@ -1191,6 +1192,7 @@
     if (
       proposalBusy ||
       !agentSession ||
+      agentSession.summary.status === 'running' ||
       turn.status === 'queued' ||
       turn.status === 'running'
     ) return;
@@ -2718,13 +2720,13 @@
                       <div class="turn-actions">
                         <button
                           class="suggest"
-                          disabled={proposalBusy || draftBusy}
+                          disabled={proposalBusy || draftBusy || activeAgentSession?.summary.status === 'running'}
                           on:click={() => void proposeEvaluation(turn)}
                         >
                           {proposalBusy ? 'Shaping evaluation…' : 'Suggest evaluation'}
                         </button>
                         <button
-                          disabled={draftBusy || proposalBusy}
+                          disabled={draftBusy || proposalBusy || activeAgentSession?.summary.status === 'running'}
                           on:click={() => void makeEvaluation(turn)}
                         >
                           {draftBusy ? 'Creating evaluation…' : 'Create manually'}

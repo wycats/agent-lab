@@ -3006,12 +3006,14 @@ impl RunController {
     /// Returns an error when the run is unknown.
     pub fn cancel(&self, id: &str) -> Result<(), RunError> {
         let state = self.state(id)?;
+        let producer_lifecycle = lock(&state.producer_lifecycle);
         let active_turn = lock(&state.active_agent_turn);
         if active_turn.is_some() {
             return Err(RunError::InvalidRequest(
                 "cancel the active agent turn before closing this workspace".to_owned(),
             ));
         }
+        self.cancel_evaluation_proposals_for_workspace(id);
         let cancel_prepared = {
             let mut summary = lock(&state.summary);
             if summary.status == RunStatus::Exploring {
@@ -3024,6 +3026,7 @@ impl RunController {
             }
         };
         drop(active_turn);
+        drop(producer_lifecycle);
         if cancel_prepared {
             let sessions = lock(&state.agent_sessions)
                 .values()
@@ -15913,6 +15916,7 @@ done
         let script = r#"
 sequence=1
 workspace=
+proposal_session=
 printf '%s\n' '{"protocolVersion":1,"sequence":1,"causedBy":null,"type":"driver.ready","driver":{"name":"promotion-fixture","version":"1","revision":null,"features":["streaming","turn-observations-v1"]}}'
 while IFS= read -r line; do
   session=$(printf '%s' "$line" | sed -E 's/.*"sessionId":"([^"]+)".*/\1/')
@@ -15926,6 +15930,7 @@ while IFS= read -r line; do
       turn=$(printf '%s' "$line" | sed -E 's/.*"turnId":"([^"]+)".*/\1/')
       case "$line" in
         *'"mode":"evaluation-proposal"'*)
+          proposal_session=1
           from=$(printf '%s' "$line" | sed -E 's/.*"fromTurnId":"([^"]+)".*/\1/')
           through=$(printf '%s' "$line" | sed -E 's/.*"throughTurnId":"([^"]+)".*/\1/')
           candidate='{\"schemaVersion\":1,\"fromTurnId\":\"'"$from"'\",\"throughTurnId\":\"'"$through"'\",\"task\":\"Use catalog list and analysis summarize to create and verify result.json.\",\"evaluator\":{\"id\":\"catalog-to-file\",\"version\":1,\"parameters\":{\"activeNames\":[\"alpha\",\"gamma\"],\"totalScore\":11,\"requiredCapabilitySources\":[\"catalog\",\"analysis\"],\"outputPath\":\"result.json\",\"requireSchema\":true}},\"measurements\":[\"duration\",\"model-turns\",\"capability-calls\",\"workspace-effects\",\"reported-usage\"],\"rationale\":\"This span captures the complete catalog-to-file behavior.\"}'
@@ -15963,10 +15968,10 @@ while IFS= read -r line; do
       printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.finished","sessionId":"%s","turnId":"%s","outcome":"aborted","evidence":{"fixture":true}}\n' "$sequence" "$session" "$turn"
       ;;
     *'"type":"session.close"'*)
-      if [ -n "${AGENT_LAB_FIXTURE_CLOSE_MARKER:-}" ]; then
+      if [ -n "$proposal_session" ] && [ -n "${AGENT_LAB_FIXTURE_CLOSE_MARKER:-}" ]; then
         printf 'closed' > "$AGENT_LAB_FIXTURE_CLOSE_MARKER"
       fi
-      if [ -n "${AGENT_LAB_FIXTURE_CLOSE_RELEASE:-}" ]; then
+      if [ -n "$proposal_session" ] && [ -n "${AGENT_LAB_FIXTURE_CLOSE_RELEASE:-}" ]; then
         while [ ! -e "$AGENT_LAB_FIXTURE_CLOSE_RELEASE" ]; do
           sleep 0.01
         done
@@ -16362,6 +16367,16 @@ done
         let draft = controller.evaluation_draft(draft_id).unwrap();
         assert_eq!(draft.summary.status, "ready");
         assert_eq!(draft.revisions.len(), 2);
+        assert_eq!(
+            draft.revisions[0]
+                .source
+                .proposal
+                .as_ref()
+                .map(|provenance| provenance.proposal_id.as_str()),
+            Some(proposal.summary.id.as_str()),
+            "the committed seed revision must remain attributable if finalization is interrupted"
+        );
+        assert!(draft.revisions[0].blocking_issues.is_empty());
         let revision = draft.revisions.last().unwrap();
         assert_eq!(
             revision
@@ -16597,6 +16612,84 @@ done
             )
             .unwrap();
         assert_eq!(next_turn.status, AgentTurnStatus::Queued);
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(marker_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn workspace_cancel_cancels_its_active_evaluation_proposal() {
+        let marker_root = temporary_root("proposal-workspace-cancel-markers");
+        let close_marker = marker_root.join("close-started");
+        let close_release = marker_root.join("close-release");
+        let mut launch = promotion_fixture_launch();
+        launch.env.push((
+            "AGENT_LAB_FIXTURE_CLOSE_MARKER".into(),
+            close_marker.clone().into_os_string(),
+        ));
+        launch.env.push((
+            "AGENT_LAB_FIXTURE_CLOSE_RELEASE".into(),
+            close_release.clone().into_os_string(),
+        ));
+        let (root, controller, explore, session) =
+            start_interactive_fixture("proposal-workspace-cancel", launch).await;
+        let source_turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "Explain the active catalog".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail
+                .turns
+                .iter()
+                .any(|turn| turn.id == source_turn.id && turn.status.is_finished())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source turn did not finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let proposal = controller
+            .start_evaluation_proposal(
+                &explore.id,
+                StartEvaluationProposalRequest {
+                    session_id: Some(session.id.clone()),
+                    from_turn_id: Some(source_turn.id.clone()),
+                    through_turn_id: Some(source_turn.id),
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !close_marker.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "proposal driver did not reach its close boundary"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        controller.cancel(&explore.id).unwrap();
+        assert_eq!(
+            controller.get(&explore.id).unwrap().summary.status,
+            RunStatus::Cancelled
+        );
+        fs::write(&close_release, []).unwrap();
+        let proposal = wait_for_proposal(&controller, &proposal.id).await;
+        assert_eq!(proposal.summary.status, EvaluationProposalStatus::Cancelled);
+        assert!(proposal.summary.draft_id.is_none());
+        assert!(controller.list_evaluation_drafts().is_empty());
 
         drop(controller);
         fs::remove_dir_all(root).unwrap();

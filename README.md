@@ -37,14 +37,13 @@ being copied here.
 
 The embedded Nushell/MCP, browser feedback, neutral external-driver, catalog,
 shared two-harness workbench, persistent interactive-agent session, and manual
-evaluation-promotion threads are implemented. A builder can continue a real
-harness-native session from Nushell, inspect its attributable turns in the
-browser, create and revise an evaluation from a turn, retain a failed
-validation, promote a passing revision, run the definition through two
-configured harnesses, and reopen the evidence after restart. Names and
-contracts remain provisional as later steel threads produce evidence.
-Attributable AI-assisted proposal drafting is the next product boundary in RFC
-0004.
+evaluation-promotion threads are implemented. A separate, read-only proposal
+agent can now suggest an editable evaluation from attributable turn evidence.
+A builder can continue a harness-native session from Nushell, inspect its turns
+in the browser, review and revise the proposal, retain failed validations,
+promote a passing revision, run the definition through two configured
+harnesses, and reopen the evidence after restart. Names and contracts remain
+provisional as later steel threads produce evidence.
 
 ## Browser workbench
 
@@ -138,7 +137,19 @@ process as interrupted.
 ## Promote a turn into an evaluation
 
 A completed turn can become an editable local evaluation without rewriting its
-starting state:
+starting state. Ask a separate read-only proposal agent for a starting point:
+
+```nu
+lab evaluation propose --from <turn-id> --through <turn-id>
+```
+
+The proposer receives durable, redacted turn evidence rather than the live
+workspace. Its structured candidate creates an ordinary draft with explicit
+proposal provenance and rationale. In the browser, **Suggest evaluation** starts
+the same operation and opens the shared **Draft** view when the advice is ready.
+The builder remains responsible for editing, validation, and promotion.
+
+The manual path remains available:
 
 ```nu
 let draft = (lab evaluation new --from <turn-id> --through <turn-id>)
@@ -155,6 +166,12 @@ complete assertion failures remain in history beside later passing attempts.
 Saving promotes only the passing revision selected by the builder. Definitions
 remain portable across compatible harness/model selections, while the source
 harness and model remain provenance and validation defaults.
+
+Proposal progress streams as structured records in Nushell and as compact
+status in the Session view. Ctrl-C cancels the proposal while preserving its
+identity and evidence. Proposal assistance has no workspace mutation authority,
+cannot execute model-generated assertion code, and cannot validate or save a
+definition on the builder's behalf.
 
 `lab evaluation drafts` and `lab evaluation definitions` list the local
 library. Bare `lab evaluation` continues to inspect paired evaluation attempts.

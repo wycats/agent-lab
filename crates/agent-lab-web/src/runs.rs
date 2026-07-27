@@ -49,9 +49,12 @@ use tokio_util::sync::CancellationToken;
 mod promotion;
 pub use promotion::{
     CreateEvaluationDraftRequest, EvaluationDefinitionDetail, EvaluationDefinitionSummary,
-    EvaluationDraftDetail, EvaluationDraftSummary, EvaluationExecutionStatus, EvaluationRevision,
+    EvaluationDraftDetail, EvaluationDraftSummary, EvaluationExecutionStatus,
+    EvaluationProposalCandidate, EvaluationProposalDetail, EvaluationProposalProvenance,
+    EvaluationProposalStatus, EvaluationProposalSummary, EvaluationRevision,
     EvaluationRevisionUpdate, EvaluationValidationAttempt, SaveEvaluationDraftRequest,
-    StartDefinitionEvaluationRequest, UpdateEvaluationDraftRequest, ValidationAssertionStatus,
+    StartDefinitionEvaluationRequest, StartEvaluationProposalRequest, UpdateEvaluationDraftRequest,
+    ValidationAssertionStatus,
 };
 
 const DRIVER_POLL: Duration = Duration::from_millis(250);
@@ -15910,6 +15913,13 @@ while IFS= read -r line; do
     *'"type":"turn.start"'*)
       turn=$(printf '%s' "$line" | sed -E 's/.*"turnId":"([^"]+)".*/\1/')
       case "$line" in
+        *'"mode":"evaluation-proposal"'*)
+          from=$(printf '%s' "$line" | sed -E 's/.*"fromTurnId":"([^"]+)".*/\1/')
+          through=$(printf '%s' "$line" | sed -E 's/.*"throughTurnId":"([^"]+)".*/\1/')
+          candidate='{\"schemaVersion\":1,\"fromTurnId\":\"'"$from"'\",\"throughTurnId\":\"'"$through"'\",\"task\":\"Use catalog list and analysis summarize to create and verify result.json.\",\"evaluator\":{\"id\":\"catalog-to-file\",\"version\":1,\"parameters\":{\"activeNames\":[\"alpha\",\"gamma\"],\"totalScore\":11,\"requiredCapabilitySources\":[\"catalog\",\"analysis\"],\"outputPath\":\"result.json\",\"requireSchema\":true}},\"measurements\":[\"duration\",\"model-turns\",\"capability-calls\",\"workspace-effects\",\"reported-usage\"],\"rationale\":\"This span captures the complete catalog-to-file behavior.\"}'
+          sequence=$((sequence + 1))
+          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.completed","payload":{"messageId":"proposal-%s","text":"%s"}}\n' "$sequence" "$session" "$turn" "$turn" "$candidate"
+          ;;
         *'"mode":"interactive"'*)
           sequence=$((sequence + 1))
           printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.completed","payload":{"messageId":"answer-%s","text":"Catalog finding: Alpha and gamma are active."}}\n' "$sequence" "$session" "$turn" "$turn"
@@ -15980,6 +15990,26 @@ done
                 Instant::now() < deadline,
                 "evaluation validation {attempt_id} did not finish; latest status: {:?}",
                 attempt.execution_status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_proposal(
+        controller: &RunController,
+        proposal_id: &str,
+    ) -> EvaluationProposalDetail {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let proposal = controller.evaluation_proposal(proposal_id).unwrap();
+            if proposal.summary.status.is_finished() {
+                return proposal;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "evaluation proposal {proposal_id} did not finish; latest status: {:?}",
+                proposal.summary.status
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -16193,6 +16223,198 @@ done
         assert_eq!(detail.output, Some(json!({ "source": "final" })));
 
         drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn proposal_session_creates_attributable_editable_draft_and_replays() {
+        let root = temporary_root("evaluation-proposal");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/bin/false"),
+        };
+        let harnesses = || {
+            vec![HarnessProfile {
+                id: "v0".to_owned(),
+                display_name: "v0".to_owned(),
+                launch: promotion_fixture_launch(),
+                models: BTreeMap::from([("test".to_owned(), "fixture/v0".to_owned())]),
+            }]
+        };
+        let models = BTreeMap::from([("test".to_owned(), "Test".to_owned())]);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let observed = controller
+                .list_agent_sessions(&explore.id)
+                .into_iter()
+                .find(|candidate| candidate.id == session.id)
+                .unwrap();
+            if observed.status == AgentSessionStatus::Ready && observed.active {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source session did not start");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "Explain the active catalog".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail
+                .turns
+                .iter()
+                .any(|candidate| candidate.id == turn.id && candidate.status.is_finished())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source turn did not finish");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let proposal = controller
+            .start_evaluation_proposal(
+                &explore.id,
+                StartEvaluationProposalRequest {
+                    session_id: Some(session.id.clone()),
+                    from_turn_id: Some(turn.id.clone()),
+                    through_turn_id: Some(turn.id.clone()),
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        assert_eq!(proposal.status, EvaluationProposalStatus::Queued);
+        assert!(
+            controller
+                .start_evaluation_proposal(
+                    &explore.id,
+                    StartEvaluationProposalRequest {
+                        session_id: Some(session.id.clone()),
+                        from_turn_id: Some(turn.id.clone()),
+                        through_turn_id: Some(turn.id.clone()),
+                    },
+                    WorkbenchOrigin::Nushell,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("active evaluation proposal")
+        );
+        let proposal = wait_for_proposal(&controller, &proposal.id).await;
+        assert_eq!(proposal.summary.status, EvaluationProposalStatus::Complete);
+        assert_eq!(
+            proposal
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.from_turn_id.as_str()),
+            Some(turn.id.as_str())
+        );
+        let draft_id = proposal.summary.draft_id.as_deref().unwrap();
+        let draft = controller.evaluation_draft(draft_id).unwrap();
+        assert_eq!(draft.summary.status, "ready");
+        assert_eq!(draft.revisions.len(), 2);
+        let revision = draft.revisions.last().unwrap();
+        assert_eq!(
+            revision
+                .source
+                .proposal
+                .as_ref()
+                .map(|provenance| provenance.proposal_id.as_str()),
+            Some(proposal.summary.id.as_str())
+        );
+        assert_eq!(
+            revision
+                .source
+                .proposal
+                .as_ref()
+                .map(|provenance| provenance.prompt_contract.as_str()),
+            Some("agent-lab/evaluation-proposal@1")
+        );
+        assert_eq!(
+            revision
+                .source
+                .proposal
+                .as_ref()
+                .map(|provenance| provenance.rationale.as_str()),
+            Some("This span captures the complete catalog-to-file behavior.")
+        );
+        assert_eq!(
+            controller.list_agent_sessions(&explore.id).len(),
+            1,
+            "operation-scoped proposal sessions must not appear as interactive sessions"
+        );
+        assert!(proposal.events.iter().any(|event| {
+            event.kind == "observation.progress" || event.kind == "observation.assistant.completed"
+        }));
+        let proposal_id = proposal.summary.id.clone();
+        drop(controller);
+
+        let proposal_events = data
+            .join("evaluation-library")
+            .join("proposals")
+            .join(&proposal_id)
+            .join("events.jsonl");
+        let events = fs::read_to_string(&proposal_events).unwrap();
+        let mut lines = events.lines().collect::<Vec<_>>();
+        assert!(
+            lines
+                .pop()
+                .unwrap()
+                .contains("evaluation-proposal.finished")
+        );
+        fs::write(&proposal_events, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let reopened = RunController::new_with_harnesses(config(), harnesses(), models).unwrap();
+        let replay = reopened.evaluation_proposal(&proposal_id).unwrap();
+        assert_eq!(replay.summary.status, EvaluationProposalStatus::Complete);
+        assert_eq!(replay.summary.draft_id.as_deref(), Some(draft_id));
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| event.kind == "evaluation-proposal.finished")
+                .count(),
+            1,
+            "replay should repair a terminal manifest whose final event append was interrupted"
+        );
+        assert_eq!(
+            reopened
+                .evaluation_draft(draft_id)
+                .unwrap()
+                .summary
+                .current_revision_id,
+            draft.summary.current_revision_id
+        );
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 

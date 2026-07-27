@@ -3431,7 +3431,7 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   await expect(page.getByTestId('evaluation-draft-view')).toBeVisible();
   await expect(page.locator('[data-testid="terminal"] textarea')).toBeFocused();
   await page.getByRole('button', { name: 'Session' }).click();
-  await turn.getByRole('button', { name: 'Make evaluation' }).dblclick();
+  await turn.getByRole('button', { name: 'Create manually' }).dblclick();
 
   const draft = page.getByTestId('evaluation-draft-view');
   await expect(draft).toBeVisible();
@@ -3580,11 +3580,25 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   const definitionRunRequest = page.waitForRequest(
     new RegExp(`/api/workbench/[^/]+/evaluation-definitions/${definitionId}/run$`)
   );
+  let releaseDefinitionRun: (() => void) | undefined;
+  const definitionRunGate = new Promise<void>((resolve) => {
+    releaseDefinitionRun = resolve;
+  });
+  await page.route(
+    new RegExp(`/api/workbench/[^/]+/evaluation-definitions/${definitionId}/run$`),
+    async (route) => {
+      await definitionRunGate;
+      await route.continue();
+    }
+  );
   await page.getByRole('button', { name: 'Run comparison' }).click();
+  await expect(page.getByRole('button', { name: 'Starting comparison…' })).toBeDisabled();
+  releaseDefinitionRun?.();
   const definitionRunBody = (await definitionRunRequest).postDataJSON() as {
     modelProfileId?: string;
     harnessIds?: string[];
   };
+  await page.unrouteAll({ behavior: 'wait' });
   expect(definitionRunBody).toEqual({
     modelProfileId: 'fixture',
     harnessIds: ['v0', 'eve']
@@ -3605,6 +3619,43 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   await expect(page.getByTestId('evaluation-draft-view').locator('.validation-card')).toHaveCount(3);
   await expect(page.getByTestId('evaluation-draft-view')).toContainText('Owned by revision');
 
+  const externalBrowserEvaluationId = await page.evaluate(async ({ definitionId }) => {
+    const tokenResponse = await fetch('/api/session-token', { cache: 'no-store' });
+    const { token } = await tokenResponse.json() as { token: string };
+    const headers = { Authorization: `Bearer ${token}` };
+    const definitionResponse = await fetch(
+      `/api/evaluation-definitions/${encodeURIComponent(definitionId)}`,
+      { headers, cache: 'no-store' }
+    );
+    const definition = await definitionResponse.json() as {
+      revision: { source: { workspaceId: string } };
+    };
+    const response = await fetch(
+      `/api/workbench/${encodeURIComponent(definition.revision.source.workspaceId)}/evaluation-definitions/${encodeURIComponent(definitionId)}/run`,
+      {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          modelProfileId: 'fixture',
+          harnessIds: ['v0', 'eve']
+        }),
+        cache: 'no-store'
+      }
+    );
+    if (!response.ok) throw new Error(`external definition run failed with ${response.status}`);
+    return ((await response.json()) as { id: string }).id;
+  }, { definitionId });
+  const synchronizedEvaluation = page.getByTestId('evaluation-view');
+  await expect(synchronizedEvaluation).toBeVisible();
+  await expect(synchronizedEvaluation).toHaveAttribute(
+    'data-evaluation-id',
+    externalBrowserEvaluationId
+  );
+  await expect(synchronizedEvaluation.locator('.run-status')).toHaveText('passed');
+
   await submit(
     page,
     'lab evaluation run (lab evaluation definitions | first | get id) v0 eve --model fixture'
@@ -3612,6 +3663,69 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   await expect(page.getByTestId('evaluation-view')).toBeVisible();
   await expect(page.getByTestId('evaluation-view').locator('.run-status')).toHaveText('passed');
   await expect(page.locator('[data-testid="terminal"] textarea')).toBeFocused();
+});
+
+test.describe.serial('evaluation proposal projections', () => {
+test('a separate proposal agent turns completed evidence into an attributed draft', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await page.getByLabel('Default harness').selectOption('v0');
+  await expect(page.getByLabel('Default model')).toHaveValue('fixture');
+
+  await submit(page, 'agent "Explain the active catalog as a reusable task"');
+  const session = page.getByTestId('interactive-agent-session');
+  const turn = session.getByTestId('session-turn').last();
+  await expect(turn).toHaveAttribute('data-status', 'completed');
+
+  const proposalStarted = page.waitForResponse((response) => {
+    const path = new URL(response.url()).pathname;
+    return (
+      response.request().method() === 'POST' &&
+      /\/api\/workbench\/[^/]+\/evaluation-proposals$/.test(path)
+    );
+  });
+  await turn.getByRole('button', { name: 'Suggest evaluation' }).click();
+  await expect((await proposalStarted).status()).toBe(202);
+
+  const draft = page.getByTestId('evaluation-draft-view');
+  await expect(draft).toBeVisible();
+  await expect(page.locator('.run-heading')).toContainText('Evaluation draft');
+  await expect(draft).toContainText('Suggested by');
+  await expect(draft).toContainText('v0 · fixture');
+  await expect(draft).toContainText('This span captures the complete catalog-to-file behavior.');
+  await expect(draft.locator('.revision-list')).toContainText('from');
+  await expect(
+    page.locator('.draft-history .history-list button.selected')
+  ).toHaveCount(1);
+  const totalScore = await page.getByLabel('Total score').boundingBox();
+  const outputPath = await page.getByLabel('Output path').boundingBox();
+  expect(totalScore?.height).toBeLessThan(50);
+  expect(outputPath?.height).toBeLessThan(50);
+  expect(Math.abs((totalScore?.height ?? 0) - (outputPath?.height ?? 0))).toBeLessThan(2);
+});
+
+test('a shell-originated proposal streams while the shared browser opens its draft', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await page.getByLabel('Default harness').selectOption('v0');
+
+  await submit(page, 'agent "Explain the active catalog as a reusable task"');
+  await expect(
+    page.getByTestId('interactive-agent-session').getByTestId('session-turn').last()
+  ).toHaveAttribute('data-status', 'completed');
+
+  await submit(
+    page,
+    'let turn = (agent turn | get turnId); lab evaluation propose --from $turn --through $turn | last | get type'
+  );
+
+  const draft = page.getByTestId('evaluation-draft-view');
+  await expect(draft).toBeVisible();
+  await expect(draft).toContainText('Suggested by');
+  await expect(page.locator('.run-heading')).toContainText('ready');
+  await expect(page.locator('[data-testid="terminal"] textarea')).toBeFocused();
+  await expect(page.getByTestId('terminal-text')).toContainText('proposal-finished');
+});
 });
 
 test('stacked surfaces keep their scroll owners inside the viewport', async ({ page }) => {

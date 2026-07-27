@@ -305,6 +305,8 @@ impl Fixture {
                 task,
                 capability_sources,
             )?;
+        } else if mode == Some("evaluation-proposal") {
+            self.complete_evaluation_proposal(output, &session_id, &turn_id, task)?;
         }
         self.emit(
             output,
@@ -419,6 +421,95 @@ impl Fixture {
             .into_driver_body(session_id, turn_id),
         )?;
         let input_tokens = prompt.split_whitespace().count() as u64;
+        let output_tokens = answer.split_whitespace().count() as u64;
+        self.emit(
+            output,
+            TurnObservation::Usage(UsageObservation {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+                total_tokens: Some(input_tokens + output_tokens),
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            })
+            .into_driver_body(session_id, turn_id),
+        )
+    }
+
+    fn complete_evaluation_proposal(
+        &mut self,
+        output: &mut impl Write,
+        session_id: &str,
+        turn_id: &str,
+        task: &JsonValue,
+    ) -> io::Result<()> {
+        let input = task.get("input").cloned().unwrap_or(JsonValue::Null);
+        let turns = input
+            .get("turns")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| io::Error::other("proposal fixture requires source turns"))?;
+        let requested = input.get("requestedSpan");
+        let from_turn_id = requested
+            .and_then(|requested| requested.get("fromTurnId"))
+            .and_then(JsonValue::as_str)
+            .or_else(|| {
+                turns
+                    .last()
+                    .and_then(|turn| turn.get("id"))
+                    .and_then(JsonValue::as_str)
+            })
+            .ok_or_else(|| io::Error::other("proposal fixture requires a source turn"))?;
+        let through_turn_id = requested
+            .and_then(|requested| requested.get("throughTurnId"))
+            .and_then(JsonValue::as_str)
+            .or_else(|| {
+                turns
+                    .last()
+                    .and_then(|turn| turn.get("id"))
+                    .and_then(JsonValue::as_str)
+            })
+            .ok_or_else(|| io::Error::other("proposal fixture requires a last turn"))?;
+        let evaluator = input
+            .get("evaluator")
+            .cloned()
+            .ok_or_else(|| io::Error::other("proposal fixture requires an evaluator"))?;
+        let candidate = json!({
+            "schemaVersion": 1,
+            "fromTurnId": from_turn_id,
+            "throughTurnId": through_turn_id,
+            "task": "Use catalog list and analysis summarize to create and verify result.json.",
+            "evaluator": evaluator,
+            "measurements": [
+                "duration",
+                "model-turns",
+                "capability-calls",
+                "workspace-effects",
+                "reported-usage"
+            ],
+            "rationale": "This span captures the complete catalog-to-file behavior."
+        });
+        let answer = serde_json::to_string(&candidate).map_err(io::Error::other)?;
+        let message_id = format!("fixture-proposal-{turn_id}");
+        self.emit(
+            output,
+            TurnObservation::Progress(ProgressObservation {
+                phase: ProgressPhase::Reasoning,
+                detail: Some("Reviewing durable turn evidence".to_owned()),
+                source: Some("fixture".to_owned()),
+            })
+            .into_driver_body(session_id, turn_id),
+        )?;
+        self.emit(
+            output,
+            TurnObservation::AssistantCompleted(AssistantCompletedObservation {
+                message_id,
+                text: answer.clone(),
+            })
+            .into_driver_body(session_id, turn_id),
+        )?;
+        let input_tokens = serde_json::to_string(&input)
+            .map_err(io::Error::other)?
+            .split_whitespace()
+            .count() as u64;
         let output_tokens = answer.split_whitespace().count() as u64;
         self.emit(
             output,

@@ -322,6 +322,26 @@ export interface EvaluationSourceProvenance {
     };
     launchDigest: string;
   };
+  proposal?: EvaluationProposalProvenance;
+}
+
+export interface EvaluationProposalProvenance {
+  proposalId: string;
+  harnessId: string;
+  modelProfileId: string;
+  modelId: string;
+  promptContract: string;
+  rationale: string;
+  sourceEventSequences: number[];
+  driver?: {
+    descriptor: {
+      name: string;
+      version: string;
+      revision?: string;
+      features: string[];
+    };
+    launchDigest: string;
+  };
 }
 
 export interface EvaluationRevision {
@@ -379,6 +399,45 @@ export interface EvaluationDraftDetail {
   summary: EvaluationDraftSummary;
   revisions: EvaluationRevision[];
   validations: EvaluationValidationAttempt[];
+  events: RunEvent[];
+}
+
+export type EvaluationProposalStatus =
+  | 'queued'
+  | 'running'
+  | 'complete'
+  | 'failed'
+  | 'cancelled';
+
+export interface EvaluationProposalCandidate {
+  schemaVersion: number;
+  fromTurnId: string;
+  throughTurnId: string;
+  task: string;
+  evaluator: EvaluationEvaluator;
+  measurements: string[];
+  rationale: string;
+}
+
+export interface EvaluationProposalSummary {
+  id: string;
+  workspaceId: string;
+  sessionId: string;
+  harnessId: string;
+  modelProfileId: string;
+  modelId: string;
+  status: EvaluationProposalStatus;
+  draftId?: string;
+  createdAtMs: number;
+  finishedAtMs?: number;
+  error?: string;
+}
+
+export interface EvaluationProposalDetail {
+  summary: EvaluationProposalSummary;
+  requestedFromTurnId?: string;
+  requestedThroughTurnId?: string;
+  candidate?: EvaluationProposalCandidate;
   events: RunEvent[];
 }
 
@@ -540,6 +599,21 @@ export interface RunClient {
     workspaceId: string,
     input: { sessionId?: string; fromTurnId: string; throughTurnId: string }
   ): Promise<EvaluationDraftDetail>;
+  evaluationProposals(workspaceId: string): Promise<EvaluationProposalSummary[]>;
+  proposeEvaluation(
+    workspaceId: string,
+    input: { sessionId?: string; fromTurnId?: string; throughTurnId?: string }
+  ): Promise<EvaluationProposalSummary>;
+  evaluationProposal(
+    workspaceId: string,
+    proposalId: string
+  ): Promise<EvaluationProposalDetail>;
+  cancelEvaluationProposal(workspaceId: string, proposalId: string): Promise<void>;
+  evaluationProposalEvents(
+    workspaceId: string,
+    proposalId: string,
+    onEvent: (event: RunEvent) => void | Promise<void>
+  ): AbortController;
   evaluationLibraryDraft(draftId: string): Promise<EvaluationDraftDetail>;
   updateEvaluationDraft(
     workspaceId: string,
@@ -846,6 +920,26 @@ export function createRunClient(): RunClient {
         method: 'POST',
         body: JSON.stringify(input)
       }),
+    evaluationProposals: (workspaceId) =>
+      request(`/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-proposals`),
+    proposeEvaluation: (workspaceId, input) =>
+      request(`/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-proposals`, {
+        method: 'POST',
+        body: JSON.stringify(input)
+      }),
+    evaluationProposal: (workspaceId, proposalId) =>
+      request(
+        `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-proposals/${encodeURIComponent(proposalId)}`
+      ),
+    cancelEvaluationProposal: (workspaceId, proposalId) =>
+      request(
+        `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-proposals/${encodeURIComponent(proposalId)}/cancel`,
+        { method: 'POST' }
+      ),
+    evaluationProposalEvents(workspaceId, proposalId, onEvent) {
+      const path = `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-proposals/${encodeURIComponent(proposalId)}/events`;
+      return reconnectingRunEvents(path, onEvent);
+    },
     evaluationLibraryDraft: (draftId) =>
       request(`/api/evaluation-drafts/${encodeURIComponent(draftId)}`),
     updateEvaluationDraft: (workspaceId, draftId, input) =>

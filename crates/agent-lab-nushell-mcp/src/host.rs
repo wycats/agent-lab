@@ -42,8 +42,8 @@ use crate::{
     bridge::BridgeError,
     value::{json_to_nu, json_to_nu_tool_result, nu_record_to_json, nu_to_json},
     workbench::{
-        AgentTurnOutput, AgentTurnStream, ComparisonStream, ValidationStream, WorkbenchBridge,
-        WorkbenchError,
+        AgentTurnOutput, AgentTurnStream, ComparisonStream, ProposalStream, ValidationStream,
+        WorkbenchBridge, WorkbenchError,
     },
 };
 
@@ -370,6 +370,7 @@ impl NushellHost {
     ///
     /// Returns an error when the initial workbench snapshot cannot be loaded or
     /// its Nushell commands cannot be registered.
+    #[allow(clippy::too_many_lines)]
     pub fn attach_workbench(&mut self, bridge: WorkbenchBridge) -> Result<(), HostError> {
         let snapshot = bridge.assembly().map_err(|error| {
             HostError::Shell(shell_error(
@@ -409,6 +410,10 @@ impl NushellHost {
             bridge: bridge.clone(),
         }));
         working_set.add_decl(Box::new(LabEvaluationNewCommand {
+            bridge: bridge.clone(),
+            draft_ids: self.workbench_drafts.clone(),
+        }));
+        working_set.add_decl(Box::new(LabEvaluationProposeCommand {
             bridge: bridge.clone(),
             draft_ids: self.workbench_drafts.clone(),
         }));
@@ -2958,6 +2963,78 @@ impl Command for LabEvaluationNewCommand {
 }
 
 #[derive(Clone)]
+struct LabEvaluationProposeCommand {
+    bridge: WorkbenchBridge,
+    draft_ids: Arc<RwLock<Vec<String>>>,
+}
+
+impl Command for LabEvaluationProposeCommand {
+    fn name(&self) -> &'static str {
+        "lab evaluation propose"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .input_output_type(Type::Nothing, Type::Table(Vec::new().into()))
+            .named("from", SyntaxShape::String, "first source turn", None)
+            .named("through", SyntaxShape::String, "last source turn", None)
+            .named("session", SyntaxShape::String, "source agent session", None)
+    }
+
+    fn description(&self) -> &'static str {
+        "Ask a separate read-only agent to suggest an editable evaluation draft"
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &nu_protocol::engine::Call<'_>,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let from = call.get_flag::<String>(engine_state, stack, "from")?;
+        let through = call.get_flag::<String>(engine_state, stack, "through")?;
+        if from.is_some() != through.is_some() {
+            return Err(shell_error(
+                "Incomplete source span",
+                "provide both --from and --through, or omit both to let the proposal agent choose"
+                    .to_owned(),
+                call.head,
+            ));
+        }
+        let session = call.get_flag::<String>(engine_state, stack, "session")?;
+        let proposal = self
+            .bridge
+            .propose_evaluation(session.as_deref(), from.as_deref(), through.as_deref())
+            .map_err(|error| {
+                shell_error("Evaluation proposal failed", error.to_string(), call.head)
+            })?;
+        let proposal_id = proposal
+            .proposal
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                shell_error(
+                    "Invalid proposal response",
+                    "proposal response has no id".to_owned(),
+                    call.head,
+                )
+            })?
+            .to_owned();
+        let stream = ProposalValueStream {
+            proposal,
+            bridge: self.bridge.clone(),
+            proposal_id,
+            draft_ids: self.draft_ids.clone(),
+            signals: engine_state.signals().clone(),
+            span: call.head,
+            finished: false,
+        };
+        Ok(ListStream::new(stream, call.head, Signals::empty()).into())
+    }
+}
+
+#[derive(Clone)]
 struct LabEvaluationDraftsCommand {
     bridge: WorkbenchBridge,
     draft_ids: Arc<RwLock<Vec<String>>>,
@@ -3508,6 +3585,80 @@ impl Drop for ValidationValueStream {
         if !self.finished && self.signals.interrupted() {
             self.bridge
                 .cancel_evaluation_validation(&self.draft_id, &self.validation_id);
+        }
+    }
+}
+
+struct ProposalValueStream {
+    proposal: ProposalStream,
+    bridge: WorkbenchBridge,
+    proposal_id: String,
+    draft_ids: Arc<RwLock<Vec<String>>>,
+    signals: Signals,
+    span: Span,
+    finished: bool,
+}
+
+impl Iterator for ProposalValueStream {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.signals.interrupted() {
+                self.bridge.cancel_evaluation_proposal(&self.proposal_id);
+                self.finished = true;
+                return Some(Value::error(
+                    shell_error(
+                        "Evaluation proposal cancelled",
+                        format!(
+                            "proposal {} remains durable and can be reopened",
+                            self.proposal_id
+                        ),
+                        self.span,
+                    ),
+                    self.span,
+                ));
+            }
+            match self
+                .proposal
+                .receiver
+                .recv_timeout(Duration::from_millis(100))
+            {
+                Ok(Ok(value)) => {
+                    if value.get("type").and_then(JsonValue::as_str) == Some("proposal-finished") {
+                        let draft_id = value
+                            .pointer("/draft/summary/id")
+                            .and_then(JsonValue::as_str);
+                        remember_resource_id(&self.draft_ids, draft_id);
+                        self.finished = true;
+                    }
+                    return Some(json_to_nu(value, self.span));
+                }
+                Ok(Err(error)) => {
+                    self.finished = true;
+                    return Some(Value::error(
+                        shell_error(
+                            "Evaluation proposal stream failed",
+                            error.to_string(),
+                            self.span,
+                        ),
+                        self.span,
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.finished = true;
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ProposalValueStream {
+    fn drop(&mut self) {
+        if !self.finished && self.signals.interrupted() {
+            self.bridge.cancel_evaluation_proposal(&self.proposal_id);
         }
     }
 }
@@ -4077,6 +4228,18 @@ mod tests {
         );
         assert_eq!(
             completion_values("lab evaluation new --session agent-session-"),
+            ["agent-session-1"]
+        );
+        assert_eq!(
+            completion_values("lab evaluation propose --from agent-turn-"),
+            ["agent-turn-1", "agent-turn-2"]
+        );
+        assert_eq!(
+            completion_values("lab evaluation propose --through agent-turn-"),
+            ["agent-turn-1", "agent-turn-2"]
+        );
+        assert_eq!(
+            completion_values("lab evaluation propose --session agent-session-"),
             ["agent-session-1"]
         );
         assert_eq!(completion_values("lab evaluation validate --r"), ["--raw"]);
@@ -5166,10 +5329,14 @@ impl Completer for AgentLabCompleter {
             }
         }
 
-        if let Some(arguments) = prefix.strip_prefix("lab evaluation new ") {
+        let source_command = ["lab evaluation new ", "lab evaluation propose "]
+            .into_iter()
+            .find(|command| prefix.starts_with(command));
+        if let Some(command) = source_command {
+            let arguments = &prefix[command.len()..];
             let value_start = arguments.rfind(' ').map_or(0, |index| index + 1);
             let value_prefix = &arguments[value_start..];
-            let replace_start = replace_start + "lab evaluation new ".len() + value_start;
+            let replace_start = replace_start + command.len() + value_start;
             let prior = arguments[..value_start]
                 .split_whitespace()
                 .collect::<Vec<_>>();

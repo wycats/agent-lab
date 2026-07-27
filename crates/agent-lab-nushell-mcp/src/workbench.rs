@@ -57,6 +57,11 @@ pub struct ValidationStream {
     pub receiver: mpsc::Receiver<Result<JsonValue, WorkbenchError>>,
 }
 
+pub struct ProposalStream {
+    pub proposal: JsonValue,
+    pub receiver: mpsc::Receiver<Result<JsonValue, WorkbenchError>>,
+}
+
 pub struct AgentTurnStream {
     pub session: JsonValue,
     pub turn: JsonValue,
@@ -186,6 +191,59 @@ impl WorkbenchBridge {
                 "throughTurnId": through_turn_id,
             }),
         )
+    }
+
+    /// Start a read-only proposal session and stream attributable progress into one editable draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the controller rejects the source session/span or streaming cannot
+    /// begin.
+    pub fn propose_evaluation(
+        &self,
+        session_id: Option<&str>,
+        from_turn_id: Option<&str>,
+        through_turn_id: Option<&str>,
+    ) -> Result<ProposalStream, WorkbenchError> {
+        let proposal = self.post_json(
+            &format!(
+                "/api/workbench/{}/evaluation-proposals",
+                self.inner.workspace_id
+            ),
+            &json!({
+                "sessionId": session_id,
+                "fromTurnId": from_turn_id,
+                "throughTurnId": through_turn_id,
+            }),
+        )?;
+        let proposal_id = proposal
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| WorkbenchError::Malformed("proposal response has no id".to_owned()))?
+            .to_owned();
+        let (sender, receiver) = mpsc::channel();
+        let bridge = self.clone();
+        thread::Builder::new()
+            .name("agent-lab-proposal-stream".to_owned())
+            .spawn(move || {
+                if let Err(error) = bridge.stream_evaluation_proposal(&proposal_id, &sender) {
+                    let _ = sender.send(Err(WorkbenchError::Request(format!(
+                        "{error}; proposal {proposal_id} remains available"
+                    ))));
+                }
+            })
+            .map_err(|error| WorkbenchError::Request(error.to_string()))?;
+        Ok(ProposalStream { proposal, receiver })
+    }
+
+    pub fn cancel_evaluation_proposal(&self, proposal_id: &str) {
+        let _ = self.post_json(
+            &format!(
+                "/api/workbench/{}/evaluation-proposals/{proposal_id}/cancel",
+                self.inner.workspace_id
+            ),
+            &json!({}),
+        );
     }
 
     /// Submit an optimistic edit and create a new immutable revision when material.
@@ -985,6 +1043,80 @@ impl WorkbenchBridge {
         ))
     }
 
+    fn stream_evaluation_proposal(
+        &self,
+        proposal_id: &str,
+        sender: &mpsc::Sender<Result<JsonValue, WorkbenchError>>,
+    ) -> Result<(), WorkbenchError> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &format!(
+                    "/api/workbench/{}/evaluation-proposals/{proposal_id}/events",
+                    self.inner.workspace_id
+                ),
+            )
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| WorkbenchError::Request(error.to_string()))?;
+        for line in BufReader::new(response).lines() {
+            let line = line.map_err(|error| WorkbenchError::Request(error.to_string()))?;
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let event: JsonValue = serde_json::from_str(data.trim())
+                .map_err(|error| WorkbenchError::Malformed(error.to_string()))?;
+            let kind = event.get("type").and_then(JsonValue::as_str).unwrap_or("");
+            let payload = event.get("payload").unwrap_or(&JsonValue::Null);
+            let projected = match kind {
+                "evaluation-proposal.created" => Some(json!({
+                    "type": "proposal-created",
+                    "proposalId": proposal_id,
+                })),
+                "evaluation-proposal.session.ready" => Some(json!({
+                    "type": "proposal-progress",
+                    "proposalId": proposal_id,
+                    "phase": "ready",
+                    "detail": "Proposal agent ready",
+                })),
+                "observation.progress" => Some(json!({
+                    "type": "proposal-progress",
+                    "proposalId": proposal_id,
+                    "phase": payload.pointer("/event/phase"),
+                    "detail": payload.pointer("/event/detail"),
+                })),
+                "evaluation-proposal.finished" => {
+                    let proposal = self.get_json(&format!(
+                        "/api/workbench/{}/evaluation-proposals/{proposal_id}",
+                        self.inner.workspace_id
+                    ))?;
+                    let draft = proposal
+                        .pointer("/summary/draftId")
+                        .and_then(JsonValue::as_str)
+                        .map(|draft_id| self.evaluation_draft(draft_id))
+                        .transpose()?;
+                    Some(json!({
+                        "type": "proposal-finished",
+                        "proposal": proposal,
+                        "draft": draft,
+                    }))
+                }
+                _ => None,
+            };
+            if let Some(projected) = projected
+                && sender.send(Ok(projected)).is_err()
+            {
+                return Ok(());
+            }
+            if kind == "evaluation-proposal.finished" {
+                return Ok(());
+            }
+        }
+        Err(WorkbenchError::Request(
+            "evaluation proposal event stream ended before completion".to_owned(),
+        ))
+    }
+
     fn get_json(&self, path: &str) -> Result<JsonValue, WorkbenchError> {
         self.request_json(reqwest::Method::GET, path, None)
     }
@@ -1524,6 +1656,104 @@ mod tests {
                 }
             })]
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn proposal_stream_projects_progress_and_returns_the_editable_draft() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut start, _) = listener.accept().unwrap();
+            assert_eq!(
+                read_http_request(&start),
+                "POST /api/workbench/workspace-1/evaluation-proposals HTTP/1.1\r\n"
+            );
+            write_json_response(
+                &mut start,
+                "201 Created",
+                r#"{"id":"proposal-1","status":"queued"}"#,
+            );
+
+            let (mut events, _) = listener.accept().unwrap();
+            assert_eq!(
+                read_http_request(&events),
+                "GET /api/workbench/workspace-1/evaluation-proposals/proposal-1/events HTTP/1.1\r\n"
+            );
+            let progress = json!({
+                "sequence": 1,
+                "atMs": 10,
+                "type": "observation.progress",
+                "payload": {
+                    "event": {
+                        "phase": "reasoning",
+                        "detail": "Choosing a reusable task"
+                    }
+                }
+            });
+            let finished = json!({
+                "sequence": 2,
+                "atMs": 11,
+                "type": "evaluation-proposal.finished",
+                "payload": {
+                    "proposalId": "proposal-1",
+                    "draftId": "draft-1",
+                    "status": "complete"
+                }
+            });
+            write_sse_response(
+                &mut events,
+                &format!("data: {progress}\n\ndata: {finished}\n\n"),
+            );
+
+            let (mut detail, _) = listener.accept().unwrap();
+            assert_eq!(
+                read_http_request(&detail),
+                "GET /api/workbench/workspace-1/evaluation-proposals/proposal-1 HTTP/1.1\r\n"
+            );
+            write_json_response(
+                &mut detail,
+                "200 OK",
+                r#"{"summary":{"id":"proposal-1","draftId":"draft-1","status":"complete"}}"#,
+            );
+
+            let (mut draft, _) = listener.accept().unwrap();
+            assert_eq!(
+                read_http_request(&draft),
+                "GET /api/workbench/workspace-1/evaluation-drafts/draft-1 HTTP/1.1\r\n"
+            );
+            write_json_response(
+                &mut draft,
+                "200 OK",
+                r#"{"summary":{"id":"draft-1","currentRevisionId":"revision-1"},"revisions":[],"validations":[],"events":[]}"#,
+            );
+        });
+        let bridge =
+            WorkbenchBridge::new(&origin, "workspace-1".to_owned(), "token".to_owned()).unwrap();
+        let stream = bridge
+            .propose_evaluation(
+                Some("agent-session-1"),
+                Some("agent-turn-1"),
+                Some("agent-turn-1"),
+            )
+            .unwrap();
+        let output = stream
+            .receiver
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            output[0],
+            json!({
+                "type": "proposal-progress",
+                "proposalId": "proposal-1",
+                "phase": "reasoning",
+                "detail": "Choosing a reusable task",
+            })
+        );
+        assert_eq!(output[1]["type"], "proposal-finished");
+        assert_eq!(output[1]["draft"]["summary"]["id"], "draft-1");
         server.join().unwrap();
     }
 }

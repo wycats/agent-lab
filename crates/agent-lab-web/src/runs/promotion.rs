@@ -557,6 +557,7 @@ impl RunController {
                 PROTECTED_WORKSPACE_PATH_ERROR.to_owned(),
             ));
         }
+        reject_serialized_protected_data(&detail, &known_secrets)?;
         let (sender, _) = broadcast::channel(128);
         let state = Arc::new(PromotionDraftState {
             detail: Mutex::new(detail),
@@ -602,6 +603,7 @@ impl RunController {
         request: UpdateEvaluationDraftRequest,
         origin: WorkbenchOrigin,
     ) -> Result<EvaluationDraftDetail, RunError> {
+        let evidence_lifecycle = lock(&self.inner.promotion.evidence_lifecycle);
         let state = self.promotion_draft_state(id)?;
         let event_commit = lock(&state.event_commit);
         let mut detail = lock(&state.detail);
@@ -633,16 +635,14 @@ impl RunController {
             next.blocking_issues
                 .retain(|issue| issue != MANUAL_AUTHORING_BLOCKER);
         }
-        if let Some(name) = &request.name {
-            validate_display_name(name)?;
-        }
+        validate_optional_display_name(request.name.as_deref())?;
         let material_change = next.task != current.task
             || next.limits != current.limits
             || next.evaluator != current.evaluator
             || next.measurements != current.measurements
             || next.blocking_issues != current.blocking_issues;
         let mut next_detail = previous_detail.clone();
-        let mut created_revision_path = None;
+        let mut created_revision = None;
         if material_change {
             if previous_detail.revisions.len() >= MAX_EVALUATION_DRAFT_REVISIONS {
                 return Err(RunError::InvalidRequest(format!(
@@ -659,12 +659,7 @@ impl RunController {
             next.created_at_ms = now_ms();
             validate_revision(&next)?;
             let revision_path = PathBuf::from("revisions").join(&revision_id);
-            write_confined_run_captured_tree(
-                &state.anchor,
-                &revision_path.join("source"),
-                &source,
-            )?;
-            created_revision_path = Some(revision_path);
+            created_revision = Some((revision_path, source));
             next_detail.summary.current_revision_id = revision_id;
             revision_status(&next).clone_into(&mut next_detail.summary.status);
             next_detail.summary.saved = false;
@@ -689,16 +684,21 @@ impl RunController {
             progress: None,
         };
         next_detail.events.push(event.clone());
+        reject_serialized_protected_data(&next_detail, &lock(&self.inner.promotion.secret_values))?;
+        if let Some((revision_path, source)) = &created_revision {
+            write_confined_run_captured_tree(&state.anchor, &revision_path.join("source"), source)?;
+        }
         persist_draft_transition(
             &state,
             &previous_detail,
             &next_detail,
             &event,
-            created_revision_path.as_deref(),
+            created_revision
+                .as_ref()
+                .map(|(revision_path, _)| revision_path.as_path()),
         )?;
         *detail = next_detail.clone();
-        drop(detail);
-        drop(event_commit);
+        drop((detail, event_commit, evidence_lifecycle));
         let _ = state.sender.send(event);
         self.notify_evaluation_library_changed(&state, "revised");
         Ok(next_detail)
@@ -857,6 +857,7 @@ impl RunController {
             validate_display_name(&name)?;
             next_detail.summary.name = name;
         }
+        reject_serialized_protected_data(&next_detail, &lock(&self.inner.promotion.secret_values))?;
         let passing = next_detail.validations.iter().any(|attempt| {
             attempt.revision_id == revision_id
                 && attempt.execution_status == EvaluationExecutionStatus::Complete
@@ -1298,6 +1299,56 @@ impl RunController {
         Ok(definition_id)
     }
 
+    #[cfg(test)]
+    pub(super) fn inject_definition_publication_before_draft_commit_for_recovery_test(
+        &self,
+        draft_id: &str,
+        revision_id: &str,
+        name: &str,
+    ) -> Result<String, RunError> {
+        let state = self.promotion_draft_state(draft_id)?;
+        let detail = lock(&state.detail).clone();
+        let revision = detail
+            .revisions
+            .iter()
+            .find(|revision| revision.id == revision_id)
+            .cloned()
+            .ok_or_else(|| {
+                RunError::InvalidRequest(format!("unknown evaluation revision: {revision_id}"))
+            })?;
+        let existing = lock(&self.inner.promotion.definitions)
+            .values()
+            .find(|definition| {
+                definition.detail.summary.draft_id == draft_id
+                    && definition.detail.summary.revision_id == revision_id
+            })
+            .cloned();
+        let prepared = prepare_definition_publication(&state, draft_id, revision, existing, name)?;
+        let definition_id = prepared.detail.summary.id.clone();
+        let _publication = begin_definition_publication(&self.inner.promotion, prepared)?;
+        Ok(definition_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_draft_manifest_ahead_of_event_log_for_recovery_test(
+        &self,
+        draft_id: &str,
+    ) -> Result<RunEvent, RunError> {
+        let state = self.promotion_draft_state(draft_id)?;
+        let _event_commit = lock(&state.event_commit);
+        let mut detail = lock(&state.detail);
+        let event = RunEvent {
+            sequence: detail.events.len() as u64 + 1,
+            at_ms: now_ms(),
+            kind: "evaluation-draft.recovery-test".to_owned(),
+            payload: json!({ "draftId": draft_id }),
+            progress: None,
+        };
+        detail.events.push(event.clone());
+        persist_draft_detail(&state, &detail)?;
+        Ok(event)
+    }
+
     async fn execute_evaluation_validation(
         &self,
         state: Arc<PromotionDraftState>,
@@ -1724,6 +1775,10 @@ fn validate_display_name(name: &str) -> Result<(), RunError> {
     Ok(())
 }
 
+fn validate_optional_display_name(name: Option<&str>) -> Result<(), RunError> {
+    name.map_or(Ok(()), validate_display_name)
+}
+
 fn revision_status(revision: &EvaluationRevision) -> &'static str {
     if revision.blocking_issues.is_empty() {
         "ready"
@@ -1860,6 +1915,22 @@ fn persist_draft_detail(
     )
 }
 
+fn reject_serialized_protected_data(
+    value: &impl Serialize,
+    secrets: &[Vec<u8>],
+) -> Result<(), RunError> {
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    let serialized = serde_json::to_vec(value)?;
+    if redact_evidence_bytes(&serialized, secrets) != serialized {
+        return Err(RunError::EvidencePersistence(
+            PROTECTED_WORKSPACE_PATH_ERROR.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn persist_draft_transition(
     state: &PromotionDraftState,
     previous_detail: &EvaluationDraftDetail,
@@ -1918,6 +1989,8 @@ struct DefinitionPublicationTransaction {
     definition_id: String,
     draft_id: String,
     revision_id: String,
+    #[serde(default)]
+    expected_draft_name: Option<String>,
     committed: bool,
     previous_detail: Option<EvaluationDefinitionDetail>,
 }
@@ -2004,6 +2077,7 @@ fn begin_definition_publication(
         definition_id,
         draft_id: publication.detail.summary.draft_id.clone(),
         revision_id: publication.detail.summary.revision_id.clone(),
+        expected_draft_name: Some(publication.detail.summary.name.clone()),
         committed: false,
         previous_detail,
     };
@@ -2192,28 +2266,18 @@ fn finish_cancelled_validation_if_requested(
 fn load_draft_event_evidence(
     anchor: &AgentSessionDirectoryAnchor,
     bundle: &Path,
+    manifest_events: &[RunEvent],
 ) -> Result<Option<Vec<RunEvent>>, RunError> {
+    validate_draft_event_sequence(bundle, manifest_events)?;
     let Some(source) = read_optional_confined_run_file(anchor, Path::new("events.jsonl"))? else {
-        return Ok(None);
+        if manifest_events.is_empty() {
+            return Ok(None);
+        }
+        write_draft_event_evidence(anchor, manifest_events)?;
+        return Ok(Some(manifest_events.to_vec()));
     };
     let events = match parse_events(&source) {
-        Ok(events)
-            if events
-                .iter()
-                .enumerate()
-                .all(|(index, event)| event.sequence == index as u64 + 1) =>
-        {
-            events
-        }
-        Ok(_) => {
-            tracing::warn!(
-                bundle = %bundle.display(),
-                "skipping evaluation draft with non-sequential event evidence"
-            );
-            return Err(RunError::EvidencePersistence(
-                "evaluation draft event evidence is non-sequential".to_owned(),
-            ));
-        }
+        Ok(events) => events,
         Err(error) => {
             tracing::warn!(
                 bundle = %bundle.display(),
@@ -2225,7 +2289,64 @@ fn load_draft_event_evidence(
             )));
         }
     };
-    Ok(Some(events))
+    validate_draft_event_sequence(bundle, &events)?;
+    if draft_events_are_prefix(&events, manifest_events)? {
+        if events.len() < manifest_events.len() {
+            write_draft_event_evidence(anchor, manifest_events)?;
+        }
+        return Ok(Some(manifest_events.to_vec()));
+    }
+    if draft_events_are_prefix(manifest_events, &events)? {
+        return Ok(Some(events));
+    }
+    tracing::warn!(
+        bundle = %bundle.display(),
+        "skipping evaluation draft with divergent manifest and event evidence"
+    );
+    Err(RunError::EvidencePersistence(
+        "evaluation draft manifest and event evidence diverge".to_owned(),
+    ))
+}
+
+fn validate_draft_event_sequence(bundle: &Path, events: &[RunEvent]) -> Result<(), RunError> {
+    if events
+        .iter()
+        .enumerate()
+        .all(|(index, event)| event.sequence == index as u64 + 1)
+    {
+        return Ok(());
+    }
+    tracing::warn!(
+        bundle = %bundle.display(),
+        "skipping evaluation draft with non-sequential event evidence"
+    );
+    Err(RunError::EvidencePersistence(
+        "evaluation draft event evidence is non-sequential".to_owned(),
+    ))
+}
+
+fn draft_events_are_prefix(prefix: &[RunEvent], events: &[RunEvent]) -> Result<bool, RunError> {
+    if prefix.len() > events.len() {
+        return Ok(false);
+    }
+    prefix
+        .iter()
+        .zip(events)
+        .try_fold(true, |matches, (left, right)| {
+            Ok(matches && serde_json::to_vec(left)? == serde_json::to_vec(right)?)
+        })
+}
+
+fn write_draft_event_evidence(
+    anchor: &AgentSessionDirectoryAnchor,
+    events: &[RunEvent],
+) -> Result<(), RunError> {
+    let mut bytes = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut bytes, event)?;
+        bytes.push(b'\n');
+    }
+    write_confined_run_bytes_atomic(anchor, Path::new("events.jsonl"), &bytes)
 }
 
 fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>, RunError> {
@@ -2269,7 +2390,7 @@ fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>,
         {
             detail.summary.promoted_revision_id = Some(detail.summary.current_revision_id.clone());
         }
-        match load_draft_event_evidence(&anchor, &entry.path()) {
+        match load_draft_event_evidence(&anchor, &entry.path(), &detail.events) {
             Ok(Some(events)) => detail.events = events,
             Ok(None) => {}
             Err(_) => continue,
@@ -2390,6 +2511,10 @@ fn load_definitions(
                 .is_some_and(|draft| {
                     draft.definition_id.as_deref() == Some(&transaction.definition_id)
                         && draft.promoted_revision_id.as_deref() == Some(&transaction.revision_id)
+                        && transaction
+                            .expected_draft_name
+                            .as_deref()
+                            .is_none_or(|expected| draft.name == expected)
                 });
             if transaction.committed || draft_committed {
                 let _ = remove_confined_run_entry(

@@ -16138,6 +16138,7 @@ done
     async fn manual_evaluation_promotion_retains_revisions_failures_modes_and_replay() {
         use std::os::unix::fs::PermissionsExt;
 
+        const EDITED_PROMOTION_SECRET: &str = "edited-promotion-credential";
         const LATER_PROMOTION_SECRET: &str = "later-promotion-credential";
         let root = temporary_root("manual-evaluation-promotion");
         let scenarios = root.join("scenarios");
@@ -16552,6 +16553,70 @@ done
                 .name,
             "Renamed catalog regression"
         );
+        let workspace = controller.state(&explore.id).unwrap();
+        invalidate_contaminated_secret_evidence(
+            &controller.inner.runs,
+            &controller.inner.evaluations,
+            &controller.inner.promotion,
+            &workspace,
+            &[EDITED_PROMOTION_SECRET.as_bytes().to_vec()],
+        )
+        .unwrap();
+        let before_protected_edit = controller.evaluation_draft(&draft.summary.id).unwrap();
+        let revision_directories_before_protected_edit = fs::read_dir(
+            data.join("evaluation-library/drafts")
+                .join(&draft.summary.id)
+                .join("revisions"),
+        )
+        .unwrap()
+        .count();
+        let error = controller
+            .update_evaluation_draft(
+                &draft.summary.id,
+                UpdateEvaluationDraftRequest {
+                    base_revision_id: before_protected_edit.summary.current_revision_id.clone(),
+                    name: None,
+                    revision: EvaluationRevisionUpdate {
+                        task: Some(format!("Do not persist {EDITED_PROMOTION_SECRET}")),
+                        ..EvaluationRevisionUpdate::default()
+                    },
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap_err();
+        assert!(matches!(error, RunError::EvidencePersistence(_)));
+        assert_eq!(
+            serde_json::to_value(controller.evaluation_draft(&draft.summary.id).unwrap()).unwrap(),
+            serde_json::to_value(&before_protected_edit).unwrap()
+        );
+        assert_eq!(
+            fs::read_dir(
+                data.join("evaluation-library/drafts")
+                    .join(&draft.summary.id)
+                    .join("revisions"),
+            )
+            .unwrap()
+            .count(),
+            revision_directories_before_protected_edit
+        );
+        let error = controller
+            .save_evaluation_draft(
+                &draft.summary.id,
+                SaveEvaluationDraftRequest {
+                    revision_id: Some(passing_revision_id.clone()),
+                    name: Some(format!("Do not persist {EDITED_PROMOTION_SECRET}")),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, RunError::EvidencePersistence(_)));
+        assert_eq!(
+            controller
+                .evaluation_definition(&definition_id)
+                .unwrap()
+                .summary
+                .name,
+            "Renamed catalog regression"
+        );
         let saved_event = controller
             .evaluation_draft(&draft.summary.id)
             .unwrap()
@@ -16580,6 +16645,33 @@ done
             .close_agent_session(&explore.id, &session.id)
             .unwrap();
         wait_for_agent_session_closed(&controller, &explore.id, &session.id).await;
+        let uncommitted_definition_id = controller
+            .inject_definition_publication_before_draft_commit_for_recovery_test(
+                &draft.summary.id,
+                &passing_revision_id,
+                "Uncommitted catalog rename",
+            )
+            .unwrap();
+        assert_eq!(uncommitted_definition_id, definition_id);
+        drop(controller);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        assert_eq!(
+            controller
+                .evaluation_definition(&definition_id)
+                .unwrap()
+                .summary
+                .name,
+            "Renamed catalog regression"
+        );
+        assert_eq!(
+            controller
+                .evaluation_draft(&draft.summary.id)
+                .unwrap()
+                .summary
+                .name,
+            "Renamed catalog regression"
+        );
         let recovered_definition_id = controller
             .inject_definition_publication_after_draft_commit_for_recovery_test(
                 &draft.summary.id,
@@ -16598,6 +16690,24 @@ done
                 .summary
                 .name,
             "Crash-recovered catalog regression"
+        );
+        let manifest_ahead_event = controller
+            .inject_draft_manifest_ahead_of_event_log_for_recovery_test(&draft.summary.id)
+            .unwrap();
+        drop(controller);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        let recovered_draft = controller.evaluation_draft(&draft.summary.id).unwrap();
+        assert_eq!(
+            recovered_draft.events.last().map(|event| event.sequence),
+            Some(manifest_ahead_event.sequence)
+        );
+        assert_eq!(
+            recovered_draft
+                .events
+                .last()
+                .map(|event| event.kind.as_str()),
+            Some("evaluation-draft.recovery-test")
         );
         let evaluation = controller
             .start_workbench_definition_evaluation(

@@ -3484,6 +3484,44 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   await page.getByRole('button', { name: 'Save to library' }).click();
   await expect(page.locator('.run-heading .run-status')).toHaveText('promoted');
   await expect(page.getByRole('button', { name: 'Run comparison' })).toBeVisible();
+
+  const definitionButton = page.locator(
+    '.draft-history .history-list button[data-definition-id]'
+  );
+  await expect(definitionButton).toHaveCount(1);
+  const definitionId = await definitionButton.getAttribute('data-definition-id');
+  if (!definitionId) throw new Error('saved definition identity is unavailable');
+  let releaseStaleDefinition: (() => void) | undefined;
+  let staleDefinitionRequested: (() => void) | undefined;
+  const staleDefinitionGate = new Promise<void>((resolve) => {
+    releaseStaleDefinition = resolve;
+  });
+  const staleDefinitionSeen = new Promise<void>((resolve) => {
+    staleDefinitionRequested = resolve;
+  });
+  await page.route(
+    new RegExp(`/api/evaluation-definitions/${definitionId}$`),
+    async (route) => {
+      const response = await route.fetch();
+      staleDefinitionRequested?.();
+      await staleDefinitionGate;
+      await route.fulfill({ response });
+    }
+  );
+  const staleDefinitionOpen = definitionButton.click();
+  await staleDefinitionSeen;
+  await otherDraftButton.click();
+  releaseStaleDefinition?.();
+  await staleDefinitionOpen;
+  await expect(
+    page.locator(`.draft-history button[data-draft-id="${otherDraftId}"]`)
+  ).toHaveClass(/selected/);
+  await page.unrouteAll({ behavior: 'wait' });
+  await page
+    .locator(`.draft-history button[data-draft-id="${selectedDraftId}"]`)
+    .click();
+  await expect(page.getByRole('button', { name: 'Run comparison' })).toBeVisible();
+
   await page.getByRole('button', { name: 'Run comparison' }).click();
   const evaluation = page.getByTestId('evaluation-view');
   await expect(evaluation.locator('.run-status')).toHaveText('passed');

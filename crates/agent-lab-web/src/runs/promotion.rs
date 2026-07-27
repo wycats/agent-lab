@@ -257,7 +257,11 @@ impl PromotionStore {
         self.root.join("definitions")
     }
 
-    pub(super) fn quarantine_contaminated_evidence(&self, secrets: &[Vec<u8>]) -> bool {
+    pub(super) fn quarantine_contaminated_evidence(
+        &self,
+        runs: &Mutex<HashMap<String, Arc<RunState>>>,
+        secrets: &[Vec<u8>],
+    ) -> bool {
         extend_secret_values(&self.secret_values, secrets.iter().cloned());
         let all_secrets = lock(&self.secret_values).clone();
         let drafts = lock(&self.drafts).values().cloned().collect::<Vec<_>>();
@@ -274,9 +278,24 @@ impl PromotionStore {
                 for cancel in lock(&state.validation_cancels).values() {
                     cancel.cancel();
                 }
-                let id = lock(&state.detail).summary.id.clone();
+                let (id, validation_run_ids) = {
+                    let detail = lock(&state.detail);
+                    (
+                        detail.summary.id.clone(),
+                        detail
+                            .validations
+                            .iter()
+                            .filter_map(|attempt| attempt.run_id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                };
                 if !quarantine_run_bundle(&state.anchor, &id) {
                     let _ = remove_confined_run_entry(&state.anchor, Path::new("manifest.json"));
+                }
+                for run_id in validation_run_ids {
+                    if let Some(run) = lock(runs).get(&run_id).cloned() {
+                        mark_workspace_evidence_unavailable(&run, false);
+                    }
                 }
                 lock(&self.drafts).remove(&id);
             }
@@ -668,6 +687,7 @@ impl RunController {
         drop(detail);
         drop(event_commit);
         let _ = state.sender.send(event);
+        self.notify_evaluation_library_changed(&state, "revised");
         Ok(next_detail)
     }
 
@@ -751,13 +771,14 @@ impl RunController {
         drop(event_commit);
         let _ = state.sender.send(event);
         let controller = self.clone();
-        let state_for_task = state;
+        let state_for_task = state.clone();
         let attempt_id = attempt.id.clone();
         tokio::spawn(async move {
             controller
                 .execute_evaluation_validation(state_for_task, revision, attempt_id, cancel)
                 .await;
         });
+        self.notify_evaluation_library_changed(&state, "validation-started");
         Ok(attempt)
     }
 
@@ -887,6 +908,7 @@ impl RunController {
                 "definitionId": lock(&state.detail).summary.definition_id,
             }),
         )?;
+        self.notify_evaluation_library_changed(&state, "saved");
         Ok(lock(&state.detail).clone())
     }
 
@@ -1291,6 +1313,21 @@ impl RunController {
                 })
             }),
         );
+        self.notify_evaluation_library_changed(&state, "validation-finished");
+    }
+
+    fn notify_evaluation_library_changed(&self, state: &PromotionDraftState, change: &str) {
+        let summary = lock(&state.detail).summary.clone();
+        if let Ok(workspace) = self.state(&summary.workspace_id) {
+            let _ = record_event(
+                &workspace,
+                "workbench.evaluation-library.changed",
+                json!({
+                    "draftId": summary.id,
+                    "change": change,
+                }),
+            );
+        }
     }
 
     async fn execute_evaluation_validation_inner(
@@ -1309,18 +1346,12 @@ impl RunController {
             "evaluation-validation.status",
             json!({ "validationId": attempt_id, "status": "running" }),
         )?;
-        let snapshot = capture_confined_run_tree(
-            &state.anchor,
-            &PathBuf::from("revisions").join(&revision.id).join("source"),
-        )?;
-        verify_captured_source_revision(
-            &snapshot,
-            &revision.source.source_revision,
-            "evaluation revision",
-        )?;
-        let prepared = self
-            .prepare_promotion_run(revision, &snapshot, &revision.source.source_revision)
-            .await?;
+        let Some(prepared) = self
+            .prepare_validation_replay(state, revision, attempt_id, &cancel)
+            .await?
+        else {
+            return Ok(());
+        };
         update_validation_attempt(state, attempt_id, |attempt| {
             attempt.run_id = Some(prepared.id.clone());
         })?;
@@ -1409,6 +1440,34 @@ impl RunController {
         }
     }
 
+    async fn prepare_validation_replay(
+        &self,
+        state: &PromotionDraftState,
+        revision: &EvaluationRevision,
+        attempt_id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<RunSummary>, RunError> {
+        if finish_cancelled_validation_if_requested(state, attempt_id, cancel)? {
+            return Ok(None);
+        }
+        self.verify_validation_model_identity(revision)?;
+        let snapshot = capture_confined_run_tree(
+            &state.anchor,
+            &PathBuf::from("revisions").join(&revision.id).join("source"),
+        )?;
+        verify_captured_source_revision(
+            &snapshot,
+            &revision.source.source_revision,
+            "evaluation revision",
+        )?;
+        if finish_cancelled_validation_if_requested(state, attempt_id, cancel)? {
+            return Ok(None);
+        }
+        self.prepare_promotion_run(revision, &snapshot, &revision.source.source_revision)
+            .await
+            .map(Some)
+    }
+
     fn cancel_validation_before_start_if_requested(
         &self,
         state: &PromotionDraftState,
@@ -1422,15 +1481,32 @@ impl RunController {
         let cancellation = self.cancel(prepared_id);
         lock(&self.inner.scenario_overrides).remove(prepared_id);
         cancellation?;
-        update_validation_attempt(state, attempt_id, |attempt| {
-            attempt.execution_status = EvaluationExecutionStatus::Cancelled;
-            attempt.assertion_status = ValidationAssertionStatus::NotEvaluated;
-            attempt.finished_at_ms = Some(now_ms());
-            attempt.error = None;
-            attempt.score = None;
-        })?;
-        persist_draft(state)?;
+        mark_validation_cancelled(state, attempt_id)?;
         Ok(true)
+    }
+
+    fn verify_validation_model_identity(
+        &self,
+        revision: &EvaluationRevision,
+    ) -> Result<(), RunError> {
+        let current_model_id = self
+            .inner
+            .harnesses
+            .get(&revision.source.harness_id)
+            .and_then(|harness| harness.models.get(&revision.source.model_profile_id))
+            .ok_or_else(|| {
+                RunError::InvalidRequest(format!(
+                    "captured validation configuration is unavailable: harness={}, profile={}",
+                    revision.source.harness_id, revision.source.model_profile_id
+                ))
+            })?;
+        if current_model_id != &revision.source.model_id {
+            return Err(RunError::InvalidRequest(format!(
+                "captured validation model changed: expected {}, found {}",
+                revision.source.model_id, current_model_id
+            )));
+        }
+        Ok(())
     }
 
     async fn prepare_promotion_run(
@@ -2016,6 +2092,32 @@ fn update_validation_attempt(
     update(attempt);
     detail.summary.updated_at_ms = now_ms();
     Ok(())
+}
+
+fn mark_validation_cancelled(
+    state: &PromotionDraftState,
+    attempt_id: &str,
+) -> Result<(), RunError> {
+    update_validation_attempt(state, attempt_id, |attempt| {
+        attempt.execution_status = EvaluationExecutionStatus::Cancelled;
+        attempt.assertion_status = ValidationAssertionStatus::NotEvaluated;
+        attempt.finished_at_ms = Some(now_ms());
+        attempt.error = None;
+        attempt.score = None;
+    })?;
+    persist_draft(state)
+}
+
+fn finish_cancelled_validation_if_requested(
+    state: &PromotionDraftState,
+    attempt_id: &str,
+    cancel: &CancellationToken,
+) -> Result<bool, RunError> {
+    if !cancel.is_cancelled() {
+        return Ok(false);
+    }
+    mark_validation_cancelled(state, attempt_id)?;
+    Ok(true)
 }
 
 fn load_draft_event_evidence(

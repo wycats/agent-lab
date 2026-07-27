@@ -304,6 +304,8 @@ pub struct NushellHost {
     workbench_models: Vec<String>,
     workbench_sessions: Arc<RwLock<Vec<String>>>,
     workbench_turns: Arc<RwLock<Vec<String>>>,
+    workbench_drafts: Arc<RwLock<Vec<String>>>,
+    workbench_definitions: Arc<RwLock<Vec<String>>>,
     agent_status: AgentStatusPresenter,
 }
 
@@ -356,6 +358,8 @@ impl NushellHost {
             workbench_models: Vec::new(),
             workbench_sessions: Arc::new(RwLock::new(Vec::new())),
             workbench_turns: Arc::new(RwLock::new(Vec::new())),
+            workbench_drafts: Arc::new(RwLock::new(Vec::new())),
+            workbench_definitions: Arc::new(RwLock::new(Vec::new())),
             agent_status: AgentStatusPresenter::terminal(),
         }
     }
@@ -381,6 +385,19 @@ impl NushellHost {
             workbench_ids(&snapshot, "agentSessions"),
         );
         replace_turn_ids(&self.workbench_turns, workbench_turn_ids(&snapshot));
+        let resource_bridge = bridge.clone();
+        let draft_ids = self.workbench_drafts.clone();
+        let definition_ids = self.workbench_definitions.clone();
+        let _resource_cache_loader = std::thread::Builder::new()
+            .name("agent-lab-evaluation-completion-cache".to_owned())
+            .spawn(move || {
+                if let Ok(drafts) = resource_bridge.evaluation_drafts() {
+                    merge_resource_ids(&draft_ids, resource_ids(&drafts));
+                }
+                if let Ok(definitions) = resource_bridge.evaluation_definitions() {
+                    merge_resource_ids(&definition_ids, resource_ids(&definitions));
+                }
+            });
         let mut working_set = StateWorkingSet::new(&self.engine_state);
         working_set.add_decl(Box::new(LabAssemblyCommand {
             bridge: bridge.clone(),
@@ -393,9 +410,11 @@ impl NushellHost {
         }));
         working_set.add_decl(Box::new(LabEvaluationNewCommand {
             bridge: bridge.clone(),
+            draft_ids: self.workbench_drafts.clone(),
         }));
         working_set.add_decl(Box::new(LabEvaluationDraftsCommand {
             bridge: bridge.clone(),
+            draft_ids: self.workbench_drafts.clone(),
         }));
         working_set.add_decl(Box::new(LabEvaluationDraftCommand {
             bridge: bridge.clone(),
@@ -405,9 +424,12 @@ impl NushellHost {
         }));
         working_set.add_decl(Box::new(LabEvaluationSaveCommand {
             bridge: bridge.clone(),
+            draft_ids: self.workbench_drafts.clone(),
+            definition_ids: self.workbench_definitions.clone(),
         }));
         working_set.add_decl(Box::new(LabEvaluationDefinitionsCommand {
             bridge: bridge.clone(),
+            definition_ids: self.workbench_definitions.clone(),
         }));
         working_set.add_decl(Box::new(LabEvaluationDefinitionCommand {
             bridge: bridge.clone(),
@@ -730,7 +752,8 @@ impl NushellHost {
                 self.workbench_models.clone(),
                 self.workbench_sessions.clone(),
                 self.workbench_turns.clone(),
-                self.workbench.clone(),
+                self.workbench_drafts.clone(),
+                self.workbench_definitions.clone(),
             )))
             .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
             .with_edit_mode(Box::new(Emacs::new(keybindings)))
@@ -1475,7 +1498,8 @@ struct AgentLabCompleter {
     workbench_models: Vec<String>,
     workbench_sessions: Arc<RwLock<Vec<String>>>,
     workbench_turns: Arc<RwLock<Vec<String>>>,
-    workbench: Option<WorkbenchBridge>,
+    workbench_drafts: Arc<RwLock<Vec<String>>>,
+    workbench_definitions: Arc<RwLock<Vec<String>>>,
 }
 
 fn workbench_ids(snapshot: &serde_json::Value, key: &str) -> Vec<String> {
@@ -1494,6 +1518,49 @@ fn workbench_turn_ids(snapshot: &serde_json::Value) -> Vec<String> {
         .flatten()
         .filter_map(|value| value["id"].as_str().map(str::to_owned))
         .collect()
+}
+
+fn resource_ids(resources: &JsonValue) -> Vec<String> {
+    resources
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn cached_resource_ids(cache: &RwLock<Vec<String>>) -> Vec<String> {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn replace_resource_ids(cache: &RwLock<Vec<String>>, mut ids: Vec<String>) {
+    ids.sort();
+    ids.dedup();
+    *cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = ids;
+}
+
+fn merge_resource_ids(cache: &RwLock<Vec<String>>, ids: Vec<String>) {
+    for id in ids {
+        remember_resource_id(cache, Some(&id));
+    }
+}
+
+fn remember_resource_id(cache: &RwLock<Vec<String>>, id: Option<&str>) {
+    let Some(id) = id else {
+        return;
+    };
+    let mut ids = cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !ids.iter().any(|known| known == id) {
+        ids.push(id.to_owned());
+        ids.sort();
+    }
 }
 
 fn session_ids(cache: &RwLock<Vec<String>>) -> Vec<String> {
@@ -2829,6 +2896,7 @@ impl Command for LabEvaluationCommand {
 #[derive(Clone)]
 struct LabEvaluationNewCommand {
     bridge: WorkbenchBridge,
+    draft_ids: Arc<RwLock<Vec<String>>>,
 }
 
 impl Command for LabEvaluationNewCommand {
@@ -2884,6 +2952,7 @@ impl Command for LabEvaluationNewCommand {
                     call.head,
                 )
             })?;
+        remember_resource_id(&self.draft_ids, draft["summary"]["id"].as_str());
         Ok(json_to_nu(draft_shell_record(&draft)?, call.head).into_pipeline_data())
     }
 }
@@ -2891,6 +2960,7 @@ impl Command for LabEvaluationNewCommand {
 #[derive(Clone)]
 struct LabEvaluationDraftsCommand {
     bridge: WorkbenchBridge,
+    draft_ids: Arc<RwLock<Vec<String>>>,
 }
 
 impl Command for LabEvaluationDraftsCommand {
@@ -2921,6 +2991,7 @@ impl Command for LabEvaluationDraftsCommand {
                 call.head,
             )
         })?;
+        replace_resource_ids(&self.draft_ids, resource_ids(&drafts));
         Ok(json_to_nu(drafts, call.head).into_pipeline_data())
     }
 }
@@ -3066,6 +3137,8 @@ impl Command for LabEvaluationValidateCommand {
 #[derive(Clone)]
 struct LabEvaluationSaveCommand {
     bridge: WorkbenchBridge,
+    draft_ids: Arc<RwLock<Vec<String>>>,
+    definition_ids: Arc<RwLock<Vec<String>>>,
 }
 
 impl Command for LabEvaluationSaveCommand {
@@ -3104,6 +3177,11 @@ impl Command for LabEvaluationSaveCommand {
             .bridge
             .save_evaluation_draft(&draft_id, revision_id.as_deref(), name.as_deref())
             .map_err(|error| shell_error("Evaluation save failed", error.to_string(), call.head))?;
+        remember_resource_id(&self.draft_ids, draft["summary"]["id"].as_str());
+        remember_resource_id(
+            &self.definition_ids,
+            draft["summary"]["definitionId"].as_str(),
+        );
         Ok(json_to_nu(draft_shell_record(&draft)?, call.head).into_pipeline_data())
     }
 }
@@ -3111,6 +3189,7 @@ impl Command for LabEvaluationSaveCommand {
 #[derive(Clone)]
 struct LabEvaluationDefinitionsCommand {
     bridge: WorkbenchBridge,
+    definition_ids: Arc<RwLock<Vec<String>>>,
 }
 
 impl Command for LabEvaluationDefinitionsCommand {
@@ -3141,6 +3220,7 @@ impl Command for LabEvaluationDefinitionsCommand {
                 call.head,
             )
         })?;
+        replace_resource_ids(&self.definition_ids, resource_ids(&definitions));
         Ok(json_to_nu(definitions, call.head).into_pipeline_data())
     }
 }
@@ -3617,7 +3697,8 @@ impl AgentLabCompleter {
         workbench_models: Vec<String>,
         workbench_sessions: Arc<RwLock<Vec<String>>>,
         workbench_turns: Arc<RwLock<Vec<String>>>,
-        workbench: Option<WorkbenchBridge>,
+        workbench_drafts: Arc<RwLock<Vec<String>>>,
+        workbench_definitions: Arc<RwLock<Vec<String>>>,
     ) -> Self {
         let mut commands = engine_state
             .get_decls_sorted(false)
@@ -3637,40 +3718,17 @@ impl AgentLabCompleter {
             workbench_models,
             workbench_sessions,
             workbench_turns,
-            workbench,
+            workbench_drafts,
+            workbench_definitions,
         }
     }
 
     fn evaluation_draft_ids(&self) -> Vec<String> {
-        self.workbench
-            .as_ref()
-            .and_then(|bridge| bridge.evaluation_drafts().ok())
-            .and_then(|drafts| drafts.as_array().cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|draft| {
-                draft
-                    .get("id")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_owned)
-            })
-            .collect()
+        cached_resource_ids(&self.workbench_drafts)
     }
 
     fn evaluation_definition_ids(&self) -> Vec<String> {
-        self.workbench
-            .as_ref()
-            .and_then(|bridge| bridge.evaluation_definitions().ok())
-            .and_then(|definitions| definitions.as_array().cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|definition| {
-                definition
-                    .get("id")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_owned)
-            })
-            .collect()
+        cached_resource_ids(&self.workbench_definitions)
     }
 }
 
@@ -3692,7 +3750,8 @@ mod tests {
                 "agent-turn-1".to_owned(),
                 "agent-turn-2".to_owned(),
             ])),
-            workbench: None,
+            workbench_drafts: Arc::new(RwLock::new(vec!["draft-1".to_owned()])),
+            workbench_definitions: Arc::new(RwLock::new(vec!["definition-1".to_owned()])),
         }
     }
 
@@ -4023,6 +4082,14 @@ mod tests {
         assert_eq!(completion_values("lab evaluation validate --r"), ["--raw"]);
         assert_eq!(completion_values("lab evaluation save --n"), ["--name"]);
         assert_eq!(
+            completion_values("lab evaluation draft draft-"),
+            ["draft-1"]
+        );
+        assert_eq!(
+            completion_values("lab evaluation definition definition-"),
+            ["definition-1"]
+        );
+        assert_eq!(
             completion_values("lab evaluation run definition-1 --model h"),
             ["haiku-4.5"]
         );
@@ -4090,7 +4157,8 @@ mod tests {
             workbench_models: Vec::new(),
             workbench_sessions: sessions.clone(),
             workbench_turns: Arc::new(RwLock::new(Vec::new())),
-            workbench: None,
+            workbench_drafts: Arc::new(RwLock::new(Vec::new())),
+            workbench_definitions: Arc::new(RwLock::new(Vec::new())),
         };
         replace_session_ids(&sessions, vec!["agent-session-2".to_owned()]);
 
@@ -4105,6 +4173,17 @@ mod tests {
     }
 
     #[test]
+    fn initial_resource_cache_merge_preserves_concurrent_command_results() {
+        let resources = RwLock::new(vec!["draft-new".to_owned()]);
+        merge_resource_ids(&resources, vec!["draft-existing".to_owned()]);
+
+        assert_eq!(
+            cached_resource_ids(&resources),
+            ["draft-existing", "draft-new"]
+        );
+    }
+
+    #[test]
     fn turn_completion_reads_sorted_deduplicated_live_turn_ids() {
         let turns = Arc::new(RwLock::new(vec!["old-turn".to_owned()]));
         let mut completer = AgentLabCompleter {
@@ -4113,7 +4192,8 @@ mod tests {
             workbench_models: Vec::new(),
             workbench_sessions: Arc::new(RwLock::new(Vec::new())),
             workbench_turns: turns.clone(),
-            workbench: None,
+            workbench_drafts: Arc::new(RwLock::new(Vec::new())),
+            workbench_definitions: Arc::new(RwLock::new(Vec::new())),
         };
         replace_turn_ids(
             &turns,

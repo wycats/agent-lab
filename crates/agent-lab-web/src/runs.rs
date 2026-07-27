@@ -10615,7 +10615,7 @@ fn invalidate_contaminated_secret_evidence(
     workspace_state: &RunState,
     secrets: &[Vec<u8>],
 ) -> Result<(), RunError> {
-    let promotion_contaminated = promotion.quarantine_contaminated_evidence(secrets);
+    let promotion_contaminated = promotion.quarantine_contaminated_evidence(runs, secrets);
     let workspace_contaminated = {
         let _commit = lock(&workspace_state.event_commit);
         let contaminated = confined_bundle_contains_protected_data(
@@ -15914,7 +15914,8 @@ done
             }
             assert!(
                 Instant::now() < deadline,
-                "evaluation validation did not finish"
+                "evaluation validation {attempt_id} did not finish; latest status: {:?}",
+                attempt.execution_status
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -16432,6 +16433,7 @@ done
             passing_attempt.assertion_status,
             ValidationAssertionStatus::Passed
         );
+        let passing_validation_run_id = passing_attempt.run_id.clone().unwrap();
         let (validation_pre_start, validation_resume) =
             controller.install_validation_before_start_hook();
         let cancelled_attempt = controller
@@ -16522,6 +16524,19 @@ done
                 .name,
             "Renamed catalog regression"
         );
+        let explore_state = controller.state(&explore.id).unwrap();
+        let library_changes = lock(&explore_state.events)
+            .iter()
+            .filter(|event| {
+                event.kind == "workbench.evaluation-library.changed"
+                    && event.payload["draftId"] == draft.summary.id
+            })
+            .filter_map(|event| event.payload["change"].as_str().map(str::to_owned))
+            .collect::<HashSet<_>>();
+        assert!(library_changes.contains("revised"));
+        assert!(library_changes.contains("validation-started"));
+        assert!(library_changes.contains("validation-finished"));
+        assert!(library_changes.contains("saved"));
 
         controller
             .close_agent_session(&explore.id, &session.id)
@@ -16690,8 +16705,59 @@ done
                 .as_deref(),
             Some(definition_id.as_str())
         );
+        let captured_harness_id = reopened_draft
+            .revisions
+            .iter()
+            .find(|revision| revision.id == passing_revision_id)
+            .unwrap()
+            .source
+            .harness_id
+            .clone();
 
         drop(reopened);
+        let drifted_harnesses = || {
+            ["v0", "eve"]
+                .into_iter()
+                .map(|id| HarnessProfile {
+                    id: id.to_owned(),
+                    display_name: id.to_owned(),
+                    launch: promotion_fixture_launch(),
+                    models: BTreeMap::from([(
+                        "test".to_owned(),
+                        if id == captured_harness_id {
+                            format!("fixture/{id}-drifted")
+                        } else {
+                            format!("fixture/{id}")
+                        },
+                    )]),
+                })
+                .collect::<Vec<_>>()
+        };
+        let drifted =
+            RunController::new_with_harnesses(config(), drifted_harnesses(), models.clone())
+                .unwrap();
+        let drifted_attempt = drifted
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        let drifted_attempt =
+            wait_for_validation(&drifted, &draft.summary.id, &drifted_attempt.id).await;
+        assert_eq!(
+            drifted_attempt.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            drifted_attempt.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(drifted_attempt.run_id.is_none());
+        assert!(
+            drifted_attempt
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("captured validation model changed"))
+        );
+        drop(drifted);
+
         fs::write(
             data.join("evaluation-library/definitions")
                 .join(&definition_id)
@@ -16743,6 +16809,7 @@ done
         assert!(matches!(error, RunError::EvidencePersistence(_)));
         assert!(before_secret.evaluation_draft(&draft.summary.id).is_err());
         assert!(before_secret.evaluation_definition(&definition_id).is_err());
+        assert!(before_secret.get(&passing_validation_run_id).is_err());
         drop(workspace);
         drop(before_secret);
         let after_secret =

@@ -1012,14 +1012,18 @@
     watchEvaluationDraft(workspaceId, draftId, openVersion);
   }
 
-  async function openEvaluationDefinition(
-    workspaceId: string,
-    definitionId: string
-  ): Promise<void> {
+  async function openEvaluationDefinition(definitionId: string): Promise<void> {
+    const requestVersion = ++draftOpenVersion;
     try {
-      selectedDefinition = await runClient.evaluationLibraryDefinition(definitionId);
-      await openEvaluationDraft(workspaceId, selectedDefinition.summary.draftId);
+      const definition = await runClient.evaluationLibraryDefinition(definitionId);
+      if (requestVersion !== draftOpenVersion) return;
+      selectedDefinition = definition;
+      await openEvaluationDraft(
+        definition.revision.source.workspaceId,
+        definition.summary.draftId
+      );
     } catch (error) {
+      if (requestVersion !== draftOpenVersion) return;
       actionError = message(error);
     }
   }
@@ -1585,6 +1589,18 @@
       ) {
         const draftId = (event.payload as { draftId: string }).draftId;
         void openEvaluationDraft(id, draftId);
+      }
+      if (
+        event.sequence > liveAfterSequence &&
+        event.type === 'workbench.evaluation-library.changed' &&
+        event.payload &&
+        typeof event.payload === 'object'
+      ) {
+        const draftId = (event.payload as { draftId?: unknown }).draftId;
+        void loadEvaluationLibrary(id);
+        if (typeof draftId === 'string' && selectedDraft?.summary.id === draftId) {
+          void refreshEvaluationDraft(id, draftId);
+        }
       }
       if (
         event.sequence > liveAfterSequence &&
@@ -3012,7 +3028,10 @@
               <p>No evaluation drafts yet.</p>
             {/each}
             {#each evaluationDefinitions as definition}
-              <button on:click={() => void openEvaluationDefinition(activeExplore?.id ?? '', definition.id)}>
+              <button
+                data-definition-id={definition.id}
+                on:click={() => void openEvaluationDefinition(definition.id)}
+              >
                 <span class="history-status" data-status="passed"></span>
                 <span>
                   <strong>{definition.name}</strong>

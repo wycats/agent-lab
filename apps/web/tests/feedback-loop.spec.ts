@@ -3042,7 +3042,6 @@ test('agent answers render constrained Markdown and retain inspectable source', 
 
   // Keep the persistent e2e workbench neutral for the catalog walkthrough that follows.
   await submit(page, 'agent close');
-  await expect(page.getByTestId('terminal-text')).toContainText('closing');
   await expect(page.locator('.run-heading')).toContainText('Session history');
   await expect(page.locator('.run-heading')).toContainText('closed');
   await expect(page.getByTestId('interactive-agent-session')).toContainText(

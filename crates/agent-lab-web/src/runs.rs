@@ -16387,7 +16387,8 @@ done
             wait_for_validation(&controller, &draft.summary.id, &failed_attempt.id).await;
         assert_eq!(
             failed_attempt.execution_status,
-            EvaluationExecutionStatus::Complete
+            EvaluationExecutionStatus::Complete,
+            "a completed replay with assertion mismatches should remain conclusive: {failed_attempt:#?}"
         );
         assert_eq!(
             failed_attempt.assertion_status,

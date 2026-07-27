@@ -5294,6 +5294,7 @@ fn run_driver(
         else {
             return Ok(cancelled_completion());
         };
+        let closed_kind = driver_message_kind(&closed.parsed.body);
         match closed.parsed.body {
             DriverBody::SessionClosed {
                 session_id: closed_session,
@@ -5304,9 +5305,9 @@ fn run_driver(
                 )));
             }
             _ => {
-                return Err(RunError::Protocol(
-                    "expected session.closed for the active session".to_owned(),
-                ));
+                return Err(RunError::Protocol(format!(
+                    "expected session.closed for the active session; received {closed_kind}"
+                )));
             }
         }
         let exit_code = match wait_for_exit_with_cancellation(
@@ -7141,6 +7142,18 @@ fn driver_event_kind(event_type: &str) -> String {
         format!("driver.event.{event_type}")
     } else {
         event_type.to_owned()
+    }
+}
+
+fn driver_message_kind(body: &DriverBody) -> &'static str {
+    match body {
+        DriverBody::StartupEvent { .. } => "startup.event",
+        DriverBody::Ready { .. } => "driver.ready",
+        DriverBody::SessionOpened { .. } => "session.opened",
+        DriverBody::TurnEvent { .. } => "turn.event",
+        DriverBody::TurnFinished { .. } => "turn.finished",
+        DriverBody::SessionClosed { .. } => "session.closed",
+        DriverBody::Failed { .. } => "driver.failed",
     }
 }
 

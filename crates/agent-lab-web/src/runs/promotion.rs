@@ -348,6 +348,7 @@ struct PromotionProposalState {
     anchor: Arc<AgentSessionDirectoryAnchor>,
     sender: broadcast::Sender<RunEvent>,
     event_commit: Mutex<()>,
+    completion_commit: Mutex<()>,
     cancel: CancellationToken,
     evidence_quarantined: AtomicBool,
 }
@@ -560,6 +561,11 @@ impl RunController {
             ));
         }
         let workspace = self.state(workspace_id)?;
+        // Proposal startup can discover new credential material and reserves the workspace against
+        // overlapping turns. Hold the same gates used by session and turn startup until the
+        // proposal is registered as both an active producer and a pending secret resolution.
+        let mut pending_secret_resolutions = lock(&workspace.pending_secret_resolutions);
+        let _producer_lifecycle = lock(&workspace.producer_lifecycle);
         if lock(&workspace.summary).status != RunStatus::Exploring {
             return Err(RunError::RunUnavailable(workspace_id.to_owned()));
         }
@@ -728,6 +734,7 @@ impl RunController {
             anchor,
             sender,
             event_commit: Mutex::new(()),
+            completion_commit: Mutex::new(()),
             cancel: CancellationToken::new(),
             evidence_quarantined: AtomicBool::new(false),
         });
@@ -760,7 +767,7 @@ impl RunController {
         let event_workspace = workspace.clone();
         let event_origin = origin;
         let execution = ProposalExecution {
-            workspace,
+            workspace: workspace.clone(),
             session,
             harness,
             model_access_provider,
@@ -772,10 +779,12 @@ impl RunController {
         };
         let controller = self.clone();
         let actor_state = state.clone();
+        pending_secret_resolutions.insert(id.clone());
         let spawn = thread::Builder::new()
             .name(format!("agent-lab-proposal-{id}"))
             .spawn(move || controller.execute_evaluation_proposal(&actor_state, &execution));
         if let Err(error) = spawn {
+            pending_secret_resolutions.remove(&id);
             let message = format!("proposal agent could not start: {error}");
             finish_proposal(
                 &state,
@@ -799,6 +808,7 @@ impl RunController {
             return Err(RunError::Io(error));
         }
         pending_bundle.commit();
+        drop(pending_secret_resolutions);
         Ok(summary)
     }
 
@@ -809,6 +819,7 @@ impl RunController {
     /// Returns an error when the proposal is unknown or already terminal.
     pub fn cancel_evaluation_proposal(&self, id: &str) -> Result<(), RunError> {
         let state = self.promotion_proposal_state(id)?;
+        let _completion = lock(&state.completion_commit);
         if lock(&state.detail).summary.status.is_finished() {
             return Err(RunError::InvalidRequest(format!(
                 "evaluation proposal is already complete: {id}"
@@ -1279,8 +1290,34 @@ impl RunController {
             transcript_result?;
             driver_result
         })();
+        // Cancellation and terminal publication share one commit boundary. A cancellation
+        // accepted before this point prevents draft publication; once publication begins, cancel
+        // waits and observes the terminal proposal instead of returning an accepted request.
+        let _completion = lock(&state.completion_commit);
         match result {
             Ok((candidate, driver)) => {
+                if state.cancel.is_cancelled() {
+                    let message = "evaluation proposal was cancelled";
+                    let _ = finish_proposal(
+                        state,
+                        EvaluationProposalStatus::Cancelled,
+                        Some(candidate),
+                        None,
+                        Some(message),
+                    );
+                    let _ = record_event(
+                        &execution.workspace,
+                        "workbench.evaluation-proposal.finished",
+                        json!({
+                            "origin": execution.origin,
+                            "proposalId": proposal_id,
+                            "draftId": JsonValue::Null,
+                            "status": EvaluationProposalStatus::Cancelled,
+                            "error": message,
+                        }),
+                    );
+                    return;
+                }
                 let source_sequences = proposal_source_sequences(
                     &execution.session,
                     &candidate.from_turn_id,
@@ -1377,6 +1414,15 @@ impl RunController {
                 );
             }
         }
+    }
+
+    pub(super) fn has_active_evaluation_proposal(&self, workspace_id: &str) -> bool {
+        lock(&self.inner.promotion.proposals)
+            .values()
+            .any(|proposal| {
+                let summary = lock(&proposal.detail).summary.clone();
+                summary.workspace_id == workspace_id && !summary.status.is_finished()
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4274,6 +4320,7 @@ fn load_proposals(root: &Path) -> Result<HashMap<String, Arc<PromotionProposalSt
             anchor,
             sender,
             event_commit: Mutex::new(()),
+            completion_commit: Mutex::new(()),
             cancel: CancellationToken::new(),
             evidence_quarantined: AtomicBool::new(false),
         });

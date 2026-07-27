@@ -3704,6 +3704,39 @@ test('a separate proposal agent turns completed evidence into an attributed draf
   expect(Math.abs((totalScore?.height ?? 0) - (outputPath?.height ?? 0))).toBeLessThan(2);
 });
 
+test('browser-originated proposals synchronize across attached tabs', async ({ page, context }) => {
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await page.getByLabel('Default harness').selectOption('v0');
+  await submit(page, 'agent "Explain the active catalog as a reusable task"');
+  const sourceTurn = page
+    .getByTestId('interactive-agent-session')
+    .getByTestId('session-turn')
+    .last();
+  await expect(sourceTurn).toHaveAttribute('data-status', 'completed');
+
+  const observer = await context.newPage();
+  await observer.goto('/');
+  await expect(observer.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await expect(observer.getByTestId('interactive-agent-session')).toBeVisible();
+  await page.getByLabel('Default harness').selectOption('eve');
+  await expect(observer.getByLabel('Default harness')).toHaveValue('eve');
+  await page.getByLabel('Default harness').selectOption('v0');
+  await expect(observer.getByLabel('Default harness')).toHaveValue('v0');
+
+  await sourceTurn.getByRole('button', { name: 'Suggest evaluation' }).click();
+
+  const initiatingDraft = page.getByTestId('evaluation-draft-view');
+  const synchronizedDraft = observer.getByTestId('evaluation-draft-view');
+  await expect(initiatingDraft).toBeVisible();
+  await expect(synchronizedDraft).toBeVisible();
+  await expect(synchronizedDraft).toContainText('Suggested by');
+  await expect(synchronizedDraft).toContainText(
+    'This span captures the complete catalog-to-file behavior.'
+  );
+  await observer.close();
+});
+
 test('a shell-originated proposal streams while the shared browser opens its draft', async ({ page }) => {
   await page.goto('/');
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');

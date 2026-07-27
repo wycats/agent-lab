@@ -1191,12 +1191,16 @@
           throughTurnId: turn.id
         }
       );
+      const shouldStartStream =
+        activeProposal?.id !== proposal.id || !proposalEventStream;
       activeProposal = proposal;
       evaluationProposals = [
         proposal,
         ...evaluationProposals.filter((candidate) => candidate.id !== proposal.id)
       ];
-      watchEvaluationProposal(agentSession.summary.workspaceId, proposal.id);
+      if (shouldStartStream) {
+        watchEvaluationProposal(agentSession.summary.workspaceId, proposal.id);
+      }
     } catch (error) {
       proposalBusy = false;
       proposalProgress = '';
@@ -1779,14 +1783,14 @@
         typeof event.payload === 'object'
       ) {
         const payload = event.payload as {
-          origin?: unknown;
           proposal?: EvaluationProposalSummary;
         };
         if (
-          payload.origin === 'nushell' &&
           payload.proposal &&
           typeof payload.proposal.id === 'string'
         ) {
+          const shouldStartStream =
+            activeProposal?.id !== payload.proposal.id || !proposalEventStream;
           activeProposal = payload.proposal;
           proposalBusy = true;
           proposalProgress = 'Preparing proposal agent…';
@@ -1798,7 +1802,9 @@
           ];
           activeTab = 'agent';
           agentInspectionMode = 'session';
-          watchEvaluationProposal(id, payload.proposal.id);
+          if (shouldStartStream) {
+            watchEvaluationProposal(id, payload.proposal.id);
+          }
         }
       }
       if (

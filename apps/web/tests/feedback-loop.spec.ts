@@ -219,6 +219,19 @@ test('a session that fails while opening becomes retained history', async ({ pag
 
 test('ready agent sessions keep their workspace selected until every driver closes', async ({ page }) => {
   let exploreRequests = 0;
+  let holdNextDraftLibraryRefresh = false;
+  let draftLibraryRefreshStartedResolve = () => {};
+  const draftLibraryRefreshStarted = new Promise<void>((resolve) => {
+    draftLibraryRefreshStartedResolve = resolve;
+  });
+  let releaseDraftLibraryRefreshResolve = () => {};
+  const releaseDraftLibraryRefresh = new Promise<void>((resolve) => {
+    releaseDraftLibraryRefreshResolve = resolve;
+  });
+  let draftLibraryRefreshFinishedResolve = () => {};
+  const draftLibraryRefreshFinished = new Promise<void>((resolve) => {
+    draftLibraryRefreshFinishedResolve = resolve;
+  });
   page.on('request', (request) => {
     if (
       request.method() === 'POST' &&
@@ -226,6 +239,18 @@ test('ready agent sessions keep their workspace selected until every driver clos
     ) {
       exploreRequests += 1;
     }
+  });
+  await page.route('/api/evaluation-drafts', async (route) => {
+    if (holdNextDraftLibraryRefresh) {
+      holdNextDraftLibraryRefresh = false;
+      draftLibraryRefreshStartedResolve();
+      await releaseDraftLibraryRefresh;
+      const response = await route.fetch();
+      await route.fulfill({ response });
+      draftLibraryRefreshFinishedResolve();
+      return;
+    }
+    await route.continue();
   });
   await page.route('/api/scenarios', async (route) => {
     const response = await route.fetch();
@@ -247,10 +272,15 @@ test('ready agent sessions keep their workspace selected until every driver clos
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
   const scenario = page.getByLabel('Scenario');
   await expect(scenario).toBeEnabled();
+  holdNextDraftLibraryRefresh = true;
   await page.getByLabel('Default harness').selectOption('v0');
+  await draftLibraryRefreshStarted;
 
   const screen = page.getByTestId('terminal-text');
   await submit(page, 'agent new | get status');
+  await expect(screen).toContainText('ready');
+  releaseDraftLibraryRefreshResolve();
+  await draftLibraryRefreshFinished;
   await expect(page.locator('.run-heading')).toContainText('Active session');
   await expect(page.getByTestId('interactive-agent-session')).toContainText(
     'Ask the harness in Explore.'

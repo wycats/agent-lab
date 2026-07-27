@@ -370,6 +370,8 @@
   }
 
   async function loadWorkbench(id: string): Promise<void> {
+    const sessionOpenRequestVersion = agentSessionOpenRequestVersion;
+    const sessionOpenVersion = agentSessionOpenVersion;
     const workbench = await runClient.workbench(id);
     if (loadedWorkbenchId !== undefined && loadedWorkbenchId !== id) {
       clearEvaluationDraftSelection();
@@ -379,9 +381,32 @@
     modelAccess = workbench.modelAccess;
     mergeAgentSessionSnapshot(id, workbench.agentSessions);
     await loadEvaluationLibrary(id);
-    const session = workbench.activeAgentSession?.active
+    const liveSession = agentSessions.find(
+      (session) =>
+        session.workspaceId === id &&
+        session.active &&
+        !agentSessionIsHistorical(session)
+    );
+    const currentSession =
+      activeAgentSession?.summary.workspaceId === id &&
+      activeAgentSession.summary.active &&
+      !agentSessionIsHistorical(activeAgentSession.summary)
+        ? activeAgentSession.summary
+        : undefined;
+    if (
+      sessionOpenRequestVersion !== agentSessionOpenRequestVersion ||
+      sessionOpenVersion !== agentSessionOpenVersion
+    ) {
+      if (!activeAgentSession && liveSession) {
+        requestAgentSessionReconciliation(id, liveSession.id, agentSessionOpenVersion, {
+          replaceCurrent: true
+        });
+      }
+      return;
+    }
+    const session = currentSession ?? liveSession ?? (workbench.activeAgentSession?.active
       ? workbench.activeAgentSession
-      : workbench.replayAgentSession;
+      : workbench.replayAgentSession);
     if (session && !starting && exploreRun?.summary.status === 'exploring') {
       try {
         await openAgentSession(id, session.id, false);
@@ -1589,7 +1614,23 @@
         typeof event.payload === 'object'
       ) {
         const summary = (event.payload as { session?: AgentSessionSummary }).session;
-        if (summary?.workspaceId === id) rememberAgentSession(summary);
+        if (summary?.workspaceId === id) {
+          rememberAgentSession(summary);
+          if (
+            event.type === 'workbench.agent.session.updated' &&
+            summary.active &&
+            !agentSessionIsHistorical(summary) &&
+            activeAgentSession?.summary.id !== summary.id
+          ) {
+            void openAgentSession(id, summary.id, false)
+              .catch((error) => {
+                agentSessionSyncError = agentSessionUnavailableMessage(error);
+                requestAgentSessionReconciliation(id, summary.id, agentSessionOpenVersion, {
+                  replaceCurrent: true
+                });
+              });
+          }
+        }
       }
       if (
         event.sequence > liveAfterSequence &&

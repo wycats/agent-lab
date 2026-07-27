@@ -15,6 +15,8 @@ const MANUAL_AUTHORING_BLOCKER: &str =
 const PROPOSAL_SCHEMA_VERSION: u32 = 1;
 const PROPOSAL_PROMPT_CONTRACT: &str = "agent-lab/evaluation-proposal@1";
 const PROPOSAL_MIN_DURATION_MS: u64 = 30_000;
+const MAX_PROPOSAL_EVENTS: usize = 1_024;
+const MAX_PROPOSAL_EVENT_BYTES: usize = 4 * 1024 * 1024;
 const PROPOSAL_MEASUREMENTS: &[&str] = &[
     "duration",
     "model-turns",
@@ -351,6 +353,7 @@ struct PromotionProposalState {
     completion_commit: Mutex<()>,
     cancel: CancellationToken,
     evidence_quarantined: AtomicBool,
+    retained_event_bytes: AtomicUsize,
     #[cfg(test)]
     fail_next_terminal_event_persist: AtomicBool,
 }
@@ -756,6 +759,7 @@ impl RunController {
             completion_commit: Mutex::new(()),
             cancel: CancellationToken::new(),
             evidence_quarantined: AtomicBool::new(false),
+            retained_event_bytes: AtomicUsize::new(0),
             #[cfg(test)]
             fail_next_terminal_event_persist: AtomicBool::new(false),
         });
@@ -1154,11 +1158,14 @@ impl RunController {
                                         record_proposal_event(
                                             state,
                                             observation.event_type(),
-                                            json!({
-                                                "proposalId": proposal_id,
-                                                "turnId": turn_id,
-                                                "event": observation.payload(),
-                                            }),
+                                            redact_value(
+                                                json!({
+                                                    "proposalId": proposal_id,
+                                                    "turnId": turn_id,
+                                                    "event": observation.payload(),
+                                                }),
+                                                &secrets,
+                                            ),
                                         )?;
                                     }
                                 } else {
@@ -1193,11 +1200,14 @@ impl RunController {
                                     record_proposal_event(
                                         state,
                                         observation.event_type(),
-                                        json!({
-                                            "proposalId": proposal_id,
-                                            "turnId": turn_id,
-                                            "event": observation.payload(),
-                                        }),
+                                        redact_value(
+                                            json!({
+                                                "proposalId": proposal_id,
+                                                "turnId": turn_id,
+                                                "event": observation.payload(),
+                                            }),
+                                            &secrets,
+                                        ),
                                     )?;
                                 }
                                 record_proposal_event(
@@ -1249,16 +1259,6 @@ impl RunController {
                     ));
                 }
                 require_successful_driver_exit(driver.wait_for_exit(DRIVER_RESPONSE_TIMEOUT)?)?;
-                let final_scratch =
-                    capture_confined_run_tree(&state.anchor, Path::new("workspace"))?;
-                let scratch_changes =
-                    captured_tree_changes(&initial_scratch, &final_scratch, &secrets);
-                if !scratch_changes.is_empty() {
-                    return Err(RunError::Protocol(format!(
-                        "read-only proposal agent changed its scratch workspace: {}",
-                        serde_json::to_string(&scratch_changes)?
-                    )));
-                }
                 let response = response.ok_or_else(|| {
                     RunError::Protocol(
                         "evaluation proposal completed without an authoritative response"
@@ -1300,7 +1300,10 @@ impl RunController {
                 &serde_json::to_value(transcript)?,
             );
             drop(driver);
+            let scratch_result =
+                restore_proposal_scratch_if_mutated(state, &initial_scratch, &secrets);
             transcript_result?;
+            scratch_result?;
             driver_result
         })();
         // Cancellation and terminal publication share one commit boundary. A cancellation
@@ -1458,7 +1461,10 @@ impl RunController {
             .cloned()
             .collect::<Vec<_>>();
         for proposal in active {
-            proposal.cancel.cancel();
+            let _completion = lock(&proposal.completion_commit);
+            if !lock(&proposal.detail).summary.status.is_finished() {
+                proposal.cancel.cancel();
+            }
         }
     }
 
@@ -3717,6 +3723,56 @@ fn validate_proposal_turn_outcome(
     Ok(())
 }
 
+fn quarantine_proposal_bundle(state: &PromotionProposalState) {
+    state.evidence_quarantined.store(true, Ordering::Release);
+    state.cancel.cancel();
+    let id = lock(&state.detail).summary.id.clone();
+    if !quarantine_run_bundle(&state.anchor, &id) {
+        let _ = remove_confined_run_entry(&state.anchor, Path::new("manifest.json"));
+    }
+}
+
+fn restore_proposal_scratch_if_mutated(
+    state: &PromotionProposalState,
+    initial: &CapturedTree,
+    secrets: &[Vec<u8>],
+) -> Result<(), RunError> {
+    let final_scratch =
+        capture_confined_run_tree(&state.anchor, Path::new("workspace")).map_err(|error| {
+            quarantine_proposal_bundle(state);
+            RunError::EvidencePersistence(format!(
+                "proposal scratch evidence could not be inspected and was quarantined: {error}"
+            ))
+        })?;
+    let changes = captured_tree_changes(initial, &final_scratch, secrets);
+    if !changes.is_empty() {
+        let restore =
+            remove_confined_run_entry(&state.anchor, Path::new("workspace")).and_then(|_| {
+                write_confined_run_captured_tree(&state.anchor, Path::new("workspace"), initial)
+                    .map(drop)
+            });
+        if let Err(error) = restore {
+            quarantine_proposal_bundle(state);
+            return Err(RunError::EvidencePersistence(format!(
+                "mutated proposal scratch evidence could not be restored and was quarantined: {error}"
+            )));
+        }
+    }
+    if confined_bundle_contains_protected_data(&state.anchor, secrets).unwrap_or(true) {
+        quarantine_proposal_bundle(state);
+        return Err(RunError::EvidencePersistence(
+            "proposal evidence contained protected data and was quarantined".to_owned(),
+        ));
+    }
+    if !changes.is_empty() {
+        return Err(RunError::Protocol(format!(
+            "read-only proposal agent changed its scratch workspace: {}",
+            serde_json::to_string(&changes)?
+        )));
+    }
+    Ok(())
+}
+
 fn verify_capability_recipe(
     state: &RunState,
     expected: &[CapabilityAssembly],
@@ -3768,6 +3824,14 @@ fn record_proposal_event(
         payload,
         progress: None,
     };
+    let mut line = serde_json::to_vec(&event)?;
+    line.push(b'\n');
+    enforce_proposal_event_budget(
+        detail.events.len(),
+        state.retained_event_bytes.load(Ordering::Acquire),
+        line.len(),
+        kind == "evaluation-proposal.finished",
+    )?;
     detail.events.push(event.clone());
     if let Err(error) = persist_proposal_detail(state, &detail) {
         *detail = previous;
@@ -3785,16 +3849,46 @@ fn record_proposal_event(
             "injected terminal proposal event persistence failure".to_owned(),
         ));
     }
-    let mut line = serde_json::to_vec(&event)?;
-    line.push(b'\n');
     if let Err(error) = append_confined_run_bytes(&state.anchor, Path::new("events.jsonl"), &line) {
         *detail = previous;
         persist_proposal_detail(state, &detail)?;
         return Err(error);
     }
+    state
+        .retained_event_bytes
+        .fetch_add(line.len(), Ordering::Release);
     drop(detail);
     let _ = state.sender.send(event.clone());
     Ok(event)
+}
+
+fn enforce_proposal_event_budget(
+    retained_count: usize,
+    retained_bytes: usize,
+    next_bytes: usize,
+    terminal: bool,
+) -> Result<(), RunError> {
+    if terminal {
+        return Ok(());
+    }
+    if retained_count >= MAX_PROPOSAL_EVENTS {
+        return Err(RunError::Protocol(format!(
+            "evaluation proposal exceeded its {MAX_PROPOSAL_EVENTS}-event evidence limit"
+        )));
+    }
+    if retained_bytes.saturating_add(next_bytes) > MAX_PROPOSAL_EVENT_BYTES {
+        return Err(RunError::Protocol(format!(
+            "evaluation proposal exceeded its {MAX_PROPOSAL_EVENT_BYTES}-byte event evidence limit"
+        )));
+    }
+    Ok(())
+}
+
+fn retained_proposal_event_bytes(events: &[RunEvent]) -> Result<usize, RunError> {
+    events.iter().try_fold(0_usize, |total, event| {
+        let bytes = serde_json::to_vec(event)?.len().saturating_add(1);
+        Ok(total.saturating_add(bytes))
+    })
 }
 
 fn persist_proposal_detail(
@@ -4573,6 +4667,7 @@ fn load_proposals(
         if interrupted {
             reconcile_interrupted_proposal(&mut detail, drafts);
         }
+        let retained_event_bytes = retained_proposal_event_bytes(&detail.events)?;
         let (sender, _) = broadcast::channel(128);
         let state = Arc::new(PromotionProposalState {
             detail: Mutex::new(detail),
@@ -4582,6 +4677,7 @@ fn load_proposals(
             completion_commit: Mutex::new(()),
             cancel: CancellationToken::new(),
             evidence_quarantined: AtomicBool::new(false),
+            retained_event_bytes: AtomicUsize::new(retained_event_bytes),
             #[cfg(test)]
             fail_next_terminal_event_persist: AtomicBool::new(false),
         });
@@ -4804,6 +4900,30 @@ fn load_definitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proposal_event_budget_bounds_progress_but_preserves_terminal_delivery() {
+        enforce_proposal_event_budget(0, 0, 32, false).unwrap();
+        assert!(
+            enforce_proposal_event_budget(MAX_PROPOSAL_EVENTS, 0, 32, false)
+                .unwrap_err()
+                .to_string()
+                .contains("event evidence limit")
+        );
+        assert!(
+            enforce_proposal_event_budget(0, MAX_PROPOSAL_EVENT_BYTES, 1, false)
+                .unwrap_err()
+                .to_string()
+                .contains("event evidence limit")
+        );
+        enforce_proposal_event_budget(
+            MAX_PROPOSAL_EVENTS,
+            MAX_PROPOSAL_EVENT_BYTES,
+            MAX_DRIVER_RECORD_BYTES,
+            true,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn catalog_evaluator_preserves_the_scenario_schema_requirement() {

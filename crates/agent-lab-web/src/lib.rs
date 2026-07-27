@@ -1470,6 +1470,12 @@ fn evaluation_proposal_event_stream(
                     continue;
                 }
                 match receiver.recv().await {
+                    Ok(event)
+                        if event.kind == "evaluation-proposal.finished"
+                            && event.payload["durable"].as_bool() == Some(false) =>
+                    {
+                        return Some((event, (pending, receiver, runs, id, last_sequence)));
+                    }
                     Ok(event) => pending.push_back(event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let Ok(events) = runs.evaluation_proposal_events_after(&id, last_sequence)
@@ -2508,6 +2514,32 @@ totalScore = 0
             let stream = evaluation_draft_event_stream(
                 runs.clone(),
                 "removed-draft".to_owned(),
+                Vec::new(),
+                receiver,
+            );
+            futures_util::pin_mut!(stream);
+            let observed = stream.next().await.expect("transient terminal event");
+            assert_eq!(observed.kind, finalization_failure.kind);
+            assert_eq!(observed.sequence, finalization_failure.sequence);
+            assert_eq!(observed.payload, finalization_failure.payload);
+        }
+        {
+            let (sender, receiver) = tokio::sync::broadcast::channel(4);
+            let finalization_failure = RunEvent {
+                sequence: 0,
+                at_ms: 1,
+                kind: "evaluation-proposal.finished".to_owned(),
+                payload: serde_json::json!({
+                    "proposalId": "proposal-finalization-failure",
+                    "status": "failed",
+                    "durable": false,
+                }),
+                progress: None,
+            };
+            sender.send(finalization_failure.clone()).unwrap();
+            let stream = evaluation_proposal_event_stream(
+                runs.clone(),
+                "removed-proposal".to_owned(),
                 Vec::new(),
                 receiver,
             );

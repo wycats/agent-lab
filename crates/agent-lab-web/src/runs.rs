@@ -10,7 +10,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -15934,6 +15934,13 @@ while IFS= read -r line; do
           from=$(printf '%s' "$line" | sed -E 's/.*"fromTurnId":"([^"]+)".*/\1/')
           through=$(printf '%s' "$line" | sed -E 's/.*"throughTurnId":"([^"]+)".*/\1/')
           candidate='{\"schemaVersion\":1,\"fromTurnId\":\"'"$from"'\",\"throughTurnId\":\"'"$through"'\",\"task\":\"Use catalog list and analysis summarize to create and verify result.json.\",\"evaluator\":{\"id\":\"catalog-to-file\",\"version\":1,\"parameters\":{\"activeNames\":[\"alpha\",\"gamma\"],\"totalScore\":11,\"requiredCapabilitySources\":[\"catalog\",\"analysis\"],\"outputPath\":\"result.json\",\"requireSchema\":true}},\"measurements\":[\"duration\",\"model-turns\",\"capability-calls\",\"workspace-effects\",\"reported-usage\"],\"rationale\":\"This span captures the complete catalog-to-file behavior.\"}'
+          if [ -n "${AGENT_LAB_PROPOSAL_SCRATCH_SECRET:-}" ]; then
+            printf '%s' "$AGENT_LAB_PROPOSAL_SCRATCH_SECRET" > "$workspace/scratch-leak.txt"
+          fi
+          if [ -n "${TOKEN:-}" ]; then
+            sequence=$((sequence + 1))
+            printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.progress","payload":{"phase":"reasoning","detail":"%s"}}\n' "$sequence" "$session" "$turn" "$TOKEN"
+          fi
           sequence=$((sequence + 1))
           printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.completed","payload":{"messageId":"proposal-%s","text":"%s"}}\n' "$sequence" "$session" "$turn" "$turn" "$candidate"
           ;;
@@ -16733,7 +16740,7 @@ printf '%s\n' '{{"status":"ready","source":"test","environment":{{"TOKEN":"propo
         let controller = RunController::new_with_harnesses_and_model_access(
             RunControllerConfig {
                 scenarios_dir: scenarios,
-                data_dir: data,
+                data_dir: data.clone(),
                 driver: DriverLaunch::new("/bin/false"),
             },
             vec![HarnessProfile {
@@ -16918,10 +16925,110 @@ printf '%s\n' '{{"status":"ready","source":"test","environment":{{"TOKEN":"propo
         let proposal = wait_for_proposal(&controller, &proposal.id).await;
         assert_eq!(proposal.summary.status, EvaluationProposalStatus::Complete);
         assert!(lock(&workspace.pending_secret_resolutions).is_empty());
+        let proposal_evidence = data
+            .join("evaluation-library")
+            .join("proposals")
+            .join(&proposal.summary.id);
+        for file in ["manifest.json", "events.jsonl", "driver.json"] {
+            let retained = fs::read_to_string(proposal_evidence.join(file)).unwrap();
+            assert!(
+                !retained.contains("proposal-secret"),
+                "{file} retained a resolved proposal credential"
+            );
+        }
 
         drop(workspace);
         drop(controller);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn failed_proposal_restores_mutated_scratch_before_retaining_evidence() {
+        const SCRATCH_SECRET: &str = "proposal-scratch-secret";
+
+        let marker_root = temporary_root("proposal-scratch-mutation-markers");
+        let outcome = marker_root.join("outcome");
+        let mut launch = promotion_fixture_launch();
+        launch.env.push((
+            "AGENT_LAB_PROPOSAL_SCRATCH_SECRET".into(),
+            SCRATCH_SECRET.into(),
+        ));
+        launch.env.push((
+            "AGENT_LAB_PROMOTION_OUTCOME_FILE".into(),
+            outcome.clone().into_os_string(),
+        ));
+        let (root, controller, explore, session) =
+            start_interactive_fixture("proposal-scratch-mutation", launch).await;
+        let source_turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "Explain the active catalog".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail
+                .turns
+                .iter()
+                .any(|turn| turn.id == source_turn.id && turn.status.is_finished())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source turn did not finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        fs::write(&outcome, b"failed").unwrap();
+        let proposal = controller
+            .start_evaluation_proposal(
+                &explore.id,
+                StartEvaluationProposalRequest {
+                    session_id: Some(session.id),
+                    from_turn_id: Some(source_turn.id.clone()),
+                    through_turn_id: Some(source_turn.id),
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let proposal = wait_for_proposal(&controller, &proposal.id).await;
+        assert_eq!(proposal.summary.status, EvaluationProposalStatus::Failed);
+        assert!(
+            proposal
+                .summary
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("scratch workspace")),
+            "scratch mutation must become the authoritative proposal failure"
+        );
+
+        let evidence = root
+            .join("runs/evaluation-library/proposals")
+            .join(&proposal.summary.id);
+        assert!(
+            !evidence.join("workspace/scratch-leak.txt").exists(),
+            "mutated scratch evidence must be removed before the failed bundle is retained"
+        );
+        let retained = snapshot_tree(&evidence).unwrap();
+        assert!(
+            retained.values().all(|contents| {
+                !contents
+                    .windows(SCRATCH_SECRET.len())
+                    .any(|window| window == SCRATCH_SECRET.as_bytes())
+            }),
+            "the retained proposal bundle must not contain the scratch secret"
+        );
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(marker_root).unwrap();
     }
 
     #[cfg(unix)]

@@ -10,7 +10,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -49,9 +49,12 @@ use tokio_util::sync::CancellationToken;
 mod promotion;
 pub use promotion::{
     CreateEvaluationDraftRequest, EvaluationDefinitionDetail, EvaluationDefinitionSummary,
-    EvaluationDraftDetail, EvaluationDraftSummary, EvaluationExecutionStatus, EvaluationRevision,
+    EvaluationDraftDetail, EvaluationDraftSummary, EvaluationExecutionStatus,
+    EvaluationProposalCandidate, EvaluationProposalDetail, EvaluationProposalProvenance,
+    EvaluationProposalStatus, EvaluationProposalSummary, EvaluationRevision,
     EvaluationRevisionUpdate, EvaluationValidationAttempt, SaveEvaluationDraftRequest,
-    StartDefinitionEvaluationRequest, UpdateEvaluationDraftRequest, ValidationAssertionStatus,
+    StartDefinitionEvaluationRequest, StartEvaluationProposalRequest, UpdateEvaluationDraftRequest,
+    ValidationAssertionStatus,
 };
 
 const DRIVER_POLL: Duration = Duration::from_millis(250);
@@ -2498,7 +2501,13 @@ impl RunController {
         }
         if !pending_secret_resolutions.is_empty() {
             return Err(RunError::RunUnavailable(
-                "wait for starting agent sessions to finish resolving model access".to_owned(),
+                "wait for model access resolution to finish".to_owned(),
+            ));
+        }
+        if self.has_active_evaluation_proposal(workspace_id) {
+            return Err(RunError::InvalidRequest(
+                "finish or cancel the active evaluation proposal before starting an agent turn"
+                    .to_owned(),
             ));
         }
         if lock(&workspace.summary).status != RunStatus::Exploring {
@@ -2997,12 +3006,14 @@ impl RunController {
     /// Returns an error when the run is unknown.
     pub fn cancel(&self, id: &str) -> Result<(), RunError> {
         let state = self.state(id)?;
+        let producer_lifecycle = lock(&state.producer_lifecycle);
         let active_turn = lock(&state.active_agent_turn);
         if active_turn.is_some() {
             return Err(RunError::InvalidRequest(
                 "cancel the active agent turn before closing this workspace".to_owned(),
             ));
         }
+        self.cancel_evaluation_proposals_for_workspace(id);
         let cancel_prepared = {
             let mut summary = lock(&state.summary);
             if summary.status == RunStatus::Exploring {
@@ -3015,6 +3026,7 @@ impl RunController {
             }
         };
         drop(active_turn);
+        drop(producer_lifecycle);
         if cancel_prepared {
             let sessions = lock(&state.agent_sessions)
                 .values()
@@ -3356,6 +3368,12 @@ impl RunController {
                 "finish or cancel the active agent turn before running the harness".to_owned(),
             ));
         }
+        if self.has_active_evaluation_proposal(id) {
+            return Err(RunError::InvalidRequest(
+                "finish or cancel the active evaluation proposal before running the harness"
+                    .to_owned(),
+            ));
+        }
         if lock(&self.inner.agent_sessions).values().any(|session| {
             lock(&session.summary).workspace_id == id
                 && matches!(
@@ -3628,7 +3646,7 @@ impl RunController {
         let pending_secret_resolutions = lock(&source.pending_secret_resolutions);
         if !pending_secret_resolutions.is_empty() {
             return Err(RunError::RunUnavailable(
-                "wait for starting agent sessions to finish resolving model access".to_owned(),
+                "wait for model access resolution to finish".to_owned(),
             ));
         }
         let (source_snapshot, source_assembly) =
@@ -15898,6 +15916,7 @@ done
         let script = r#"
 sequence=1
 workspace=
+proposal_session=
 printf '%s\n' '{"protocolVersion":1,"sequence":1,"causedBy":null,"type":"driver.ready","driver":{"name":"promotion-fixture","version":"1","revision":null,"features":["streaming","turn-observations-v1"]}}'
 while IFS= read -r line; do
   session=$(printf '%s' "$line" | sed -E 's/.*"sessionId":"([^"]+)".*/\1/')
@@ -15910,6 +15929,21 @@ while IFS= read -r line; do
     *'"type":"turn.start"'*)
       turn=$(printf '%s' "$line" | sed -E 's/.*"turnId":"([^"]+)".*/\1/')
       case "$line" in
+        *'"mode":"evaluation-proposal"'*)
+          proposal_session=1
+          from=$(printf '%s' "$line" | sed -E 's/.*"fromTurnId":"([^"]+)".*/\1/')
+          through=$(printf '%s' "$line" | sed -E 's/.*"throughTurnId":"([^"]+)".*/\1/')
+          candidate='{\"schemaVersion\":1,\"fromTurnId\":\"'"$from"'\",\"throughTurnId\":\"'"$through"'\",\"task\":\"Use catalog list and analysis summarize to create and verify result.json.\",\"evaluator\":{\"id\":\"catalog-to-file\",\"version\":1,\"parameters\":{\"activeNames\":[\"alpha\",\"gamma\"],\"totalScore\":11,\"requiredCapabilitySources\":[\"catalog\",\"analysis\"],\"outputPath\":\"result.json\",\"requireSchema\":true}},\"measurements\":[\"duration\",\"model-turns\",\"capability-calls\",\"workspace-effects\",\"reported-usage\"],\"rationale\":\"This span captures the complete catalog-to-file behavior.\"}'
+          if [ -n "${AGENT_LAB_PROPOSAL_SCRATCH_SECRET:-}" ]; then
+            printf '%s' "$AGENT_LAB_PROPOSAL_SCRATCH_SECRET" > "$workspace/scratch-leak.txt"
+          fi
+          if [ -n "${TOKEN:-}" ]; then
+            sequence=$((sequence + 1))
+            printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.progress","payload":{"phase":"reasoning","detail":"%s"}}\n' "$sequence" "$session" "$turn" "$TOKEN"
+          fi
+          sequence=$((sequence + 1))
+          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.completed","payload":{"messageId":"proposal-%s","text":"%s"}}\n' "$sequence" "$session" "$turn" "$turn" "$candidate"
+          ;;
         *'"mode":"interactive"'*)
           sequence=$((sequence + 1))
           printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.completed","payload":{"messageId":"answer-%s","text":"Catalog finding: Alpha and gamma are active."}}\n' "$sequence" "$session" "$turn" "$turn"
@@ -15941,6 +15975,14 @@ while IFS= read -r line; do
       printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.finished","sessionId":"%s","turnId":"%s","outcome":"aborted","evidence":{"fixture":true}}\n' "$sequence" "$session" "$turn"
       ;;
     *'"type":"session.close"'*)
+      if [ -n "$proposal_session" ] && [ -n "${AGENT_LAB_FIXTURE_CLOSE_MARKER:-}" ]; then
+        printf 'closed' > "$AGENT_LAB_FIXTURE_CLOSE_MARKER"
+      fi
+      if [ -n "$proposal_session" ] && [ -n "${AGENT_LAB_FIXTURE_CLOSE_RELEASE:-}" ]; then
+        while [ ! -e "$AGENT_LAB_FIXTURE_CLOSE_RELEASE" ]; do
+          sleep 0.01
+        done
+      fi
       sequence=$((sequence + 1))
       printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"session.closed","sessionId":"%s"}\n' "$sequence" "$session"
       exit 0
@@ -15980,6 +16022,26 @@ done
                 Instant::now() < deadline,
                 "evaluation validation {attempt_id} did not finish; latest status: {:?}",
                 attempt.execution_status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_proposal(
+        controller: &RunController,
+        proposal_id: &str,
+    ) -> EvaluationProposalDetail {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let proposal = controller.evaluation_proposal(proposal_id).unwrap();
+            if proposal.summary.status.is_finished() {
+                return proposal;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "evaluation proposal {proposal_id} did not finish; latest status: {:?}",
+                proposal.summary.status
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -16194,6 +16256,779 @@ done
 
         drop(controller);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn proposal_session_creates_attributable_editable_draft_and_replays() {
+        let root = temporary_root("evaluation-proposal");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/bin/false"),
+        };
+        let harnesses = || {
+            vec![HarnessProfile {
+                id: "v0".to_owned(),
+                display_name: "v0".to_owned(),
+                launch: promotion_fixture_launch(),
+                models: BTreeMap::from([("test".to_owned(), "fixture/v0".to_owned())]),
+            }]
+        };
+        let models = BTreeMap::from([("test".to_owned(), "Test".to_owned())]);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let observed = controller
+                .list_agent_sessions(&explore.id)
+                .into_iter()
+                .find(|candidate| candidate.id == session.id)
+                .unwrap();
+            if observed.status == AgentSessionStatus::Ready && observed.active {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source session did not start");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "Explain the active catalog".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail
+                .turns
+                .iter()
+                .any(|candidate| candidate.id == turn.id && candidate.status.is_finished())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source turn did not finish");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let proposal = controller
+            .start_evaluation_proposal(
+                &explore.id,
+                StartEvaluationProposalRequest {
+                    session_id: Some(session.id.clone()),
+                    from_turn_id: Some(turn.id.clone()),
+                    through_turn_id: Some(turn.id.clone()),
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        assert_eq!(proposal.status, EvaluationProposalStatus::Queued);
+        assert!(
+            controller
+                .start_evaluation_proposal(
+                    &explore.id,
+                    StartEvaluationProposalRequest {
+                        session_id: Some(session.id.clone()),
+                        from_turn_id: Some(turn.id.clone()),
+                        through_turn_id: Some(turn.id.clone()),
+                    },
+                    WorkbenchOrigin::Nushell,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("model access resolution")
+        );
+        let proposal = wait_for_proposal(&controller, &proposal.id).await;
+        assert_eq!(proposal.summary.status, EvaluationProposalStatus::Complete);
+        assert_eq!(
+            proposal
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.from_turn_id.as_str()),
+            Some(turn.id.as_str())
+        );
+        let draft_id = proposal.summary.draft_id.as_deref().unwrap();
+        let draft = controller.evaluation_draft(draft_id).unwrap();
+        assert_eq!(draft.summary.status, "ready");
+        assert_eq!(draft.revisions.len(), 2);
+        assert_eq!(
+            draft.revisions[0]
+                .source
+                .proposal
+                .as_ref()
+                .map(|provenance| provenance.proposal_id.as_str()),
+            Some(proposal.summary.id.as_str()),
+            "the committed seed revision must remain attributable if finalization is interrupted"
+        );
+        assert!(draft.revisions[0].blocking_issues.is_empty());
+        let revision = draft.revisions.last().unwrap();
+        assert_eq!(
+            revision
+                .source
+                .proposal
+                .as_ref()
+                .map(|provenance| provenance.proposal_id.as_str()),
+            Some(proposal.summary.id.as_str())
+        );
+        assert_eq!(
+            revision
+                .source
+                .proposal
+                .as_ref()
+                .map(|provenance| provenance.prompt_contract.as_str()),
+            Some("agent-lab/evaluation-proposal@1")
+        );
+        assert_eq!(
+            revision
+                .source
+                .proposal
+                .as_ref()
+                .map(|provenance| provenance.rationale.as_str()),
+            Some("This span captures the complete catalog-to-file behavior.")
+        );
+        assert_eq!(
+            controller.list_agent_sessions(&explore.id).len(),
+            1,
+            "operation-scoped proposal sessions must not appear as interactive sessions"
+        );
+        assert!(proposal.events.iter().any(|event| {
+            event.kind == "observation.progress" || event.kind == "observation.assistant.completed"
+        }));
+        let proposal_id = proposal.summary.id.clone();
+        drop(controller);
+
+        let proposal_events = data
+            .join("evaluation-library")
+            .join("proposals")
+            .join(&proposal_id)
+            .join("events.jsonl");
+        let proposal_manifest = data
+            .join("evaluation-library")
+            .join("proposals")
+            .join(&proposal_id)
+            .join("manifest.json");
+        let mut interrupted_manifest: JsonValue =
+            serde_json::from_slice(&fs::read(&proposal_manifest).unwrap()).unwrap();
+        interrupted_manifest["summary"]["status"] = json!("running");
+        interrupted_manifest["summary"]["draftId"] = JsonValue::Null;
+        interrupted_manifest["summary"]["finishedAtMs"] = JsonValue::Null;
+        interrupted_manifest["summary"]["error"] = JsonValue::Null;
+        interrupted_manifest["candidate"] = JsonValue::Null;
+        interrupted_manifest["events"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|event| event["type"] != "evaluation-proposal.finished");
+        fs::write(
+            &proposal_manifest,
+            serde_json::to_vec_pretty(&interrupted_manifest).unwrap(),
+        )
+        .unwrap();
+        let events = fs::read_to_string(&proposal_events).unwrap();
+        let terminal_count = events
+            .lines()
+            .filter(|line| line.contains("\"type\":\"evaluation-proposal.finished\""))
+            .count();
+        assert_eq!(terminal_count, 1);
+        let lines = events
+            .lines()
+            .filter(|line| !line.contains("\"type\":\"evaluation-proposal.finished\""))
+            .collect::<Vec<_>>();
+        fs::write(&proposal_events, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let reopened = RunController::new_with_harnesses(config(), harnesses(), models).unwrap();
+        let replay = reopened.evaluation_proposal(&proposal_id).unwrap();
+        assert_eq!(replay.summary.status, EvaluationProposalStatus::Complete);
+        assert_eq!(replay.summary.draft_id.as_deref(), Some(draft_id));
+        assert_eq!(
+            replay
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.rationale.as_str()),
+            Some("This span captures the complete catalog-to-file behavior.")
+        );
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| event.kind == "evaluation-proposal.finished")
+                .count(),
+            1,
+            "replay should repair a terminal manifest whose final event append was interrupted"
+        );
+        assert_eq!(
+            reopened
+                .evaluation_draft(draft_id)
+                .unwrap()
+                .summary
+                .current_revision_id,
+            draft.summary.current_revision_id
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn proposal_reserves_turns_and_cancellation_wins_before_draft_publication() {
+        let marker_root = temporary_root("proposal-publication-cancellation-markers");
+        let close_marker = marker_root.join("close-started");
+        let close_release = marker_root.join("close-release");
+        let mut launch = promotion_fixture_launch();
+        launch.env.push((
+            "AGENT_LAB_FIXTURE_CLOSE_MARKER".into(),
+            close_marker.clone().into_os_string(),
+        ));
+        launch.env.push((
+            "AGENT_LAB_FIXTURE_CLOSE_RELEASE".into(),
+            close_release.clone().into_os_string(),
+        ));
+        let (root, controller, explore, session) =
+            start_interactive_fixture("proposal-publication-cancellation", launch).await;
+        let source_turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "Explain the active catalog".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail
+                .turns
+                .iter()
+                .any(|turn| turn.id == source_turn.id && turn.status.is_finished())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "source turn did not finish before proposal startup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let proposal = controller
+            .start_evaluation_proposal(
+                &explore.id,
+                StartEvaluationProposalRequest {
+                    session_id: Some(session.id.clone()),
+                    from_turn_id: Some(source_turn.id.clone()),
+                    through_turn_id: Some(source_turn.id.clone()),
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !close_marker.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "proposal driver did not reach post-turn session close"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let blocked_turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "This turn must wait for the proposal".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            blocked_turn,
+            RunError::InvalidRequest(message) if message.contains("active evaluation proposal")
+        ));
+
+        controller
+            .fail_next_proposal_terminal_event_persist(&proposal.id)
+            .unwrap();
+        let (prefix, mut proposal_events) = controller
+            .subscribe_evaluation_proposal(&proposal.id)
+            .unwrap();
+        assert!(
+            prefix
+                .iter()
+                .all(|event| event.kind != "evaluation-proposal.finished")
+        );
+        controller.cancel_evaluation_proposal(&proposal.id).unwrap();
+        fs::write(&close_release, []).unwrap();
+        let proposal = wait_for_proposal(&controller, &proposal.id).await;
+        assert_eq!(proposal.summary.status, EvaluationProposalStatus::Cancelled);
+        assert!(proposal.summary.draft_id.is_none());
+        let fallback = tokio::time::timeout(Duration::from_secs(2), proposal_events.recv())
+            .await
+            .expect("terminal fallback was not published")
+            .expect("proposal event stream closed before terminal fallback");
+        assert_eq!(fallback.kind, "evaluation-proposal.finished");
+        assert_eq!(fallback.payload["status"], "cancelled");
+        assert_eq!(fallback.payload["durable"], false);
+        assert!(
+            proposal
+                .events
+                .iter()
+                .all(|event| event.kind != "evaluation-proposal.finished"),
+            "the injected persistence failure should leave only the transient terminal fallback"
+        );
+        assert!(
+            controller.list_evaluation_drafts().is_empty(),
+            "an accepted cancellation before publication must not create a seed draft"
+        );
+
+        let next_turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "The reservation is released".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        assert_eq!(next_turn.status, AgentTurnStatus::Queued);
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(marker_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn workspace_cancel_cancels_its_active_evaluation_proposal() {
+        let marker_root = temporary_root("proposal-workspace-cancel-markers");
+        let close_marker = marker_root.join("close-started");
+        let close_release = marker_root.join("close-release");
+        let mut launch = promotion_fixture_launch();
+        launch.env.push((
+            "AGENT_LAB_FIXTURE_CLOSE_MARKER".into(),
+            close_marker.clone().into_os_string(),
+        ));
+        launch.env.push((
+            "AGENT_LAB_FIXTURE_CLOSE_RELEASE".into(),
+            close_release.clone().into_os_string(),
+        ));
+        let (root, controller, explore, session) =
+            start_interactive_fixture("proposal-workspace-cancel", launch).await;
+        let source_turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "Explain the active catalog".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail
+                .turns
+                .iter()
+                .any(|turn| turn.id == source_turn.id && turn.status.is_finished())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source turn did not finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let proposal = controller
+            .start_evaluation_proposal(
+                &explore.id,
+                StartEvaluationProposalRequest {
+                    session_id: Some(session.id.clone()),
+                    from_turn_id: Some(source_turn.id.clone()),
+                    through_turn_id: Some(source_turn.id),
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !close_marker.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "proposal driver did not reach its close boundary"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        controller.cancel(&explore.id).unwrap();
+        assert_eq!(
+            controller.get(&explore.id).unwrap().summary.status,
+            RunStatus::Cancelled
+        );
+        fs::write(&close_release, []).unwrap();
+        let proposal = wait_for_proposal(&controller, &proposal.id).await;
+        assert_eq!(proposal.summary.status, EvaluationProposalStatus::Cancelled);
+        assert!(proposal.summary.draft_id.is_none());
+        assert!(controller.list_evaluation_drafts().is_empty());
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(marker_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn proposal_credential_resolution_is_registered_with_workspace_gates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("proposal-secret-resolution");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let resolver_started = root.join("resolver-started");
+        let resolver_release = root.join("resolver-release");
+        let resolver_path = root.join("resolver.sh");
+        fs::write(
+            &resolver_path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "probe" ]; then
+  printf '%s\n' '{{"status":"ready","source":"test"}}'
+  exit 0
+fi
+: > '{}'
+while [ ! -f '{}' ]; do sleep 0.01; done
+printf '%s\n' '{{"status":"ready","source":"test","environment":{{"TOKEN":"proposal-secret"}}}}'
+"#,
+                resolver_started.display(),
+                resolver_release.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&resolver_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&resolver_release, []).unwrap();
+        let controller = RunController::new_with_harnesses_and_model_access(
+            RunControllerConfig {
+                scenarios_dir: scenarios,
+                data_dir: data.clone(),
+                driver: DriverLaunch::new("/bin/false"),
+            },
+            vec![HarnessProfile {
+                id: "fixture".to_owned(),
+                display_name: "Fixture".to_owned(),
+                launch: promotion_fixture_launch(),
+                models: BTreeMap::from([("test".to_owned(), "fixture/test".to_owned())]),
+            }],
+            BTreeMap::from([("test".to_owned(), "Test".to_owned())]),
+            vec![ModelAccessProvider {
+                id: "slow".to_owned(),
+                display_name: "Slow resolver".to_owned(),
+                resolver: Some(DriverLaunch::new(resolver_path)),
+                environment_names: vec!["TOKEN".to_owned()],
+                setup_hint: "Connect".to_owned(),
+            }],
+            BTreeMap::from([("fixture".to_owned(), "slow".to_owned())]),
+        )
+        .unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let observed = controller
+                .list_agent_sessions(&explore.id)
+                .into_iter()
+                .find(|candidate| candidate.id == session.id)
+                .unwrap();
+            if observed.status == AgentSessionStatus::Ready && observed.active {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source session did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let source_turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "Explain the active catalog".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail
+                .turns
+                .iter()
+                .any(|turn| turn.id == source_turn.id && turn.status.is_finished())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source turn did not finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        controller
+            .close_agent_session(&explore.id, &session.id)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if controller
+                .agent_session(&explore.id, &session.id)
+                .unwrap()
+                .summary
+                .status
+                == AgentSessionStatus::Closed
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source session did not close");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        fs::remove_file(&resolver_release).unwrap();
+        fs::remove_file(&resolver_started).unwrap();
+        let proposal = controller
+            .start_evaluation_proposal(
+                &explore.id,
+                StartEvaluationProposalRequest {
+                    session_id: Some(session.id.clone()),
+                    from_turn_id: Some(source_turn.id.clone()),
+                    through_turn_id: Some(source_turn.id.clone()),
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !resolver_started.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "proposal credential resolver did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let workspace = controller.state(&explore.id).unwrap();
+        assert!(
+            lock(&workspace.pending_secret_resolutions).contains(&proposal.id),
+            "proposal credential discovery must be registered before its resolver runs"
+        );
+        let blocked_proposal = controller
+            .start_evaluation_proposal(
+                &explore.id,
+                StartEvaluationProposalRequest {
+                    session_id: Some(session.id.clone()),
+                    from_turn_id: Some(source_turn.id.clone()),
+                    through_turn_id: Some(source_turn.id.clone()),
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            blocked_proposal,
+            RunError::RunUnavailable(message) if message.contains("model access resolution")
+        ));
+        assert_eq!(
+            controller.list_evaluation_proposals().len(),
+            1,
+            "a pending credential resolution must reject proposal startup before evidence is built"
+        );
+        let blocked_prepared_run = controller
+            .start_prepared(
+                &explore.id,
+                &StartPreparedRunRequest {
+                    model_id: None,
+                    harness_id: Some("fixture".to_owned()),
+                    model_profile_id: Some("test".to_owned()),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            blocked_prepared_run,
+            RunError::InvalidRequest(message) if message.contains("active evaluation proposal")
+        ));
+        assert_eq!(
+            controller.get(&explore.id).unwrap().summary.status,
+            RunStatus::Exploring,
+            "an active proposal must retain ownership of the Explore workspace"
+        );
+        let blocked_turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "Do not persist while credentials are unresolved".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            blocked_turn,
+            RunError::RunUnavailable(message) if message.contains("model access resolution")
+        ));
+        let blocked_evaluation = controller
+            .start_evaluation(StartEvaluationRequest {
+                scenario_id: "catalog".to_owned(),
+                model_profile_id: "test".to_owned(),
+                source_workspace_id: explore.id.clone(),
+                harness_ids: vec!["fixture".to_owned(), "fixture".to_owned()],
+            })
+            .unwrap_err();
+        assert!(matches!(
+            blocked_evaluation,
+            RunError::RunUnavailable(message) if message.contains("model access resolution")
+        ));
+
+        fs::write(&resolver_release, []).unwrap();
+        let proposal = wait_for_proposal(&controller, &proposal.id).await;
+        assert_eq!(proposal.summary.status, EvaluationProposalStatus::Complete);
+        assert!(lock(&workspace.pending_secret_resolutions).is_empty());
+        let proposal_evidence = data
+            .join("evaluation-library")
+            .join("proposals")
+            .join(&proposal.summary.id);
+        for file in ["manifest.json", "events.jsonl", "driver.json"] {
+            let retained = fs::read_to_string(proposal_evidence.join(file)).unwrap();
+            assert!(
+                !retained.contains("proposal-secret"),
+                "{file} retained a resolved proposal credential"
+            );
+        }
+
+        drop(workspace);
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn failed_proposal_restores_mutated_scratch_before_retaining_evidence() {
+        const SCRATCH_SECRET: &str = "proposal-scratch-secret";
+
+        let marker_root = temporary_root("proposal-scratch-mutation-markers");
+        let outcome = marker_root.join("outcome");
+        let mut launch = promotion_fixture_launch();
+        launch.env.push((
+            "AGENT_LAB_PROPOSAL_SCRATCH_SECRET".into(),
+            SCRATCH_SECRET.into(),
+        ));
+        launch.env.push((
+            "AGENT_LAB_PROMOTION_OUTCOME_FILE".into(),
+            outcome.clone().into_os_string(),
+        ));
+        let (root, controller, explore, session) =
+            start_interactive_fixture("proposal-scratch-mutation", launch).await;
+        let source_turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "Explain the active catalog".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            if detail
+                .turns
+                .iter()
+                .any(|turn| turn.id == source_turn.id && turn.status.is_finished())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source turn did not finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        fs::write(&outcome, b"failed").unwrap();
+        let proposal = controller
+            .start_evaluation_proposal(
+                &explore.id,
+                StartEvaluationProposalRequest {
+                    session_id: Some(session.id),
+                    from_turn_id: Some(source_turn.id.clone()),
+                    through_turn_id: Some(source_turn.id),
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let proposal = wait_for_proposal(&controller, &proposal.id).await;
+        assert_eq!(proposal.summary.status, EvaluationProposalStatus::Failed);
+        assert!(
+            proposal
+                .summary
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("scratch workspace")),
+            "scratch mutation must become the authoritative proposal failure"
+        );
+
+        let evidence = root
+            .join("runs/evaluation-library/proposals")
+            .join(&proposal.summary.id);
+        assert!(
+            !evidence.join("workspace/scratch-leak.txt").exists(),
+            "mutated scratch evidence must be removed before the failed bundle is retained"
+        );
+        let retained = snapshot_tree(&evidence).unwrap();
+        assert!(
+            retained.values().all(|contents| {
+                !contents
+                    .windows(SCRATCH_SECRET.len())
+                    .any(|window| window == SCRATCH_SECRET.as_bytes())
+            }),
+            "the retained proposal bundle must not contain the scratch secret"
+        );
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(marker_root).unwrap();
     }
 
     #[cfg(unix)]
@@ -26145,7 +26980,7 @@ printf '%s\n' '{{"status":"ready","source":"test","environment":{{"TOKEN":"{LATE
             .unwrap_err();
         assert!(matches!(
             blocked,
-            RunError::RunUnavailable(message) if message.contains("starting agent sessions")
+            RunError::RunUnavailable(message) if message.contains("model access resolution")
         ));
         let blocked_evaluation = controller
             .start_evaluation(StartEvaluationRequest {
@@ -26157,7 +26992,7 @@ printf '%s\n' '{{"status":"ready","source":"test","environment":{{"TOKEN":"{LATE
             .unwrap_err();
         assert!(matches!(
             blocked_evaluation,
-            RunError::RunUnavailable(message) if message.contains("starting agent sessions")
+            RunError::RunUnavailable(message) if message.contains("model access resolution")
         ));
         assert!(controller.list_evaluations().is_empty());
         fs::write(&resolver_release, []).unwrap();

@@ -36,15 +36,18 @@ pub use runs::{
     AgentTurnCompletionIndex, AgentTurnCompletionRef, AgentTurnDetail, AgentTurnPresentation,
     AgentTurnStatus, AgentTurnSummary, CompareWorkbenchRequest, CreateEvaluationDraftRequest,
     EvaluationDefinitionDetail, EvaluationDefinitionSummary, EvaluationDetail,
-    EvaluationDraftDetail, EvaluationDraftSummary, EvaluationExecutionStatus, EvaluationRevision,
+    EvaluationDraftDetail, EvaluationDraftSummary, EvaluationExecutionStatus,
+    EvaluationProposalCandidate, EvaluationProposalDetail, EvaluationProposalProvenance,
+    EvaluationProposalStatus, EvaluationProposalSummary, EvaluationRevision,
     EvaluationRevisionUpdate, EvaluationStatus, EvaluationSummary, EvaluationValidationAttempt,
     HarnessMetadata, HarnessProfile, ModelAccessProvider, ModelAccessSnapshot, ModelAccessStatus,
     ModelProfileMetadata, PrepareRunRequest, RunController, RunControllerConfig, RunDetail,
     RunError, RunEvent, RunStatus, RunSummary, SaveEvaluationDraftRequest, ScenarioManifest,
     StartAgentSessionRequest, StartAgentTurnRequest, StartDefinitionEvaluationRequest,
-    StartEvaluationRequest, StartPreparedRunRequest, StartRunRequest, TerminalBinding,
-    TerminalCapabilityBinding, UpdateEvaluationDraftRequest, UpdateWorkbenchSelectionRequest,
-    ValidationAssertionStatus, WorkbenchOrigin, WorkbenchSelection, WorkbenchSnapshot,
+    StartEvaluationProposalRequest, StartEvaluationRequest, StartPreparedRunRequest,
+    StartRunRequest, TerminalBinding, TerminalCapabilityBinding, UpdateEvaluationDraftRequest,
+    UpdateWorkbenchSelectionRequest, ValidationAssertionStatus, WorkbenchOrigin,
+    WorkbenchSelection, WorkbenchSnapshot,
 };
 
 const DEFAULT_COLS: u16 = 100;
@@ -498,6 +501,22 @@ pub fn app_with_runs(
         .route(
             "/api/workbench/{workspace_id}/evaluation-drafts",
             get(list_workbench_evaluation_drafts).post(create_evaluation_draft),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluation-proposals",
+            get(list_workbench_evaluation_proposals).post(start_evaluation_proposal),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluation-proposals/{proposal_id}",
+            get(get_workbench_evaluation_proposal),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluation-proposals/{proposal_id}/cancel",
+            post(cancel_evaluation_proposal),
+        )
+        .route(
+            "/api/workbench/{workspace_id}/evaluation-proposals/{proposal_id}/events",
+            get(evaluation_proposal_events),
         )
         .route(
             "/api/workbench/{workspace_id}/evaluation-drafts/{draft_id}",
@@ -1068,6 +1087,105 @@ struct ValidateEvaluationDraftRequest {
     revision_id: Option<String>,
 }
 
+async fn list_workbench_evaluation_proposals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    Json(
+        runs.list_evaluation_proposals()
+            .into_iter()
+            .filter(|proposal| proposal.workspace_id == workspace_id)
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
+}
+
+async fn start_evaluation_proposal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<StartEvaluationProposalRequest>,
+) -> Response {
+    let Some((runs, origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.start_evaluation_proposal(&workspace_id, request, origin) {
+        Ok(proposal) => (StatusCode::ACCEPTED, Json(proposal)).into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn get_workbench_evaluation_proposal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, proposal_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match runs.evaluation_proposal(&proposal_id) {
+        Ok(proposal) if proposal.summary.workspace_id == workspace_id => {
+            Json(proposal).into_response()
+        }
+        Ok(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn cancel_evaluation_proposal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, proposal_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if !runs
+        .evaluation_proposal(&proposal_id)
+        .is_ok_and(|proposal| proposal.summary.workspace_id == workspace_id)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match runs.cancel_evaluation_proposal(&proposal_id) {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => run_error_response(error),
+    }
+}
+
+async fn evaluation_proposal_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, proposal_id)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((runs, _origin)) = authorized_workbench(&state, &headers, &workspace_id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if !runs
+        .evaluation_proposal(&proposal_id)
+        .is_ok_and(|proposal| proposal.summary.workspace_id == workspace_id)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Ok((history, receiver)) = runs.subscribe_evaluation_proposal(&proposal_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let stream = evaluation_proposal_event_stream(runs, proposal_id, history, receiver)
+        .map(|event| {
+            Event::default()
+                .id(event.sequence.to_string())
+                .event(&event.kind)
+                .json_data(event)
+        })
+        .take_until(state.config.shutdown.cancelled_owned());
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
 async fn list_workbench_evaluation_drafts(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1315,6 +1433,52 @@ fn evaluation_draft_event_stream(
                     Ok(event) => pending.push_back(event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let Ok(events) = runs.evaluation_draft_events_after(&id, last_sequence)
+                        else {
+                            return None;
+                        };
+                        pending.extend(events);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
+}
+
+fn evaluation_proposal_event_stream(
+    runs: RunController,
+    id: String,
+    history: Vec<RunEvent>,
+    receiver: tokio::sync::broadcast::Receiver<RunEvent>,
+) -> impl futures_util::Stream<Item = RunEvent> {
+    futures_util::stream::unfold(
+        (VecDeque::from(history), receiver, runs, id, 0_u64),
+        |(mut pending, mut receiver, runs, id, mut last_sequence)| async move {
+            loop {
+                if !pending.is_empty() {
+                    let Ok(current) = runs.evaluation_proposal_events_after(&id, last_sequence)
+                    else {
+                        return None;
+                    };
+                    pending = VecDeque::from(current);
+                }
+                if let Some(event) = pending.pop_front() {
+                    if event_is_after_history(&event, last_sequence) {
+                        last_sequence = event.sequence;
+                        return Some((event, (pending, receiver, runs, id, last_sequence)));
+                    }
+                    continue;
+                }
+                match receiver.recv().await {
+                    Ok(event)
+                        if event.kind == "evaluation-proposal.finished"
+                            && event.payload["durable"].as_bool() == Some(false) =>
+                    {
+                        return Some((event, (pending, receiver, runs, id, last_sequence)));
+                    }
+                    Ok(event) => pending.push_back(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let Ok(events) = runs.evaluation_proposal_events_after(&id, last_sequence)
                         else {
                             return None;
                         };
@@ -2350,6 +2514,32 @@ totalScore = 0
             let stream = evaluation_draft_event_stream(
                 runs.clone(),
                 "removed-draft".to_owned(),
+                Vec::new(),
+                receiver,
+            );
+            futures_util::pin_mut!(stream);
+            let observed = stream.next().await.expect("transient terminal event");
+            assert_eq!(observed.kind, finalization_failure.kind);
+            assert_eq!(observed.sequence, finalization_failure.sequence);
+            assert_eq!(observed.payload, finalization_failure.payload);
+        }
+        {
+            let (sender, receiver) = tokio::sync::broadcast::channel(4);
+            let finalization_failure = RunEvent {
+                sequence: 0,
+                at_ms: 1,
+                kind: "evaluation-proposal.finished".to_owned(),
+                payload: serde_json::json!({
+                    "proposalId": "proposal-finalization-failure",
+                    "status": "failed",
+                    "durable": false,
+                }),
+                progress: None,
+            };
+            sender.send(finalization_failure.clone()).unwrap();
+            let stream = evaluation_proposal_event_stream(
+                runs.clone(),
+                "removed-proposal".to_owned(),
                 Vec::new(),
                 receiver,
             );

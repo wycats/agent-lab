@@ -1,7 +1,8 @@
 # RFC 0004: Interactive agent sessions and evaluation promotion
 
 - Status: Provisional
-- Evidence: [steel thread 0005](../steel-threads/0005-manual-evaluation-promotion.md)
+- Evidence: [steel thread 0005](../steel-threads/0005-manual-evaluation-promotion.md),
+  [steel thread 0006](../steel-threads/0006-assisted-evaluation-proposal.md)
 
 ## Summary
 
@@ -50,14 +51,15 @@ builder reviews it, replays it from its captured starting state, and explicitly
 saves a passing revision. A later evaluation may exercise the same definition
 with different harnesses or models.
 
-An attributable `ProposalSession` remains the next assistance layer. It should
-help choose a meaningful turn span and draft the editable resource while
-preserving the manual path and the identities demonstrated here.
+An attributable `ProposalSession` now supplies the optional assistance layer.
+It proposes a meaningful turn span and editable resource while preserving the
+manual path and the identities demonstrated here. Its candidate remains advice:
+the builder edits, validates, and explicitly promotes the resulting revision.
 
 ## Implementation status
 
-This milestone implements the interactive-session and manual-promotion
-substrate:
+This milestone implements the interactive-session, assisted-drafting, and
+manual-promotion substrate:
 
 - workspace-scoped, multi-turn harness-native sessions and explicit session
   lifecycle commands;
@@ -68,6 +70,9 @@ substrate:
   modes, and durable turn reopening; and
 - a synchronized browser Session view with live progress and
   **Rendered**/**Source** presentation;
+- a separate read-only `ProposalSession` with explicit source/proposer
+  provenance, versioned structured output, cancellation, recovery, and shared
+  Nushell/browser progress;
 - editable draft revisions derived from stable turn spans and revision-owned
   pre-turn snapshots;
 - reviewed `catalog-to-file@1` validation with distinct execution and
@@ -77,9 +82,8 @@ substrate:
 - definition reruns through the existing paired v0/Eve evaluation machinery,
   with durable browser and Nushell reopening after restart.
 
-AI-assisted proposal drafting through a separate `ProposalSession` remains
-proposed. General assertion languages, repository export, and repeated
-statistical claims also remain outside the demonstrated boundary.
+Real-model proposer quality, general assertion languages, repository export,
+and repeated statistical claims remain outside the demonstrated boundary.
 
 ## Motivation
 
@@ -91,9 +95,10 @@ still originates outside the exploration that motivated it.
 
 The two-harness baseline left two gaps. The interactive-session milestone closes
 the first by letting the shell ask the selected agent to work in the environment
-being explored. The second remains: a useful interaction cannot yet become an
-editable evaluation without manually reconstructing its task, starting state,
-and expected outcome.
+being explored. Evaluation promotion closes the second: a useful interaction
+can become an editable evaluation without manually reconstructing its task,
+starting state, and expected outcome. The optional proposal session shortens
+that transition while leaving the builder in control of the durable definition.
 
 Harness builders need a shorter path between developing a working feel for an
 agent and preserving what they learn. They should be able to inspect a
@@ -314,9 +319,9 @@ implementation partly combines:
 5. **Evaluation attempt.** One later execution of a definition with concrete
    harnesses, models, limits, and resulting evidence.
 
-### AI assistance remains attributable advice
+### AI assistance is attributable advice
 
-Agent Lab should use a separate `ProposalSession` to help select a meaningful
+Agent Lab uses a separate `ProposalSession` to help select a meaningful
 turn span and draft the standalone task, assertions, and measurements. A
 `ProposalSession` is an operation-scoped external-driver session, not an
 interactive `AgentSession`: it never appears in `agent sessions`, never becomes
@@ -325,10 +330,10 @@ durable identity and evidence remain available after the driver exits.
 
 By default, the `ProposalSession` uses the source session's harness and model
 profile but has no mutation authority over the Explore workspace. The workbench
-should record the proposal-session identity, harness, model, adapter revision,
+records the proposal-session identity, harness, model, adapter revision,
 prompt contract, source evidence references, and returned structured value.
 
-The proposal session should receive the redacted evidence needed for its task.
+The proposal session receives the redacted evidence needed for its task.
 Its model-provider credential is resolved directly into the isolated child
 process through the server's model-access boundary. It does not receive source
 capability credentials or workspace control grants. Its output must conform to
@@ -444,7 +449,7 @@ interactive turn and fails if none is running. For `agent new`, omitted harness
 and model arguments use the shared workbench selection and fail before creating
 a session when no compatible selection is available.
 
-The proposed evaluation-promotion command surface is:
+The evaluation-promotion command surface is:
 
 ```nu
 lab evaluation propose [--session session-id] [--from turn-id --through turn-id]
@@ -455,7 +460,7 @@ lab evaluation run definition-id [harness-a harness-b] [--model model-profile]
 ```
 
 Omitting the session from `propose` or `new` selects the active
-`AgentSession`; the proposed command should fail clearly if none exists.
+`AgentSession`; the command fails clearly if none exists.
 
 When `--from` and `--through` are supplied, both are required. The controller
 verifies that the stable turn identities belong to the selected session and
@@ -469,14 +474,15 @@ until the builder confirms or edits those fields by creating a revision.
 That confirmation, rather than the presence of suggested values, is what makes
 the manual draft eligible for validation.
 
-`propose` returns the full draft record as structured data. `validate` and
-`save` require exactly one draft source: either the positional draft identity
-or a non-empty draft record from pipeline input. Supplying both or neither is
-an error. This permits a Nushell-native editing flow without requiring
-generated code:
+`propose` streams structured lifecycle progress and ends with the proposal and
+draft identities. The resulting draft is available through the ordinary draft
+commands. `validate` and `save` require exactly one draft source: either the
+positional draft identity or a non-empty draft record from pipeline input.
+Supplying both or neither is an error. This permits a Nushell-native editing
+flow without requiring generated code:
 
 ```nu
-let draft = (lab evaluation propose)
+let draft = (lab evaluation propose | last | get draft)
 $draft | update task "Summarize the active catalog items" | lab evaluation validate
 ```
 
@@ -530,12 +536,13 @@ The Session view does not place an unrelated Explore-run review beneath the
 conversation. Assembly and raw lifecycle state remain available as secondary
 disclosures.
 
-The proposed promotion projection extends that view with **Compare this turn**
-and **Make evaluation** as natural continuations. **Make evaluation** should
-open an editable draft rather than silently saving model output as an
-evaluation.
+The promotion projection extends that view with **Suggest evaluation** and
+**Create manually** as natural continuations. **Suggest evaluation** runs the
+separate proposer and opens its editable draft; **Create manually** opens the
+same resource without proposal assistance. Neither action silently saves model
+output as an evaluation.
 
-A shell-created evaluation proposal should open the corresponding draft review
+A shell-created evaluation proposal opens the corresponding draft review
 without unmounting the terminal or stealing its focus.
 
 The draft view makes the following relationships visible:
@@ -548,10 +555,10 @@ The draft view makes the following relationships visible:
 - whether the current draft revision has been promoted into a runnable
   definition.
 
-The browser's New Draft operation uses the same manual `new` operation as
+The browser's **Create manually** operation uses the same `new` operation as
 Nushell: the builder selects an evidence span and receives an incomplete,
-editable draft without starting a `ProposalSession`. Propose remains the
-separate AI-assisted operation.
+editable draft without starting a `ProposalSession`. **Suggest evaluation**
+remains the separate assisted operation.
 
 Browser edits and shell operations should observe the same revision. Updates
 travel through controller events rather than independent browser state or idle
@@ -697,7 +704,7 @@ checked-in scenario.
 
 ## Validation boundary
 
-The first steel thread should prove one complete catalog-based path as a
+The first steel threads prove one complete catalog-based path as a
 five-minute harness-builder walkthrough. The participant understands agent
 harnesses but receives only this orientation:
 
@@ -707,7 +714,7 @@ harnesses but receives only this orientation:
 The walkthrough is:
 
 Steps 1-5 exercise the interactive-session substrate. Steps 6-10 describe the
-manual promotion boundary demonstrated by steel thread 0005.
+assisted promotion boundary demonstrated by steel threads 0005 and 0006.
 
 1. Run `agent "Find the active catalog items and explain what matters"` without
    pipeline input. A real harness discovers the catalog capability, and the
@@ -722,8 +729,9 @@ manual promotion boundary demonstrated by steel thread 0005.
    turns that have no pipeline input.
 5. Create a second session, switch between sessions, and reopen the first with
    its conversation and evidence intact.
-6. Choose **Make evaluation** on a stable turn and create an editable draft
-   from its durable pre-turn state and capability recipe.
+6. Choose **Suggest evaluation** on a stable turn. Observe the separate,
+   read-only proposer and open its attributed editable draft. Demonstrate
+   **Create manually** as the equivalent no-proposer path.
 7. Review and edit the same draft through Nushell and the browser.
 8. Replay it from the captured state, retain one complete failed validation,
    revise the evaluator parameters, and produce a passing current revision.
@@ -742,18 +750,20 @@ failure, and recovery contracts. One real-model catalog demonstration,
 including a retained assertion failure, corrected passing revision, explicit
 promotion, and paired variant run, establishes that the interaction survives
 contact with actual harnesses. The visible walkthrough completed locally; its
-public-safe evidence is summarized in steel thread 0005.
+public-safe evidence is summarized in steel threads 0005 and 0006. Steel thread
+0006 uses deterministic adapters to prove proposer lifecycle and trust
+boundaries; it does not establish real-model proposal quality.
 
 ## Boundaries
 
-This RFC's demonstrated manual boundary extends interactive sessions with
-evaluation drafts, bounded validation attempts sufficient to retain a failed
-revision and pass a corrected revision, local versioned saving, and one paired
-variant run.
+This RFC's demonstrated boundary extends interactive sessions with an optional
+read-only proposal operation, evaluation drafts, bounded validation attempts
+sufficient to retain a failed revision and pass a corrected revision, local
+versioned saving, and paired variant runs.
 
 The following work remains available for subsequent evidence:
 
-- attributable AI-assisted proposal drafting;
+- real-model proposer-quality observations and proposal-policy refinement;
 - a general assertion or evaluator language;
 - repeated trials and statistical quality claims;
 - cross-harness checkpoint or conversation portability;
@@ -764,14 +774,15 @@ The following work remains available for subsequent evidence:
 
 ## Remaining implementation questions
 
-The manual steel thread answered the initial snapshot, evaluator, revision,
-validation, and local-library questions. The next slices should answer:
+The promotion and proposal steel threads answered the initial snapshot,
+evaluator, revision, validation, local-library, proposal-attribution, and
+progress-projection questions. The next slices should answer:
 
 - Which normalized assistant, capability, native-action, workspace-effect, and
   usage observations must an adapter supply, and how should incomplete
   projections remain visible?
-- How should proposal progress remain readable and composable without replacing
-  its useful draft with lifecycle records?
+- Which proposal fields remain useful after direct use with multiple real
+  harnesses and models?
 - Which local definition layout supports later repository export without
   freezing that export format prematurely?
 
@@ -785,6 +796,7 @@ provisional interaction contract for the promotion step.
 revision of this proposal after implementation.
 
 [RFC 0003](0003-first-evidence-backed-architecture.md) records the demonstrated
-controller, driver, capability, surface, and evidence boundaries. Manual
-promotion now adds revision-owned snapshots, distinct validation attempts, and
-portable definitions without changing RFC 0003's Candidate status.
+controller, driver, capability, surface, and evidence boundaries. Promotion and
+proposal assistance add revision-owned snapshots, distinct validation
+attempts, portable definitions, and operation-scoped read-only agent work
+without changing RFC 0003's Candidate status.

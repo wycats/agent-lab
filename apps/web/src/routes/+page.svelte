@@ -19,6 +19,8 @@
     type EvaluationDetail,
     type EvaluationDraftDetail,
     type EvaluationDraftSummary,
+    type EvaluationProposalStatus,
+    type EvaluationProposalSummary,
     type EvaluationRevision,
     type EvaluationSummary,
     type EvaluationValidationAttempt,
@@ -93,6 +95,7 @@
   let inspectionEventStream: AbortController | undefined;
   let evaluationRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let draftEventStream: AbortController | undefined;
+  let proposalEventStream: AbortController | undefined;
   let draftRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let loadedWorkbenchId: string | undefined;
   let draftOpenVersion = 0;
@@ -125,6 +128,9 @@
   let evaluations: EvaluationSummary[] = [];
   let evaluationDrafts: EvaluationDraftSummary[] = [];
   let evaluationDefinitions: EvaluationDefinitionSummary[] = [];
+  let evaluationProposals: EvaluationProposalSummary[] = [];
+  let activeProposal: EvaluationProposalSummary | undefined;
+  let proposalProgress = '';
   let selectedDraft: EvaluationDraftDetail | undefined;
   let selectedDefinition: EvaluationDefinitionDetail | undefined;
   let selectedEvaluation: EvaluationDetail | undefined;
@@ -150,6 +156,8 @@
   let fixtureOnly = false;
   let comparing = false;
   let draftBusy = false;
+  let definitionRunStarting = false;
+  let proposalBusy = false;
   let draftName = '';
   let draftTask = '';
   let draftActiveNames: string[] = [];
@@ -379,6 +387,11 @@
     const workbench = await runClient.workbench(id);
     if (loadedWorkbenchId !== undefined && loadedWorkbenchId !== id) {
       clearEvaluationDraftSelection();
+      proposalEventStream?.abort();
+      proposalEventStream = undefined;
+      activeProposal = undefined;
+      proposalBusy = false;
+      proposalProgress = '';
     }
     loadedWorkbenchId = id;
     applyWorkbenchSelection(workbench.selection);
@@ -966,13 +979,41 @@
   }
 
   async function loadEvaluationLibrary(workspaceId: string): Promise<void> {
-    const [drafts, definitions] = await Promise.all([
+    const [drafts, definitions, proposals] = await Promise.all([
       runClient.evaluationLibraryDrafts(),
-      runClient.evaluationLibraryDefinitions()
+      runClient.evaluationLibraryDefinitions(),
+      runClient.evaluationProposals(workspaceId)
     ]);
     if (workspaceId !== loadedWorkbenchId) return;
     evaluationDrafts = drafts;
     evaluationDefinitions = definitions;
+    evaluationProposals = proposals;
+    const running = proposals.find(
+      (proposal) => proposal.status === 'queued' || proposal.status === 'running'
+    );
+    if (running && activeProposal?.id !== running.id) {
+      activeProposal = running;
+      proposalBusy = true;
+      proposalProgress = running.status === 'queued'
+        ? 'Preparing proposal agent…'
+        : 'Reviewing the selected turns…';
+      watchEvaluationProposal(workspaceId, running.id);
+    } else if (!running && !activeProposal) {
+      const latest = proposals[0];
+      const terminalFailure =
+        latest && (latest.status === 'failed' || latest.status === 'cancelled')
+          ? latest
+          : undefined;
+      if (terminalFailure) {
+        activeProposal = terminalFailure;
+        proposalBusy = false;
+        proposalProgress =
+          terminalFailure.error ??
+          (terminalFailure.status === 'cancelled'
+            ? 'Proposal cancelled'
+            : 'Proposal could not produce a draft');
+      }
+    }
   }
 
   function clearEvaluationDraftSelection(): void {
@@ -1075,6 +1116,7 @@
     if (
       draftBusy ||
       !agentSession ||
+      agentSession.summary.status === 'running' ||
       turn.status === 'queued' ||
       turn.status === 'running'
     ) return;
@@ -1100,6 +1142,96 @@
       actionError = message(error);
     } finally {
       draftBusy = false;
+    }
+  }
+
+  function watchEvaluationProposal(workspaceId: string, proposalId: string): void {
+    proposalEventStream?.abort();
+    proposalEventStream = runClient.evaluationProposalEvents(
+      workspaceId,
+      proposalId,
+      async (event) => {
+        if (activeProposal?.id !== proposalId) return;
+        if (event.type === 'evaluation-proposal.session.ready') {
+          proposalProgress = 'Proposal agent is reviewing the evidence…';
+        } else if (event.type === 'observation.progress') {
+          const payload = eventRecord(event.payload);
+          const observation = eventRecord(payload.event);
+          proposalProgress =
+            typeof observation.detail === 'string'
+              ? observation.detail
+              : 'Proposal agent is shaping the evaluation…';
+        } else if (event.type === 'evaluation-proposal.finished') {
+          proposalEventStream?.abort();
+          proposalEventStream = undefined;
+          const detail = await runClient.evaluationProposal(workspaceId, proposalId);
+          if (activeProposal?.id !== proposalId) return;
+          activeProposal = detail.summary;
+          evaluationProposals = [
+            detail.summary,
+            ...evaluationProposals.filter((proposal) => proposal.id !== proposalId)
+          ];
+          proposalBusy = false;
+          if (detail.summary.status === 'complete' && detail.summary.draftId) {
+            proposalProgress = 'Evaluation draft ready';
+            await openEvaluationDraft(workspaceId, detail.summary.draftId);
+          } else {
+            proposalProgress =
+              detail.summary.error ??
+              (detail.summary.status === 'cancelled'
+                ? 'Proposal cancelled'
+                : 'Proposal could not produce a draft');
+          }
+        }
+      }
+    );
+  }
+
+  async function proposeEvaluation(turn: AgentTurnSummary): Promise<void> {
+    const agentSession = activeAgentSession;
+    if (
+      proposalBusy ||
+      !agentSession ||
+      agentSession.summary.status === 'running' ||
+      turn.status === 'queued' ||
+      turn.status === 'running'
+    ) return;
+    proposalBusy = true;
+    actionError = '';
+    proposalProgress = 'Preparing proposal agent…';
+    try {
+      const proposal = await runClient.proposeEvaluation(
+        agentSession.summary.workspaceId,
+        {
+          sessionId: agentSession.summary.id,
+          fromTurnId: turn.id,
+          throughTurnId: turn.id
+        }
+      );
+      const shouldStartStream =
+        activeProposal?.id !== proposal.id || !proposalEventStream;
+      activeProposal = proposal;
+      evaluationProposals = [
+        proposal,
+        ...evaluationProposals.filter((candidate) => candidate.id !== proposal.id)
+      ];
+      if (shouldStartStream) {
+        watchEvaluationProposal(agentSession.summary.workspaceId, proposal.id);
+      }
+    } catch (error) {
+      proposalBusy = false;
+      proposalProgress = '';
+      actionError = message(error);
+    }
+  }
+
+  async function cancelProposal(): Promise<void> {
+    if (!activeProposal || !['queued', 'running'].includes(activeProposal.status)) return;
+    try {
+      await runClient.cancelEvaluationProposal(activeProposal.workspaceId, activeProposal.id);
+      proposalProgress = 'Cancelling proposal…';
+    } catch (error) {
+      actionError = message(error);
     }
   }
 
@@ -1223,10 +1355,12 @@
     const workspaceId =
       selectedDefinition?.revision.source.workspaceId ?? selectedDraft?.summary.workspaceId;
     if (
+      definitionRunStarting ||
       !definitionId ||
       !workspaceId ||
       (!selectedDefinition && !selectedDraftRevisionIsPromoted)
     ) return;
+    definitionRunStarting = true;
     draftBusy = true;
     actionError = '';
     try {
@@ -1244,6 +1378,7 @@
       actionError = message(error);
     } finally {
       draftBusy = false;
+      definitionRunStarting = false;
     }
   }
 
@@ -1422,6 +1557,10 @@
     try {
       const detail = await loadEvaluation(id);
       if (!detail || unavailableEvaluationIds.has(id)) return;
+      evaluations = [
+        detail.summary,
+        ...evaluations.filter((evaluation) => evaluation.id !== detail.summary.id)
+      ];
       activeTab = 'evaluation';
       if (detail.summary.status === 'running' || detail.summary.status === 'queued') {
         watchEvaluation(id);
@@ -1656,10 +1795,77 @@
       }
       if (
         event.sequence > liveAfterSequence &&
+        event.type === 'workbench.evaluation-proposal.started' &&
+        event.payload &&
+        typeof event.payload === 'object'
+      ) {
+        const payload = event.payload as {
+          proposal?: EvaluationProposalSummary;
+        };
+        if (
+          payload.proposal &&
+          typeof payload.proposal.id === 'string'
+        ) {
+          const shouldStartStream =
+            activeProposal?.id !== payload.proposal.id || !proposalEventStream;
+          activeProposal = payload.proposal;
+          proposalBusy = true;
+          proposalProgress = 'Preparing proposal agent…';
+          evaluationProposals = [
+            payload.proposal,
+            ...evaluationProposals.filter(
+              (proposal) => proposal.id !== payload.proposal?.id
+            )
+          ];
+          activeTab = 'agent';
+          agentInspectionMode = 'session';
+          if (shouldStartStream) {
+            watchEvaluationProposal(id, payload.proposal.id);
+          }
+        }
+      }
+      if (
+        event.sequence > liveAfterSequence &&
+        event.type === 'workbench.evaluation-proposal.finished' &&
+        event.payload &&
+        typeof event.payload === 'object'
+      ) {
+        const payload = event.payload as {
+          proposalId?: unknown;
+          draftId?: unknown;
+          status?: unknown;
+          error?: unknown;
+        };
+        if (
+          typeof payload.proposalId === 'string' &&
+          activeProposal?.id === payload.proposalId
+        ) {
+          const status = typeof payload.status === 'string' &&
+            ['complete', 'failed', 'cancelled'].includes(payload.status)
+            ? payload.status as EvaluationProposalStatus
+            : undefined;
+          if (status) {
+            activeProposal = {
+              ...activeProposal,
+              status,
+              draftId: typeof payload.draftId === 'string' ? payload.draftId : undefined,
+              error: typeof payload.error === 'string' ? payload.error : undefined
+            };
+          }
+          proposalBusy = false;
+          if (status === 'complete' && typeof payload.draftId === 'string') {
+            proposalProgress = 'Evaluation draft ready';
+            void openEvaluationDraft(id, payload.draftId);
+          } else if (typeof payload.error === 'string') {
+            proposalProgress = payload.error;
+          }
+        }
+      }
+      if (
+        event.sequence > liveAfterSequence &&
         event.type === 'workbench.evaluation.started' &&
         event.payload &&
         typeof event.payload === 'object' &&
-        (event.payload as { origin?: unknown }).origin === 'nushell' &&
         typeof (event.payload as { evaluationId?: unknown }).evaluationId === 'string'
       ) {
         const evaluationId = (event.payload as { evaluationId: string }).evaluationId;
@@ -2415,6 +2621,29 @@
                   onCancel={() => void cancelActiveAgentTurn()}
                 />
               {/if}
+              {#if activeProposal && activeProposal.status !== 'complete'}
+                <section
+                  class="proposal-status"
+                  aria-live="polite"
+                  data-status={activeProposal.status}
+                  data-testid="proposal-status"
+                >
+                  <span class="proposal-status-marker" aria-hidden="true"></span>
+                  <div>
+                    <strong>
+                      {activeProposal.status === 'failed'
+                        ? 'Evaluation suggestion failed'
+                        : activeProposal.status === 'cancelled'
+                          ? 'Evaluation suggestion cancelled'
+                          : 'Shaping an evaluation'}
+                    </strong>
+                    <p>{proposalProgress || 'Reviewing the selected turns…'}</p>
+                  </div>
+                  {#if ['queued', 'running'].includes(activeProposal.status)}
+                    <button on:click={() => void cancelProposal()}>Cancel</button>
+                  {/if}
+                </section>
+              {/if}
               <div class="session-turns">
                 {#each activeAgentSession.turns as turn, index}
                   <article class="session-turn" data-testid="session-turn" data-status={turn.status}>
@@ -2490,10 +2719,17 @@
                     {#if turn.status !== 'queued' && turn.status !== 'running'}
                       <div class="turn-actions">
                         <button
-                          disabled={draftBusy}
+                          class="suggest"
+                          disabled={proposalBusy || draftBusy || activeAgentSession?.summary.status === 'running'}
+                          on:click={() => void proposeEvaluation(turn)}
+                        >
+                          {proposalBusy ? 'Shaping evaluation…' : 'Suggest evaluation'}
+                        </button>
+                        <button
+                          disabled={draftBusy || proposalBusy || activeAgentSession?.summary.status === 'running'}
                           on:click={() => void makeEvaluation(turn)}
                         >
-                          {draftBusy ? 'Creating evaluation…' : 'Make evaluation'}
+                          {draftBusy ? 'Creating evaluation…' : 'Create manually'}
                         </button>
                       </div>
                     {/if}
@@ -2899,11 +3135,12 @@
                     <button
                       type="button"
                       disabled={draftBusy ||
+                        definitionRunStarting ||
                         draftMaterialEditsPending ||
                         !comparisonModelAccessReady}
                       on:click={() => void runDraftDefinition()}
                     >
-                      Run comparison
+                      {definitionRunStarting ? 'Starting comparison…' : 'Run comparison'}
                     </button>
                   {/if}
                 </div>
@@ -2966,6 +3203,11 @@
                 <dl>
                   <div><dt>Source digest</dt><dd>{selectedDraftRevision.source.sourceDigest}</dd></div>
                   <div><dt>Evidence events</dt><dd>{selectedDraftRevision.source.sourceEventSequences.join(', ') || 'none reported'}</dd></div>
+                  {#if selectedDraftRevision.source.proposal}
+                    <div><dt>Suggested by</dt><dd>{selectedDraftRevision.source.proposal.harnessId} · {selectedDraftRevision.source.proposal.modelProfileId}</dd></div>
+                    <div><dt>Proposal</dt><dd>{shortId(selectedDraftRevision.source.proposal.proposalId)}</dd></div>
+                    <div><dt>Why this span</dt><dd>{selectedDraftRevision.source.proposal.rationale}</dd></div>
+                  {/if}
                 </dl>
                 <ul>
                   {#each Object.entries(selectedDraftRevision.source.capabilityRevisions) as [source, revision]}
@@ -2976,12 +3218,16 @@
             {:else}
               <div class="empty-state">
                 <strong>No evaluation draft selected</strong>
-                <p>Open a completed agent turn and choose Make evaluation, or create one with <code>lab evaluation new</code>.</p>
+                <p>Open a completed turn and choose Suggest evaluation, or run <code>lab evaluation propose</code>.</p>
               </div>
             {/if}
           </section>
         {:else}
-          <section class="evaluation" data-testid="evaluation-view">
+          <section
+            class="evaluation"
+            data-testid="evaluation-view"
+            data-evaluation-id={selectedEvaluation?.summary.id}
+          >
             {#if selectedEvaluation}
               <div class="evaluation-heading">
                 <div>
@@ -3328,6 +3574,18 @@
   .answer-view-toggle button { border-radius: 3px; padding: 4px 7px; color: #718078; font-size: 0.56rem; }
   .answer-view-toggle button.active { color: #cbd5cf; background: #1a2520; }
   .answer-view-toggle button:focus-visible { outline: 2px solid #789d6b; outline-offset: 2px; }
+  .proposal-status { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; margin: 12px 17px 0; padding: 9px 10px; border: 1px solid #33483c; border-radius: 7px; background: #101a15; }
+  .proposal-status-marker { width: 8px; height: 8px; border: 2px solid #50665a; border-top-color: #a4c78e; border-radius: 50%; animation: proposal-spin 0.9s linear infinite; }
+  .proposal-status strong { color: #c6d2cb; font-size: 0.68rem; font-weight: 580; }
+  .proposal-status p { margin: 2px 0 0; color: #819188; font-size: 0.61rem; line-height: 1.4; }
+  .proposal-status button { padding: 5px 7px; color: #8fa099; font-size: 0.57rem; }
+  .proposal-status[data-status='failed'] { border-color: #68423f; background: #1a1211; }
+  .proposal-status[data-status='failed'] .proposal-status-marker { animation: none; border-color: #c67a72; background: #c67a72; }
+  .proposal-status[data-status='cancelled'] .proposal-status-marker { animation: none; border-color: #8fa099; background: #8fa099; }
+  @keyframes proposal-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .proposal-status-marker { animation: none; border-color: #789d6b; background: #789d6b; }
+  }
   .session-turns { display: grid; }
   .session-turn { min-width: 0; padding: 15px 17px 13px; border-bottom: 1px solid #27342f; }
   .session-turn > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; color: #718078; font-family: var(--font-mono); font-size: 0.59rem; }
@@ -3366,8 +3624,9 @@
   .turn-activity small { display: block; margin-top: 3px; color: #687870; font-family: var(--font-mono); font-size: 0.54rem; }
   .turn-summary { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 12px 0 0 56px; color: #6f7e76; font-family: var(--font-mono); font-size: 0.54rem; }
   .turn-summary .turn-error { color: #d98d92; }
-  .turn-actions { display: flex; justify-content: flex-end; margin: 10px 0 0 56px; }
+  .turn-actions { display: flex; justify-content: flex-end; gap: 6px; margin: 10px 0 0 56px; }
   .turn-actions button { padding: 6px 9px; border: 1px solid #34463d; border-radius: 5px; color: #a5b8ae; font-size: 0.6rem; }
+  .turn-actions button.suggest { border-color: #58714f; color: #bdd4ad; background: #152016; }
   .turn-actions button:not(:disabled):hover { border-color: #567261; color: #d0d9d4; background: #121c17; }
   .turn-evidence { margin: 10px 0 0 56px; border-top: 1px solid #1f2b26; }
   .turn-evidence > summary { padding: 8px 0 0; color: #718078; font-size: 0.59rem; }
@@ -3462,7 +3721,7 @@
   .draft-form input:not([type="checkbox"]), .draft-form textarea { width: 100%; min-width: 0; border: 1px solid #293832; border-radius: 6px; padding: 8px 9px; color: #c9d3ce; background: #0a100e; font: 0.66rem/1.45 var(--font-mono); outline: none; }
   .draft-form textarea { resize: vertical; }
   .draft-form input:focus, .draft-form textarea:focus { border-color: #567261; box-shadow: 0 0 0 1px #344d40; }
-  .draft-form fieldset { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 11px; margin: 0; padding: 11px; border: 1px solid #25342d; border-radius: 7px; }
+  .draft-form fieldset { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 9px 11px; margin: 0; padding: 11px; border: 1px solid #25342d; border-radius: 7px; }
   .draft-form legend { padding: 0 5px; color: #829189; font-size: 0.6rem; font-weight: 630; }
   .draft-form .checkbox { display: flex; grid-column: 1 / -1; align-items: center; gap: 7px; color: #8d9b94; font-size: 0.63rem; }
   .draft-form .checkbox input { accent-color: #91b976; }

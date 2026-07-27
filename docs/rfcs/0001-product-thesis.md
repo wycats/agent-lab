@@ -421,7 +421,8 @@ Existing steel threads have demonstrated:
 - manual evaluation drafts created from durable interactive turns;
 - immutable draft revisions with retained failed and passing validations;
 - explicit promotion of an exactly validated revision into the local
-  evaluation library; and
+  evaluation library;
+- attributable read-only proposal assistance over durable turn evidence; and
 - a promoted definition rerun through v0 and Eve and reopened after restart.
 
 The manual catalog promotion is the first coherent end-to-end improvement
@@ -430,23 +431,22 @@ resulting turn, deliberately observe and retain a failed replay, correct the
 draft, promote the passing revision, compare v0 and Eve without rewriting the
 task, and reopen every resource from stored evidence.
 
-The demonstrated result remains one real-model observation. AI assistance has
-not yet proposed a draft, and no harness implementation change has yet been
-followed by a controlled rerun of the preserved evaluation.
+The demonstrated result remains one real-model manual-promotion observation
+plus one deterministic proposal-session observation. Proposal quality across
+real harnesses and models is not yet established, and no harness implementation
+change has yet been followed by a controlled rerun of the preserved evaluation.
 
 ## Next validation boundary
 
-Add attributable AI assistance to the demonstrated manual path in
-[RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md). A
-separate read-only `ProposalSession` should recommend a meaningful source span,
-standalone task, and reviewed evaluator parameters while producing the same
-editable draft resource the builder can already create manually. Its advice,
-model, prompt contract, source references, and lifecycle must remain explicit.
+Use the completed interaction-to-evaluation loop for the first richer
+capability experiment: live code-server diagnostics. Expose the same settled
+diagnostic source through MCP and harness-native projections, preserve the
+workspace revision that each observation describes, and test whether semantic
+diagnostics improve repair behavior while preserving correctness.
 
-After that assistance layer, live code-server diagnostics remain the first
-richer capability experiment. They should use the completed promotion loop to
-test whether settled semantic diagnostics improve repair behavior while
-preserving correctness.
+Real-model proposal observations can refine the assistance contract in
+[RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md) without
+blocking that experiment.
 
 ## Open questions
 

@@ -12,6 +12,18 @@ pub(super) const MAX_EVALUATION_DRAFT_REVISIONS: usize = 32;
 pub(super) const MAX_EVALUATION_VALIDATION_ATTEMPTS: usize = 32;
 const MANUAL_AUTHORING_BLOCKER: &str =
     "review and confirm the suggested task, assertions, and measurements";
+const PROPOSAL_SCHEMA_VERSION: u32 = 1;
+const PROPOSAL_PROMPT_CONTRACT: &str = "agent-lab/evaluation-proposal@1";
+const PROPOSAL_MIN_DURATION_MS: u64 = 30_000;
+const MAX_PROPOSAL_EVENTS: usize = 1_024;
+const MAX_PROPOSAL_EVENT_BYTES: usize = 4 * 1024 * 1024;
+const PROPOSAL_MEASUREMENTS: &[&str] = &[
+    "duration",
+    "model-turns",
+    "capability-calls",
+    "workspace-effects",
+    "reported-usage",
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -76,6 +88,8 @@ pub struct EvaluationSourceProvenance {
     pub model_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<EvaluationSourceDriverIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<EvaluationProposalProvenance>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +97,21 @@ pub struct EvaluationSourceProvenance {
 pub struct EvaluationSourceDriverIdentity {
     pub descriptor: DriverDescriptor,
     pub launch_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluationProposalProvenance {
+    pub proposal_id: String,
+    pub harness_id: String,
+    pub model_profile_id: String,
+    pub model_id: String,
+    pub prompt_contract: String,
+    #[serde(default)]
+    pub rationale: String,
+    pub source_event_sequences: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<EvaluationSourceDriverIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,10 +242,77 @@ pub struct SaveEvaluationDraftRequest {
     pub name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvaluationProposalStatus {
+    Queued,
+    Running,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+impl EvaluationProposalStatus {
+    #[must_use]
+    pub fn is_finished(self) -> bool {
+        matches!(self, Self::Complete | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StartEvaluationProposalRequest {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub from_turn_id: Option<String>,
+    #[serde(default)]
+    pub through_turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluationProposalCandidate {
+    pub schema_version: u32,
+    pub from_turn_id: String,
+    pub through_turn_id: String,
+    pub task: String,
+    pub evaluator: EvaluationEvaluator,
+    pub measurements: Vec<String>,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluationProposalSummary {
+    pub id: String,
+    pub workspace_id: String,
+    pub session_id: String,
+    pub harness_id: String,
+    pub model_profile_id: String,
+    pub model_id: String,
+    pub status: EvaluationProposalStatus,
+    pub draft_id: Option<String>,
+    pub created_at_ms: u128,
+    pub finished_at_ms: Option<u128>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluationProposalDetail {
+    pub summary: EvaluationProposalSummary,
+    pub requested_from_turn_id: Option<String>,
+    pub requested_through_turn_id: Option<String>,
+    pub candidate: Option<EvaluationProposalCandidate>,
+    pub events: Vec<RunEvent>,
+}
+
 pub(super) struct PromotionStore {
     root: PathBuf,
     drafts: Mutex<HashMap<String, Arc<PromotionDraftState>>>,
     definitions: Mutex<HashMap<String, Arc<PromotionDefinitionState>>>,
+    proposals: Mutex<HashMap<String, Arc<PromotionProposalState>>>,
     secret_values: Mutex<Vec<Vec<u8>>>,
     evidence_lifecycle: Mutex<()>,
     #[cfg(test)]
@@ -249,18 +345,53 @@ struct PromotionDefinitionState {
     anchor: Arc<AgentSessionDirectoryAnchor>,
 }
 
+struct PromotionProposalState {
+    detail: Mutex<EvaluationProposalDetail>,
+    anchor: Arc<AgentSessionDirectoryAnchor>,
+    sender: broadcast::Sender<RunEvent>,
+    event_commit: Mutex<()>,
+    completion_commit: Mutex<()>,
+    cancel: CancellationToken,
+    evidence_quarantined: AtomicBool,
+    retained_event_bytes: AtomicUsize,
+    #[cfg(test)]
+    fail_next_terminal_event_persist: AtomicBool,
+}
+
+struct ProposalExecution {
+    workspace: Arc<RunState>,
+    session: Arc<AgentSessionState>,
+    harness: HarnessProfile,
+    model_access_provider: Option<ModelAccessProvider>,
+    limits: ScenarioLimits,
+    evaluator: EvaluationEvaluator,
+    source_turns: Vec<AgentTurnSummary>,
+    turn_task: JsonValue,
+    origin: WorkbenchOrigin,
+}
+
+struct EvaluationProposalDraftSeed {
+    proposal_id: String,
+    candidate: EvaluationProposalCandidate,
+    driver: EvaluationSourceDriverIdentity,
+    source_event_sequences: Vec<u64>,
+}
+
 impl PromotionStore {
     pub(super) fn load(data_dir: &Path) -> Result<Self, RunError> {
         let root = data_dir.join("evaluation-library");
         fs::create_dir_all(root.join("drafts"))?;
         fs::create_dir_all(root.join("definitions"))?;
+        fs::create_dir_all(root.join("proposals"))?;
         let root = fs::canonicalize(root)?;
         let drafts = load_drafts(&root.join("drafts"))?;
         let definitions = load_definitions(&root.join("definitions"), &drafts)?;
+        let proposals = load_proposals(&root.join("proposals"), &drafts)?;
         Ok(Self {
             root,
             drafts: Mutex::new(drafts),
             definitions: Mutex::new(definitions),
+            proposals: Mutex::new(proposals),
             secret_values: Mutex::new(Vec::new()),
             evidence_lifecycle: Mutex::new(()),
             #[cfg(test)]
@@ -282,6 +413,10 @@ impl PromotionStore {
         self.root.join("definitions")
     }
 
+    fn proposal_root(&self) -> PathBuf {
+        self.root.join("proposals")
+    }
+
     pub(super) fn quarantine_contaminated_evidence(
         &self,
         runs: &Mutex<HashMap<String, Arc<RunState>>>,
@@ -295,6 +430,7 @@ impl PromotionStore {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let proposals = lock(&self.proposals).values().cloned().collect::<Vec<_>>();
         let mut contaminated = false;
         for state in drafts {
             if confined_bundle_contains_protected_data(&state.anchor, &all_secrets).unwrap_or(true)
@@ -335,6 +471,19 @@ impl PromotionStore {
                     let _ = remove_confined_run_entry(&state.anchor, Path::new("manifest.json"));
                 }
                 lock(&self.definitions).remove(&id);
+            }
+        }
+        for state in proposals {
+            if confined_bundle_contains_protected_data(&state.anchor, &all_secrets).unwrap_or(true)
+            {
+                contaminated = true;
+                state.evidence_quarantined.store(true, Ordering::Release);
+                state.cancel.cancel();
+                let id = lock(&state.detail).summary.id.clone();
+                if !quarantine_run_bundle(&state.anchor, &id) {
+                    let _ = remove_confined_run_entry(&state.anchor, Path::new("manifest.json"));
+                }
+                lock(&self.proposals).remove(&id);
             }
         }
         contaminated
@@ -385,6 +534,1032 @@ impl RunController {
             .ok_or_else(|| RunError::InvalidRequest(format!("unknown evaluation definition: {id}")))
     }
 
+    /// List proposal sessions in most-recently-created order.
+    #[must_use]
+    pub fn list_evaluation_proposals(&self) -> Vec<EvaluationProposalSummary> {
+        let mut proposals = lock(&self.inner.promotion.proposals)
+            .values()
+            .map(|state| lock(&state.detail).summary.clone())
+            .collect::<Vec<_>>();
+        proposals.sort_by_key(|proposal| std::cmp::Reverse(proposal.created_at_ms));
+        proposals
+    }
+
+    /// Return one durable proposal session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the proposal is unknown.
+    pub fn evaluation_proposal(&self, id: &str) -> Result<EvaluationProposalDetail, RunError> {
+        Ok(lock(&self.promotion_proposal_state(id)?.detail).clone())
+    }
+
+    /// Start a read-only, operation-scoped agent session that suggests an evaluation draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace, source session, requested turn span, or harness
+    /// configuration is unavailable.
+    #[allow(clippy::too_many_lines)]
+    pub fn start_evaluation_proposal(
+        &self,
+        workspace_id: &str,
+        request: StartEvaluationProposalRequest,
+        origin: WorkbenchOrigin,
+    ) -> Result<EvaluationProposalSummary, RunError> {
+        if request.from_turn_id.is_some() != request.through_turn_id.is_some() {
+            return Err(RunError::InvalidRequest(
+                "--from and --through must be supplied together".to_owned(),
+            ));
+        }
+        let workspace = self.state(workspace_id)?;
+        // Proposal startup can discover new credential material and reserves the workspace against
+        // overlapping turns. Hold the same gates used by session and turn startup until the
+        // proposal is registered as both an active producer and a pending secret resolution.
+        let mut pending_secret_resolutions = lock(&workspace.pending_secret_resolutions);
+        let _producer_lifecycle = lock(&workspace.producer_lifecycle);
+        if !pending_secret_resolutions.is_empty() {
+            return Err(RunError::RunUnavailable(
+                "wait for model access resolution to finish".to_owned(),
+            ));
+        }
+        if lock(&workspace.summary).status != RunStatus::Exploring {
+            return Err(RunError::RunUnavailable(workspace_id.to_owned()));
+        }
+        if lock(&workspace.active_agent_turn).is_some() {
+            return Err(RunError::InvalidRequest(
+                "finish or cancel the active agent turn before proposing an evaluation".to_owned(),
+            ));
+        }
+        let _evidence_lifecycle = lock(&self.inner.promotion.evidence_lifecycle);
+        if lock(&self.inner.promotion.proposals)
+            .values()
+            .any(|proposal| {
+                let summary = lock(&proposal.detail).summary.clone();
+                summary.workspace_id == workspace_id && !summary.status.is_finished()
+            })
+        {
+            return Err(RunError::InvalidRequest(
+                "finish or cancel the active evaluation proposal before starting another"
+                    .to_owned(),
+            ));
+        }
+        let session_id = request
+            .session_id
+            .clone()
+            .or_else(|| lock(&workspace.active_agent_session_id).clone())
+            .ok_or_else(|| {
+                RunError::InvalidRequest(
+                    "provide a session id or activate an agent session first".to_owned(),
+                )
+            })?;
+        let session = self.agent_session_state(&session_id)?;
+        let session_summary = lock(&session.summary).clone();
+        if session_summary.workspace_id != workspace_id {
+            return Err(RunError::UnknownAgentSession(session_id));
+        }
+        let scenario_id = lock(&workspace.summary).scenario_id.clone();
+        let scenario = self
+            .inner
+            .scenarios
+            .get(&scenario_id)
+            .cloned()
+            .ok_or_else(|| RunError::UnknownScenario(scenario_id.clone()))?;
+        let turns = lock(&session.turns).clone();
+        let terminal_turns = turns
+            .iter()
+            .filter(|turn| turn.status.is_finished())
+            .cloned()
+            .collect::<Vec<_>>();
+        if terminal_turns.is_empty() {
+            return Err(RunError::InvalidRequest(
+                "proposal sessions require at least one terminal agent turn".to_owned(),
+            ));
+        }
+        let evidence_turns = if let (Some(from), Some(through)) = (
+            request.from_turn_id.as_deref(),
+            request.through_turn_id.as_deref(),
+        ) {
+            validate_requested_proposal_span(&turns, from, through)?;
+            let from = turns
+                .iter()
+                .position(|turn| turn.id == from)
+                .ok_or_else(|| RunError::InvalidRequest(format!("unknown source turn: {from}")))?;
+            let through = turns
+                .iter()
+                .position(|turn| turn.id == through)
+                .ok_or_else(|| {
+                    RunError::InvalidRequest(format!("unknown source turn: {through}"))
+                })?;
+            let selected = turns[from..=through].to_vec();
+            validate_coherent_proposal_span(&selected).map_err(RunError::InvalidRequest)?;
+            selected
+        } else {
+            terminal_turns
+        };
+        let source_turns = evidence_turns
+            .iter()
+            .map(|turn| {
+                let presentation =
+                    load_or_build_agent_turn_presentation(&session, &workspace, turn)?;
+                Ok(json!({
+                    "id": turn.id,
+                    "prompt": turn.prompt,
+                    "input": turn.input,
+                    "sourceRevision": turn.source_revision,
+                    "capabilityRevisions": turn.capability_revisions,
+                    "status": turn.status,
+                    "outcome": turn.outcome,
+                    "response": presentation.response,
+                    "activity": presentation.activity,
+                    "usage": presentation.usage,
+                    "sourceEventSequences": presentation.source_event_sequences,
+                    "sourceDigest": presentation.source_digest,
+                }))
+            })
+            .collect::<Result<Vec<_>, RunError>>()?;
+        let evaluator = catalog_evaluator(&scenario);
+        let source_input = json!({
+            "schemaVersion": PROPOSAL_SCHEMA_VERSION,
+            "promptContract": PROPOSAL_PROMPT_CONTRACT,
+            "requestedSpan": {
+                "fromTurnId": request.from_turn_id,
+                "throughTurnId": request.through_turn_id,
+            },
+            "evaluator": evaluator,
+            "turns": source_turns,
+        });
+        if serde_json::to_vec(&source_input)?.len() > MAX_AGENT_TURN_INPUT_BYTES {
+            return Err(RunError::InvalidRequest(format!(
+                "proposal source evidence exceeds the {MAX_AGENT_TURN_INPUT_BYTES} byte input limit"
+            )));
+        }
+        let id = format!("proposal-{}-{}", now_ms(), random_suffix());
+        let turn_task = json!({
+            "mode": "evaluation-proposal",
+            "promptContract": PROPOSAL_PROMPT_CONTRACT,
+            "prompt": proposal_prompt(),
+            "input": source_input,
+        });
+        validate_proposal_turn_command_size(&id, &turn_task)?;
+        let harness = self
+            .inner
+            .harnesses
+            .get(&session_summary.harness_id)
+            .cloned()
+            .ok_or_else(|| {
+                RunError::InvalidRequest(format!(
+                    "unknown source harness: {}",
+                    session_summary.harness_id
+                ))
+            })?;
+        let model_access_provider = self.model_access_provider_for_harness(&harness)?.cloned();
+        let mut limits = scenario.limits;
+        limits.max_duration_ms = limits.max_duration_ms.max(PROPOSAL_MIN_DURATION_MS);
+        let directory = confined_child(&self.inner.promotion.proposal_root(), &id)?;
+        fs::create_dir(&directory)?;
+        fs::create_dir(directory.join("workspace"))?;
+        let anchor = match AgentSessionDirectoryAnchor::open(directory.clone()) {
+            Ok(anchor) => Arc::new(anchor),
+            Err(error) => {
+                let _ = fs::remove_dir_all(&directory);
+                return Err(error);
+            }
+        };
+        let pending_bundle = PendingEvaluationBundle::new(id.clone(), anchor.clone());
+        let summary = EvaluationProposalSummary {
+            id: id.clone(),
+            workspace_id: workspace_id.to_owned(),
+            session_id: session_summary.id.clone(),
+            harness_id: session_summary.harness_id.clone(),
+            model_profile_id: session_summary.model_profile_id.clone(),
+            model_id: session_summary.model_id.clone(),
+            status: EvaluationProposalStatus::Queued,
+            draft_id: None,
+            created_at_ms: now_ms(),
+            finished_at_ms: None,
+            error: None,
+        };
+        let detail = EvaluationProposalDetail {
+            summary: summary.clone(),
+            requested_from_turn_id: request.from_turn_id,
+            requested_through_turn_id: request.through_turn_id,
+            candidate: None,
+            events: Vec::new(),
+        };
+        let known_secrets = lock(&self.inner.promotion.secret_values);
+        reject_serialized_protected_data(&detail, &known_secrets)?;
+        reject_serialized_protected_data(&source_input, &known_secrets)?;
+        let (sender, _) = broadcast::channel(128);
+        let state = Arc::new(PromotionProposalState {
+            detail: Mutex::new(detail),
+            anchor,
+            sender,
+            event_commit: Mutex::new(()),
+            completion_commit: Mutex::new(()),
+            cancel: CancellationToken::new(),
+            evidence_quarantined: AtomicBool::new(false),
+            retained_event_bytes: AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_terminal_event_persist: AtomicBool::new(false),
+        });
+        persist_proposal(&state)?;
+        write_confined_run_json_atomic(&state.anchor, Path::new("source.json"), &source_input)?;
+        record_proposal_event(
+            &state,
+            "evaluation-proposal.created",
+            json!({
+                "proposalId": id,
+                "workspaceId": workspace_id,
+                "sessionId": session_summary.id,
+                "origin": origin,
+            }),
+        )?;
+        lock(&self.inner.promotion.proposals).insert(id.clone(), state.clone());
+        drop(known_secrets);
+        if let Err(error) = record_event(
+            &workspace,
+            "workbench.evaluation-proposal.started",
+            json!({
+                "origin": origin,
+                "proposalId": id,
+                "proposal": summary,
+            }),
+        ) {
+            lock(&self.inner.promotion.proposals).remove(&id);
+            return Err(error);
+        }
+        let event_workspace = workspace.clone();
+        let event_origin = origin;
+        let execution = ProposalExecution {
+            workspace: workspace.clone(),
+            session,
+            harness,
+            model_access_provider,
+            limits,
+            evaluator,
+            source_turns: evidence_turns,
+            turn_task,
+            origin,
+        };
+        let controller = self.clone();
+        let actor_state = state.clone();
+        pending_secret_resolutions.insert(id.clone());
+        let spawn = thread::Builder::new()
+            .name(format!("agent-lab-proposal-{id}"))
+            .spawn(move || controller.execute_evaluation_proposal(&actor_state, &execution));
+        if let Err(error) = spawn {
+            pending_secret_resolutions.remove(&id);
+            let message = format!("proposal agent could not start: {error}");
+            finish_proposal(
+                &state,
+                EvaluationProposalStatus::Failed,
+                None,
+                None,
+                Some(&message),
+            )?;
+            let _ = record_event(
+                &event_workspace,
+                "workbench.evaluation-proposal.finished",
+                json!({
+                    "origin": event_origin,
+                    "proposalId": id,
+                    "draftId": JsonValue::Null,
+                    "status": EvaluationProposalStatus::Failed,
+                    "error": message,
+                }),
+            );
+            pending_bundle.commit();
+            return Err(RunError::Io(error));
+        }
+        pending_bundle.commit();
+        drop(pending_secret_resolutions);
+        Ok(summary)
+    }
+
+    /// Cancel an active proposal session while retaining its evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the proposal is unknown or already terminal.
+    pub fn cancel_evaluation_proposal(&self, id: &str) -> Result<(), RunError> {
+        let state = self.promotion_proposal_state(id)?;
+        let _completion = lock(&state.completion_commit);
+        if lock(&state.detail).summary.status.is_finished() {
+            return Err(RunError::InvalidRequest(format!(
+                "evaluation proposal is already complete: {id}"
+            )));
+        }
+        state.cancel.cancel();
+        Ok(())
+    }
+
+    /// Subscribe to durable and live events for one proposal session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the proposal is unknown.
+    pub fn subscribe_evaluation_proposal(
+        &self,
+        id: &str,
+    ) -> Result<(Vec<RunEvent>, broadcast::Receiver<RunEvent>), RunError> {
+        let state = self.promotion_proposal_state(id)?;
+        let _commit = lock(&state.event_commit);
+        let detail = lock(&state.detail);
+        let receiver = state.sender.subscribe();
+        Ok((detail.events.clone(), receiver))
+    }
+
+    /// Return proposal events after an acknowledged durable sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the proposal is unknown.
+    pub fn evaluation_proposal_events_after(
+        &self,
+        id: &str,
+        sequence: u64,
+    ) -> Result<Vec<RunEvent>, RunError> {
+        let state = self.promotion_proposal_state(id)?;
+        Ok(lock(&state.detail)
+            .events
+            .iter()
+            .filter(|event| event.sequence > sequence)
+            .cloned()
+            .collect())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_evaluation_proposal(
+        &self,
+        state: &Arc<PromotionProposalState>,
+        execution: &ProposalExecution,
+    ) {
+        let proposal_id = lock(&state.detail).summary.id.clone();
+        let session_id = format!("proposal-session-{proposal_id}");
+        let turn_id = format!("proposal-turn-{proposal_id}");
+        let mut pending_resolution =
+            PendingSecretResolutionGuard::new(&execution.workspace, &proposal_id);
+        let result = (|| -> Result<(EvaluationProposalCandidate, EvaluationSourceDriverIdentity), RunError> {
+            update_proposal_status(state, EvaluationProposalStatus::Running, None)?;
+            record_proposal_event(
+                state,
+                "evaluation-proposal.started",
+                json!({ "proposalId": proposal_id }),
+            )?;
+            let driver_launch = resolve_harness_driver_with_cancellation(
+                &execution.harness,
+                execution.model_access_provider.as_ref(),
+                &state.cancel,
+            )?;
+            if state.cancel.is_cancelled() {
+                return Err(RunError::RunUnavailable(
+                    "evaluation proposal was cancelled".to_owned(),
+                ));
+            }
+            let resolved_secrets = driver_secret_values(&driver_launch);
+            let secrets =
+                extend_workspace_secret_values(&execution.workspace, resolved_secrets);
+            extend_secret_values(
+                &self.inner.promotion.secret_values,
+                secrets.iter().cloned(),
+            );
+            quarantine_protected_bundle_paths(&execution.workspace, &secrets)?;
+            invalidate_contaminated_secret_evidence(
+                &self.inner.runs,
+                &self.inner.evaluations,
+                &self.inner.promotion,
+                &execution.workspace,
+                &secrets,
+            )?;
+            pending_resolution.complete();
+
+            let launch_digest = driver_launch_digest(&driver_launch)?;
+            let initial_scratch =
+                capture_confined_run_tree(&state.anchor, Path::new("workspace"))?;
+            let mut driver = DriverProcess::spawn_with(driver_launch)?;
+            let driver_result = (|| -> Result<
+                (EvaluationProposalCandidate, EvaluationSourceDriverIdentity),
+                RunError,
+            > {
+                let ready_deadline = Instant::now() + DRIVER_READY_TIMEOUT;
+                let descriptor = loop {
+                    let message =
+                        receive_until_deadline(&mut driver, ready_deadline, &state.cancel)?
+                            .ok_or_else(|| {
+                                RunError::RunUnavailable(
+                                    "evaluation proposal was cancelled".to_owned(),
+                                )
+                            })?;
+                    match message.parsed.body {
+                        DriverBody::StartupEvent {
+                            phase,
+                            status,
+                            detail,
+                        } => {
+                            record_proposal_event(
+                                state,
+                                "startup.event",
+                                redact_value(
+                                    json!({ "phase": phase, "status": status, "detail": detail }),
+                                    &secrets,
+                                ),
+                            )?;
+                        }
+                        DriverBody::Ready { driver } => {
+                            break redact_driver_descriptor(driver, &secrets);
+                        }
+                        DriverBody::Failed { code, message, .. } => {
+                            return Err(RunError::Protocol(format!(
+                                "proposal driver failed during startup: {code}: {message}"
+                            )));
+                        }
+                        _ => {
+                            return Err(RunError::Protocol(
+                                "expected startup.event or driver.ready for evaluation proposal"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                };
+                let supports_turn_observations = descriptor
+                    .features
+                    .iter()
+                    .any(|feature| feature == TURN_OBSERVATIONS_FEATURE);
+                let scratch = state.anchor.display_path.join("workspace");
+                driver.send(&command(
+                    "proposal-open",
+                    CommandBody::OpenSession {
+                        session_id: session_id.clone(),
+                        config: json!({
+                            "files": {},
+                            "modelId": lock(&state.detail).summary.model_id,
+                            "workspaceRoot": scratch,
+                            "capabilitySources": [],
+                            "readOnly": true,
+                        }),
+                        limits: serde_json::to_value(&execution.limits)?,
+                    },
+                ))?;
+                let open_deadline = Instant::now() + DRIVER_RESPONSE_TIMEOUT;
+                loop {
+                    let message =
+                        receive_until_deadline(&mut driver, open_deadline, &state.cancel)?
+                            .ok_or_else(|| {
+                                RunError::RunUnavailable(
+                                    "evaluation proposal was cancelled".to_owned(),
+                                )
+                            })?;
+                    match message.parsed.body {
+                        DriverBody::StartupEvent {
+                            phase,
+                            status,
+                            detail,
+                        } => {
+                            record_proposal_event(
+                                state,
+                                "startup.event",
+                                redact_value(
+                                    json!({ "phase": phase, "status": status, "detail": detail }),
+                                    &secrets,
+                                ),
+                            )?;
+                        }
+                        DriverBody::SessionOpened {
+                            session_id: opened,
+                            process_id,
+                        } if opened == session_id => {
+                            record_proposal_event(
+                                state,
+                                "evaluation-proposal.session.ready",
+                                json!({
+                                    "proposalId": proposal_id,
+                                    "processId": process_id,
+                                    "driver": descriptor,
+                                }),
+                            )?;
+                            break;
+                        }
+                        DriverBody::Failed { code, message, .. } => {
+                            return Err(RunError::Protocol(format!(
+                                "proposal driver failed while opening: {code}: {message}"
+                            )));
+                        }
+                        _ => {
+                            return Err(RunError::Protocol(
+                                "expected startup.event or session.opened for evaluation proposal"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                }
+                driver.send(&command(
+                    "proposal-start",
+                    CommandBody::StartTurn {
+                        session_id: session_id.clone(),
+                        turn_id: turn_id.clone(),
+                        task: execution.turn_task.clone(),
+                        capability_sources: json!([]),
+                    },
+                ))?;
+                record_proposal_event(
+                    state,
+                    "evaluation-proposal.turn.started",
+                    json!({ "proposalId": proposal_id, "turnId": turn_id }),
+                )?;
+                let started = Instant::now();
+                let mut abort_sent_at = None;
+                let mut timed_out = false;
+                let mut assistant_redactor = AssistantObservationRedactor::new(&secrets);
+                let mut response = None;
+                loop {
+                    if state.cancel.is_cancelled() && abort_sent_at.is_none() {
+                        driver.send(&command(
+                            "proposal-abort",
+                            CommandBody::AbortTurn {
+                                session_id: session_id.clone(),
+                                turn_id: turn_id.clone(),
+                                reason: Some("cancelled from Agent Lab".to_owned()),
+                            },
+                        ))?;
+                        abort_sent_at = Some(Instant::now());
+                    }
+                    if started.elapsed() >= Duration::from_millis(execution.limits.max_duration_ms)
+                        && abort_sent_at.is_none()
+                    {
+                        driver.send(&command(
+                            "proposal-timeout",
+                            CommandBody::AbortTurn {
+                                session_id: session_id.clone(),
+                                turn_id: turn_id.clone(),
+                                reason: Some(
+                                    "evaluation proposal duration limit exceeded".to_owned(),
+                                ),
+                            },
+                        ))?;
+                        abort_sent_at = Some(Instant::now());
+                        timed_out = true;
+                    }
+                    if abort_sent_at.is_some_and(|sent| sent.elapsed() >= Duration::from_secs(10)) {
+                        return Err(RunError::Protocol(
+                            "proposal driver did not finish within 10 seconds of abort".to_owned(),
+                        ));
+                    }
+                    match driver.receive(DRIVER_POLL) {
+                        Ok(message) => match message.parsed.body {
+                            DriverBody::StartupEvent {
+                                phase,
+                                status,
+                                detail,
+                            } => {
+                                record_proposal_event(
+                                    state,
+                                    "startup.event",
+                                    redact_value(
+                                        json!({ "phase": phase, "status": status, "detail": detail }),
+                                        &secrets,
+                                    ),
+                                )?;
+                            }
+                            DriverBody::TurnEvent {
+                                session_id: observed_session,
+                                turn_id: observed_turn,
+                                event_type,
+                                payload,
+                            } => {
+                                validate_turn_identity(
+                                    &observed_session,
+                                    &observed_turn,
+                                    &session_id,
+                                    &turn_id,
+                                    "turn.event",
+                                )?;
+                                let observation = TurnObservation::parse(&event_type, &payload)
+                                    .map_err(|error| RunError::Protocol(error.to_string()))?;
+                                if event_type.starts_with("observation.") {
+                                    if !supports_turn_observations {
+                                        return Err(RunError::Protocol(format!(
+                                            "proposal driver emitted {event_type} without advertising {TURN_OBSERVATIONS_FEATURE}"
+                                        )));
+                                    }
+                                    if observation.is_none() {
+                                        return Err(RunError::Protocol(format!(
+                                            "unknown reserved proposal observation: {event_type}"
+                                        )));
+                                    }
+                                }
+                                if let Some(observation) = observation {
+                                    for observation in assistant_redactor.redact(observation)? {
+                                        if let TurnObservation::AssistantCompleted(completed) =
+                                            &observation
+                                        {
+                                            response = Some(completed.text.clone());
+                                        }
+                                        record_proposal_event(
+                                            state,
+                                            observation.event_type(),
+                                            redact_value(
+                                                json!({
+                                                    "proposalId": proposal_id,
+                                                    "turnId": turn_id,
+                                                    "event": observation.payload(),
+                                                }),
+                                                &secrets,
+                                            ),
+                                        )?;
+                                    }
+                                } else {
+                                    record_proposal_event(
+                                        state,
+                                        &driver_event_kind(&event_type),
+                                        redact_value(
+                                            json!({
+                                                "proposalId": proposal_id,
+                                                "turnId": turn_id,
+                                                "event": payload,
+                                            }),
+                                            &secrets,
+                                        ),
+                                    )?;
+                                }
+                            }
+                            DriverBody::TurnFinished {
+                                session_id: observed_session,
+                                turn_id: observed_turn,
+                                outcome,
+                                evidence,
+                            } => {
+                                validate_turn_identity(
+                                    &observed_session,
+                                    &observed_turn,
+                                    &session_id,
+                                    &turn_id,
+                                    "turn.finished",
+                                )?;
+                                for observation in assistant_redactor.flush_incomplete() {
+                                    record_proposal_event(
+                                        state,
+                                        observation.event_type(),
+                                        redact_value(
+                                            json!({
+                                                "proposalId": proposal_id,
+                                                "turnId": turn_id,
+                                                "event": observation.payload(),
+                                            }),
+                                            &secrets,
+                                        ),
+                                    )?;
+                                }
+                                record_proposal_event(
+                                    state,
+                                    "evaluation-proposal.turn.finished",
+                                    redact_value(
+                                        json!({
+                                            "proposalId": proposal_id,
+                                            "turnId": turn_id,
+                                            "outcome": outcome,
+                                            "evidence": evidence,
+                                        }),
+                                        &secrets,
+                                    ),
+                                )?;
+                                validate_proposal_turn_outcome(
+                                    state.cancel.is_cancelled(),
+                                    timed_out,
+                                    &outcome,
+                                )?;
+                                break;
+                            }
+                            DriverBody::Failed { code, message, .. } => {
+                                return Err(RunError::Protocol(format!(
+                                    "proposal driver failed during turn: {code}: {message}"
+                                )));
+                            }
+                            _ => {
+                                return Err(RunError::Protocol(
+                                    "unexpected proposal driver message".to_owned(),
+                                ));
+                            }
+                        },
+                        Err(ProcessError::Timeout) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                driver.send(&command(
+                    "proposal-close",
+                    CommandBody::CloseSession {
+                        session_id: session_id.clone(),
+                    },
+                ))?;
+                let closed = driver.receive(DRIVER_RESPONSE_TIMEOUT)?;
+                if !matches!(closed.parsed.body, DriverBody::SessionClosed { session_id: ref closed } if closed == &session_id)
+                {
+                    return Err(RunError::Protocol(
+                        "expected session.closed for evaluation proposal".to_owned(),
+                    ));
+                }
+                require_successful_driver_exit(driver.wait_for_exit(DRIVER_RESPONSE_TIMEOUT)?)?;
+                let response = response.ok_or_else(|| {
+                    RunError::Protocol(
+                        "evaluation proposal completed without an authoritative response"
+                            .to_owned(),
+                    )
+                })?;
+                let candidate: EvaluationProposalCandidate = serde_json::from_str(&response)
+                    .map_err(|error| {
+                        RunError::Protocol(format!(
+                            "evaluation proposal returned invalid JSON: {error}"
+                        ))
+                    })?;
+                let (requested_from, requested_through) = {
+                    let detail = lock(&state.detail);
+                    (
+                        detail.requested_from_turn_id.clone(),
+                        detail.requested_through_turn_id.clone(),
+                    )
+                };
+                validate_proposal_candidate(
+                    &candidate,
+                    &execution.source_turns,
+                    &execution.evaluator,
+                    requested_from.as_deref(),
+                    requested_through.as_deref(),
+                )?;
+                Ok((
+                    candidate,
+                    EvaluationSourceDriverIdentity {
+                        descriptor,
+                        launch_digest,
+                    },
+                ))
+            })();
+            let transcript = redact_transcript(driver.transcript(), &secrets);
+            let transcript_result = write_confined_run_json_atomic(
+                &state.anchor,
+                Path::new("driver.json"),
+                &serde_json::to_value(transcript)?,
+            );
+            drop(driver);
+            let scratch_result =
+                restore_proposal_scratch_if_mutated(state, &initial_scratch, &secrets);
+            transcript_result?;
+            scratch_result?;
+            driver_result
+        })();
+        // Cancellation and terminal publication share one commit boundary. A cancellation
+        // accepted before this point prevents draft publication; once publication begins, cancel
+        // waits and observes the terminal proposal instead of returning an accepted request.
+        let _completion = lock(&state.completion_commit);
+        match result {
+            Ok((candidate, driver)) => {
+                if state.cancel.is_cancelled() {
+                    let message = "evaluation proposal was cancelled";
+                    let _ = finish_proposal_with_terminal_fallback(
+                        state,
+                        EvaluationProposalStatus::Cancelled,
+                        Some(candidate),
+                        None,
+                        Some(message),
+                    );
+                    let _ = record_event(
+                        &execution.workspace,
+                        "workbench.evaluation-proposal.finished",
+                        json!({
+                            "origin": execution.origin,
+                            "proposalId": proposal_id,
+                            "draftId": JsonValue::Null,
+                            "status": EvaluationProposalStatus::Cancelled,
+                            "error": message,
+                        }),
+                    );
+                    return;
+                }
+                let source_sequences = proposal_source_sequences(
+                    &execution.session,
+                    &candidate.from_turn_id,
+                    &candidate.through_turn_id,
+                );
+                let proposal = lock(&state.detail).summary.clone();
+                let proposal_seed = EvaluationProposalDraftSeed {
+                    proposal_id: proposal_id.clone(),
+                    candidate: candidate.clone(),
+                    driver,
+                    source_event_sequences: source_sequences,
+                };
+                let seed_draft = self.create_evaluation_draft_internal(
+                    &proposal.workspace_id,
+                    CreateEvaluationDraftRequest {
+                        session_id: Some(proposal.session_id),
+                        from_turn_id: candidate.from_turn_id.clone(),
+                        through_turn_id: candidate.through_turn_id.clone(),
+                    },
+                    execution.origin,
+                    false,
+                    Some(&proposal_seed),
+                );
+                let retained_draft_id = seed_draft
+                    .as_ref()
+                    .ok()
+                    .map(|draft| draft.summary.id.clone());
+                let draft_result = seed_draft.and_then(|draft| {
+                    self.apply_evaluation_proposal(
+                        &draft.summary.id,
+                        &proposal_seed,
+                        execution.origin,
+                    )
+                });
+                match draft_result {
+                    Ok(draft) => {
+                        let _ = finish_proposal_with_terminal_fallback(
+                            state,
+                            EvaluationProposalStatus::Complete,
+                            Some(candidate),
+                            Some(&draft.summary.id),
+                            None,
+                        );
+                        let _ = record_event(
+                            &execution.workspace,
+                            "workbench.evaluation-proposal.finished",
+                            json!({
+                                "origin": execution.origin,
+                                "proposalId": proposal_id,
+                                "draftId": draft.summary.id,
+                                "status": EvaluationProposalStatus::Complete,
+                            }),
+                        );
+                    }
+                    Err(error) => {
+                        let secrets = lock(&self.inner.promotion.secret_values).clone();
+                        let message = redact_string(&error.to_string(), &secrets);
+                        let _ = finish_proposal_with_terminal_fallback(
+                            state,
+                            EvaluationProposalStatus::Failed,
+                            Some(candidate),
+                            retained_draft_id.as_deref(),
+                            Some(&message),
+                        );
+                        let _ = record_event(
+                            &execution.workspace,
+                            "workbench.evaluation-proposal.finished",
+                            json!({
+                                "origin": execution.origin,
+                                "proposalId": proposal_id,
+                                "draftId": retained_draft_id,
+                                "status": EvaluationProposalStatus::Failed,
+                                "error": message,
+                            }),
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                let status = if state.cancel.is_cancelled() {
+                    EvaluationProposalStatus::Cancelled
+                } else {
+                    EvaluationProposalStatus::Failed
+                };
+                let secrets = lock(&self.inner.promotion.secret_values).clone();
+                let message = redact_string(&error.to_string(), &secrets);
+                let _ = finish_proposal_with_terminal_fallback(
+                    state,
+                    status,
+                    None,
+                    None,
+                    Some(&message),
+                );
+                let _ = record_event(
+                    &execution.workspace,
+                    "workbench.evaluation-proposal.finished",
+                    json!({
+                        "origin": execution.origin,
+                        "proposalId": proposal_id,
+                        "draftId": JsonValue::Null,
+                        "status": status,
+                        "error": message,
+                    }),
+                );
+            }
+        }
+    }
+
+    pub(super) fn has_active_evaluation_proposal(&self, workspace_id: &str) -> bool {
+        lock(&self.inner.promotion.proposals)
+            .values()
+            .any(|proposal| {
+                let summary = lock(&proposal.detail).summary.clone();
+                summary.workspace_id == workspace_id && !summary.status.is_finished()
+            })
+    }
+
+    pub(super) fn cancel_evaluation_proposals_for_workspace(&self, workspace_id: &str) {
+        let active = lock(&self.inner.promotion.proposals)
+            .values()
+            .filter(|proposal| {
+                let summary = lock(&proposal.detail).summary.clone();
+                summary.workspace_id == workspace_id && !summary.status.is_finished()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for proposal in active {
+            let _completion = lock(&proposal.completion_commit);
+            if !lock(&proposal.detail).summary.status.is_finished() {
+                proposal.cancel.cancel();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_proposal_terminal_event_persist(
+        &self,
+        proposal_id: &str,
+    ) -> Result<(), RunError> {
+        self.promotion_proposal_state(proposal_id)?
+            .fail_next_terminal_event_persist
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn apply_evaluation_proposal(
+        &self,
+        draft_id: &str,
+        seed: &EvaluationProposalDraftSeed,
+        origin: WorkbenchOrigin,
+    ) -> Result<EvaluationDraftDetail, RunError> {
+        let _evidence_lifecycle = lock(&self.inner.promotion.evidence_lifecycle);
+        let state = self.promotion_draft_state(draft_id)?;
+        let event_commit = lock(&state.event_commit);
+        let mut detail = lock(&state.detail);
+        let previous_detail = detail.clone();
+        let current = current_draft_revision(&previous_detail, draft_id)?;
+        if previous_detail.revisions.len() >= MAX_EVALUATION_DRAFT_REVISIONS {
+            return Err(RunError::InvalidRequest(format!(
+                "evaluation drafts retain at most {MAX_EVALUATION_DRAFT_REVISIONS} revisions"
+            )));
+        }
+        let source = capture_confined_run_tree(
+            &state.anchor,
+            &PathBuf::from("revisions").join(&current.id).join("source"),
+        )?;
+        let revision_id = format!("revision-{}-{}", now_ms(), random_suffix());
+        let mut next = current.clone();
+        next.id.clone_from(&revision_id);
+        next.previous_revision_id = Some(current.id);
+        next.created_at_ms = now_ms();
+        next.task.clone_from(&seed.candidate.task);
+        next.evaluator = seed.candidate.evaluator.clone();
+        next.measurements.clone_from(&seed.candidate.measurements);
+        next.blocking_issues
+            .retain(|issue| issue != MANUAL_AUTHORING_BLOCKER);
+        next.source.proposal = Some(EvaluationProposalProvenance {
+            proposal_id: seed.proposal_id.clone(),
+            harness_id: next.source.harness_id.clone(),
+            model_profile_id: next.source.model_profile_id.clone(),
+            model_id: next.source.model_id.clone(),
+            prompt_contract: PROPOSAL_PROMPT_CONTRACT.to_owned(),
+            rationale: seed.candidate.rationale.clone(),
+            source_event_sequences: seed.source_event_sequences.clone(),
+            driver: Some(seed.driver.clone()),
+        });
+        validate_revision(&next)?;
+        let revision_path = PathBuf::from("revisions").join(&revision_id);
+        write_confined_run_captured_tree(&state.anchor, &revision_path.join("source"), &source)?;
+        let mut next_detail = previous_detail.clone();
+        next_detail
+            .summary
+            .current_revision_id
+            .clone_from(&revision_id);
+        revision_status(&next).clone_into(&mut next_detail.summary.status);
+        next_detail.summary.updated_at_ms = now_ms();
+        next_detail.revisions.push(next);
+        let event = RunEvent {
+            sequence: next_detail.events.len() as u64 + 1,
+            at_ms: now_ms(),
+            kind: "evaluation-draft.proposed".to_owned(),
+            payload: json!({
+                "draftId": draft_id,
+                "revisionId": revision_id,
+                "proposalId": seed.proposal_id,
+                "origin": origin,
+            }),
+            progress: None,
+        };
+        next_detail.events.push(event.clone());
+        reject_serialized_protected_data(&next_detail, &lock(&self.inner.promotion.secret_values))?;
+        persist_draft_transition(
+            &state,
+            &previous_detail,
+            &next_detail,
+            &event,
+            Some(&revision_path),
+        )?;
+        *detail = next_detail.clone();
+        drop(detail);
+        drop(event_commit);
+        let _ = state.sender.send(event);
+        self.notify_evaluation_library_changed(&state, "proposed");
+        Ok(next_detail)
+    }
+
     /// Create a draft from a contiguous span of terminal agent turns.
     ///
     /// # Errors
@@ -396,6 +1571,18 @@ impl RunController {
         workspace_id: &str,
         request: CreateEvaluationDraftRequest,
         origin: WorkbenchOrigin,
+    ) -> Result<EvaluationDraftDetail, RunError> {
+        self.create_evaluation_draft_internal(workspace_id, request, origin, true, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn create_evaluation_draft_internal(
+        &self,
+        workspace_id: &str,
+        request: CreateEvaluationDraftRequest,
+        origin: WorkbenchOrigin,
+        notify_workbench: bool,
+        proposal_seed: Option<&EvaluationProposalDraftSeed>,
     ) -> Result<EvaluationDraftDetail, RunError> {
         let workspace = self.state(workspace_id)?;
         if lock(&workspace.summary).status != RunStatus::Exploring {
@@ -485,7 +1672,9 @@ impl RunController {
                 "selected turns cross capability revisions; narrow the source span".to_owned(),
             );
         }
-        blocking_issues.push(MANUAL_AUTHORING_BLOCKER.to_owned());
+        if proposal_seed.is_none() {
+            blocking_issues.push(MANUAL_AUTHORING_BLOCKER.to_owned());
+        }
         let presentations = selected
             .iter()
             .map(|turn| {
@@ -506,6 +1695,18 @@ impl RunController {
         let source_digest = selected_turns_digest(selected, &presentations)?;
         let capability_recipe = lock(&workspace.assembly).capability_sources.clone();
         let source_driver = self.evaluation_source_driver_identity(&session, &session_summary)?;
+        let proposal_provenance = proposal_seed
+            .as_ref()
+            .map(|seed| EvaluationProposalProvenance {
+                proposal_id: seed.proposal_id.clone(),
+                harness_id: session_summary.harness_id.clone(),
+                model_profile_id: session_summary.model_profile_id.clone(),
+                model_id: session_summary.model_id.clone(),
+                prompt_contract: PROPOSAL_PROMPT_CONTRACT.to_owned(),
+                rationale: seed.candidate.rationale.clone(),
+                source_event_sequences: seed.source_event_sequences.clone(),
+                driver: Some(seed.driver.clone()),
+            });
         let id = format!("draft-{}-{}", now_ms(), random_suffix());
         let revision_id = format!("revision-{}-{}", now_ms(), random_suffix());
         let created_at_ms = now_ms();
@@ -515,7 +1716,9 @@ impl RunController {
             draft_id: id.clone(),
             previous_revision_id: None,
             created_at_ms,
-            task: first.prompt.clone(),
+            task: proposal_seed
+                .as_ref()
+                .map_or_else(|| first.prompt.clone(), |seed| seed.candidate.task.clone()),
             source: EvaluationSourceProvenance {
                 workspace_id: workspace_id.to_owned(),
                 session_id: session_summary.id,
@@ -529,17 +1732,26 @@ impl RunController {
                 model_profile_id: session_summary.model_profile_id,
                 model_id: session_summary.model_id,
                 driver: Some(source_driver),
+                proposal: proposal_provenance,
             },
             capability_recipe,
             limits: scenario.limits.clone(),
-            evaluator: catalog_evaluator(scenario),
-            measurements: vec![
-                "duration".to_owned(),
-                "model-turns".to_owned(),
-                "capability-calls".to_owned(),
-                "workspace-effects".to_owned(),
-                "reported-usage".to_owned(),
-            ],
+            evaluator: proposal_seed.as_ref().map_or_else(
+                || catalog_evaluator(scenario),
+                |seed| seed.candidate.evaluator.clone(),
+            ),
+            measurements: proposal_seed.as_ref().map_or_else(
+                || {
+                    vec![
+                        "duration".to_owned(),
+                        "model-turns".to_owned(),
+                        "capability-calls".to_owned(),
+                        "workspace-effects".to_owned(),
+                        "reported-usage".to_owned(),
+                    ]
+                },
+                |seed| seed.candidate.measurements.clone(),
+            ),
             blocking_issues,
         };
         validate_revision(&revision)?;
@@ -596,6 +1808,7 @@ impl RunController {
             evidence_quarantined: AtomicBool::new(false),
         });
         persist_draft(&state)?;
+        let proposal_id = proposal_seed.as_ref().map(|seed| seed.proposal_id.clone());
         record_draft_event(
             &state,
             "evaluation-draft.created",
@@ -603,20 +1816,23 @@ impl RunController {
                 "draftId": id,
                 "revisionId": revision_id,
                 "workspaceId": workspace_id,
+                "proposalId": proposal_id,
                 "origin": origin,
             }),
         )?;
         lock(&self.inner.promotion.drafts).insert(id.clone(), state.clone());
         drop(known_secrets);
-        if let Err(error) = record_event(
-            &workspace,
-            "workbench.evaluation-draft.created",
-            json!({
-                "origin": origin,
-                "draftId": id,
-                "revisionId": revision_id,
-            }),
-        ) {
+        if notify_workbench
+            && let Err(error) = record_event(
+                &workspace,
+                "workbench.evaluation-draft.created",
+                json!({
+                    "origin": origin,
+                    "draftId": id,
+                    "revisionId": revision_id,
+                }),
+            )
+        {
             lock(&self.inner.promotion.drafts).remove(&id);
             return Err(error);
         }
@@ -1184,6 +2400,7 @@ impl RunController {
                 model_profile_id: model_profile_id.clone(),
                 model_id: String::new(),
                 driver: None,
+                proposal: None,
             },
             capability_recipe: capability_recipe.to_vec(),
             limits: limits.clone(),
@@ -1321,6 +2538,21 @@ impl RunController {
         if state.evidence_quarantined.load(Ordering::Acquire) {
             return Err(RunError::InvalidRequest(format!(
                 "unknown evaluation draft: {id}"
+            )));
+        }
+        Ok(state)
+    }
+
+    fn promotion_proposal_state(&self, id: &str) -> Result<Arc<PromotionProposalState>, RunError> {
+        let state = lock(&self.inner.promotion.proposals)
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                RunError::InvalidRequest(format!("unknown evaluation proposal: {id}"))
+            })?;
+        if state.evidence_quarantined.load(Ordering::Acquire) {
+            return Err(RunError::InvalidRequest(format!(
+                "unknown evaluation proposal: {id}"
             )));
         }
         Ok(state)
@@ -2002,6 +3234,192 @@ fn selected_turns_digest(
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
+fn proposal_prompt() -> &'static str {
+    r"You are proposing one portable evaluation from durable agent-turn evidence.
+Return exactly one JSON object and no Markdown.
+Use schemaVersion 1 with these fields:
+- fromTurnId and throughTurnId: a contiguous meaningful terminal span from the supplied turns
+- task: a standalone instruction that can be replayed from the first turn's starting state
+- evaluator: the reviewed catalog-to-file evaluator object supplied by the source scenario
+- measurements: a useful subset of duration, model-turns, capability-calls, workspace-effects, and reported-usage
+- rationale: a concise explanation for the builder
+If requestedSpan contains turn IDs, use that exact span.
+Do not include a harness or model in the portable task."
+}
+
+fn validate_requested_proposal_span(
+    turns: &[AgentTurnSummary],
+    from_turn_id: &str,
+    through_turn_id: &str,
+) -> Result<(), RunError> {
+    let from = turns
+        .iter()
+        .position(|turn| turn.id == from_turn_id)
+        .ok_or_else(|| RunError::InvalidRequest(format!("unknown source turn: {from_turn_id}")))?;
+    let through = turns
+        .iter()
+        .position(|turn| turn.id == through_turn_id)
+        .ok_or_else(|| {
+            RunError::InvalidRequest(format!("unknown source turn: {through_turn_id}"))
+        })?;
+    if through < from {
+        return Err(RunError::InvalidRequest(
+            "--through must not precede --from".to_owned(),
+        ));
+    }
+    if turns[from..=through]
+        .iter()
+        .any(|turn| !turn.status.is_finished())
+    {
+        return Err(RunError::InvalidRequest(
+            "evaluation proposals require terminal source turns".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_coherent_proposal_span(turns: &[AgentTurnSummary]) -> Result<(), String> {
+    let Some(first) = turns.first() else {
+        return Err("evaluation proposal source span must not be empty".to_owned());
+    };
+    if turns.iter().any(|turn| {
+        turn.source_revision != first.source_revision
+            || turn.capability_revisions != first.capability_revisions
+    }) {
+        return Err(
+            "evaluation proposal source turns must share one workspace and capability revision"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_proposal_turn_command_size(
+    proposal_id: &str,
+    turn_task: &JsonValue,
+) -> Result<(), RunError> {
+    let start_record = command(
+        "proposal-start",
+        CommandBody::StartTurn {
+            session_id: format!("proposal-session-{proposal_id}"),
+            turn_id: format!("proposal-turn-{proposal_id}"),
+            task: turn_task.clone(),
+            capability_sources: json!([]),
+        },
+    );
+    if serde_json::to_vec(&start_record)?.len().saturating_add(1) > MAX_DRIVER_RECORD_BYTES {
+        return Err(RunError::InvalidRequest(format!(
+            "proposal source evidence exceeds the {MAX_DRIVER_RECORD_BYTES}-byte driver record limit"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_proposal_candidate(
+    candidate: &EvaluationProposalCandidate,
+    source_turns: &[AgentTurnSummary],
+    expected_evaluator: &EvaluationEvaluator,
+    requested_from: Option<&str>,
+    requested_through: Option<&str>,
+) -> Result<(), RunError> {
+    if candidate.schema_version != PROPOSAL_SCHEMA_VERSION {
+        return Err(RunError::Protocol(format!(
+            "unsupported evaluation proposal schema: {}",
+            candidate.schema_version
+        )));
+    }
+    let from = source_turns
+        .iter()
+        .position(|turn| turn.id == candidate.from_turn_id)
+        .ok_or_else(|| {
+            RunError::Protocol(format!(
+                "evaluation proposal selected unavailable source turn: {}",
+                candidate.from_turn_id
+            ))
+        })?;
+    let through = source_turns
+        .iter()
+        .position(|turn| turn.id == candidate.through_turn_id)
+        .ok_or_else(|| {
+            RunError::Protocol(format!(
+                "evaluation proposal selected unavailable source turn: {}",
+                candidate.through_turn_id
+            ))
+        })?;
+    if through < from {
+        return Err(RunError::Protocol(
+            "evaluation proposal selected a reversed source span".to_owned(),
+        ));
+    }
+    validate_coherent_proposal_span(&source_turns[from..=through]).map_err(RunError::Protocol)?;
+    if let (Some(from), Some(through)) = (requested_from, requested_through)
+        && (candidate.from_turn_id != from || candidate.through_turn_id != through)
+    {
+        return Err(RunError::Protocol(
+            "evaluation proposal changed the explicitly requested turn span".to_owned(),
+        ));
+    }
+    if candidate.task.trim().is_empty() {
+        return Err(RunError::Protocol(
+            "evaluation proposal task must not be empty".to_owned(),
+        ));
+    }
+    if candidate.rationale.trim().is_empty() {
+        return Err(RunError::Protocol(
+            "evaluation proposal rationale must not be empty".to_owned(),
+        ));
+    }
+    let unique = candidate.measurements.iter().collect::<BTreeSet<_>>();
+    if candidate.measurements.is_empty()
+        || unique.len() != candidate.measurements.len()
+        || candidate
+            .measurements
+            .iter()
+            .any(|measurement| !PROPOSAL_MEASUREMENTS.contains(&measurement.as_str()))
+    {
+        return Err(RunError::Protocol(
+            "evaluation proposal measurements must be a unique non-empty supported subset"
+                .to_owned(),
+        ));
+    }
+    if &candidate.evaluator != expected_evaluator {
+        return Err(RunError::Protocol(
+            "evaluation proposal must preserve the reviewed evaluator and its parameters"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn proposal_source_sequences(
+    session: &AgentSessionState,
+    from_turn_id: &str,
+    through_turn_id: &str,
+) -> Vec<u64> {
+    let turns = lock(&session.turns);
+    let Some(from) = turns.iter().position(|turn| turn.id == from_turn_id) else {
+        return Vec::new();
+    };
+    let Some(through) = turns.iter().position(|turn| turn.id == through_turn_id) else {
+        return Vec::new();
+    };
+    let selected = turns[from..=through]
+        .iter()
+        .map(|turn| turn.id.as_str())
+        .collect::<HashSet<_>>();
+    lock(&session.events)
+        .iter()
+        .filter(|event| {
+            event
+                .payload
+                .get("turnId")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|turn_id| selected.contains(turn_id))
+        })
+        .map(|event| event.sequence)
+        .collect()
+}
+
 fn driver_launch_digest(launch: &DriverLaunch) -> Result<String, RunError> {
     fn update(hasher: &mut Sha256, value: &[u8]) {
         hasher.update(value.len().to_le_bytes());
@@ -2277,6 +3695,84 @@ fn verify_captured_source_revision(
     Ok(())
 }
 
+fn validate_proposal_turn_outcome(
+    cancelled: bool,
+    timed_out: bool,
+    outcome: &str,
+) -> Result<(), RunError> {
+    if cancelled {
+        return Err(RunError::RunUnavailable(
+            "evaluation proposal was cancelled".to_owned(),
+        ));
+    }
+    if timed_out {
+        return Err(RunError::RunUnavailable(
+            "evaluation proposal duration limit exceeded".to_owned(),
+        ));
+    }
+    if outcome == "aborted" {
+        return Err(RunError::RunUnavailable(
+            "evaluation proposal was cancelled".to_owned(),
+        ));
+    }
+    if outcome != "completed" {
+        return Err(RunError::Protocol(format!(
+            "proposal driver finished with outcome {outcome}"
+        )));
+    }
+    Ok(())
+}
+
+fn quarantine_proposal_bundle(state: &PromotionProposalState) {
+    state.evidence_quarantined.store(true, Ordering::Release);
+    state.cancel.cancel();
+    let id = lock(&state.detail).summary.id.clone();
+    if !quarantine_run_bundle(&state.anchor, &id) {
+        let _ = remove_confined_run_entry(&state.anchor, Path::new("manifest.json"));
+    }
+}
+
+fn restore_proposal_scratch_if_mutated(
+    state: &PromotionProposalState,
+    initial: &CapturedTree,
+    secrets: &[Vec<u8>],
+) -> Result<(), RunError> {
+    let final_scratch =
+        capture_confined_run_tree(&state.anchor, Path::new("workspace")).map_err(|error| {
+            quarantine_proposal_bundle(state);
+            RunError::EvidencePersistence(format!(
+                "proposal scratch evidence could not be inspected and was quarantined: {error}"
+            ))
+        })?;
+    let changes = captured_tree_changes(initial, &final_scratch, secrets);
+    if !changes.is_empty() {
+        let restore =
+            remove_confined_run_entry(&state.anchor, Path::new("workspace")).and_then(|_| {
+                write_confined_run_captured_tree(&state.anchor, Path::new("workspace"), initial)
+                    .map(drop)
+            });
+        if let Err(error) = restore {
+            quarantine_proposal_bundle(state);
+            return Err(RunError::EvidencePersistence(format!(
+                "mutated proposal scratch evidence could not be restored and was quarantined: {error}"
+            )));
+        }
+    }
+    if confined_bundle_contains_protected_data(&state.anchor, secrets).unwrap_or(true) {
+        quarantine_proposal_bundle(state);
+        return Err(RunError::EvidencePersistence(
+            "proposal evidence contained protected data and was quarantined".to_owned(),
+        ));
+    }
+    if !changes.is_empty() {
+        return Err(RunError::Protocol(format!(
+            "read-only proposal agent changed its scratch workspace: {}",
+            serde_json::to_string(&changes)?
+        )));
+    }
+    Ok(())
+}
+
 fn verify_capability_recipe(
     state: &RunState,
     expected: &[CapabilityAssembly],
@@ -2298,6 +3794,194 @@ fn verify_capability_recipe(
 fn persist_draft(state: &PromotionDraftState) -> Result<(), RunError> {
     let detail = lock(&state.detail).clone();
     persist_draft_detail(state, &detail)
+}
+
+fn persist_proposal(state: &PromotionProposalState) -> Result<(), RunError> {
+    if state.evidence_quarantined.load(Ordering::Acquire) {
+        return Err(RunError::InvalidRequest(
+            "unknown evaluation proposal".to_owned(),
+        ));
+    }
+    write_confined_run_json_atomic(
+        &state.anchor,
+        Path::new("manifest.json"),
+        &serde_json::to_value(lock(&state.detail).clone())?,
+    )
+}
+
+fn record_proposal_event(
+    state: &PromotionProposalState,
+    kind: &str,
+    payload: JsonValue,
+) -> Result<RunEvent, RunError> {
+    let _commit = lock(&state.event_commit);
+    let mut detail = lock(&state.detail);
+    let previous = detail.clone();
+    let event = RunEvent {
+        sequence: detail.events.len() as u64 + 1,
+        at_ms: now_ms(),
+        kind: kind.to_owned(),
+        payload,
+        progress: None,
+    };
+    let mut line = serde_json::to_vec(&event)?;
+    line.push(b'\n');
+    enforce_proposal_event_budget(
+        detail.events.len(),
+        state.retained_event_bytes.load(Ordering::Acquire),
+        line.len(),
+        kind == "evaluation-proposal.finished",
+    )?;
+    detail.events.push(event.clone());
+    if let Err(error) = persist_proposal_detail(state, &detail) {
+        *detail = previous;
+        return Err(error);
+    }
+    #[cfg(test)]
+    if kind == "evaluation-proposal.finished"
+        && state
+            .fail_next_terminal_event_persist
+            .swap(false, Ordering::AcqRel)
+    {
+        *detail = previous;
+        persist_proposal_detail(state, &detail)?;
+        return Err(RunError::EvidencePersistence(
+            "injected terminal proposal event persistence failure".to_owned(),
+        ));
+    }
+    if let Err(error) = append_confined_run_bytes(&state.anchor, Path::new("events.jsonl"), &line) {
+        *detail = previous;
+        persist_proposal_detail(state, &detail)?;
+        return Err(error);
+    }
+    state
+        .retained_event_bytes
+        .fetch_add(line.len(), Ordering::Release);
+    drop(detail);
+    let _ = state.sender.send(event.clone());
+    Ok(event)
+}
+
+fn enforce_proposal_event_budget(
+    retained_count: usize,
+    retained_bytes: usize,
+    next_bytes: usize,
+    terminal: bool,
+) -> Result<(), RunError> {
+    if terminal {
+        return Ok(());
+    }
+    if retained_count >= MAX_PROPOSAL_EVENTS {
+        return Err(RunError::Protocol(format!(
+            "evaluation proposal exceeded its {MAX_PROPOSAL_EVENTS}-event evidence limit"
+        )));
+    }
+    if retained_bytes.saturating_add(next_bytes) > MAX_PROPOSAL_EVENT_BYTES {
+        return Err(RunError::Protocol(format!(
+            "evaluation proposal exceeded its {MAX_PROPOSAL_EVENT_BYTES}-byte event evidence limit"
+        )));
+    }
+    Ok(())
+}
+
+fn retained_proposal_event_bytes(events: &[RunEvent]) -> Result<usize, RunError> {
+    events.iter().try_fold(0_usize, |total, event| {
+        let bytes = serde_json::to_vec(event)?.len().saturating_add(1);
+        Ok(total.saturating_add(bytes))
+    })
+}
+
+fn persist_proposal_detail(
+    state: &PromotionProposalState,
+    detail: &EvaluationProposalDetail,
+) -> Result<(), RunError> {
+    if state.evidence_quarantined.load(Ordering::Acquire) {
+        return Err(RunError::InvalidRequest(format!(
+            "unknown evaluation proposal: {}",
+            detail.summary.id
+        )));
+    }
+    write_confined_run_json_atomic(
+        &state.anchor,
+        Path::new("manifest.json"),
+        &serde_json::to_value(detail)?,
+    )
+}
+
+fn update_proposal_status(
+    state: &PromotionProposalState,
+    status: EvaluationProposalStatus,
+    error: Option<&str>,
+) -> Result<(), RunError> {
+    let _commit = lock(&state.event_commit);
+    let mut detail = lock(&state.detail);
+    detail.summary.status = status;
+    detail.summary.error = error.map(str::to_owned);
+    if status.is_finished() {
+        detail.summary.finished_at_ms = Some(now_ms());
+    }
+    persist_proposal_detail(state, &detail)
+}
+
+fn finish_proposal(
+    state: &PromotionProposalState,
+    status: EvaluationProposalStatus,
+    candidate: Option<EvaluationProposalCandidate>,
+    draft_id: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), RunError> {
+    {
+        let _commit = lock(&state.event_commit);
+        let mut detail = lock(&state.detail);
+        detail.summary.status = status;
+        detail.summary.draft_id = draft_id.map(str::to_owned);
+        detail.summary.finished_at_ms = Some(now_ms());
+        detail.summary.error = error.map(str::to_owned);
+        detail.candidate = candidate;
+        persist_proposal_detail(state, &detail)?;
+    }
+    let proposal_id = lock(&state.detail).summary.id.clone();
+    record_proposal_event(
+        state,
+        "evaluation-proposal.finished",
+        json!({
+            "proposalId": proposal_id,
+            "draftId": draft_id,
+            "status": status,
+            "error": error,
+        }),
+    )?;
+    Ok(())
+}
+
+fn finish_proposal_with_terminal_fallback(
+    state: &PromotionProposalState,
+    status: EvaluationProposalStatus,
+    candidate: Option<EvaluationProposalCandidate>,
+    draft_id: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), RunError> {
+    let result = finish_proposal(state, status, candidate, draft_id, error);
+    if result.is_err() {
+        let detail = lock(&state.detail);
+        let event = RunEvent {
+            sequence: detail.events.len() as u64 + 1,
+            at_ms: now_ms(),
+            kind: "evaluation-proposal.finished".to_owned(),
+            payload: json!({
+                "proposalId": detail.summary.id,
+                "draftId": draft_id,
+                "status": status,
+                "error": error,
+                "durable": false,
+                "persistenceError": "terminal proposal evidence could not be persisted",
+            }),
+            progress: None,
+        };
+        drop(detail);
+        let _ = state.sender.send(event);
+    }
+    result
 }
 
 fn persist_draft_detail(
@@ -2841,6 +4525,183 @@ fn recover_unfinalized_validations(
     recovered
 }
 
+fn recover_published_proposal(
+    proposal_id: &str,
+    drafts: &HashMap<String, Arc<PromotionDraftState>>,
+) -> Result<Option<(String, EvaluationProposalCandidate)>, RunError> {
+    let mut recovered = Vec::new();
+    for draft in drafts.values() {
+        let detail = lock(&draft.detail);
+        if let Some(revision) = detail.revisions.iter().find(|revision| {
+            revision
+                .source
+                .proposal
+                .as_ref()
+                .is_some_and(|provenance| provenance.proposal_id == proposal_id)
+        }) {
+            let provenance = revision
+                .source
+                .proposal
+                .as_ref()
+                .expect("the matching proposal provenance was checked");
+            let Some(from_turn_id) = revision.source.turn_ids.first().cloned() else {
+                return Err(RunError::Protocol(format!(
+                    "published proposal revision has no source turns: {proposal_id}"
+                )));
+            };
+            let through_turn_id = revision
+                .source
+                .turn_ids
+                .last()
+                .cloned()
+                .expect("source turns were checked as non-empty");
+            recovered.push((
+                detail.summary.id.clone(),
+                EvaluationProposalCandidate {
+                    schema_version: PROPOSAL_SCHEMA_VERSION,
+                    from_turn_id,
+                    through_turn_id,
+                    task: revision.task.clone(),
+                    evaluator: revision.evaluator.clone(),
+                    measurements: revision.measurements.clone(),
+                    rationale: provenance.rationale.clone(),
+                },
+            ));
+        }
+    }
+    if recovered.len() > 1 {
+        return Err(RunError::Protocol(format!(
+            "proposal publication is attributed to multiple draft revisions: {proposal_id}"
+        )));
+    }
+    Ok(recovered.pop())
+}
+
+fn reconcile_interrupted_proposal(
+    detail: &mut EvaluationProposalDetail,
+    drafts: &HashMap<String, Arc<PromotionDraftState>>,
+) {
+    match recover_published_proposal(&detail.summary.id, drafts) {
+        Ok(Some((draft_id, candidate))) => {
+            detail.summary.status = EvaluationProposalStatus::Complete;
+            detail.summary.draft_id = Some(draft_id);
+            detail.summary.finished_at_ms = Some(now_ms());
+            detail.summary.error = None;
+            detail.candidate = Some(candidate);
+        }
+        Ok(None) => {
+            detail.summary.status = EvaluationProposalStatus::Failed;
+            detail.summary.finished_at_ms = Some(now_ms());
+            detail.summary.error =
+                Some("controller stopped before the proposal session finalized".to_owned());
+        }
+        Err(error) => {
+            detail.summary.status = EvaluationProposalStatus::Failed;
+            detail.summary.finished_at_ms = Some(now_ms());
+            detail.summary.error = Some(format!(
+                "proposal publication could not be reconciled: {error}"
+            ));
+        }
+    }
+}
+
+fn load_proposals(
+    root: &Path,
+    drafts: &HashMap<String, Arc<PromotionDraftState>>,
+) -> Result<HashMap<String, Arc<PromotionProposalState>>, RunError> {
+    let mut proposals = HashMap::new();
+    for entry in fs::read_dir(root)? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let anchor = match AgentSessionDirectoryAnchor::open(entry.path()) {
+            Ok(anchor) => Arc::new(anchor),
+            Err(error) => {
+                tracing::warn!(bundle = %entry.path().display(), %error, "skipping unreadable evaluation proposal");
+                continue;
+            }
+        };
+        if confined_run_quarantine_marker_exists(&anchor).unwrap_or(true)
+            || confined_external_quarantine_tombstone_exists(&anchor).unwrap_or(true)
+        {
+            continue;
+        }
+        let Some(manifest) = read_optional_confined_run_file(&anchor, Path::new("manifest.json"))?
+        else {
+            continue;
+        };
+        let mut detail: EvaluationProposalDetail = match serde_json::from_slice(&manifest) {
+            Ok(detail) => detail,
+            Err(error) => {
+                tracing::warn!(bundle = %entry.path().display(), %error, "skipping malformed evaluation proposal");
+                continue;
+            }
+        };
+        if detail.summary.id != entry.file_name().to_string_lossy() {
+            continue;
+        }
+        match load_draft_event_evidence(&anchor, &entry.path(), &detail.events) {
+            Ok(Some(events)) => detail.events = events,
+            Ok(None) => {}
+            Err(_) => continue,
+        }
+        let terminal_event_count = detail
+            .events
+            .iter()
+            .filter(|event| event.kind == "evaluation-proposal.finished")
+            .count();
+        if terminal_event_count > 1
+            || (terminal_event_count == 1 && !detail.summary.status.is_finished())
+        {
+            tracing::warn!(
+                bundle = %entry.path().display(),
+                "skipping evaluation proposal with contradictory terminal evidence"
+            );
+            continue;
+        }
+        let needs_terminal_event = terminal_event_count == 0;
+        let interrupted = !detail.summary.status.is_finished();
+        if interrupted {
+            reconcile_interrupted_proposal(&mut detail, drafts);
+        }
+        let retained_event_bytes = retained_proposal_event_bytes(&detail.events)?;
+        let (sender, _) = broadcast::channel(128);
+        let state = Arc::new(PromotionProposalState {
+            detail: Mutex::new(detail),
+            anchor,
+            sender,
+            event_commit: Mutex::new(()),
+            completion_commit: Mutex::new(()),
+            cancel: CancellationToken::new(),
+            evidence_quarantined: AtomicBool::new(false),
+            retained_event_bytes: AtomicUsize::new(retained_event_bytes),
+            #[cfg(test)]
+            fail_next_terminal_event_persist: AtomicBool::new(false),
+        });
+        if needs_terminal_event {
+            let summary = lock(&state.detail).summary.clone();
+            record_proposal_event(
+                &state,
+                "evaluation-proposal.finished",
+                json!({
+                    "proposalId": summary.id,
+                    "draftId": summary.draft_id,
+                    "status": summary.status,
+                    "error": summary.error,
+                }),
+            )?;
+        } else {
+            persist_proposal(&state)?;
+        }
+        let id = lock(&state.detail).summary.id.clone();
+        proposals.insert(id, state);
+    }
+    Ok(proposals)
+}
+
 fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>, RunError> {
     let mut drafts = HashMap::new();
     for entry in fs::read_dir(root)? {
@@ -3041,6 +4902,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn proposal_event_budget_bounds_progress_but_preserves_terminal_delivery() {
+        enforce_proposal_event_budget(0, 0, 32, false).unwrap();
+        assert!(
+            enforce_proposal_event_budget(MAX_PROPOSAL_EVENTS, 0, 32, false)
+                .unwrap_err()
+                .to_string()
+                .contains("event evidence limit")
+        );
+        assert!(
+            enforce_proposal_event_budget(0, MAX_PROPOSAL_EVENT_BYTES, 1, false)
+                .unwrap_err()
+                .to_string()
+                .contains("event evidence limit")
+        );
+        enforce_proposal_event_budget(
+            MAX_PROPOSAL_EVENTS,
+            MAX_PROPOSAL_EVENT_BYTES,
+            MAX_DRIVER_RECORD_BYTES,
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn catalog_evaluator_preserves_the_scenario_schema_requirement() {
         let scenario = ScenarioManifest {
             version: 1,
@@ -3074,6 +4959,116 @@ mod tests {
     }
 
     #[test]
+    fn proposal_candidate_is_confined_to_supplied_turns_and_reviewed_evaluator() {
+        let evaluator = EvaluationEvaluator {
+            id: CATALOG_EVALUATOR_ID.to_owned(),
+            version: CATALOG_EVALUATOR_VERSION,
+            parameters: CatalogEvaluatorParameters {
+                active_names: vec!["alpha".to_owned()],
+                total_score: 3,
+                required_capability_sources: vec!["catalog".to_owned()],
+                output_path: "result.json".into(),
+                require_schema: true,
+            },
+        };
+        let mut candidate = EvaluationProposalCandidate {
+            schema_version: PROPOSAL_SCHEMA_VERSION,
+            from_turn_id: "turn-1".to_owned(),
+            through_turn_id: "turn-2".to_owned(),
+            task: "Create result.json from the active catalog".to_owned(),
+            evaluator: evaluator.clone(),
+            measurements: vec!["duration".to_owned(), "capability-calls".to_owned()],
+            rationale: "These turns contain the reusable behavior.".to_owned(),
+        };
+        let source_turns = ["turn-1", "turn-2"]
+            .into_iter()
+            .map(|id| AgentTurnSummary {
+                id: id.to_owned(),
+                session_id: "session-1".to_owned(),
+                prompt: "prompt".to_owned(),
+                input: None,
+                source_revision: "revision-1".to_owned(),
+                capability_revisions: BTreeMap::from([(
+                    "catalog".to_owned(),
+                    "catalog-revision-1".to_owned(),
+                )]),
+                status: AgentTurnStatus::Completed,
+                started_at_ms: 1,
+                finished_at_ms: Some(2),
+                outcome: Some("completed".to_owned()),
+                error: None,
+                human_intervention_at_ms: None,
+            })
+            .collect::<Vec<_>>();
+
+        validate_proposal_candidate(&candidate, &source_turns, &evaluator, None, None).unwrap();
+
+        candidate.through_turn_id = "turn-3".to_owned();
+        assert!(
+            validate_proposal_candidate(&candidate, &source_turns, &evaluator, None, None,)
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable source turn")
+        );
+
+        candidate.through_turn_id = "turn-2".to_owned();
+        candidate.evaluator.parameters.total_score = 99;
+        assert!(
+            validate_proposal_candidate(&candidate, &source_turns, &evaluator, None, None,)
+                .unwrap_err()
+                .to_string()
+                .contains("preserve the reviewed evaluator")
+        );
+
+        candidate.evaluator = evaluator.clone();
+        let mut incompatible_turns = source_turns;
+        incompatible_turns[1].source_revision = "revision-2".to_owned();
+        validate_requested_proposal_span(&incompatible_turns, "turn-1", "turn-2").unwrap();
+        assert!(
+            validate_coherent_proposal_span(&incompatible_turns)
+                .unwrap_err()
+                .contains("must share one workspace and capability revision")
+        );
+        assert!(
+            validate_proposal_candidate(&candidate, &incompatible_turns, &evaluator, None, None,)
+                .unwrap_err()
+                .to_string()
+                .contains("must share one workspace and capability revision")
+        );
+    }
+
+    #[test]
+    fn proposal_input_limit_accounts_for_the_fully_encoded_driver_record() {
+        let source = json!({
+            "turns": ["x".repeat(MAX_AGENT_TURN_INPUT_BYTES - 512)],
+        });
+        assert!(serde_json::to_vec(&source).unwrap().len() <= MAX_AGENT_TURN_INPUT_BYTES);
+        let turn_task = json!({
+            "mode": "evaluation-proposal",
+            "promptContract": PROPOSAL_PROMPT_CONTRACT,
+            "prompt": proposal_prompt(),
+            "input": source,
+        });
+        assert!(
+            validate_proposal_turn_command_size("proposal-1", &turn_task)
+                .unwrap_err()
+                .to_string()
+                .contains("driver record limit")
+        );
+    }
+
+    #[test]
+    fn proposal_timeout_remains_authoritative_over_a_late_completed_outcome() {
+        assert!(
+            validate_proposal_turn_outcome(false, true, "completed")
+                .unwrap_err()
+                .to_string()
+                .contains("duration limit exceeded")
+        );
+        assert!(validate_proposal_turn_outcome(false, false, "completed").is_ok());
+    }
+
+    #[test]
     fn catalog_revision_rejects_unreviewed_evaluator_code() {
         let mut revision = EvaluationRevision {
             schema_version: PROMOTION_SCHEMA_VERSION,
@@ -3095,6 +5090,7 @@ mod tests {
                 model_profile_id: "haiku".to_owned(),
                 model_id: "provider/model".to_owned(),
                 driver: None,
+                proposal: None,
             },
             capability_recipe: Vec::new(),
             limits: ScenarioLimits {
@@ -3153,6 +5149,7 @@ mod tests {
                 model_profile_id: "haiku".to_owned(),
                 model_id: "provider/model".to_owned(),
                 driver: None,
+                proposal: None,
             },
             capability_recipe: vec![CapabilityAssembly {
                 id: "catalog".to_owned(),

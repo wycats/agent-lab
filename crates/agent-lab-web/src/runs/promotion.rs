@@ -9,6 +9,7 @@ const CATALOG_EVALUATOR_ID: &str = "catalog-to-file";
 const CATALOG_EVALUATOR_VERSION: u32 = 1;
 const DEFINITION_PUBLICATION_TRANSACTION: &str = "publication.pending.json";
 pub(super) const MAX_EVALUATION_DRAFT_REVISIONS: usize = 32;
+pub(super) const MAX_EVALUATION_VALIDATION_ATTEMPTS: usize = 32;
 const MANUAL_AUTHORING_BLOCKER: &str =
     "review and confirm the suggested task, assertions, and measurements";
 
@@ -73,6 +74,15 @@ pub struct EvaluationSourceProvenance {
     pub harness_id: String,
     pub model_profile_id: String,
     pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<EvaluationSourceDriverIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluationSourceDriverIdentity {
+    pub descriptor: DriverDescriptor,
+    pub launch_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -212,6 +222,8 @@ pub(super) struct PromotionStore {
     #[cfg(test)]
     fail_next_validation_assembly_persist: AtomicBool,
     #[cfg(test)]
+    fail_next_validation_finalization_persist: AtomicBool,
+    #[cfg(test)]
     validation_before_start_hook: Mutex<Option<ValidationBeforeStartHook>>,
 }
 
@@ -251,6 +263,8 @@ impl PromotionStore {
             evidence_lifecycle: Mutex::new(()),
             #[cfg(test)]
             fail_next_validation_assembly_persist: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_validation_finalization_persist: AtomicBool::new(false),
             #[cfg(test)]
             validation_before_start_hook: Mutex::new(None),
         })
@@ -389,6 +403,7 @@ impl RunController {
                     .to_owned(),
             ));
         }
+        let _evidence_lifecycle = lock(&self.inner.promotion.evidence_lifecycle);
         let session_id = request
             .session_id
             .or_else(|| lock(&workspace.active_agent_session_id).clone())
@@ -486,6 +501,7 @@ impl RunController {
             .collect::<Vec<_>>();
         let source_digest = selected_turns_digest(selected, &presentations)?;
         let capability_recipe = lock(&workspace.assembly).capability_sources.clone();
+        let source_driver = self.evaluation_source_driver_identity(&session, &session_summary)?;
         let id = format!("draft-{}-{}", now_ms(), random_suffix());
         let revision_id = format!("revision-{}-{}", now_ms(), random_suffix());
         let created_at_ms = now_ms();
@@ -508,6 +524,7 @@ impl RunController {
                 harness_id: session_summary.harness_id,
                 model_profile_id: session_summary.model_profile_id,
                 model_id: session_summary.model_id,
+                driver: Some(source_driver),
             },
             capability_recipe,
             limits: scenario.limits.clone(),
@@ -542,7 +559,14 @@ impl RunController {
         };
         let directory = confined_child(&self.inner.promotion.draft_root(), &id)?;
         fs::create_dir(&directory)?;
-        let anchor = Arc::new(AgentSessionDirectoryAnchor::open(directory)?);
+        let anchor = match AgentSessionDirectoryAnchor::open(directory.clone()) {
+            Ok(anchor) => Arc::new(anchor),
+            Err(error) => {
+                let _ = fs::remove_dir(&directory);
+                return Err(error);
+            }
+        };
+        let pending_bundle = PendingEvaluationBundle::new(id.clone(), anchor.clone());
         write_confined_run_captured_tree(
             &anchor,
             &PathBuf::from("revisions").join(&revision_id).join("source"),
@@ -578,9 +602,9 @@ impl RunController {
                 "origin": origin,
             }),
         )?;
-        lock(&self.inner.promotion.drafts).insert(id.clone(), state);
+        lock(&self.inner.promotion.drafts).insert(id.clone(), state.clone());
         drop(known_secrets);
-        record_event(
+        if let Err(error) = record_event(
             &workspace,
             "workbench.evaluation-draft.created",
             json!({
@@ -588,8 +612,12 @@ impl RunController {
                 "draftId": id,
                 "revisionId": revision_id,
             }),
-        )?;
-        self.evaluation_draft(&id)
+        ) {
+            lock(&self.inner.promotion.drafts).remove(&id);
+            return Err(error);
+        }
+        pending_bundle.commit();
+        Ok(lock(&state.detail).clone())
     }
 
     /// Create an immutable revision from an optimistic draft edit.
@@ -742,6 +770,11 @@ impl RunController {
                 "this evaluation revision already has an active validation".to_owned(),
             ));
         }
+        if previous_detail.validations.len() >= MAX_EVALUATION_VALIDATION_ATTEMPTS {
+            return Err(RunError::InvalidRequest(format!(
+                "evaluation drafts retain at most {MAX_EVALUATION_VALIDATION_ATTEMPTS} validation attempts"
+            )));
+        }
         let attempt = EvaluationValidationAttempt {
             id: format!("validation-{}-{}", now_ms(), random_suffix()),
             draft_id: draft_id.to_owned(),
@@ -858,11 +891,8 @@ impl RunController {
             next_detail.summary.name = name;
         }
         reject_serialized_protected_data(&next_detail, &lock(&self.inner.promotion.secret_values))?;
-        let passing = next_detail.validations.iter().any(|attempt| {
-            attempt.revision_id == revision_id
-                && attempt.execution_status == EvaluationExecutionStatus::Complete
-                && attempt.assertion_status == ValidationAssertionStatus::Passed
-        });
+        let passing = self.revalidate_passing_attempts(&mut next_detail, &revision);
+        reject_serialized_protected_data(&next_detail, &lock(&self.inner.promotion.secret_values))?;
         let mut publication = None;
         if passing {
             let existing = lock(&self.inner.promotion.definitions)
@@ -937,6 +967,68 @@ impl RunController {
         Ok(response)
     }
 
+    fn validation_attempt_supports_promotion(
+        &self,
+        attempt: &EvaluationValidationAttempt,
+        revision: &EvaluationRevision,
+    ) -> Result<(), String> {
+        let run_id = attempt
+            .run_id
+            .as_deref()
+            .ok_or_else(|| "passing validation has no retained run evidence".to_owned())?;
+        let run = self
+            .get(run_id)
+            .map_err(|error| format!("passing validation evidence is unavailable: {error}"))?;
+        if run.summary.status != RunStatus::Passed
+            || run.score != attempt.score
+            || run
+                .score
+                .as_ref()
+                .is_none_or(|score| score["passed"].as_bool() != Some(true))
+            || run.summary.scenario_id != revision.source.scenario_id
+            || run.summary.harness_id.as_deref() != Some(revision.source.harness_id.as_str())
+            || run.summary.model_profile_id.as_deref()
+                != Some(revision.source.model_profile_id.as_str())
+            || run.summary.model_id != revision.source.model_id
+            || run.assembly.question != revision.task
+            || run.assembly.scenario.id != revision.source.scenario_id
+            || run.assembly.workspace.seed_revision != revision.source.source_revision
+            || run.assembly.capability_sources != revision.capability_recipe
+            || run.assembly.limits != revision.limits
+        {
+            return Err(
+                "passing validation evidence is inconsistent with the retained attempt".to_owned(),
+            );
+        }
+        Self::verify_validation_driver_identity(revision, run.assembly.harness.driver.as_ref())
+            .map_err(|error| error.to_string())
+    }
+
+    fn revalidate_passing_attempts(
+        &self,
+        detail: &mut EvaluationDraftDetail,
+        revision: &EvaluationRevision,
+    ) -> bool {
+        let mut passing = false;
+        for attempt in &mut detail.validations {
+            if attempt.revision_id != revision.id
+                || attempt.execution_status != EvaluationExecutionStatus::Complete
+                || attempt.assertion_status != ValidationAssertionStatus::Passed
+            {
+                continue;
+            }
+            match self.validation_attempt_supports_promotion(attempt, revision) {
+                Ok(()) => passing = true,
+                Err(error) => {
+                    attempt.execution_status = EvaluationExecutionStatus::Inconclusive;
+                    attempt.assertion_status = ValidationAssertionStatus::NotEvaluated;
+                    attempt.error = Some(error);
+                }
+            }
+        }
+        passing
+    }
+
     /// Run a promoted definition through a compatible harness pair.
     ///
     /// # Errors
@@ -947,6 +1039,7 @@ impl RunController {
         definition_id: &str,
         request: StartDefinitionEvaluationRequest,
     ) -> Result<EvaluationSummary, RunError> {
+        let _evidence_lifecycle = lock(&self.inner.promotion.evidence_lifecycle);
         let definition = lock(&self.inner.promotion.definitions)
             .get(definition_id)
             .cloned()
@@ -1079,6 +1172,7 @@ impl RunController {
                 harness_id: String::new(),
                 model_profile_id: model_profile_id.clone(),
                 model_id: String::new(),
+                driver: None,
             },
             capability_recipe: capability_recipe.to_vec(),
             limits: limits.clone(),
@@ -1244,6 +1338,14 @@ impl RunController {
     }
 
     #[cfg(test)]
+    pub(super) fn fail_next_validation_finalization_persist(&self) {
+        self.inner
+            .promotion
+            .fail_next_validation_finalization_persist
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
     pub(super) fn inject_stale_validation_manifest_for_recovery_test(
         &self,
         draft_id: &str,
@@ -1259,6 +1361,47 @@ impl RunController {
             serde_json::to_value(validation)?,
         )?;
         write_confined_run_json_atomic(&state.anchor, Path::new("manifest.json"), &stale_manifest)
+    }
+
+    #[cfg(test)]
+    pub(super) fn fill_validation_retention_for_test(
+        &self,
+        draft_id: &str,
+        revision_id: &str,
+    ) -> Result<(), RunError> {
+        let state = self.promotion_draft_state(draft_id)?;
+        let _event_commit = lock(&state.event_commit);
+        let mut detail = lock(&state.detail);
+        let mut next_detail = detail.clone();
+        while next_detail.validations.len() < MAX_EVALUATION_VALIDATION_ATTEMPTS {
+            let attempt = EvaluationValidationAttempt {
+                id: format!("validation-retention-{}", next_detail.validations.len()),
+                draft_id: draft_id.to_owned(),
+                revision_id: revision_id.to_owned(),
+                execution_status: EvaluationExecutionStatus::Complete,
+                assertion_status: ValidationAssertionStatus::Failed,
+                harness_id: "fixture".to_owned(),
+                model_profile_id: "fixture".to_owned(),
+                run_id: None,
+                started_at_ms: now_ms(),
+                finished_at_ms: Some(now_ms()),
+                error: None,
+                score: Some(json!({ "passed": false })),
+            };
+            let event = RunEvent {
+                sequence: next_detail.events.len() as u64 + 1,
+                at_ms: now_ms(),
+                kind: "evaluation-validation.created".to_owned(),
+                payload: serde_json::to_value(&attempt)?,
+                progress: None,
+            };
+            next_detail.validations.push(attempt);
+            next_detail.events.push(event);
+        }
+        persist_draft_detail(&state, &next_detail)?;
+        write_draft_event_evidence(&state.anchor, &next_detail.events)?;
+        *detail = next_detail;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1360,7 +1503,7 @@ impl RunController {
             .execute_evaluation_validation_inner(&state, &revision, &attempt_id, cancel.clone())
             .await;
         if let Err(error) = result {
-            let _ = update_validation_attempt(&state, &attempt_id, |attempt| {
+            let _ = persist_validation_attempt_update(&state, &attempt_id, |attempt| {
                 attempt.execution_status = if cancel.is_cancelled() {
                     EvaluationExecutionStatus::Cancelled
                 } else {
@@ -1380,23 +1523,44 @@ impl RunController {
             lock(&self.inner.scenario_overrides).remove(&run_id);
         }
         lock(&state.validation_cancels).remove(&attempt_id);
-        let _ = persist_draft(&state);
         let attempt = lock(&state.detail)
             .validations
             .iter()
             .find(|attempt| attempt.id == attempt_id)
             .cloned();
-        let _ = record_draft_event(
+        if let Err(error) = self.record_validation_finished(
             &state,
-            "evaluation-validation.finished",
             serde_json::to_value(attempt).unwrap_or_else(|_| {
                 json!({
                     "validationId": attempt_id,
                     "executionStatus": "inconclusive",
                 })
             }),
-        );
+        ) {
+            broadcast_validation_finalization_failure(&state, &attempt_id, &error);
+        }
         self.notify_evaluation_library_changed(&state, "validation-finished");
+    }
+
+    fn record_validation_finished(
+        &self,
+        state: &PromotionDraftState,
+        payload: JsonValue,
+    ) -> Result<(), RunError> {
+        #[cfg(not(test))]
+        let _ = self;
+        #[cfg(test)]
+        if self
+            .inner
+            .promotion
+            .fail_next_validation_finalization_persist
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(RunError::EvidencePersistence(
+                "injected validation finalization persistence failure".to_owned(),
+            ));
+        }
+        record_draft_event(state, "evaluation-validation.finished", payload)
     }
 
     fn notify_evaluation_library_changed(&self, state: &PromotionDraftState, change: &str) {
@@ -1420,10 +1584,9 @@ impl RunController {
         attempt_id: &str,
         cancel: CancellationToken,
     ) -> Result<(), RunError> {
-        update_validation_attempt(state, attempt_id, |attempt| {
+        persist_validation_attempt_update(state, attempt_id, |attempt| {
             attempt.execution_status = EvaluationExecutionStatus::Running;
         })?;
-        persist_draft(state)?;
         record_draft_event(
             state,
             "evaluation-validation.status",
@@ -1435,10 +1598,7 @@ impl RunController {
         else {
             return Ok(());
         };
-        update_validation_attempt(state, attempt_id, |attempt| {
-            attempt.run_id = Some(prepared.id.clone());
-        })?;
-        if let Err(error) = persist_draft(state) {
+        if let Err(error) = self.publish_validation_run(state, attempt_id, &prepared.id) {
             lock(&self.inner.scenario_overrides).remove(&prepared.id);
             let _ = self.cancel(&prepared.id);
             return Err(error);
@@ -1472,41 +1632,15 @@ impl RunController {
             if run.summary.status.is_finished() {
                 lock(&self.inner.scenario_overrides).remove(&prepared.id);
                 let score = run.score.clone();
-                let (execution_status, assertion_status, error) = match run.summary.status {
-                    RunStatus::Passed => (
-                        EvaluationExecutionStatus::Complete,
-                        ValidationAssertionStatus::Passed,
-                        None,
-                    ),
-                    RunStatus::Cancelled => (
-                        EvaluationExecutionStatus::Cancelled,
-                        ValidationAssertionStatus::NotEvaluated,
-                        run.summary.error.clone(),
-                    ),
-                    RunStatus::Failed
-                        if run.summary.error.is_none()
-                            && score.as_ref().is_some_and(catalog_score_is_complete) =>
-                    {
-                        (
-                            EvaluationExecutionStatus::Complete,
-                            ValidationAssertionStatus::Failed,
-                            None,
-                        )
-                    }
-                    _ => (
-                        EvaluationExecutionStatus::Inconclusive,
-                        ValidationAssertionStatus::NotEvaluated,
-                        run.summary.error.clone(),
-                    ),
-                };
-                update_validation_attempt(state, attempt_id, |attempt| {
+                let (execution_status, assertion_status, error) =
+                    classify_validation_run(revision, &run);
+                persist_validation_attempt_update(state, attempt_id, |attempt| {
                     attempt.execution_status = execution_status;
                     attempt.assertion_status = assertion_status;
                     attempt.finished_at_ms = Some(now_ms());
                     attempt.error = error;
                     attempt.score = score;
                 })?;
-                persist_draft(state)?;
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1551,6 +1685,35 @@ impl RunController {
             .map(Some)
     }
 
+    fn publish_validation_run(
+        &self,
+        state: &PromotionDraftState,
+        attempt_id: &str,
+        run_id: &str,
+    ) -> Result<(), RunError> {
+        let _evidence_lifecycle = lock(&self.inner.promotion.evidence_lifecycle);
+        if state.evidence_quarantined.load(Ordering::Acquire) {
+            return Err(RunError::InvalidRequest(format!(
+                "unknown evaluation draft: {}",
+                lock(&state.detail).summary.id
+            )));
+        }
+        let run = self.state(run_id)?;
+        let secrets = lock(&self.inner.promotion.secret_values).clone();
+        if !secrets.is_empty()
+            && confined_bundle_contains_protected_data(&run.agent_session_directories, &secrets)
+                .unwrap_or(true)
+        {
+            mark_workspace_evidence_unavailable(&run, false);
+            return Err(RunError::EvidencePersistence(
+                PROTECTED_WORKSPACE_PATH_ERROR.to_owned(),
+            ));
+        }
+        persist_validation_attempt_update(state, attempt_id, |attempt| {
+            attempt.run_id = Some(run_id.to_owned());
+        })
+    }
+
     fn cancel_validation_before_start_if_requested(
         &self,
         state: &PromotionDraftState,
@@ -1572,11 +1735,19 @@ impl RunController {
         &self,
         revision: &EvaluationRevision,
     ) -> Result<(), RunError> {
-        let current_model_id = self
+        let harness = self
             .inner
             .harnesses
             .get(&revision.source.harness_id)
-            .and_then(|harness| harness.models.get(&revision.source.model_profile_id))
+            .ok_or_else(|| {
+                RunError::InvalidRequest(format!(
+                    "captured validation configuration is unavailable: harness={}, profile={}",
+                    revision.source.harness_id, revision.source.model_profile_id
+                ))
+            })?;
+        let current_model_id = harness
+            .models
+            .get(&revision.source.model_profile_id)
             .ok_or_else(|| {
                 RunError::InvalidRequest(format!(
                     "captured validation configuration is unavailable: harness={}, profile={}",
@@ -1589,7 +1760,77 @@ impl RunController {
                 revision.source.model_id, current_model_id
             )));
         }
+        let source_driver = revision.source.driver.as_ref().ok_or_else(|| {
+            RunError::EvidencePersistence(
+                "captured validation has no driver stack identity".to_owned(),
+            )
+        })?;
+        let current_launch_digest = driver_launch_digest(&harness.launch)?;
+        if current_launch_digest != source_driver.launch_digest {
+            return Err(RunError::EvidencePersistence(
+                "captured validation harness launch changed".to_owned(),
+            ));
+        }
         Ok(())
+    }
+
+    fn verify_validation_driver_identity(
+        revision: &EvaluationRevision,
+        current: Option<&DriverDescriptor>,
+    ) -> Result<(), RunError> {
+        let expected = revision.source.driver.as_ref().ok_or_else(|| {
+            RunError::EvidencePersistence(
+                "captured validation has no driver stack identity".to_owned(),
+            )
+        })?;
+        let current = current.ok_or_else(|| {
+            RunError::EvidencePersistence(
+                "validation run did not retain its driver identity".to_owned(),
+            )
+        })?;
+        if current != &expected.descriptor {
+            return Err(RunError::EvidencePersistence(format!(
+                "captured validation driver changed: expected {} {} {:?}, found {} {} {:?}",
+                expected.descriptor.name,
+                expected.descriptor.version,
+                expected.descriptor.revision,
+                current.name,
+                current.version,
+                current.revision,
+            )));
+        }
+        Ok(())
+    }
+
+    fn evaluation_source_driver_identity(
+        &self,
+        session: &AgentSessionState,
+        summary: &AgentSessionSummary,
+    ) -> Result<EvaluationSourceDriverIdentity, RunError> {
+        let descriptor = lock(&session.events)
+            .iter()
+            .rev()
+            .find(|event| event.kind == "agent.session.ready")
+            .and_then(|event| event.payload.get("driver"))
+            .cloned()
+            .ok_or_else(|| {
+                RunError::EvidencePersistence(format!(
+                    "agent session {} has no captured driver identity",
+                    summary.id
+                ))
+            })
+            .and_then(|value| serde_json::from_value(value).map_err(RunError::from))?;
+        let harness = self
+            .inner
+            .harnesses
+            .get(&summary.harness_id)
+            .ok_or_else(|| {
+                RunError::InvalidRequest(format!("unknown harness: {}", summary.harness_id))
+            })?;
+        Ok(EvaluationSourceDriverIdentity {
+            descriptor,
+            launch_digest: driver_launch_digest(&harness.launch)?,
+        })
     }
 
     async fn prepare_promotion_run(
@@ -1644,6 +1885,73 @@ impl RunController {
     }
 }
 
+fn classify_validation_run(
+    revision: &EvaluationRevision,
+    run: &RunDetail,
+) -> (
+    EvaluationExecutionStatus,
+    ValidationAssertionStatus,
+    Option<String>,
+) {
+    let driver_outcome = run.events.iter().rev().find_map(|event| {
+        (event.kind == "driver.turn-finished")
+            .then(|| event.payload.get("outcome").and_then(JsonValue::as_str))
+            .flatten()
+    });
+    let driver_identity_error = (run.summary.status != RunStatus::Cancelled)
+        .then(|| {
+            RunController::verify_validation_driver_identity(
+                revision,
+                run.assembly.harness.driver.as_ref(),
+            )
+            .err()
+            .map(|error| error.to_string())
+        })
+        .flatten();
+    match (run.summary.status, driver_outcome, driver_identity_error) {
+        (_, _, Some(error)) => (
+            EvaluationExecutionStatus::Inconclusive,
+            ValidationAssertionStatus::NotEvaluated,
+            Some(error),
+        ),
+        (RunStatus::Passed, Some("completed"), None) => (
+            EvaluationExecutionStatus::Complete,
+            ValidationAssertionStatus::Passed,
+            None,
+        ),
+        (RunStatus::Cancelled, _, None) => (
+            EvaluationExecutionStatus::Cancelled,
+            ValidationAssertionStatus::NotEvaluated,
+            run.summary.error.clone(),
+        ),
+        (RunStatus::Failed, Some("intervened"), None) => (
+            EvaluationExecutionStatus::Intervened,
+            ValidationAssertionStatus::NotEvaluated,
+            Some("validation driver outcome was intervened".to_owned()),
+        ),
+        (RunStatus::Failed, Some("completed"), None)
+            if run.summary.error.is_none()
+                && run.score.as_ref().is_some_and(catalog_score_is_complete) =>
+        {
+            (
+                EvaluationExecutionStatus::Complete,
+                ValidationAssertionStatus::Failed,
+                None,
+            )
+        }
+        (_, outcome, None) => (
+            EvaluationExecutionStatus::Inconclusive,
+            ValidationAssertionStatus::NotEvaluated,
+            run.summary.error.clone().or_else(|| {
+                Some(format!(
+                    "validation driver did not complete normally: {}",
+                    outcome.unwrap_or("missing terminal outcome")
+                ))
+            }),
+        ),
+    }
+}
+
 fn selected_turns_digest(
     turns: &[AgentTurnSummary],
     presentations: &[AgentTurnPresentation],
@@ -1660,6 +1968,63 @@ fn selected_turns_digest(
         .collect::<Vec<_>>();
     let bytes = serde_json::to_vec(&source)?;
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn driver_launch_digest(launch: &DriverLaunch) -> Result<String, RunError> {
+    fn update(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update(value.len().to_le_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = Sha256::new();
+    update(
+        &mut hasher,
+        launch.executable.as_os_str().as_encoded_bytes(),
+    );
+    for argument in &launch.args {
+        update(&mut hasher, argument.as_encoded_bytes());
+    }
+    if let Some(cwd) = &launch.cwd {
+        update(&mut hasher, cwd.as_os_str().as_encoded_bytes());
+    }
+    for (name, _) in &launch.env {
+        update(&mut hasher, name.as_encoded_bytes());
+    }
+    update(&mut hasher, &[u8::from(launch.clear_env)]);
+    if let Some(executable) = resolve_driver_executable(launch)
+        && executable.is_file()
+    {
+        update(&mut hasher, &fs::read(executable)?);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn resolve_driver_executable(launch: &DriverLaunch) -> Option<PathBuf> {
+    if launch.executable.is_absolute() {
+        return Some(launch.executable.clone());
+    }
+    if launch.executable.components().count() > 1 {
+        return Some(
+            launch
+                .cwd
+                .as_deref()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&launch.executable),
+        );
+    }
+    let configured_path = launch
+        .env
+        .iter()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value.clone());
+    let path = configured_path.or_else(|| {
+        (!launch.clear_env)
+            .then(|| std::env::var_os("PATH"))
+            .flatten()
+    })?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(&launch.executable))
+        .find(|candidate| candidate.is_file())
 }
 
 fn catalog_score_is_complete(score: &JsonValue) -> bool {
@@ -2199,33 +2564,33 @@ fn record_draft_event(
         )));
     }
     let _commit = lock(&state.event_commit);
-    let event = {
-        let mut detail = lock(&state.detail);
-        let event = RunEvent {
-            sequence: detail.events.len() as u64 + 1,
-            at_ms: now_ms(),
-            kind: kind.to_owned(),
-            payload,
-            progress: None,
-        };
-        let mut line = serde_json::to_vec(&event)?;
-        line.push(b'\n');
-        append_confined_run_bytes(&state.anchor, Path::new("events.jsonl"), &line)?;
-        detail.events.push(event.clone());
-        event
+    let mut detail = lock(&state.detail);
+    let previous_detail = detail.clone();
+    let mut next_detail = previous_detail.clone();
+    let event = RunEvent {
+        sequence: next_detail.events.len() as u64 + 1,
+        at_ms: now_ms(),
+        kind: kind.to_owned(),
+        payload,
+        progress: None,
     };
-    persist_draft(state)?;
+    next_detail.events.push(event.clone());
+    persist_draft_transition(state, &previous_detail, &next_detail, &event, None)?;
+    *detail = next_detail;
+    drop(detail);
     let _ = state.sender.send(event);
     Ok(())
 }
 
-fn update_validation_attempt(
+fn persist_validation_attempt_update(
     state: &PromotionDraftState,
     attempt_id: &str,
     update: impl FnOnce(&mut EvaluationValidationAttempt),
 ) -> Result<(), RunError> {
+    let _event_commit = lock(&state.event_commit);
     let mut detail = lock(&state.detail);
-    let attempt = detail
+    let mut next_detail = detail.clone();
+    let attempt = next_detail
         .validations
         .iter_mut()
         .find(|attempt| attempt.id == attempt_id)
@@ -2233,22 +2598,70 @@ fn update_validation_attempt(
             RunError::InvalidRequest(format!("unknown evaluation validation: {attempt_id}"))
         })?;
     update(attempt);
-    detail.summary.updated_at_ms = now_ms();
+    next_detail.summary.updated_at_ms = now_ms();
+    persist_draft_detail(state, &next_detail)?;
+    *detail = next_detail;
     Ok(())
+}
+
+fn broadcast_validation_finalization_failure(
+    state: &PromotionDraftState,
+    attempt_id: &str,
+    error: &RunError,
+) {
+    let message = format!("validation finalization could not be persisted: {error}");
+    let durable_attempt = persist_validation_attempt_update(state, attempt_id, |attempt| {
+        attempt.execution_status = EvaluationExecutionStatus::Inconclusive;
+        attempt.assertion_status = ValidationAssertionStatus::NotEvaluated;
+        attempt.finished_at_ms = Some(now_ms());
+        attempt.error = Some(message.clone());
+    })
+    .is_ok();
+    if !durable_attempt {
+        let _event_commit = lock(&state.event_commit);
+        let mut detail = lock(&state.detail);
+        if let Some(attempt) = detail
+            .validations
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+        {
+            attempt.execution_status = EvaluationExecutionStatus::Inconclusive;
+            attempt.assertion_status = ValidationAssertionStatus::NotEvaluated;
+            attempt.finished_at_ms = Some(now_ms());
+            attempt.error = Some(message.clone());
+        }
+    }
+    let event = {
+        let detail = lock(&state.detail);
+        RunEvent {
+            sequence: detail.events.len() as u64,
+            at_ms: now_ms(),
+            kind: "evaluation-validation.finished".to_owned(),
+            payload: json!({
+                "validationId": attempt_id,
+                "executionStatus": EvaluationExecutionStatus::Inconclusive,
+                "assertionStatus": ValidationAssertionStatus::NotEvaluated,
+                "error": message,
+                "durable": false,
+                "durableAttempt": durable_attempt,
+            }),
+            progress: None,
+        }
+    };
+    let _ = state.sender.send(event);
 }
 
 fn mark_validation_cancelled(
     state: &PromotionDraftState,
     attempt_id: &str,
 ) -> Result<(), RunError> {
-    update_validation_attempt(state, attempt_id, |attempt| {
+    persist_validation_attempt_update(state, attempt_id, |attempt| {
         attempt.execution_status = EvaluationExecutionStatus::Cancelled;
         attempt.assertion_status = ValidationAssertionStatus::NotEvaluated;
         attempt.finished_at_ms = Some(now_ms());
         attempt.error = None;
         attempt.score = None;
-    })?;
-    persist_draft(state)
+    })
 }
 
 fn finish_cancelled_validation_if_requested(
@@ -2612,6 +3025,7 @@ mod tests {
                 harness_id: "v0".to_owned(),
                 model_profile_id: "haiku".to_owned(),
                 model_id: "provider/model".to_owned(),
+                driver: None,
             },
             capability_recipe: Vec::new(),
             limits: ScenarioLimits {
@@ -2669,6 +3083,7 @@ mod tests {
                 harness_id: "v0".to_owned(),
                 model_profile_id: "haiku".to_owned(),
                 model_id: "provider/model".to_owned(),
+                driver: None,
             },
             capability_recipe: vec![CapabilityAssembly {
                 id: "catalog".to_owned(),

@@ -15881,8 +15881,12 @@ while IFS= read -r line; do
           printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"workspace.changed","payload":{"path":"result.json","kind":"created"}}\n' "$sequence" "$session" "$turn"
           ;;
       esac
+      outcome=completed
+      if [ -n "${AGENT_LAB_PROMOTION_OUTCOME_FILE:-}" ] && [ -f "$AGENT_LAB_PROMOTION_OUTCOME_FILE" ]; then
+        outcome=$(cat "$AGENT_LAB_PROMOTION_OUTCOME_FILE")
+      fi
       sequence=$((sequence + 1))
-      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.finished","sessionId":"%s","turnId":"%s","outcome":"completed","evidence":{"fixture":true}}\n' "$sequence" "$session" "$turn"
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.finished","sessionId":"%s","turnId":"%s","outcome":"%s","evidence":{"fixture":true}}\n' "$sequence" "$session" "$turn" "$outcome"
       ;;
     *'"type":"turn.abort"'*)
       turn=$(printf '%s' "$line" | sed -E 's/.*"turnId":"([^"]+)".*/\1/')
@@ -16169,14 +16173,22 @@ done
             data_dir: data.clone(),
             driver: DriverLaunch::new("/bin/false"),
         };
+        let promotion_outcome = root.join("promotion-outcome");
         let harnesses = || {
             ["v0", "eve"]
                 .into_iter()
-                .map(|id| HarnessProfile {
-                    id: id.to_owned(),
-                    display_name: id.to_owned(),
-                    launch: promotion_fixture_launch(),
-                    models: BTreeMap::from([("test".to_owned(), format!("fixture/{id}"))]),
+                .map(|id| {
+                    let mut launch = promotion_fixture_launch();
+                    launch.env.push((
+                        "AGENT_LAB_PROMOTION_OUTCOME_FILE".into(),
+                        promotion_outcome.clone().into_os_string(),
+                    ));
+                    HarnessProfile {
+                        id: id.to_owned(),
+                        display_name: id.to_owned(),
+                        launch,
+                        models: BTreeMap::from([("test".to_owned(), format!("fixture/{id}"))]),
+                    }
                 })
                 .collect::<Vec<_>>()
         };
@@ -16235,6 +16247,32 @@ done
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
+        let workspace_events = controller
+            .state(&explore.id)
+            .unwrap()
+            .bundle_dir
+            .join("events.jsonl");
+        let workspace_events_before_failed_draft = fs::read(&workspace_events).unwrap();
+        fs::remove_file(&workspace_events).unwrap();
+        fs::create_dir(&workspace_events).unwrap();
+        assert!(
+            controller
+                .create_evaluation_draft(
+                    &explore.id,
+                    CreateEvaluationDraftRequest {
+                        session_id: Some(session.id.clone()),
+                        from_turn_id: turn.id.clone(),
+                        through_turn_id: turn.id.clone(),
+                    },
+                    WorkbenchOrigin::Browser,
+                )
+                .is_err(),
+            "a workspace-event failure should roll back the pending draft bundle"
+        );
+        assert!(controller.list_evaluation_drafts().is_empty());
+        fs::remove_dir(&workspace_events).unwrap();
+        fs::write(&workspace_events, workspace_events_before_failed_draft).unwrap();
+
         let draft = controller
             .create_evaluation_draft(
                 &explore.id,
@@ -16256,6 +16294,20 @@ done
                 .any(|issue| issue.contains("review and confirm the suggested task"))
         );
         assert!(first.source.source_digest.starts_with("sha256:"));
+        assert_eq!(
+            first.source.driver.as_ref().map(|driver| (
+                driver.descriptor.name.as_str(),
+                driver.descriptor.version.as_str()
+            )),
+            Some(("promotion-fixture", "1"))
+        );
+        assert!(
+            first
+                .source
+                .driver
+                .as_ref()
+                .is_some_and(|driver| driver.launch_digest.starts_with("sha256:"))
+        );
         let copied_source = data
             .join("evaluation-library/drafts")
             .join(&draft.summary.id)
@@ -16449,7 +16501,127 @@ done
             passing_attempt.assertion_status,
             ValidationAssertionStatus::Passed
         );
-        let passing_validation_run_id = passing_attempt.run_id.clone().unwrap();
+        let quarantined_passing_run_id = passing_attempt.run_id.clone().unwrap();
+        mark_workspace_evidence_unavailable(
+            &controller.state(&quarantined_passing_run_id).unwrap(),
+            false,
+        );
+        assert!(controller.get(&quarantined_passing_run_id).is_err());
+        assert!(controller.evaluation_draft(&draft.summary.id).is_ok());
+        let invalidated_passing = controller
+            .save_evaluation_draft(
+                &draft.summary.id,
+                SaveEvaluationDraftRequest {
+                    revision_id: Some(passing_revision_id.clone()),
+                    name: None,
+                },
+            )
+            .unwrap();
+        assert!(invalidated_passing.summary.definition_id.is_none());
+        let invalidated_attempt = invalidated_passing
+            .validations
+            .iter()
+            .find(|attempt| attempt.id == passing_attempt.id)
+            .unwrap();
+        assert_eq!(
+            invalidated_attempt.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            invalidated_attempt.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+
+        let replacement_passing_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        exercise_validation_capabilities(
+            &controller,
+            &draft.summary.id,
+            &replacement_passing_attempt.id,
+        )
+        .await;
+        let replacement_passing_attempt = wait_for_validation(
+            &controller,
+            &draft.summary.id,
+            &replacement_passing_attempt.id,
+        )
+        .await;
+        assert_eq!(
+            replacement_passing_attempt.execution_status,
+            EvaluationExecutionStatus::Complete
+        );
+        assert_eq!(
+            replacement_passing_attempt.assertion_status,
+            ValidationAssertionStatus::Passed
+        );
+        let passing_validation_run_id = replacement_passing_attempt.run_id.clone().unwrap();
+
+        controller.fail_next_validation_finalization_persist();
+        let (_, mut finalization_events) = controller
+            .subscribe_evaluation_draft(&draft.summary.id)
+            .unwrap();
+        let finalization_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        exercise_validation_capabilities(&controller, &draft.summary.id, &finalization_attempt.id)
+            .await;
+        let finalization_event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = finalization_events.recv().await.unwrap();
+                if event.kind == "evaluation-validation.finished"
+                    && event.payload["validationId"] == finalization_attempt.id
+                {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("validation finalization failure should terminate the live event stream");
+        assert_eq!(finalization_event.payload["durable"], false);
+        assert_eq!(
+            finalization_event.payload["executionStatus"],
+            "inconclusive"
+        );
+        let finalization_attempt =
+            wait_for_validation(&controller, &draft.summary.id, &finalization_attempt.id).await;
+        assert_eq!(
+            finalization_attempt.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            finalization_attempt.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(finalization_attempt.error.as_deref().is_some_and(|error| {
+            error.contains("injected validation finalization persistence failure")
+        }));
+
+        fs::write(&promotion_outcome, b"intervened").unwrap();
+        let intervened_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        exercise_validation_capabilities(&controller, &draft.summary.id, &intervened_attempt.id)
+            .await;
+        let intervened_attempt =
+            wait_for_validation(&controller, &draft.summary.id, &intervened_attempt.id).await;
+        assert_eq!(
+            intervened_attempt.execution_status,
+            EvaluationExecutionStatus::Intervened
+        );
+        assert_eq!(
+            intervened_attempt.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(
+            intervened_attempt
+                .score
+                .as_ref()
+                .is_some_and(|score| score["passed"] == true),
+            "a schema-complete score must not turn an intervened driver outcome into an assertion result"
+        );
+        fs::remove_file(&promotion_outcome).unwrap();
+
         controller.fail_next_validation_assembly_persist();
         let failed_assembly_attempt = controller
             .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
@@ -16672,6 +16844,11 @@ done
         let controller =
             RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
         assert_eq!(
+            controller.list_evaluation_drafts().len(),
+            1,
+            "a failed draft creation must not reappear after restart"
+        );
+        assert_eq!(
             controller
                 .evaluation_definition(&definition_id)
                 .unwrap()
@@ -16824,7 +17001,7 @@ done
             RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
         let reopened_draft = reopened.evaluation_draft(&draft.summary.id).unwrap();
         assert_eq!(reopened_draft.revisions.len(), 4);
-        assert_eq!(reopened_draft.validations.len(), 5);
+        assert_eq!(reopened_draft.validations.len(), 8);
         let recovered_validation = reopened_draft
             .validations
             .iter()
@@ -16976,6 +17153,83 @@ done
                 .is_some_and(|error| error.contains("captured validation model changed"))
         );
         drop(drifted);
+
+        let launch_drifted_harnesses = || {
+            ["v0", "eve"]
+                .into_iter()
+                .map(|id| {
+                    let mut launch = promotion_fixture_launch();
+                    launch.env.push((
+                        "AGENT_LAB_PROMOTION_OUTCOME_FILE".into(),
+                        promotion_outcome.clone().into_os_string(),
+                    ));
+                    if id == captured_harness_id {
+                        launch
+                            .env
+                            .push(("AGENT_LAB_ADAPTER_REVISION".into(), "drifted".into()));
+                    }
+                    HarnessProfile {
+                        id: id.to_owned(),
+                        display_name: id.to_owned(),
+                        launch,
+                        models: BTreeMap::from([("test".to_owned(), format!("fixture/{id}"))]),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let launch_drifted =
+            RunController::new_with_harnesses(config(), launch_drifted_harnesses(), models.clone())
+                .unwrap();
+        let launch_drifted_attempt = launch_drifted
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        let launch_drifted_attempt = wait_for_validation(
+            &launch_drifted,
+            &draft.summary.id,
+            &launch_drifted_attempt.id,
+        )
+        .await;
+        assert_eq!(
+            launch_drifted_attempt.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            launch_drifted_attempt.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(launch_drifted_attempt.run_id.is_none());
+        assert!(
+            launch_drifted_attempt
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("captured validation harness launch changed"))
+        );
+        drop(launch_drifted);
+
+        let retention =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        retention
+            .fill_validation_retention_for_test(&draft.summary.id, &passing_revision_id)
+            .unwrap();
+        let at_validation_limit = retention.evaluation_draft(&draft.summary.id).unwrap();
+        assert_eq!(
+            at_validation_limit.validations.len(),
+            promotion::MAX_EVALUATION_VALIDATION_ATTEMPTS
+        );
+        let error = retention
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap_err();
+        assert!(matches!(error, RunError::InvalidRequest(_)));
+        assert!(error.to_string().contains("retain at most"));
+        assert_eq!(
+            retention
+                .evaluation_draft(&draft.summary.id)
+                .unwrap()
+                .validations
+                .len(),
+            promotion::MAX_EVALUATION_VALIDATION_ATTEMPTS
+        );
+        drop(retention);
 
         fs::write(
             data.join("evaluation-library/definitions")

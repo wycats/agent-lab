@@ -152,16 +152,16 @@
   let draftBusy = false;
   let draftName = '';
   let draftTask = '';
-  let draftActiveNames = '';
+  let draftActiveNames: string[] = [];
   let draftTotalScore = 0;
-  let draftRequiredCapabilities = '';
+  let draftRequiredCapabilities: string[] = [];
   let draftOutputPath = 'result.json';
   let draftRequireSchema = true;
   let draftMaxDurationMs = 0;
   let draftMaxCommandCount = 0;
   let draftMaxOrchestratorInvocations = 0;
   let draftMaxToolInvocations = 0;
-  let draftMeasurements = '';
+  let draftMeasurements: string[] = [];
   let hydratedDraftRevisionKey = '';
   let agentTurnCancelling = false;
 
@@ -194,12 +194,12 @@
   $: draftMaterialEditsPending = selectedDraftRevision
     ? draftTask !== selectedDraftRevision.task ||
       !sameStringList(
-        parseCommaSeparated(draftActiveNames),
+        stringListValues(draftActiveNames),
         selectedDraftRevision.evaluator.parameters.activeNames
       ) ||
       Number(draftTotalScore) !== selectedDraftRevision.evaluator.parameters.totalScore ||
       !sameStringList(
-        parseCommaSeparated(draftRequiredCapabilities),
+        stringListValues(draftRequiredCapabilities),
         selectedDraftRevision.evaluator.parameters.requiredCapabilitySources
       ) ||
       draftOutputPath.trim() !== selectedDraftRevision.evaluator.parameters.outputPath ||
@@ -210,7 +210,7 @@
         selectedDraftRevision.limits.maxOrchestratorInvocations ||
       Number(draftMaxToolInvocations) !== selectedDraftRevision.limits.maxToolInvocations ||
       !sameStringList(
-        parseCommaSeparated(draftMeasurements),
+        stringListValues(draftMeasurements),
         selectedDraftRevision.measurements
       )
     : false;
@@ -219,6 +219,10 @@
         .reverse()
         .find((attempt) => attempt.revisionId === selectedDraftRevision?.id)
     : undefined;
+  $: selectedDraftValidationActive = Boolean(
+    selectedDraftValidation &&
+      ['queued', 'running'].includes(selectedDraftValidation.executionStatus)
+  );
   $: previousDraftValidations = selectedDraft
     ? [...selectedDraft.validations]
         .reverse()
@@ -925,15 +929,8 @@
     comparisonHarnessIds = selection.comparisonHarnessIds;
   }
 
-  function commaSeparated(values: string[]): string {
-    return values.join(', ');
-  }
-
-  function parseCommaSeparated(value: string): string[] {
-    return value
-      .split(',')
-      .map((part) => part.trim())
-      .filter((part, index, all) => part.length > 0 && all.indexOf(part) === index);
+  function stringListValues(values: string[]): string[] {
+    return values.filter((value) => value.length > 0);
   }
 
   function sameStringList(left: string[], right: string[]): boolean {
@@ -954,18 +951,18 @@
     hydratedDraftRevisionKey = key;
     draftName = draft.summary.name;
     draftTask = revision.task;
-    draftActiveNames = commaSeparated(revision.evaluator.parameters.activeNames);
+    draftActiveNames = [...revision.evaluator.parameters.activeNames];
     draftTotalScore = revision.evaluator.parameters.totalScore;
-    draftRequiredCapabilities = commaSeparated(
-      revision.evaluator.parameters.requiredCapabilitySources
-    );
+    draftRequiredCapabilities = [
+      ...revision.evaluator.parameters.requiredCapabilitySources
+    ];
     draftOutputPath = revision.evaluator.parameters.outputPath;
     draftRequireSchema = revision.evaluator.parameters.requireSchema;
     draftMaxDurationMs = revision.limits.maxDurationMs;
     draftMaxCommandCount = revision.limits.maxCommandCount;
     draftMaxOrchestratorInvocations = revision.limits.maxOrchestratorInvocations;
     draftMaxToolInvocations = revision.limits.maxToolInvocations;
-    draftMeasurements = commaSeparated(revision.measurements);
+    draftMeasurements = [...revision.measurements];
   }
 
   async function loadEvaluationLibrary(workspaceId: string): Promise<void> {
@@ -1122,14 +1119,14 @@
           id: revision.evaluator.id,
           version: revision.evaluator.version,
           parameters: {
-            activeNames: parseCommaSeparated(draftActiveNames),
+            activeNames: stringListValues(draftActiveNames),
             totalScore: Number(draftTotalScore),
-            requiredCapabilitySources: parseCommaSeparated(draftRequiredCapabilities),
+            requiredCapabilitySources: stringListValues(draftRequiredCapabilities),
             outputPath: draftOutputPath.trim(),
             requireSchema: draftRequireSchema
           }
         },
-        measurements: parseCommaSeparated(draftMeasurements)
+        measurements: stringListValues(draftMeasurements)
       }
     };
   }
@@ -1200,6 +1197,27 @@
     }
   }
 
+  async function cancelDraftValidation(): Promise<void> {
+    if (
+      !selectedDraft ||
+      !selectedDraftValidation ||
+      !['queued', 'running'].includes(selectedDraftValidation.executionStatus)
+    ) return;
+    draftBusy = true;
+    actionError = '';
+    try {
+      await runClient.cancelEvaluationValidation(
+        selectedDraft.summary.workspaceId,
+        selectedDraft.summary.id,
+        selectedDraftValidation.id
+      );
+    } catch (error) {
+      actionError = message(error);
+    } finally {
+      draftBusy = false;
+    }
+  }
+
   async function runDraftDefinition(): Promise<void> {
     const definitionId = selectedDefinition?.summary.id ?? selectedDraft?.summary.definitionId;
     const workspaceId =
@@ -1214,7 +1232,11 @@
     try {
       const summary = await runClient.runEvaluationDefinition(
         workspaceId,
-        definitionId
+        definitionId,
+        {
+          modelProfileId,
+          harnessIds: comparisonHarnessIds
+        }
       );
       evaluations = [summary, ...evaluations.filter((item) => item.id !== summary.id)];
       await openEvaluation(summary.id);
@@ -2743,18 +2765,56 @@
 
                 <fieldset class="wide">
                   <legend>Catalog evaluator · v{selectedDraftRevision.evaluator.version}</legend>
-                  <label>
+                  <div class="string-list-field" data-testid="draft-active-names">
                     <span>Expected active names</span>
-                    <input bind:value={draftActiveNames} autocomplete="off" disabled={Boolean(selectedDefinition)} />
-                  </label>
+                    <div class="string-list-rows">
+                      {#each draftActiveNames as _, index}
+                        <label class="string-list-row">
+                          <span class="sr-only">Expected active name {index + 1}</span>
+                          <input bind:value={draftActiveNames[index]} autocomplete="off" disabled={Boolean(selectedDefinition)} />
+                          {#if !selectedDefinition}
+                            <button
+                              type="button"
+                              aria-label={`Remove expected active name ${index + 1}`}
+                              on:click={() => draftActiveNames = draftActiveNames.filter((_, itemIndex) => itemIndex !== index)}
+                            >
+                              Remove
+                            </button>
+                          {/if}
+                        </label>
+                      {/each}
+                      {#if !selectedDefinition}
+                        <button type="button" on:click={() => draftActiveNames = [...draftActiveNames, '']}>Add name</button>
+                      {/if}
+                    </div>
+                  </div>
                   <label>
                     <span>Total score</span>
                     <input type="number" bind:value={draftTotalScore} disabled={Boolean(selectedDefinition)} />
                   </label>
-                  <label>
+                  <div class="string-list-field" data-testid="draft-required-capabilities">
                     <span>Required capabilities</span>
-                    <input bind:value={draftRequiredCapabilities} autocomplete="off" disabled={Boolean(selectedDefinition)} />
-                  </label>
+                    <div class="string-list-rows">
+                      {#each draftRequiredCapabilities as _, index}
+                        <label class="string-list-row">
+                          <span class="sr-only">Required capability {index + 1}</span>
+                          <input bind:value={draftRequiredCapabilities[index]} autocomplete="off" disabled={Boolean(selectedDefinition)} />
+                          {#if !selectedDefinition}
+                            <button
+                              type="button"
+                              aria-label={`Remove required capability ${index + 1}`}
+                              on:click={() => draftRequiredCapabilities = draftRequiredCapabilities.filter((_, itemIndex) => itemIndex !== index)}
+                            >
+                              Remove
+                            </button>
+                          {/if}
+                        </label>
+                      {/each}
+                      {#if !selectedDefinition}
+                        <button type="button" on:click={() => draftRequiredCapabilities = [...draftRequiredCapabilities, '']}>Add capability</button>
+                      {/if}
+                    </div>
+                  </div>
                   <label>
                     <span>Output path</span>
                     <input bind:value={draftOutputPath} autocomplete="off" disabled={Boolean(selectedDefinition)} />
@@ -2773,10 +2833,29 @@
                   <label><span>Tool calls</span><input type="number" min="0" bind:value={draftMaxToolInvocations} disabled={Boolean(selectedDefinition)} /></label>
                 </fieldset>
 
-                <label class="wide">
+                <div class="wide string-list-field" data-testid="draft-measurements">
                   <span>Tracked measurements</span>
-                  <input bind:value={draftMeasurements} autocomplete="off" disabled={Boolean(selectedDefinition)} />
-                </label>
+                  <div class="string-list-rows">
+                    {#each draftMeasurements as _, index}
+                      <label class="string-list-row">
+                        <span class="sr-only">Tracked measurement {index + 1}</span>
+                        <input bind:value={draftMeasurements[index]} autocomplete="off" disabled={Boolean(selectedDefinition)} />
+                        {#if !selectedDefinition}
+                          <button
+                            type="button"
+                            aria-label={`Remove tracked measurement ${index + 1}`}
+                            on:click={() => draftMeasurements = draftMeasurements.filter((_, itemIndex) => itemIndex !== index)}
+                          >
+                            Remove
+                          </button>
+                        {/if}
+                      </label>
+                    {/each}
+                    {#if !selectedDefinition}
+                      <button type="button" on:click={() => draftMeasurements = [...draftMeasurements, '']}>Add measurement</button>
+                    {/if}
+                  </div>
+                </div>
 
                 {#if draftMaterialEditsPending}
                   <p class="draft-suggestion wide">
@@ -2793,11 +2872,21 @@
                     disabled={draftBusy ||
                       Boolean(selectedDefinition) ||
                       draftMaterialEditsPending ||
-                      selectedDraftRevision.blockingIssues.length > 0}
+                      selectedDraftRevision.blockingIssues.length > 0 ||
+                      selectedDraftValidationActive}
                     on:click={() => void validateDraft()}
                   >
                     Validate revision
                   </button>
+                  {#if selectedDraftValidationActive}
+                    <button
+                      type="button"
+                      disabled={draftBusy || Boolean(selectedDefinition)}
+                      on:click={() => void cancelDraftValidation()}
+                    >
+                      Cancel validation
+                    </button>
+                  {/if}
                   <button
                     type="button"
                     disabled={draftBusy || Boolean(selectedDefinition) || draftMaterialEditsPending}
@@ -3363,6 +3452,13 @@
   .draft-definition-context small { color: #8fac9b; font-family: var(--font-mono); font-size: 0.56rem; }
   .draft-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; margin-top: 14px; }
   .draft-form .wide { grid-column: 1 / -1; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }
+  .string-list-field { display: grid; align-content: start; gap: 4px; min-width: 0; }
+  .string-list-field > span { color: #73847b; font-size: 0.62rem; font-weight: 680; letter-spacing: 0.12em; text-transform: uppercase; }
+  .string-list-rows { display: grid; gap: 5px; }
+  .string-list-row { grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 5px; }
+  .string-list-rows button { justify-self: start; min-height: 27px; padding: 0 8px; border: 1px solid #304139; border-radius: 5px; color: #8fa198; font-size: 0.56rem; }
+  .string-list-row button { justify-self: stretch; color: #718078; }
   .draft-form input:not([type="checkbox"]), .draft-form textarea { width: 100%; min-width: 0; border: 1px solid #293832; border-radius: 6px; padding: 8px 9px; color: #c9d3ce; background: #0a100e; font: 0.66rem/1.45 var(--font-mono); outline: none; }
   .draft-form textarea { resize: vertical; }
   .draft-form input:focus, .draft-form textarea:focus { border-color: #567261; box-shadow: 0 0 0 1px #344d40; }

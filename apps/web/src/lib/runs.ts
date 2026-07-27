@@ -313,6 +313,15 @@ export interface EvaluationSourceProvenance {
   harnessId: string;
   modelProfileId: string;
   modelId: string;
+  driver?: {
+    descriptor: {
+      name: string;
+      version: string;
+      revision?: string;
+      features: string[];
+    };
+    launchDigest: string;
+  };
 }
 
 export interface EvaluationRevision {
@@ -546,6 +555,11 @@ export interface RunClient {
     draftId: string,
     revisionId?: string
   ): Promise<EvaluationValidationAttempt>;
+  cancelEvaluationValidation(
+    workspaceId: string,
+    draftId: string,
+    validationId: string
+  ): Promise<void>;
   saveEvaluationDraft(
     workspaceId: string,
     draftId: string,
@@ -836,6 +850,11 @@ export function createRunClient(): RunClient {
       request(
         `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts/${encodeURIComponent(draftId)}/validate`,
         { method: 'POST', body: JSON.stringify({ revisionId }) }
+      ),
+    cancelEvaluationValidation: (workspaceId, draftId, validationId) =>
+      request(
+        `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts/${encodeURIComponent(draftId)}/validations/${encodeURIComponent(validationId)}/cancel`,
+        { method: 'POST' }
       ),
     saveEvaluationDraft: (workspaceId, draftId, input = {}) =>
       request(

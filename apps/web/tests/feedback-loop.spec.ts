@@ -3484,18 +3484,36 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   ).toHaveClass(/selected/);
   await page.unrouteAll({ behavior: 'wait' });
 
-  const expectedNames = page.getByLabel('Expected active names');
-  await expectedNames.fill('not-the-catalog');
+  const expectedNames = page.getByTestId('draft-active-names').locator('input');
+  await expect(expectedNames).toHaveCount(2);
+  await expectedNames.nth(0).fill('ACME, Inc.');
+  await expectedNames.nth(1).fill('not-the-catalog');
   await expect(page.getByRole('button', { name: 'Validate revision' })).toBeDisabled();
   await expect(draft).toContainText('Create a revision to make these edits');
   await page.getByRole('button', { name: 'Create revision' }).click();
   await expect(draft.locator('.revision-list li')).toHaveCount(2);
+  expect(
+    await expectedNames.evaluateAll((inputs) =>
+      inputs.map((input) => (input as HTMLInputElement).value)
+    )
+  ).toEqual(['ACME, Inc.', 'not-the-catalog']);
+  await page.getByRole('button', { name: 'Validate revision' }).click();
+  const cancelValidation = page.getByRole('button', { name: 'Cancel validation' });
+  await expect(cancelValidation).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Validate revision' })).toBeDisabled();
+  await cancelValidation.click();
+  const cancelled = draft.locator('.current-validation .validation-card');
+  await expect(cancelled).toHaveAttribute('data-status', 'not-evaluated', {
+    timeout: 30_000
+  });
+  await expect(cancelled).toContainText('cancelled');
   await page.getByRole('button', { name: 'Validate revision' }).click();
   const failed = draft.locator('.current-validation .validation-card');
   await expect(failed).toHaveAttribute('data-status', 'failed', { timeout: 30_000 });
   await expect(failed).toContainText('complete');
 
-  await expectedNames.fill('alpha, gamma');
+  await expectedNames.nth(0).fill('alpha');
+  await expectedNames.nth(1).fill('gamma');
   await page.getByRole('button', { name: 'Create revision' }).click();
   await expect(draft.locator('.revision-list li')).toHaveCount(3);
   await expect(draft).toContainText('Current revision not validated');
@@ -3504,11 +3522,11 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   await expect(passed).toHaveAttribute('data-status', 'passed', { timeout: 30_000 });
   await expect(passed).toContainText('complete');
   await expect(draft.locator('.validation-history')).toContainText('Previous attempts');
-  await expect(draft.locator('.validation-history .validation-card')).toHaveAttribute(
+  await expect(draft.locator('.validation-history .validation-card[data-status="failed"]')).toHaveAttribute(
     'data-status',
     'failed'
   );
-  await expect(draft.locator('.validation-card')).toHaveCount(2);
+  await expect(draft.locator('.validation-card')).toHaveCount(3);
 
   await page.getByRole('button', { name: 'Save to library' }).click();
   await expect(page.locator('.run-heading .run-status')).toHaveText('promoted');
@@ -3559,7 +3577,18 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   await expect(page.getByLabel('Standalone task')).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Run comparison' })).toBeVisible();
 
+  const definitionRunRequest = page.waitForRequest(
+    new RegExp(`/api/workbench/[^/]+/evaluation-definitions/${definitionId}/run$`)
+  );
   await page.getByRole('button', { name: 'Run comparison' }).click();
+  const definitionRunBody = (await definitionRunRequest).postDataJSON() as {
+    modelProfileId?: string;
+    harnessIds?: string[];
+  };
+  expect(definitionRunBody).toEqual({
+    modelProfileId: 'fixture',
+    harnessIds: ['v0', 'eve']
+  });
   const evaluation = page.getByTestId('evaluation-view');
   await expect(evaluation.locator('.run-status')).toHaveText('passed');
   await expect(evaluation.locator('.paired-result')).toContainText('Same evaluated artifact');
@@ -3573,7 +3602,7 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   await savedDefinition.click();
   await expect(page.getByTestId('evaluation-draft-view')).toContainText('Saved definition');
   await expect(page.getByLabel('Standalone task')).toHaveValue(promotedTask);
-  await expect(page.getByTestId('evaluation-draft-view').locator('.validation-card')).toHaveCount(2);
+  await expect(page.getByTestId('evaluation-draft-view').locator('.validation-card')).toHaveCount(3);
   await expect(page.getByTestId('evaluation-draft-view')).toContainText('Owned by revision');
 
   await submit(

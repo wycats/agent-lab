@@ -1306,6 +1306,12 @@ fn evaluation_draft_event_stream(
                     continue;
                 }
                 match receiver.recv().await {
+                    Ok(event)
+                        if event.kind == "evaluation-validation.finished"
+                            && event.payload["durable"].as_bool() == Some(false) =>
+                    {
+                        return Some((event, (pending, receiver, runs, id, last_sequence)));
+                    }
                     Ok(event) => pending.push_back(event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let Ok(events) = runs.evaluation_draft_events_after(&id, last_sequence)
@@ -2238,6 +2244,7 @@ totalScore = 0
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn evidence_streams_revalidate_non_lagged_live_events_before_yielding() {
         let root =
             std::env::temp_dir().join(format!("agent-lab-live-recheck-{}", generate_token()));
@@ -2324,6 +2331,33 @@ totalScore = 0
             );
             futures_util::pin_mut!(stream);
             assert!(stream.next().await.is_none());
+        }
+        {
+            let (sender, receiver) = tokio::sync::broadcast::channel(4);
+            let finalization_failure = RunEvent {
+                sequence: 0,
+                at_ms: 1,
+                kind: "evaluation-validation.finished".to_owned(),
+                payload: serde_json::json!({
+                    "validationId": "validation-finalization-failure",
+                    "executionStatus": "inconclusive",
+                    "assertionStatus": "not-evaluated",
+                    "durable": false,
+                }),
+                progress: None,
+            };
+            sender.send(finalization_failure.clone()).unwrap();
+            let stream = evaluation_draft_event_stream(
+                runs.clone(),
+                "removed-draft".to_owned(),
+                Vec::new(),
+                receiver,
+            );
+            futures_util::pin_mut!(stream);
+            let observed = stream.next().await.expect("transient terminal event");
+            assert_eq!(observed.kind, finalization_failure.kind);
+            assert_eq!(observed.sequence, finalization_failure.sequence);
+            assert_eq!(observed.payload, finalization_failure.payload);
         }
 
         drop(runs);

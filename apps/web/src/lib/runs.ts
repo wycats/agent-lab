@@ -714,9 +714,16 @@ function reconnectingRunEvents(
           path,
           controller.signal,
           async (event) => {
-            if (event.sequence <= lastDeliveredSequence) return;
+            const transientFinalization = (
+              event.type === 'evaluation-validation.finished' &&
+              typeof event.payload === 'object' &&
+              event.payload !== null &&
+              'durable' in event.payload &&
+              event.payload.durable === false
+            );
+            if (!transientFinalization && event.sequence <= lastDeliveredSequence) return;
             await onEvent(event);
-            lastDeliveredSequence = event.sequence;
+            if (!transientFinalization) lastDeliveredSequence = event.sequence;
           },
           async (response) => {
             connectedAtMs = Date.now();

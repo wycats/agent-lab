@@ -224,6 +224,8 @@ pub(super) struct PromotionStore {
     #[cfg(test)]
     fail_next_validation_finalization_persist: AtomicBool,
     #[cfg(test)]
+    fail_next_validation_fallback_persist: AtomicBool,
+    #[cfg(test)]
     validation_before_start_hook: Mutex<Option<ValidationBeforeStartHook>>,
 }
 
@@ -265,6 +267,8 @@ impl PromotionStore {
             fail_next_validation_assembly_persist: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_validation_finalization_persist: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_validation_fallback_persist: AtomicBool::new(false),
             #[cfg(test)]
             validation_before_start_hook: Mutex::new(None),
         })
@@ -1009,12 +1013,19 @@ impl RunController {
         detail: &mut EvaluationDraftDetail,
         revision: &EvaluationRevision,
     ) -> bool {
+        let terminal_validation_ids = durable_terminal_validation_ids(&detail.events);
         let mut passing = false;
         for attempt in &mut detail.validations {
             if attempt.revision_id != revision.id
                 || attempt.execution_status != EvaluationExecutionStatus::Complete
                 || attempt.assertion_status != ValidationAssertionStatus::Passed
             {
+                continue;
+            }
+            if !terminal_validation_ids.contains(&attempt.id) {
+                attempt.execution_status = EvaluationExecutionStatus::Inconclusive;
+                attempt.assertion_status = ValidationAssertionStatus::NotEvaluated;
+                attempt.error = Some("validation finalization evidence is missing".to_owned());
                 continue;
             }
             match self.validation_attempt_supports_promotion(attempt, revision) {
@@ -1346,6 +1357,14 @@ impl RunController {
     }
 
     #[cfg(test)]
+    pub(super) fn fail_next_validation_fallback_persist(&self) {
+        self.inner
+            .promotion
+            .fail_next_validation_fallback_persist
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
     pub(super) fn inject_stale_validation_manifest_for_recovery_test(
         &self,
         draft_id: &str,
@@ -1537,7 +1556,20 @@ impl RunController {
                 })
             }),
         ) {
-            broadcast_validation_finalization_failure(&state, &attempt_id, &error);
+            #[cfg(test)]
+            let fail_fallback_persist = self
+                .inner
+                .promotion
+                .fail_next_validation_fallback_persist
+                .swap(false, Ordering::AcqRel);
+            #[cfg(not(test))]
+            let fail_fallback_persist = false;
+            broadcast_validation_finalization_failure(
+                &state,
+                &attempt_id,
+                &error,
+                fail_fallback_persist,
+            );
         }
         self.notify_evaluation_library_changed(&state, "validation-finished");
     }
@@ -1987,8 +2019,13 @@ fn driver_launch_digest(launch: &DriverLaunch) -> Result<String, RunError> {
     if let Some(cwd) = &launch.cwd {
         update(&mut hasher, cwd.as_os_str().as_encoded_bytes());
     }
-    for (name, _) in &launch.env {
+    for (name, value) in &launch.env {
         update(&mut hasher, name.as_encoded_bytes());
+        if sensitive_name(&name.to_string_lossy()) {
+            update(&mut hasher, b"[sensitive-value]");
+        } else {
+            update(&mut hasher, value.as_encoded_bytes());
+        }
     }
     update(&mut hasher, &[u8::from(launch.clear_env)]);
     if let Some(executable) = resolve_driver_executable(launch)
@@ -2608,15 +2645,17 @@ fn broadcast_validation_finalization_failure(
     state: &PromotionDraftState,
     attempt_id: &str,
     error: &RunError,
+    fail_fallback_persist: bool,
 ) {
     let message = format!("validation finalization could not be persisted: {error}");
-    let durable_attempt = persist_validation_attempt_update(state, attempt_id, |attempt| {
-        attempt.execution_status = EvaluationExecutionStatus::Inconclusive;
-        attempt.assertion_status = ValidationAssertionStatus::NotEvaluated;
-        attempt.finished_at_ms = Some(now_ms());
-        attempt.error = Some(message.clone());
-    })
-    .is_ok();
+    let durable_attempt = !fail_fallback_persist
+        && persist_validation_attempt_update(state, attempt_id, |attempt| {
+            attempt.execution_status = EvaluationExecutionStatus::Inconclusive;
+            attempt.assertion_status = ValidationAssertionStatus::NotEvaluated;
+            attempt.finished_at_ms = Some(now_ms());
+            attempt.error = Some(message.clone());
+        })
+        .is_ok();
     if !durable_attempt {
         let _event_commit = lock(&state.event_commit);
         let mut detail = lock(&state.detail);
@@ -2750,6 +2789,22 @@ fn draft_events_are_prefix(prefix: &[RunEvent], events: &[RunEvent]) -> Result<b
         })
 }
 
+fn durable_terminal_validation_ids(events: &[RunEvent]) -> HashSet<String> {
+    events
+        .iter()
+        .filter(|event| {
+            event.kind == "evaluation-validation.finished"
+                && event.payload["durable"].as_bool() != Some(false)
+        })
+        .filter_map(|event| {
+            event.payload["id"]
+                .as_str()
+                .or_else(|| event.payload["validationId"].as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 fn write_draft_event_evidence(
     anchor: &AgentSessionDirectoryAnchor,
     events: &[RunEvent],
@@ -2760,6 +2815,30 @@ fn write_draft_event_evidence(
         bytes.push(b'\n');
     }
     write_confined_run_bytes_atomic(anchor, Path::new("events.jsonl"), &bytes)
+}
+
+fn recover_unfinalized_validations(
+    detail: &mut EvaluationDraftDetail,
+) -> Vec<EvaluationValidationAttempt> {
+    let terminal_validation_ids = durable_terminal_validation_ids(&detail.events);
+    let mut recovered = Vec::new();
+    for validation in &mut detail.validations {
+        let missing_terminal_evidence = validation.execution_status.is_finished()
+            && !terminal_validation_ids.contains(&validation.id);
+        if validation.execution_status.is_finished() && !missing_terminal_evidence {
+            continue;
+        }
+        validation.execution_status = EvaluationExecutionStatus::Inconclusive;
+        validation.assertion_status = ValidationAssertionStatus::NotEvaluated;
+        validation.finished_at_ms = Some(now_ms());
+        validation.error = Some(if missing_terminal_evidence {
+            "validation finalization evidence is missing".to_owned()
+        } else {
+            "controller stopped before validation finalized".to_owned()
+        });
+        recovered.push(validation.clone());
+    }
+    recovered
 }
 
 fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>, RunError> {
@@ -2826,17 +2905,7 @@ fn load_drafts(root: &Path) -> Result<HashMap<String, Arc<PromotionDraftState>>,
             tracing::warn!(bundle = %entry.path().display(), "skipping evaluation draft with missing or mismatched revision source");
             continue;
         }
-        let mut recovered_validations = Vec::new();
-        for validation in &mut detail.validations {
-            if !validation.execution_status.is_finished() {
-                validation.execution_status = EvaluationExecutionStatus::Inconclusive;
-                validation.assertion_status = ValidationAssertionStatus::NotEvaluated;
-                validation.finished_at_ms = Some(now_ms());
-                validation.error =
-                    Some("controller stopped before validation finalized".to_owned());
-                recovered_validations.push(validation.clone());
-            }
-        }
+        let recovered_validations = recover_unfinalized_validations(&mut detail);
         let (sender, _) = broadcast::channel(128);
         let state = Arc::new(PromotionDraftState {
             detail: Mutex::new(detail),
@@ -3118,5 +3187,22 @@ mod tests {
                 .to_string()
                 .contains("capability recipe")
         );
+    }
+
+    #[test]
+    fn launch_identity_tracks_behavior_environment_without_fingerprinting_credentials() {
+        let mut launch = DriverLaunch::new("driver");
+        launch.env = vec![
+            ("ADAPTER_MODE".into(), "one".into()),
+            ("PROVIDER_TOKEN".into(), "credential-one".into()),
+        ];
+        let original = driver_launch_digest(&launch).unwrap();
+
+        launch.env[0].1 = "two".into();
+        assert_ne!(driver_launch_digest(&launch).unwrap(), original);
+
+        launch.env[0].1 = "one".into();
+        launch.env[1].1 = "credential-two".into();
+        assert_eq!(driver_launch_digest(&launch).unwrap(), original);
     }
 }

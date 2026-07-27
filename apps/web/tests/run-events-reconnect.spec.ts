@@ -96,6 +96,94 @@ test('run event streams reconnect and replay only events after the last delivere
   }
 });
 
+test('transient terminal events bypass durable sequence deduplication without advancing its cursor', async () => {
+  const nativeFetch = globalThis.fetch;
+  const running = {
+    sequence: 1,
+    atMs: 1,
+    type: 'evaluation-validation.status',
+    payload: { validationId: 'validation-1', status: 'running' }
+  } satisfies RunEvent;
+  const transientFinished = {
+    sequence: 1,
+    atMs: 2,
+    type: 'evaluation-validation.finished',
+    payload: {
+      validationId: 'validation-1',
+      executionStatus: 'inconclusive',
+      assertionStatus: 'not-evaluated',
+      durable: false
+    }
+  } satisfies RunEvent;
+  const durableFollowup = {
+    sequence: 2,
+    atMs: 3,
+    type: 'workbench.evaluation-library.changed',
+    payload: { draftId: 'draft-1', change: 'validation-finished' }
+  } satisfies RunEvent;
+  let streamRequests = 0;
+
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url,
+      'http://127.0.0.1'
+    );
+    if (url.pathname === '/api/session-token') {
+      return Response.json({ token: 'test-token' });
+    }
+    if (url.pathname === '/api/workbench/workspace-1/evaluation-drafts/draft-1/events') {
+      streamRequests += 1;
+      const events = streamRequests === 1
+        ? [running, transientFinished]
+        : [running, durableFollowup];
+      const encoder = new TextEncoder();
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const event of events) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          }
+          controller.close();
+        }
+      }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': 'boot-1'
+        }
+      });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  try {
+    const delivered: RunEvent[] = [];
+    let finish: (() => void) | undefined;
+    const receivedFollowup = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const controller = createRunClient().evaluationDraftEvents(
+      'workspace-1',
+      'draft-1',
+      (event) => {
+        delivered.push(event);
+        if (event.sequence === durableFollowup.sequence) finish?.();
+      }
+    );
+
+    await receivedFollowup;
+    controller.abort();
+
+    expect(delivered).toEqual([running, transientFinished, durableFollowup]);
+    expect(streamRequests).toBe(2);
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
 test('a new server epoch reconciles authoritative terminal history before resetting sequence delivery', async () => {
   const nativeFetch = globalThis.fetch;
   const initial = {

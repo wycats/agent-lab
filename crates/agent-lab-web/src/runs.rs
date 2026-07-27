@@ -719,6 +719,8 @@ struct ControllerInner {
     scenario_overrides: Mutex<HashMap<String, ScenarioManifest>>,
     workbench_grants: Mutex<HashMap<String, String>>,
     agent_sessions: Mutex<HashMap<String, Arc<AgentSessionState>>>,
+    #[cfg(test)]
+    fail_next_scenario_override_persist: AtomicBool,
 }
 
 struct ScenarioOverrideGuard<'a> {
@@ -1870,6 +1872,8 @@ impl RunController {
                 scenario_overrides: Mutex::new(HashMap::new()),
                 workbench_grants: Mutex::new(HashMap::new()),
                 agent_sessions: Mutex::new(agent_sessions),
+                #[cfg(test)]
+                fail_next_scenario_override_persist: AtomicBool::new(false),
             }),
         })
     }
@@ -3856,8 +3860,46 @@ impl RunController {
                     overrides: &self.inner.scenario_overrides,
                     run_id: prepared.id.clone(),
                 };
-                if let Ok(run_state) = self.state(&prepared.id) {
-                    apply_run_scenario_override(&run_state, scenario)?;
+                #[cfg(test)]
+                let override_result = if self
+                    .inner
+                    .fail_next_scenario_override_persist
+                    .swap(false, Ordering::AcqRel)
+                {
+                    Err(RunError::EvidencePersistence(
+                        "injected scenario override persistence failure".to_owned(),
+                    ))
+                } else {
+                    self.state(&prepared.id)
+                        .and_then(|run_state| apply_run_scenario_override(&run_state, scenario))
+                };
+                #[cfg(not(test))]
+                let override_result = self
+                    .state(&prepared.id)
+                    .and_then(|run_state| apply_run_scenario_override(&run_state, scenario));
+                if let Err(error) = override_result {
+                    drop(guard);
+                    drop(producer_lifecycle);
+                    let cleanup = self.cancel(&prepared.id);
+                    if state.evidence_quarantined.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let message = cleanup.map_or_else(
+                        |cleanup| format!("{error}; prepared arm cleanup also failed: {cleanup}"),
+                        |()| error.to_string(),
+                    );
+                    set_evaluation_arm(&state, index, Some(prepared.id.clone()), "failed")?;
+                    record_evaluation_event(
+                        &state,
+                        "evaluation.arm.finished",
+                        json!({
+                            "harnessId": harness_id,
+                            "runId": prepared.id,
+                            "status": "failed",
+                            "error": message,
+                        }),
+                    )?;
+                    continue;
                 }
                 Some(guard)
             } else {
@@ -8090,13 +8132,18 @@ fn apply_run_scenario_override(
     state: &RunState,
     scenario: &ScenarioManifest,
 ) -> Result<(), RunError> {
+    let previous = lock(&state.assembly).clone();
     {
         let mut assembly = lock(&state.assembly);
         assembly.question.clone_from(&scenario.prompt);
         assembly.limits = scenario.limits.clone();
         assembly.scenario.output.clone_from(&scenario.output);
     }
-    persist_assembly(state)
+    if let Err(error) = persist_assembly(state) {
+        *lock(&state.assembly) = previous;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn persist_selection(state: &RunState) -> Result<(), RunError> {
@@ -16558,6 +16605,7 @@ done
         let passing_validation_run_id = replacement_passing_attempt.run_id.clone().unwrap();
 
         controller.fail_next_validation_finalization_persist();
+        controller.fail_next_validation_fallback_persist();
         let (_, mut finalization_events) = controller
             .subscribe_evaluation_draft(&draft.summary.id)
             .unwrap();
@@ -16579,6 +16627,7 @@ done
         .await
         .expect("validation finalization failure should terminate the live event stream");
         assert_eq!(finalization_event.payload["durable"], false);
+        assert_eq!(finalization_event.payload["durableAttempt"], false);
         assert_eq!(
             finalization_event.payload["executionStatus"],
             "inconclusive"
@@ -16719,6 +16768,55 @@ done
         let definition_id = promoted.summary.definition_id.clone().unwrap();
         let definition = controller.evaluation_definition(&definition_id).unwrap();
         assert_eq!(definition.summary.revision_id, passing_revision_id);
+        controller
+            .inner
+            .fail_next_scenario_override_persist
+            .store(true, Ordering::Release);
+        let override_failure_evaluation = controller
+            .start_workbench_definition_evaluation(
+                &explore.id,
+                &definition_id,
+                StartDefinitionEvaluationRequest::default(),
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut exercised_override_run = false;
+        let override_failure_evaluation = loop {
+            let detail = controller
+                .get_evaluation(&override_failure_evaluation.id)
+                .unwrap();
+            if let Some(run_id) = detail.summary.arms[1].run_id.as_deref()
+                && !detail.summary.status.is_finished()
+                && !exercised_override_run
+            {
+                exercised_override_run = true;
+                exercise_catalog_capabilities(&controller, run_id).await;
+            }
+            if detail.summary.status.is_finished() {
+                break detail;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "definition evaluation did not continue after override persistence failed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            override_failure_evaluation.summary.status,
+            EvaluationStatus::Failed
+        );
+        assert_eq!(override_failure_evaluation.summary.arms[0].status, "failed");
+        assert_eq!(override_failure_evaluation.summary.arms[1].status, "passed");
+        assert!(
+            override_failure_evaluation
+                .summary
+                .arms
+                .iter()
+                .filter_map(|arm| arm.run_id.as_deref())
+                .all(|run_id| controller.get(run_id).unwrap().summary.status.is_finished())
+        );
+        assert!(lock(&controller.inner.scenario_overrides).is_empty());
         let renamed = controller
             .save_evaluation_draft(
                 &draft.summary.id,
@@ -16832,6 +16930,27 @@ done
             .close_agent_session(&explore.id, &session.id)
             .unwrap();
         wait_for_agent_session_closed(&controller, &explore.id, &session.id).await;
+        let unterminated_passing_validation_id =
+            format!("validation-unterminated-{}", random_suffix());
+        controller
+            .inject_stale_validation_manifest_for_recovery_test(
+                &draft.summary.id,
+                EvaluationValidationAttempt {
+                    id: unterminated_passing_validation_id.clone(),
+                    draft_id: draft.summary.id.clone(),
+                    revision_id: passing_revision_id.clone(),
+                    execution_status: EvaluationExecutionStatus::Complete,
+                    assertion_status: ValidationAssertionStatus::Passed,
+                    harness_id: "v0".to_owned(),
+                    model_profile_id: "test".to_owned(),
+                    run_id: Some(passing_validation_run_id.clone()),
+                    started_at_ms: now_ms(),
+                    finished_at_ms: Some(now_ms()),
+                    error: None,
+                    score: controller.get(&passing_validation_run_id).unwrap().score,
+                },
+            )
+            .unwrap();
         let uncommitted_definition_id = controller
             .inject_definition_publication_before_draft_commit_for_recovery_test(
                 &draft.summary.id,
@@ -16863,6 +16982,27 @@ done
                 .summary
                 .name,
             "Renamed catalog regression"
+        );
+        let recovered_unterminated = controller
+            .evaluation_draft(&draft.summary.id)
+            .unwrap()
+            .validations
+            .into_iter()
+            .find(|attempt| attempt.id == unterminated_passing_validation_id)
+            .unwrap();
+        assert_eq!(
+            recovered_unterminated.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            recovered_unterminated.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(
+            recovered_unterminated
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("validation finalization evidence is missing"))
         );
         let recovered_definition_id = controller
             .inject_definition_publication_after_draft_commit_for_recovery_test(
@@ -17001,7 +17141,7 @@ done
             RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
         let reopened_draft = reopened.evaluation_draft(&draft.summary.id).unwrap();
         assert_eq!(reopened_draft.revisions.len(), 4);
-        assert_eq!(reopened_draft.validations.len(), 8);
+        assert_eq!(reopened_draft.validations.len(), 9);
         let recovered_validation = reopened_draft
             .validations
             .iter()
@@ -17161,13 +17301,12 @@ done
                     let mut launch = promotion_fixture_launch();
                     launch.env.push((
                         "AGENT_LAB_PROMOTION_OUTCOME_FILE".into(),
-                        promotion_outcome.clone().into_os_string(),
+                        if id == captured_harness_id {
+                            promotion_outcome.with_extension("changed").into_os_string()
+                        } else {
+                            promotion_outcome.clone().into_os_string()
+                        },
                     ));
-                    if id == captured_harness_id {
-                        launch
-                            .env
-                            .push(("AGENT_LAB_ADAPTER_REVISION".into(), "drifted".into()));
-                    }
                     HarnessProfile {
                         id: id.to_owned(),
                         display_name: id.to_owned(),

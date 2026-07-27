@@ -417,42 +417,36 @@ Existing steel threads have demonstrated:
 - real v0 and Eve runs using the same model profile, prompt, capability
   revisions, workspace seed, and limits;
 - behavioral comparison that preserves native timelines, unavailable metrics,
-  workspace effects, and independently replayable arm evidence.
+  workspace effects, and independently replayable arm evidence;
+- manual evaluation drafts created from durable interactive turns;
+- immutable draft revisions with retained failed and passing validations;
+- explicit promotion of an exactly validated revision into the local
+  evaluation library; and
+- a promoted definition rerun through v0 and Eve and reopened after restart.
 
-The two-harness catalog evaluation is the first coherent run-and-review product
-loop. A builder can inspect the active assembly, explore its capabilities,
-start the same evaluation from Nushell or the browser, compare two real
-harnesses, and reopen the result from stored evidence.
+The manual catalog promotion is the first coherent end-to-end improvement
+loop. A builder can ask a real harness to act, create an evaluation from the
+resulting turn, deliberately observe and retain a failed replay, correct the
+draft, promote the passing revision, compare v0 and Eve without rewriting the
+task, and reopen every resource from stored evidence.
 
-It does not yet demonstrate the complete improvement loop. The catalog question
-is checked in rather than authored from an exploratory discovery, the product
-cannot promote observations into an editable evaluation, the real-model result
-is a single trial, and no harness change has yet been followed by a controlled
-rerun of the preserved evaluation.
+The demonstrated result remains one real-model observation. AI assistance has
+not yet proposed a draft, and no harness implementation change has yet been
+followed by a controlled rerun of the preserved evaluation.
 
 ## Next validation boundary
 
-Complete the missing transition from exploration to durable improvement through
-[RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md).
-Interactive harness-native sessions are now a demonstrated substrate: a builder
-can continue a session from Nushell, pass structured exploration results into a
-turn, preserve more than one session, and inspect durable answer, activity,
-progress, and workspace evidence through the browser and shell.
+Add attributable AI assistance to the demonstrated manual path in
+[RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md). A
+separate read-only `ProposalSession` should recommend a meaningful source span,
+standalone task, and reviewed evaluator parameters while producing the same
+editable draft resource the builder can already create manually. Its advice,
+model, prompt contract, source references, and lifecycle must remain explicit.
 
-The remaining boundary begins with a meaningful span of those turns and
-produces an editable evaluation. The proposal must capture its starting state,
-capabilities, task, assertions, measurements, limits, and provenance without
-baking the source harness or model into the portable definition.
-
-The builder then reviews the same draft through Nushell and the browser,
-replays it from the captured state, keeps failed drafts as editable evidence,
-and explicitly saves a passing revision into the local evaluation library. A
-passing replay means reproduced once, not a general behavioral claim.
-
-After this product-flow boundary exists, live code-server diagnostics remain
-the first richer capability experiment. They should use the completed
-promotion loop to test whether settled semantic diagnostics improve repair
-behavior while preserving correctness.
+After that assistance layer, live code-server diagnostics remain the first
+richer capability experiment. They should use the completed promotion loop to
+test whether settled semantic diagnostics improve repair behavior while
+preserving correctness.
 
 ## Open questions
 

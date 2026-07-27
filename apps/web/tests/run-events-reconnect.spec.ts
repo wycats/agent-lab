@@ -96,6 +96,94 @@ test('run event streams reconnect and replay only events after the last delivere
   }
 });
 
+test('transient terminal events bypass durable sequence deduplication without advancing its cursor', async () => {
+  const nativeFetch = globalThis.fetch;
+  const running = {
+    sequence: 1,
+    atMs: 1,
+    type: 'evaluation-validation.status',
+    payload: { validationId: 'validation-1', status: 'running' }
+  } satisfies RunEvent;
+  const transientFinished = {
+    sequence: 1,
+    atMs: 2,
+    type: 'evaluation-validation.finished',
+    payload: {
+      validationId: 'validation-1',
+      executionStatus: 'inconclusive',
+      assertionStatus: 'not-evaluated',
+      durable: false
+    }
+  } satisfies RunEvent;
+  const durableFollowup = {
+    sequence: 2,
+    atMs: 3,
+    type: 'workbench.evaluation-library.changed',
+    payload: { draftId: 'draft-1', change: 'validation-finished' }
+  } satisfies RunEvent;
+  let streamRequests = 0;
+
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url,
+      'http://127.0.0.1'
+    );
+    if (url.pathname === '/api/session-token') {
+      return Response.json({ token: 'test-token' });
+    }
+    if (url.pathname === '/api/workbench/workspace-1/evaluation-drafts/draft-1/events') {
+      streamRequests += 1;
+      const events = streamRequests === 1
+        ? [running, transientFinished]
+        : [running, durableFollowup];
+      const encoder = new TextEncoder();
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const event of events) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          }
+          controller.close();
+        }
+      }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'X-Agent-Lab-Event-Stream-Epoch': 'boot-1'
+        }
+      });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  try {
+    const delivered: RunEvent[] = [];
+    let finish: (() => void) | undefined;
+    const receivedFollowup = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const controller = createRunClient().evaluationDraftEvents(
+      'workspace-1',
+      'draft-1',
+      (event) => {
+        delivered.push(event);
+        if (event.sequence === durableFollowup.sequence) finish?.();
+      }
+    );
+
+    await receivedFollowup;
+    controller.abort();
+
+    expect(delivered).toEqual([running, transientFinished, durableFollowup]);
+    expect(streamRequests).toBe(2);
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
 test('a new server epoch reconciles authoritative terminal history before resetting sequence delivery', async () => {
   const nativeFetch = globalThis.fetch;
   const initial = {
@@ -238,6 +326,95 @@ test('a new server epoch reconciles authoritative terminal history before resett
       'reset:2',
       'detail',
       'reconciled'
+    ]);
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+test('successful accepted responses preserve their JSON resource', async () => {
+  const nativeFetch = globalThis.fetch;
+  const attempt = {
+    id: 'validation-1',
+    draftId: 'draft-1',
+    revisionId: 'revision-1',
+    executionStatus: 'queued',
+    assertionStatus: 'not-evaluated',
+    harnessId: 'v0',
+    modelProfileId: 'fixture',
+    startedAtMs: 1
+  } as const;
+
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url,
+      'http://127.0.0.1'
+    );
+    if (url.pathname === '/api/session-token') {
+      return Response.json({ token: 'test-token' });
+    }
+    if (
+      url.pathname ===
+      '/api/workbench/workspace-1/evaluation-drafts/draft-1/validate'
+    ) {
+      expect(init?.method).toBe('POST');
+      return Response.json(attempt, { status: 202 });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  try {
+    await expect(
+      createRunClient().validateEvaluationDraft('workspace-1', 'draft-1', 'revision-1')
+    ).resolves.toEqual(attempt);
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+});
+
+test('evaluation library reads remain global when the active workspace changes', async () => {
+  const nativeFetch = globalThis.fetch;
+  const requested: string[] = [];
+
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url,
+      'http://127.0.0.1'
+    );
+    if (url.pathname === '/api/session-token') {
+      return Response.json({ token: 'test-token' });
+    }
+    requested.push(url.pathname);
+    if (url.pathname === '/api/evaluation-drafts') return Response.json([]);
+    if (url.pathname === '/api/evaluation-drafts/draft-1') {
+      return Response.json({ summary: { id: 'draft-1' } });
+    }
+    if (url.pathname === '/api/evaluation-definitions') return Response.json([]);
+    if (url.pathname === '/api/evaluation-definitions/definition-1') {
+      return Response.json({ summary: { id: 'definition-1' } });
+    }
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+
+  try {
+    const client = createRunClient();
+    await client.evaluationLibraryDrafts();
+    await client.evaluationLibraryDraft('draft-1');
+    await client.evaluationLibraryDefinitions();
+    await client.evaluationLibraryDefinition('definition-1');
+    expect(requested).toEqual([
+      '/api/evaluation-drafts',
+      '/api/evaluation-drafts/draft-1',
+      '/api/evaluation-definitions',
+      '/api/evaluation-definitions/definition-1'
     ]);
   } finally {
     globalThis.fetch = nativeFetch;

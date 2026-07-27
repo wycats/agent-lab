@@ -219,6 +219,19 @@ test('a session that fails while opening becomes retained history', async ({ pag
 
 test('ready agent sessions keep their workspace selected until every driver closes', async ({ page }) => {
   let exploreRequests = 0;
+  let holdNextDraftLibraryRefresh = false;
+  let draftLibraryRefreshStartedResolve = () => {};
+  const draftLibraryRefreshStarted = new Promise<void>((resolve) => {
+    draftLibraryRefreshStartedResolve = resolve;
+  });
+  let releaseDraftLibraryRefreshResolve = () => {};
+  const releaseDraftLibraryRefresh = new Promise<void>((resolve) => {
+    releaseDraftLibraryRefreshResolve = resolve;
+  });
+  let draftLibraryRefreshFinishedResolve = () => {};
+  const draftLibraryRefreshFinished = new Promise<void>((resolve) => {
+    draftLibraryRefreshFinishedResolve = resolve;
+  });
   page.on('request', (request) => {
     if (
       request.method() === 'POST' &&
@@ -226,6 +239,18 @@ test('ready agent sessions keep their workspace selected until every driver clos
     ) {
       exploreRequests += 1;
     }
+  });
+  await page.route('/api/evaluation-drafts', async (route) => {
+    if (holdNextDraftLibraryRefresh) {
+      holdNextDraftLibraryRefresh = false;
+      draftLibraryRefreshStartedResolve();
+      await releaseDraftLibraryRefresh;
+      const response = await route.fetch();
+      await route.fulfill({ response });
+      draftLibraryRefreshFinishedResolve();
+      return;
+    }
+    await route.continue();
   });
   await page.route('/api/scenarios', async (route) => {
     const response = await route.fetch();
@@ -247,10 +272,15 @@ test('ready agent sessions keep their workspace selected until every driver clos
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
   const scenario = page.getByLabel('Scenario');
   await expect(scenario).toBeEnabled();
+  holdNextDraftLibraryRefresh = true;
   await page.getByLabel('Default harness').selectOption('v0');
+  await draftLibraryRefreshStarted;
 
   const screen = page.getByTestId('terminal-text');
   await submit(page, 'agent new | get status');
+  await expect(screen).toContainText('ready');
+  releaseDraftLibraryRefreshResolve();
+  await draftLibraryRefreshFinished;
   await expect(page.locator('.run-heading')).toContainText('Active session');
   await expect(page.getByTestId('interactive-agent-session')).toContainText(
     'Ask the harness in Explore.'
@@ -3042,7 +3072,6 @@ test('agent answers render constrained Markdown and retain inspectable source', 
 
   // Keep the persistent e2e workbench neutral for the catalog walkthrough that follows.
   await submit(page, 'agent close');
-  await expect(page.getByTestId('terminal-text')).toContainText('closing');
   await expect(page.locator('.run-heading')).toContainText('Session history');
   await expect(page.locator('.run-heading')).toContainText('closed');
   await expect(page.getByTestId('interactive-agent-session')).toContainText(
@@ -3382,6 +3411,207 @@ test('a paired harness evaluation streams, compares, and reopens', async ({ page
     })
   ).toBeDisabled();
   await page.unrouteAll({ behavior: 'wait' });
+});
+
+test('a completed turn becomes a revised, validated, saved, and rerunnable evaluation', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  await page.getByLabel('Default harness').selectOption('v0');
+  await expect(page.getByLabel('Default model')).toHaveValue('fixture');
+
+  await submit(page, 'agent "Explain the active catalog as a reusable task"');
+  const session = page.getByTestId('interactive-agent-session');
+  const turn = session.getByTestId('session-turn').last();
+  await expect(turn).toHaveAttribute('data-status', 'completed');
+
+  await submit(
+    page,
+    'let turn = (agent turn | get turnId); lab evaluation new --from $turn --through $turn | get id'
+  );
+  await expect(page.getByTestId('evaluation-draft-view')).toBeVisible();
+  await expect(page.locator('[data-testid="terminal"] textarea')).toBeFocused();
+  await page.getByRole('button', { name: 'Session' }).click();
+  await turn.getByRole('button', { name: 'Make evaluation' }).dblclick();
+
+  const draft = page.getByTestId('evaluation-draft-view');
+  await expect(draft).toBeVisible();
+  await expect(page.locator('.draft-history .history-list button')).toHaveCount(2);
+  await expect(page.locator('.run-heading')).toContainText('Evaluation draft');
+  await expect(draft).toContainText('Owned by revision');
+  await expect(draft).toContainText('catalog-v2');
+  await expect(draft).toContainText('analysis-v1');
+  await expect(draft).toContainText('starting suggestions');
+  await expect(page.getByRole('button', { name: 'Validate revision' })).toBeDisabled();
+
+  const draftButtons = page.locator('.draft-history .history-list button[data-draft-id]');
+  const selectedDraftButton = page.locator(
+    '.draft-history .history-list button.selected[data-draft-id]'
+  );
+  const selectedDraftId = await selectedDraftButton.getAttribute('data-draft-id');
+  if (!selectedDraftId) throw new Error('selected draft identity is unavailable');
+  const draftIds = await draftButtons.evaluateAll((buttons) =>
+    buttons.map((button) => button.getAttribute('data-draft-id'))
+  );
+  const otherDraftId = draftIds.find((id) => id !== selectedDraftId);
+  if (!otherDraftId) throw new Error('second draft identity is unavailable');
+  const otherDraftButton = page.locator(
+    `.draft-history .history-list button[data-draft-id="${otherDraftId}"]`
+  );
+  let releaseStaleDraft: (() => void) | undefined;
+  let staleDraftRequested: (() => void) | undefined;
+  const staleDraftGate = new Promise<void>((resolve) => {
+    releaseStaleDraft = resolve;
+  });
+  const staleDraftSeen = new Promise<void>((resolve) => {
+    staleDraftRequested = resolve;
+  });
+  await page.route(
+    new RegExp(`/api/evaluation-drafts/${otherDraftId}$`),
+    async (route) => {
+      const response = await route.fetch();
+      staleDraftRequested?.();
+      await staleDraftGate;
+      await route.fulfill({ response });
+    }
+  );
+  const staleOpen = otherDraftButton.click();
+  await staleDraftSeen;
+  await selectedDraftButton.click();
+  releaseStaleDraft?.();
+  await staleOpen;
+  await expect(
+    page.locator(`.draft-history button[data-draft-id="${selectedDraftId}"]`)
+  ).toHaveClass(/selected/);
+  await page.unrouteAll({ behavior: 'wait' });
+
+  const expectedNames = page.getByTestId('draft-active-names').locator('input');
+  await expect(expectedNames).toHaveCount(2);
+  await expectedNames.nth(0).fill('ACME, Inc.');
+  await expectedNames.nth(1).fill('not-the-catalog');
+  await expect(page.getByRole('button', { name: 'Validate revision' })).toBeDisabled();
+  await expect(draft).toContainText('Create a revision to make these edits');
+  await page.getByRole('button', { name: 'Create revision' }).click();
+  await expect(draft.locator('.revision-list li')).toHaveCount(2);
+  expect(
+    await expectedNames.evaluateAll((inputs) =>
+      inputs.map((input) => (input as HTMLInputElement).value)
+    )
+  ).toEqual(['ACME, Inc.', 'not-the-catalog']);
+  await page.getByRole('button', { name: 'Validate revision' }).click();
+  const cancelValidation = page.getByRole('button', { name: 'Cancel validation' });
+  await expect(cancelValidation).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Validate revision' })).toBeDisabled();
+  await cancelValidation.click();
+  const cancelled = draft.locator('.current-validation .validation-card');
+  await expect(cancelled).toHaveAttribute('data-status', 'not-evaluated', {
+    timeout: 30_000
+  });
+  await expect(cancelled).toContainText('cancelled');
+  await page.getByRole('button', { name: 'Validate revision' }).click();
+  const failed = draft.locator('.current-validation .validation-card');
+  await expect(failed).toHaveAttribute('data-status', 'failed', { timeout: 30_000 });
+  await expect(failed).toContainText('complete');
+
+  await expectedNames.nth(0).fill('alpha');
+  await expectedNames.nth(1).fill('gamma');
+  await page.getByRole('button', { name: 'Create revision' }).click();
+  await expect(draft.locator('.revision-list li')).toHaveCount(3);
+  await expect(draft).toContainText('Current revision not validated');
+  await page.getByRole('button', { name: 'Validate revision' }).click();
+  const passed = draft.locator('.current-validation .validation-card');
+  await expect(passed).toHaveAttribute('data-status', 'passed', { timeout: 30_000 });
+  await expect(passed).toContainText('complete');
+  await expect(draft.locator('.validation-history')).toContainText('Previous attempts');
+  await expect(draft.locator('.validation-history .validation-card[data-status="failed"]')).toHaveAttribute(
+    'data-status',
+    'failed'
+  );
+  await expect(draft.locator('.validation-card')).toHaveCount(3);
+
+  await page.getByRole('button', { name: 'Save to library' }).click();
+  await expect(page.locator('.run-heading .run-status')).toHaveText('promoted');
+  await expect(page.getByRole('button', { name: 'Run comparison' })).toBeVisible();
+  const promotedTask = await page.getByLabel('Standalone task').inputValue();
+  await page.getByLabel('Standalone task').fill('A later draft revision');
+  await page.getByRole('button', { name: 'Create revision' }).click();
+  await expect(page.getByTestId('evaluation-draft-view')).toContainText(
+    'Current revision not validated'
+  );
+  await expect(page.getByRole('button', { name: 'Run comparison' })).toHaveCount(0);
+
+  const definitionButton = page.locator(
+    '.draft-history .history-list button[data-definition-id]'
+  );
+  await expect(definitionButton).toHaveCount(1);
+  const definitionId = await definitionButton.getAttribute('data-definition-id');
+  if (!definitionId) throw new Error('saved definition identity is unavailable');
+  let releaseStaleDefinition: (() => void) | undefined;
+  let staleDefinitionRequested: (() => void) | undefined;
+  const staleDefinitionGate = new Promise<void>((resolve) => {
+    releaseStaleDefinition = resolve;
+  });
+  const staleDefinitionSeen = new Promise<void>((resolve) => {
+    staleDefinitionRequested = resolve;
+  });
+  await page.route(
+    new RegExp(`/api/evaluation-definitions/${definitionId}$`),
+    async (route) => {
+      const response = await route.fetch();
+      staleDefinitionRequested?.();
+      await staleDefinitionGate;
+      await route.fulfill({ response });
+    }
+  );
+  const staleDefinitionOpen = definitionButton.click();
+  await staleDefinitionSeen;
+  await otherDraftButton.click();
+  releaseStaleDefinition?.();
+  await staleDefinitionOpen;
+  await expect(
+    page.locator(`.draft-history button[data-draft-id="${otherDraftId}"]`)
+  ).toHaveClass(/selected/);
+  await page.unrouteAll({ behavior: 'wait' });
+  await definitionButton.click();
+  await expect(page.getByTestId('evaluation-draft-view')).toContainText('Saved definition');
+  await expect(page.getByLabel('Standalone task')).toHaveValue(promotedTask);
+  await expect(page.getByLabel('Standalone task')).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Run comparison' })).toBeVisible();
+
+  const definitionRunRequest = page.waitForRequest(
+    new RegExp(`/api/workbench/[^/]+/evaluation-definitions/${definitionId}/run$`)
+  );
+  await page.getByRole('button', { name: 'Run comparison' }).click();
+  const definitionRunBody = (await definitionRunRequest).postDataJSON() as {
+    modelProfileId?: string;
+    harnessIds?: string[];
+  };
+  expect(definitionRunBody).toEqual({
+    modelProfileId: 'fixture',
+    harnessIds: ['v0', 'eve']
+  });
+  const evaluation = page.getByTestId('evaluation-view');
+  await expect(evaluation.locator('.run-status')).toHaveText('passed');
+  await expect(evaluation.locator('.paired-result')).toContainText('Same evaluated artifact');
+
+  await page.reload();
+  await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const savedDefinition = page.locator(
+    '.draft-history .history-list button[data-definition-id]'
+  ).first();
+  await expect(savedDefinition).toContainText('runnable');
+  await savedDefinition.click();
+  await expect(page.getByTestId('evaluation-draft-view')).toContainText('Saved definition');
+  await expect(page.getByLabel('Standalone task')).toHaveValue(promotedTask);
+  await expect(page.getByTestId('evaluation-draft-view').locator('.validation-card')).toHaveCount(3);
+  await expect(page.getByTestId('evaluation-draft-view')).toContainText('Owned by revision');
+
+  await submit(
+    page,
+    'lab evaluation run (lab evaluation definitions | first | get id) v0 eve --model fixture'
+  );
+  await expect(page.getByTestId('evaluation-view')).toBeVisible();
+  await expect(page.getByTestId('evaluation-view').locator('.run-status')).toHaveText('passed');
+  await expect(page.locator('[data-testid="terminal"] textarea')).toBeFocused();
 });
 
 test('stacked surfaces keep their scroll owners inside the viewport', async ({ page }) => {

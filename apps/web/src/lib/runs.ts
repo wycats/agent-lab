@@ -271,11 +271,128 @@ export interface EvaluationSummary {
   modelProfileId: string;
   sourceWorkspaceId: string;
   sourceRevision: string;
+  definitionId?: string;
+  definitionRevisionId?: string;
   harnessIds: string[];
   arms: Array<{ harnessId: string; runId?: string; status: string }>;
   status: EvaluationStatus;
   startedAtMs: number;
   finishedAtMs?: number;
+}
+
+export interface ScenarioLimits {
+  maxDurationMs: number;
+  maxCommandCount: number;
+  maxOrchestratorInvocations: number;
+  maxToolInvocations: number;
+}
+
+export interface CatalogEvaluatorParameters {
+  activeNames: string[];
+  totalScore: number;
+  requiredCapabilitySources: string[];
+  outputPath: string;
+  requireSchema: boolean;
+}
+
+export interface EvaluationEvaluator {
+  id: string;
+  version: number;
+  parameters: CatalogEvaluatorParameters;
+}
+
+export interface EvaluationSourceProvenance {
+  workspaceId: string;
+  sessionId: string;
+  turnIds: string[];
+  sourceRevision: string;
+  sourceDigest: string;
+  capabilityRevisions: Record<string, string>;
+  sourceEventSequences: number[];
+  scenarioId: string;
+  harnessId: string;
+  modelProfileId: string;
+  modelId: string;
+  driver?: {
+    descriptor: {
+      name: string;
+      version: string;
+      revision?: string;
+      features: string[];
+    };
+    launchDigest: string;
+  };
+}
+
+export interface EvaluationRevision {
+  schemaVersion: number;
+  id: string;
+  draftId: string;
+  previousRevisionId?: string;
+  createdAtMs: number;
+  task: string;
+  source: EvaluationSourceProvenance;
+  limits: ScenarioLimits;
+  evaluator: EvaluationEvaluator;
+  measurements: string[];
+  blockingIssues: string[];
+}
+
+export type EvaluationExecutionStatus =
+  | 'queued'
+  | 'running'
+  | 'complete'
+  | 'inconclusive'
+  | 'cancelled'
+  | 'intervened';
+export type ValidationAssertionStatus = 'passed' | 'failed' | 'not-evaluated';
+
+export interface EvaluationValidationAttempt {
+  id: string;
+  draftId: string;
+  revisionId: string;
+  executionStatus: EvaluationExecutionStatus;
+  assertionStatus: ValidationAssertionStatus;
+  harnessId: string;
+  modelProfileId: string;
+  runId?: string;
+  startedAtMs: number;
+  finishedAtMs?: number;
+  error?: string;
+  score?: unknown;
+}
+
+export interface EvaluationDraftSummary {
+  id: string;
+  workspaceId: string;
+  name: string;
+  currentRevisionId: string;
+  status: string;
+  saved: boolean;
+  definitionId?: string;
+  promotedRevisionId?: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface EvaluationDraftDetail {
+  summary: EvaluationDraftSummary;
+  revisions: EvaluationRevision[];
+  validations: EvaluationValidationAttempt[];
+  events: RunEvent[];
+}
+
+export interface EvaluationDefinitionSummary {
+  id: string;
+  name: string;
+  draftId: string;
+  revisionId: string;
+  createdAtMs: number;
+}
+
+export interface EvaluationDefinitionDetail {
+  summary: EvaluationDefinitionSummary;
+  revision: EvaluationRevision;
 }
 
 export interface EvaluationDetail {
@@ -418,6 +535,48 @@ export interface RunClient {
     onEvent: (event: RunEvent) => void | Promise<void>,
     onReset?: (reset: RunEventStreamReset) => number | Promise<number>
   ): AbortController;
+  evaluationLibraryDrafts(): Promise<EvaluationDraftSummary[]>;
+  createEvaluationDraft(
+    workspaceId: string,
+    input: { sessionId?: string; fromTurnId: string; throughTurnId: string }
+  ): Promise<EvaluationDraftDetail>;
+  evaluationLibraryDraft(draftId: string): Promise<EvaluationDraftDetail>;
+  updateEvaluationDraft(
+    workspaceId: string,
+    draftId: string,
+    input: {
+      baseRevisionId: string;
+      name?: string;
+      revision: Partial<Pick<EvaluationRevision, 'task' | 'limits' | 'evaluator' | 'measurements'>>;
+    }
+  ): Promise<EvaluationDraftDetail>;
+  validateEvaluationDraft(
+    workspaceId: string,
+    draftId: string,
+    revisionId?: string
+  ): Promise<EvaluationValidationAttempt>;
+  cancelEvaluationValidation(
+    workspaceId: string,
+    draftId: string,
+    validationId: string
+  ): Promise<void>;
+  saveEvaluationDraft(
+    workspaceId: string,
+    draftId: string,
+    input?: { revisionId?: string; name?: string }
+  ): Promise<EvaluationDraftDetail>;
+  evaluationDraftEvents(
+    workspaceId: string,
+    draftId: string,
+    onEvent: (event: RunEvent) => void | Promise<void>
+  ): AbortController;
+  evaluationLibraryDefinitions(): Promise<EvaluationDefinitionSummary[]>;
+  evaluationLibraryDefinition(definitionId: string): Promise<EvaluationDefinitionDetail>;
+  runEvaluationDefinition(
+    workspaceId: string,
+    definitionId: string,
+    input?: { modelProfileId?: string; harnessIds?: string[] }
+  ): Promise<EvaluationSummary>;
 }
 
 export interface RunEventStreamReset {
@@ -452,8 +611,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     }
     throw new Error(message);
   }
-  if (response.status === 202 || response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  if (response.status === 204) return undefined as T;
+  const body = await response.text();
+  if (body.length === 0) return undefined as T;
+  return JSON.parse(body) as T;
 }
 
 async function streamEvents(
@@ -553,9 +714,16 @@ function reconnectingRunEvents(
           path,
           controller.signal,
           async (event) => {
-            if (event.sequence <= lastDeliveredSequence) return;
+            const transientFinalization = (
+              event.type === 'evaluation-validation.finished' &&
+              typeof event.payload === 'object' &&
+              event.payload !== null &&
+              'durable' in event.payload &&
+              event.payload.durable === false
+            );
+            if (!transientFinalization && event.sequence <= lastDeliveredSequence) return;
             await onEvent(event);
-            lastDeliveredSequence = event.sequence;
+            if (!transientFinalization) lastDeliveredSequence = event.sequence;
           },
           async (response) => {
             connectedAtMs = Date.now();
@@ -668,6 +836,49 @@ export function createRunClient(): RunClient {
     agentSessionEvents(workspaceId, sessionId, onEvent, onReset) {
       const path = `/api/workbench/${encodeURIComponent(workspaceId)}/agent-sessions/${encodeURIComponent(sessionId)}/events`;
       return reconnectingRunEvents(path, onEvent, onReset);
-    }
+    },
+    // Library reads are intentionally process-scoped so saved work remains
+    // inspectable while the builder explores another scenario. Mutations and
+    // event streams remain authorized through their owning workspace.
+    evaluationLibraryDrafts: () => request('/api/evaluation-drafts'),
+    createEvaluationDraft: (workspaceId, input) =>
+      request(`/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts`, {
+        method: 'POST',
+        body: JSON.stringify(input)
+      }),
+    evaluationLibraryDraft: (draftId) =>
+      request(`/api/evaluation-drafts/${encodeURIComponent(draftId)}`),
+    updateEvaluationDraft: (workspaceId, draftId, input) =>
+      request(
+        `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts/${encodeURIComponent(draftId)}`,
+        { method: 'PATCH', body: JSON.stringify(input) }
+      ),
+    validateEvaluationDraft: (workspaceId, draftId, revisionId) =>
+      request(
+        `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts/${encodeURIComponent(draftId)}/validate`,
+        { method: 'POST', body: JSON.stringify({ revisionId }) }
+      ),
+    cancelEvaluationValidation: (workspaceId, draftId, validationId) =>
+      request(
+        `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts/${encodeURIComponent(draftId)}/validations/${encodeURIComponent(validationId)}/cancel`,
+        { method: 'POST' }
+      ),
+    saveEvaluationDraft: (workspaceId, draftId, input = {}) =>
+      request(
+        `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts/${encodeURIComponent(draftId)}/save`,
+        { method: 'POST', body: JSON.stringify(input) }
+      ),
+    evaluationDraftEvents(workspaceId, draftId, onEvent) {
+      const path = `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-drafts/${encodeURIComponent(draftId)}/events`;
+      return reconnectingRunEvents(path, onEvent);
+    },
+    evaluationLibraryDefinitions: () => request('/api/evaluation-definitions'),
+    evaluationLibraryDefinition: (definitionId) =>
+      request(`/api/evaluation-definitions/${encodeURIComponent(definitionId)}`),
+    runEvaluationDefinition: (workspaceId, definitionId, input = {}) =>
+      request(
+        `/api/workbench/${encodeURIComponent(workspaceId)}/evaluation-definitions/${encodeURIComponent(definitionId)}/run`,
+        { method: 'POST', body: JSON.stringify(input) }
+      )
   };
 }

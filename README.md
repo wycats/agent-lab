@@ -36,13 +36,15 @@ being copied here.
 ## Status
 
 The embedded Nushell/MCP, browser feedback, neutral external-driver, catalog,
-shared two-harness workbench, and persistent interactive-agent session threads
-are implemented. A builder can continue a real harness-native session from
-Nushell, inspect its attributable turns in the browser, capture one Explore
-revision, run two configured harnesses sequentially, and reopen the paired
-evidence after restart. Names and contracts remain provisional as later steel
-threads produce evidence. Evaluation drafting, validation, saving, and rerunning
-from an exploratory turn remain the proposed next boundary in RFC 0004.
+shared two-harness workbench, persistent interactive-agent session, and manual
+evaluation-promotion threads are implemented. A builder can continue a real
+harness-native session from Nushell, inspect its attributable turns in the
+browser, create and revise an evaluation from a turn, retain a failed
+validation, promote a passing revision, run the definition through two
+configured harnesses, and reopen the evidence after restart. Names and
+contracts remain provisional as later steel threads produce evidence.
+Attributable AI-assisted proposal drafting is the next product boundary in RFC
+0004.
 
 ## Browser workbench
 
@@ -132,6 +134,32 @@ Use `agent new`, `agent sessions`, `agent switch`, `agent cancel`, and
 turn input, native activity, cancellation, and workspace effects are retained as
 local evidence; server restart preserves the history and marks any live native
 process as interrupted.
+
+## Promote a turn into an evaluation
+
+A completed turn can become an editable local evaluation without rewriting its
+starting state:
+
+```nu
+let draft = (lab evaluation new --from <turn-id> --through <turn-id>)
+lab evaluation draft $draft.id
+let validation = ($draft | lab evaluation validate)
+let saved = (lab evaluation save $draft.id --name "Catalog result")
+lab evaluation run $saved.definitionId v0 eve --model haiku-4-5
+```
+
+The browser **Draft** view edits the same controller-owned resource as
+`lab evaluation draft`. Each material edit creates an immutable revision.
+Validation replays that exact revision from its captured pre-turn workspace;
+complete assertion failures remain in history beside later passing attempts.
+Saving promotes only the passing revision selected by the builder. Definitions
+remain portable across compatible harness/model selections, while the source
+harness and model remain provenance and validation defaults.
+
+`lab evaluation drafts` and `lab evaluation definitions` list the local
+library. Bare `lab evaluation` continues to inspect paired evaluation attempts.
+All drafts, revisions, validations, definitions, and paired runs reopen from
+durable evidence after restart.
 
 ## Model access
 

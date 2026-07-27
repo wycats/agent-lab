@@ -8,6 +8,7 @@ implementation and record the result afterward.
 - [0002: Neutral external agent driver and evidence](0002-external-agent-driver.md)
 - [0003: Catalog feedback loop](0003-catalog-feedback-loop.md)
 - [0004: Two-harness workbench](0004-two-harness-workbench.md)
+- [0005: Manual evaluation promotion](0005-manual-evaluation-promotion.md)
 
 ## Feedback loops
 

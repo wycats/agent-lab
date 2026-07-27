@@ -46,6 +46,14 @@ use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, sync::broadcast};
 use tokio_util::sync::CancellationToken;
 
+mod promotion;
+pub use promotion::{
+    CreateEvaluationDraftRequest, EvaluationDefinitionDetail, EvaluationDefinitionSummary,
+    EvaluationDraftDetail, EvaluationDraftSummary, EvaluationExecutionStatus, EvaluationRevision,
+    EvaluationRevisionUpdate, EvaluationValidationAttempt, SaveEvaluationDraftRequest,
+    StartDefinitionEvaluationRequest, UpdateEvaluationDraftRequest, ValidationAssertionStatus,
+};
+
 const DRIVER_POLL: Duration = Duration::from_millis(250);
 // The extracted v0 adapter loads the production agent module graph before it
 // can announce readiness. A cold TypeScript process can take over a minute on
@@ -82,7 +90,7 @@ pub struct ScenarioManifest {
     pub assertions: CatalogAssertions,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[allow(clippy::struct_field_names)]
 pub struct ScenarioLimits {
@@ -97,6 +105,21 @@ pub struct ScenarioLimits {
 pub struct CatalogAssertions {
     pub active_names: Vec<String>,
     pub total_score: i64,
+    #[serde(default = "default_catalog_required_capability_sources")]
+    pub required_capability_sources: Vec<String>,
+    #[serde(default = "default_true")]
+    pub require_schema: bool,
+}
+
+fn default_catalog_required_capability_sources() -> Vec<String> {
+    CATALOG_REQUIRED_SOURCES
+        .iter()
+        .map(|source| (*source).to_owned())
+        .collect()
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -273,6 +296,16 @@ pub enum AgentTurnStatus {
     Intervened,
     Failed,
     Cancelled,
+}
+
+impl AgentTurnStatus {
+    #[must_use]
+    pub fn is_finished(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Intervened | Self::Failed | Self::Cancelled
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -468,6 +501,10 @@ pub struct EvaluationSummary {
     pub model_profile_id: String,
     pub source_workspace_id: String,
     pub source_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_revision_id: Option<String>,
     pub harness_ids: Vec<String>,
     pub arms: Vec<EvaluationArmSummary>,
     pub status: EvaluationStatus,
@@ -615,7 +652,7 @@ pub struct WorkspaceAssembly {
     pub change_tracking: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityAssembly {
     pub id: String,
@@ -678,8 +715,23 @@ struct ControllerInner {
     scenario_transition_lock: tokio::sync::Mutex<()>,
     evaluations_dir: PathBuf,
     evaluations: Arc<Mutex<HashMap<String, Arc<EvaluationState>>>>,
+    promotion: Arc<promotion::PromotionStore>,
+    scenario_overrides: Mutex<HashMap<String, ScenarioManifest>>,
     workbench_grants: Mutex<HashMap<String, String>>,
     agent_sessions: Mutex<HashMap<String, Arc<AgentSessionState>>>,
+    #[cfg(test)]
+    fail_next_scenario_override_persist: AtomicBool,
+}
+
+struct ScenarioOverrideGuard<'a> {
+    overrides: &'a Mutex<HashMap<String, ScenarioManifest>>,
+    run_id: String,
+}
+
+impl Drop for ScenarioOverrideGuard<'_> {
+    fn drop(&mut self) {
+        lock(self.overrides).remove(&self.run_id);
+    }
 }
 
 impl Drop for ControllerInner {
@@ -739,7 +791,6 @@ struct RunState {
     agent_session_directories: AgentSessionDirectoryAnchor,
     workspace: PathBuf,
     workspace_evidence_root: WorkspaceEvidenceRoot,
-    output: PathBuf,
     initial_snapshot: Option<BTreeMap<String, Vec<u8>>>,
     capabilities: Mutex<Vec<CapabilityEndpoint>>,
     secret_values: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -811,6 +862,8 @@ struct EvaluationState {
     bundle_directories: Arc<AgentSessionDirectoryAnchor>,
     evidence_quarantined: AtomicBool,
     replay_failed: bool,
+    scenario_override: Option<ScenarioManifest>,
+    capability_recipe: Option<Vec<CapabilityAssembly>>,
 }
 
 struct PendingEvaluationBundle {
@@ -1740,6 +1793,7 @@ impl RunController {
         let evaluations_dir = data_dir.join("evaluations");
         fs::create_dir_all(&evaluations_dir)?;
         let evaluations_dir = fs::canonicalize(evaluations_dir)?;
+        let promotion = Arc::new(promotion::PromotionStore::load(&data_dir)?);
         let scenarios = load_scenarios(&scenarios_dir)?;
         if scenarios.is_empty() {
             return Err(RunError::InvalidScenario(
@@ -1814,8 +1868,12 @@ impl RunController {
                 scenario_transition_lock: tokio::sync::Mutex::new(()),
                 evaluations_dir,
                 evaluations: Arc::new(Mutex::new(evaluations)),
+                promotion,
+                scenario_overrides: Mutex::new(HashMap::new()),
                 workbench_grants: Mutex::new(HashMap::new()),
                 agent_sessions: Mutex::new(agent_sessions),
+                #[cfg(test)]
+                fail_next_scenario_override_persist: AtomicBool::new(false),
             }),
         })
     }
@@ -2335,6 +2393,7 @@ impl RunController {
         pending_secret_resolutions.insert(id.clone());
         let actor_runs = self.inner.runs.clone();
         let actor_evaluations = self.inner.evaluations.clone();
+        let actor_promotion = self.inner.promotion.clone();
         let actor_state = state.clone();
         let actor_workspace = workspace.clone();
         let workspace_path = workspace.workspace.clone();
@@ -2353,6 +2412,7 @@ impl RunController {
                     run_agent_session_actor(
                         &actor_runs,
                         &actor_evaluations,
+                        &actor_promotion,
                         &actor_state,
                         &actor_workspace,
                         &harness,
@@ -2849,13 +2909,15 @@ impl RunController {
         } else {
             build_review(&summary, &events)
         };
+        let assembly = lock(&state.assembly).clone();
+        let output_path = &assembly.scenario.output;
         let output_result = if summary.status.is_finished() {
             read_optional_confined_run_json(
                 &state.agent_session_directories,
-                &Path::new("final").join(&state.output),
+                &Path::new("final").join(output_path),
             )
         } else {
-            read_optional_workspace_json(&state.workspace_evidence_root, &state.output)
+            read_optional_workspace_json(&state.workspace_evidence_root, output_path)
         };
         let secret_values = lock(&state.secret_values).clone();
         let (output, output_error) = match output_result {
@@ -2867,7 +2929,7 @@ impl RunController {
         };
         Ok(RunDetail {
             summary,
-            assembly: lock(&state.assembly).clone(),
+            assembly,
             review,
             events,
             score,
@@ -3244,7 +3306,6 @@ impl RunController {
             agent_session_directories,
             workspace,
             workspace_evidence_root,
-            output: scenario.output.clone(),
             initial_snapshot: Some(initial_snapshot),
             capabilities: Mutex::new(Vec::new()),
             secret_values: Arc::new(Mutex::new(driver_secret_values(&self.inner.driver))),
@@ -3318,11 +3379,10 @@ impl RunController {
             if summary.status != RunStatus::Exploring {
                 return Err(RunError::RunUnavailable(id.to_owned()));
             }
-            let scenario = self
-                .inner
-                .scenarios
-                .get(&summary.scenario_id)
+            let scenario = lock(&self.inner.scenario_overrides)
+                .get(id)
                 .cloned()
+                .or_else(|| self.inner.scenarios.get(&summary.scenario_id).cloned())
                 .ok_or_else(|| RunError::UnknownScenario(summary.scenario_id.clone()))?;
             let previous_summary = summary.clone();
             summary.model_id.clone_from(&model_id);
@@ -3387,6 +3447,7 @@ impl RunController {
             invalidate_contaminated_secret_evidence(
                 &self.inner.runs,
                 &self.inner.evaluations,
+                &self.inner.promotion,
                 &state,
                 &secrets,
             )
@@ -3572,6 +3633,7 @@ impl RunController {
         }
         let (source_snapshot, source_assembly) =
             self.validate_evaluation_request(&request, &source)?;
+        let capability_recipe = source_assembly.capability_sources.clone();
         let _producer_lifecycle = lock(&source.producer_lifecycle);
         if source.evidence_quarantined.load(Ordering::Acquire) {
             return Err(RunError::UnknownRun(request.source_workspace_id));
@@ -3600,6 +3662,8 @@ impl RunController {
             model_profile_id: request.model_profile_id,
             source_workspace_id: request.source_workspace_id,
             source_revision,
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: request.harness_ids.clone(),
             arms: request
                 .harness_ids
@@ -3625,6 +3689,8 @@ impl RunController {
             bundle_directories,
             evidence_quarantined: AtomicBool::new(false),
             replay_failed: false,
+            scenario_override: None,
+            capability_recipe: Some(capability_recipe),
         });
         write_confined_run_json_atomic(
             &state.bundle_directories,
@@ -3754,12 +3820,91 @@ impl RunController {
                     continue;
                 }
             };
+            if let Some(expected) = &state.capability_recipe {
+                let actual = self
+                    .state(&prepared.id)
+                    .map(|run| lock(&run.assembly).capability_sources.clone());
+                if let Err(error) = actual.and_then(|actual| {
+                    (actual == *expected).then_some(()).ok_or_else(|| {
+                        RunError::EvidencePersistence(format!(
+                            "capability recipe mismatch: expected {}, found {}",
+                            serde_json::to_string(expected).unwrap_or_default(),
+                            serde_json::to_string(&actual).unwrap_or_default()
+                        ))
+                    })
+                }) {
+                    let _ = self.cancel(&prepared.id);
+                    set_evaluation_arm(&state, index, Some(prepared.id.clone()), "failed")?;
+                    record_evaluation_event(
+                        &state,
+                        "evaluation.arm.finished",
+                        json!({
+                            "harnessId": harness_id,
+                            "runId": prepared.id,
+                            "status": "failed",
+                            "error": error.to_string(),
+                        }),
+                    )?;
+                    continue;
+                }
+            }
             let producer_lifecycle = lock(&state.producer_lifecycle);
             if state.evidence_quarantined.load(Ordering::Acquire) {
                 drop(producer_lifecycle);
                 quarantine_evaluation_evidence(&self.inner.runs, &state);
                 return Ok(());
             }
+            let _scenario_override = if let Some(scenario) = &state.scenario_override {
+                lock(&self.inner.scenario_overrides).insert(prepared.id.clone(), scenario.clone());
+                let guard = ScenarioOverrideGuard {
+                    overrides: &self.inner.scenario_overrides,
+                    run_id: prepared.id.clone(),
+                };
+                #[cfg(test)]
+                let override_result = if self
+                    .inner
+                    .fail_next_scenario_override_persist
+                    .swap(false, Ordering::AcqRel)
+                {
+                    Err(RunError::EvidencePersistence(
+                        "injected scenario override persistence failure".to_owned(),
+                    ))
+                } else {
+                    self.state(&prepared.id)
+                        .and_then(|run_state| apply_run_scenario_override(&run_state, scenario))
+                };
+                #[cfg(not(test))]
+                let override_result = self
+                    .state(&prepared.id)
+                    .and_then(|run_state| apply_run_scenario_override(&run_state, scenario));
+                if let Err(error) = override_result {
+                    drop(guard);
+                    drop(producer_lifecycle);
+                    let cleanup = self.cancel(&prepared.id);
+                    if state.evidence_quarantined.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let message = cleanup.map_or_else(
+                        |cleanup| format!("{error}; prepared arm cleanup also failed: {cleanup}"),
+                        |()| error.to_string(),
+                    );
+                    set_evaluation_arm(&state, index, Some(prepared.id.clone()), "failed")?;
+                    record_evaluation_event(
+                        &state,
+                        "evaluation.arm.finished",
+                        json!({
+                            "harnessId": harness_id,
+                            "runId": prepared.id,
+                            "status": "failed",
+                            "error": message,
+                        }),
+                    )?;
+                    continue;
+                }
+                Some(guard)
+            } else {
+                None
+            };
             set_evaluation_arm(&state, index, Some(prepared.id.clone()), "starting")?;
             record_evaluation_event(
                 &state,
@@ -3976,7 +4121,6 @@ impl RunController {
             agent_session_directories,
             workspace,
             workspace_evidence_root,
-            output: scenario.output.clone(),
             initial_snapshot: Some(initial_snapshot),
             capabilities: Mutex::new(Vec::new()),
             secret_values: Arc::new(Mutex::new(driver_secret_values(&self.inner.driver))),
@@ -5192,6 +5336,7 @@ fn run_driver(
         else {
             return Ok(cancelled_completion());
         };
+        let closed_kind = driver_message_kind(&closed.parsed.body);
         match closed.parsed.body {
             DriverBody::SessionClosed {
                 session_id: closed_session,
@@ -5202,9 +5347,9 @@ fn run_driver(
                 )));
             }
             _ => {
-                return Err(RunError::Protocol(
-                    "expected session.closed for the active session".to_owned(),
-                ));
+                return Err(RunError::Protocol(format!(
+                    "expected session.closed for the active session; received {closed_kind}"
+                )));
             }
         }
         let exit_code = match wait_for_exit_with_cancellation(
@@ -5289,6 +5434,7 @@ fn run_driver(
 fn run_agent_session_actor(
     runs: &Mutex<HashMap<String, Arc<RunState>>>,
     evaluations: &Mutex<HashMap<String, Arc<EvaluationState>>>,
+    promotion: &promotion::PromotionStore,
     state: &AgentSessionState,
     workspace_state: &RunState,
     harness: &HarnessProfile,
@@ -5320,6 +5466,7 @@ fn run_agent_session_actor(
         invalidate_contaminated_secret_evidence(
             runs,
             evaluations,
+            promotion,
             workspace_state,
             &workspace_secrets,
         )?;
@@ -7040,6 +7187,18 @@ fn driver_event_kind(event_type: &str) -> String {
     }
 }
 
+fn driver_message_kind(body: &DriverBody) -> &'static str {
+    match body {
+        DriverBody::StartupEvent { .. } => "startup.event",
+        DriverBody::Ready { .. } => "driver.ready",
+        DriverBody::SessionOpened { .. } => "session.opened",
+        DriverBody::TurnEvent { .. } => "turn.event",
+        DriverBody::TurnFinished { .. } => "turn.finished",
+        DriverBody::SessionClosed { .. } => "session.closed",
+        DriverBody::Failed { .. } => "driver.failed",
+    }
+}
+
 fn redact_driver_descriptor(
     mut descriptor: DriverDescriptor,
     secrets: &[Vec<u8>],
@@ -7105,9 +7264,11 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
         })
         .filter_map(|event| event.payload["source"].as_str().map(str::to_owned))
         .collect::<std::collections::BTreeSet<_>>();
-    let capability_evidence_complete = CATALOG_REQUIRED_SOURCES
+    let capability_evidence_complete = scenario
+        .assertions
+        .required_capability_sources
         .iter()
-        .all(|source| capability_sources_used.contains(*source));
+        .all(|source| capability_sources_used.contains(source));
     let analysis_result = catalog_analysis_result(&lock(&state.events));
     let catalog_analysis_composed = analysis_result.is_some();
     let analysis_result_matches = analysis_result
@@ -7115,7 +7276,7 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
         .is_some_and(|expected| output.as_ref() == Some(expected));
     Ok(json!({
         "passed": output.is_some()
-            && schema_valid
+            && (!scenario.assertions.require_schema || schema_valid)
             && names_match
             && score_matches
             && capability_evidence_complete
@@ -7130,7 +7291,8 @@ fn score_catalog(state: &RunState, scenario: &ScenarioManifest) -> Result<JsonVa
         "expectedTotalScore": scenario.assertions.total_score,
         "scoreMatches": score_matches,
         "capabilitySourcesUsed": capability_sources_used,
-        "expectedCapabilitySources": CATALOG_REQUIRED_SOURCES,
+        "expectedCapabilitySources": scenario.assertions.required_capability_sources,
+        "schemaRequired": scenario.assertions.require_schema,
         "capabilityEvidenceComplete": capability_evidence_complete,
         "catalogAnalysisComposed": catalog_analysis_composed,
         "analysisResultMatches": analysis_result_matches,
@@ -7964,6 +8126,24 @@ fn persist_assembly(state: &RunState) -> Result<(), RunError> {
         Path::new("assembly.json"),
         &serde_json::to_value(lock(&state.assembly).clone())?,
     )
+}
+
+fn apply_run_scenario_override(
+    state: &RunState,
+    scenario: &ScenarioManifest,
+) -> Result<(), RunError> {
+    let previous = lock(&state.assembly).clone();
+    {
+        let mut assembly = lock(&state.assembly);
+        assembly.question.clone_from(&scenario.prompt);
+        assembly.limits = scenario.limits.clone();
+        assembly.scenario.output.clone_from(&scenario.output);
+    }
+    if let Err(error) = persist_assembly(state) {
+        *lock(&state.assembly) = previous;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn persist_selection(state: &RunState) -> Result<(), RunError> {
@@ -9111,7 +9291,6 @@ fn load_run_bundle(
         assembly.scenario.output.clone_from(&scenario.output);
     }
     assembly.scenario.output = workspace_relative_path(&assembly.scenario.output)?;
-    let output = assembly.scenario.output.clone();
     let initial_snapshot = (summary.status == RunStatus::Exploring)
         .then(|| {
             capture_confined_run_tree(&agent_session_directories, Path::new("initial"))
@@ -9149,7 +9328,6 @@ fn load_run_bundle(
         agent_session_directories,
         workspace,
         workspace_evidence_root,
-        output,
         initial_snapshot,
         capabilities: Mutex::new(Vec::new()),
         secret_values: Arc::new(Mutex::new(Vec::new())),
@@ -9397,6 +9575,8 @@ fn load_evaluation_bundle(
         bundle_directories,
         evidence_quarantined: AtomicBool::new(false),
         replay_failed,
+        scenario_override: None,
+        capability_recipe: None,
     });
     if interrupted {
         persist_evaluation(&state)?;
@@ -10491,9 +10671,11 @@ fn evaluation_arm_states(
 fn invalidate_contaminated_secret_evidence(
     runs: &Mutex<HashMap<String, Arc<RunState>>>,
     evaluations: &Mutex<HashMap<String, Arc<EvaluationState>>>,
+    promotion: &promotion::PromotionStore,
     workspace_state: &RunState,
     secrets: &[Vec<u8>],
 ) -> Result<(), RunError> {
+    let promotion_contaminated = promotion.quarantine_contaminated_evidence(runs, secrets);
     let workspace_contaminated = {
         let _commit = lock(&workspace_state.event_commit);
         let contaminated = confined_bundle_contains_protected_data(
@@ -10557,6 +10739,8 @@ fn invalidate_contaminated_secret_evidence(
 
     if workspace_contaminated {
         mark_workspace_evidence_unavailable(workspace_state, false);
+    }
+    if workspace_contaminated || promotion_contaminated {
         return Err(RunError::EvidencePersistence(
             PROTECTED_WORKSPACE_PATH_ERROR.to_owned(),
         ));
@@ -11168,7 +11352,9 @@ fn create_confined_directory_at(
     let name = components
         .pop()
         .expect("confined directory path has a final component");
-    let parent = open_confined_evidence_directory_at(root_directory, components, &display_path)?;
+    let parent_relative = components.iter().collect::<PathBuf>();
+    let parent =
+        open_or_create_confined_directory_at(root_directory, &parent_relative, &display_path)?;
     rustix::fs::mkdirat(
         &parent,
         &name,
@@ -12902,6 +13088,8 @@ pub enum RunError {
     ModelAccessUnavailable(String),
     #[error("invalid run request: {0}")]
     InvalidRequest(String),
+    #[error("conflicting run request: {0}")]
+    Conflict(String),
     #[error("invalid scenario: {0}")]
     InvalidScenario(String),
     #[error("path escapes its configured root: {0}")]
@@ -12936,7 +13124,7 @@ impl From<RunError> for (StatusCode, String) {
             RunError::UnknownRun(_)
             | RunError::UnknownScenario(_)
             | RunError::UnknownAgentSession(_) => StatusCode::NOT_FOUND,
-            RunError::RunUnavailable(_) => StatusCode::CONFLICT,
+            RunError::RunUnavailable(_) | RunError::Conflict(_) => StatusCode::CONFLICT,
             RunError::ModelAccessUnavailable(_) => StatusCode::PRECONDITION_FAILED,
             RunError::InvalidRequest(_)
             | RunError::InvalidScenario(_)
@@ -12959,7 +13147,27 @@ fn _assert_send_sync() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    #[cfg(unix)]
+    use rmcp::{
+        ClientHandler, ServiceExt,
+        model::CallToolRequestParams,
+        transport::{
+            StreamableHttpClientTransport,
+            streamable_http_client::StreamableHttpClientTransportConfig,
+        },
+    };
+    #[cfg(unix)]
+    use serde_json::Map;
+
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct PromotionMcpClient;
+
+    #[cfg(unix)]
+    impl ClientHandler for PromotionMcpClient {}
 
     fn event(sequence: u64, kind: &str, payload: JsonValue) -> RunEvent {
         RunEvent {
@@ -15686,6 +15894,1545 @@ done
     }
 
     #[cfg(unix)]
+    fn promotion_fixture_launch() -> DriverLaunch {
+        let script = r#"
+sequence=1
+workspace=
+printf '%s\n' '{"protocolVersion":1,"sequence":1,"causedBy":null,"type":"driver.ready","driver":{"name":"promotion-fixture","version":"1","revision":null,"features":["streaming","turn-observations-v1"]}}'
+while IFS= read -r line; do
+  session=$(printf '%s' "$line" | sed -E 's/.*"sessionId":"([^"]+)".*/\1/')
+  case "$line" in
+    *'"type":"session.open"'*)
+      workspace=$(printf '%s' "$line" | sed -E 's/.*"workspaceRoot":"([^"]+)".*/\1/')
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"session.opened","sessionId":"%s","processId":4242}\n' "$sequence" "$session"
+      ;;
+    *'"type":"turn.start"'*)
+      turn=$(printf '%s' "$line" | sed -E 's/.*"turnId":"([^"]+)".*/\1/')
+      case "$line" in
+        *'"mode":"interactive"'*)
+          sequence=$((sequence + 1))
+          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"observation.assistant.completed","payload":{"messageId":"answer-%s","text":"Catalog finding: Alpha and gamma are active."}}\n' "$sequence" "$session" "$turn" "$turn"
+          ;;
+        *)
+          while [ ! -e "$workspace/.agent-lab-promotion-capabilities-ready" ]; do
+            sleep 0.01
+          done
+          rm -f "$workspace/.agent-lab-promotion-capabilities-ready"
+          printf '%s\n' '{"active":[{"name":"alpha","active":true,"score":3},{"name":"gamma","active":true,"score":8}],"activeCount":2,"totalScore":11}' > "$workspace/result.json"
+          sequence=$((sequence + 1))
+          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"mcp.tool.completed","payload":{"actor":"agent","source":"catalog","name":"list","isError":false,"result":{"items":[{"name":"alpha","score":3,"active":true},{"name":"beta","score":5,"active":false},{"name":"gamma","score":8,"active":true}]}}}\n' "$sequence" "$session" "$turn"
+          sequence=$((sequence + 1))
+	          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"mcp.tool.completed","payload":{"actor":"agent","source":"analysis","name":"summarize","isError":false,"arguments":{"items":[{"name":"alpha","score":3,"active":true},{"name":"beta","score":5,"active":false},{"name":"gamma","score":8,"active":true}]},"result":{"active":[{"name":"alpha","active":true,"score":3},{"name":"gamma","active":true,"score":8}],"activeCount":2,"totalScore":11}}}\n' "$sequence" "$session" "$turn"
+          sequence=$((sequence + 1))
+          printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.event","sessionId":"%s","turnId":"%s","eventType":"workspace.changed","payload":{"path":"result.json","kind":"created"}}\n' "$sequence" "$session" "$turn"
+          ;;
+      esac
+      outcome=completed
+      if [ -n "${AGENT_LAB_PROMOTION_OUTCOME_FILE:-}" ] && [ -f "$AGENT_LAB_PROMOTION_OUTCOME_FILE" ]; then
+        outcome=$(cat "$AGENT_LAB_PROMOTION_OUTCOME_FILE")
+      fi
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.finished","sessionId":"%s","turnId":"%s","outcome":"%s","evidence":{"fixture":true}}\n' "$sequence" "$session" "$turn" "$outcome"
+      ;;
+    *'"type":"turn.abort"'*)
+      turn=$(printf '%s' "$line" | sed -E 's/.*"turnId":"([^"]+)".*/\1/')
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"turn.finished","sessionId":"%s","turnId":"%s","outcome":"aborted","evidence":{"fixture":true}}\n' "$sequence" "$session" "$turn"
+      ;;
+    *'"type":"session.close"'*)
+      sequence=$((sequence + 1))
+      printf '{"protocolVersion":1,"sequence":%s,"causedBy":null,"type":"session.closed","sessionId":"%s"}\n' "$sequence" "$session"
+      exit 0
+      ;;
+  esac
+done
+"#;
+        let mut launch = DriverLaunch::new("/bin/sh");
+        launch.args = vec!["-c".into(), script.into()];
+        launch
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_validation(
+        controller: &RunController,
+        draft_id: &str,
+        attempt_id: &str,
+    ) -> EvaluationValidationAttempt {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let draft = controller.evaluation_draft(draft_id).unwrap();
+            let attempt = draft
+                .validations
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .unwrap();
+            if matches!(
+                attempt.execution_status,
+                EvaluationExecutionStatus::Complete
+                    | EvaluationExecutionStatus::Inconclusive
+                    | EvaluationExecutionStatus::Cancelled
+                    | EvaluationExecutionStatus::Intervened
+            ) {
+                return attempt.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "evaluation validation {attempt_id} did not finish; latest status: {:?}",
+                attempt.execution_status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn call_promotion_capability(
+        endpoint: &CapabilityEndpoint,
+        tool: &str,
+        arguments: Map<String, JsonValue>,
+    ) -> JsonValue {
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(endpoint.agent_url.as_str())
+                .auth_header(&endpoint.agent_token),
+        );
+        let service = PromotionMcpClient.serve(transport).await.unwrap();
+        let result = service
+            .peer()
+            .call_tool(CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        service.cancel().await.unwrap();
+        result
+    }
+
+    #[cfg(unix)]
+    async fn exercise_catalog_capabilities(controller: &RunController, run_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (state, capabilities) = loop {
+            if let Some(state) = lock(&controller.inner.runs).get(run_id).cloned() {
+                let capabilities = lock(&state.capabilities).clone();
+                if capabilities.len() == 2 {
+                    break (state, capabilities);
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "evaluation run capabilities did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let catalog = capabilities
+            .iter()
+            .find(|capability| capability.id == "catalog")
+            .unwrap();
+        let analysis = capabilities
+            .iter()
+            .find(|capability| capability.id == "analysis")
+            .unwrap();
+        let catalog_result = call_promotion_capability(catalog, "list", Map::new()).await;
+        let items = catalog_result["items"].as_array().unwrap().clone();
+        call_promotion_capability(
+            analysis,
+            "summarize",
+            json!({ "items": items }).as_object().unwrap().clone(),
+        )
+        .await;
+        fs::write(
+            state
+                .workspace
+                .join(".agent-lab-promotion-capabilities-ready"),
+            b"ready",
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn exercise_validation_capabilities(
+        controller: &RunController,
+        draft_id: &str,
+        attempt_id: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let run_id = loop {
+            let draft = controller.evaluation_draft(draft_id).unwrap();
+            if let Some(run_id) = draft
+                .validations
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .and_then(|attempt| attempt.run_id.clone())
+            {
+                break run_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "validation did not allocate its run"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        exercise_catalog_capabilities(controller, &run_id).await;
+    }
+
+    #[cfg(unix)]
+    async fn exercise_evaluation_capabilities(controller: &RunController, evaluation_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut exercised = BTreeSet::new();
+        loop {
+            let evaluation = controller.get_evaluation(evaluation_id).unwrap();
+            for run_id in evaluation
+                .summary
+                .arms
+                .iter()
+                .filter_map(|arm| arm.run_id.as_deref())
+            {
+                if exercised.insert(run_id.to_owned()) {
+                    exercise_catalog_capabilities(controller, run_id).await;
+                }
+            }
+            if evaluation.summary.status.is_finished() {
+                assert_eq!(exercised.len(), 2);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "definition evaluation did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_evaluation(
+        controller: &RunController,
+        evaluation_id: &str,
+    ) -> EvaluationDetail {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let detail = controller.get_evaluation(evaluation_id).unwrap();
+            if !matches!(
+                detail.summary.status,
+                EvaluationStatus::Queued | EvaluationStatus::Running
+            ) {
+                return detail;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "definition evaluation did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_agent_session_closed(
+        controller: &RunController,
+        workspace_id: &str,
+        session_id: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if controller
+                .agent_session(workspace_id, session_id)
+                .unwrap()
+                .summary
+                .status
+                == AgentSessionStatus::Closed
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "agent session did not close");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn scenario_output_override_drives_live_and_final_evidence_lookup() {
+        let root = temporary_root("scenario-output-override");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        let controller = RunController::new(RunControllerConfig {
+            scenarios_dir: scenarios,
+            data_dir: data,
+            driver: DriverLaunch::new("/bin/false"),
+        })
+        .unwrap();
+        let prepared = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = controller.state(&prepared.id).unwrap();
+        let mut scenario = controller.inner.scenarios["catalog"].clone();
+        scenario.output = "revised-result.json".into();
+        apply_run_scenario_override(&state, &scenario).unwrap();
+
+        fs::write(
+            state.workspace.join("revised-result.json"),
+            br#"{"source":"workspace"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            controller.get(&prepared.id).unwrap().output,
+            Some(json!({ "source": "workspace" }))
+        );
+
+        fs::create_dir_all(state.bundle_dir.join("final")).unwrap();
+        fs::write(
+            state.bundle_dir.join("final/revised-result.json"),
+            br#"{"source":"final"}"#,
+        )
+        .unwrap();
+        lock(&state.summary).status = RunStatus::Passed;
+        let detail = controller.get(&prepared.id).unwrap();
+        assert_eq!(detail.assembly.scenario.output, scenario.output);
+        assert_eq!(detail.output, Some(json!({ "source": "final" })));
+
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn manual_evaluation_promotion_retains_revisions_failures_modes_and_replay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const EDITED_PROMOTION_SECRET: &str = "edited-promotion-credential";
+        const LATER_PROMOTION_SECRET: &str = "later-promotion-credential";
+        let root = temporary_root("manual-evaluation-promotion");
+        let scenarios = root.join("scenarios");
+        let data = root.join("runs");
+        fs::create_dir(&scenarios).unwrap();
+        fs::create_dir(&data).unwrap();
+        write_scenario(&scenarios);
+        fs::set_permissions(
+            scenarios.join("catalog/workspace/README.md"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        let config = || RunControllerConfig {
+            scenarios_dir: scenarios.clone(),
+            data_dir: data.clone(),
+            driver: DriverLaunch::new("/bin/false"),
+        };
+        let promotion_outcome = root.join("promotion-outcome");
+        let harnesses = || {
+            ["v0", "eve"]
+                .into_iter()
+                .map(|id| {
+                    let mut launch = promotion_fixture_launch();
+                    launch.env.push((
+                        "AGENT_LAB_PROMOTION_OUTCOME_FILE".into(),
+                        promotion_outcome.clone().into_os_string(),
+                    ));
+                    HarnessProfile {
+                        id: id.to_owned(),
+                        display_name: id.to_owned(),
+                        launch,
+                        models: BTreeMap::from([("test".to_owned(), format!("fixture/{id}"))]),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let models = BTreeMap::from([("test".to_owned(), "Test".to_owned())]);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        let explore = controller
+            .prepare(PrepareRunRequest {
+                scenario_id: "catalog".to_owned(),
+            })
+            .await
+            .unwrap();
+        let session = controller
+            .start_agent_session(
+                &explore.id,
+                StartAgentSessionRequest::default(),
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let observed = controller
+                .list_agent_sessions(&explore.id)
+                .into_iter()
+                .find(|candidate| candidate.id == session.id)
+                .unwrap();
+            if observed.status == AgentSessionStatus::Ready && observed.active {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source session did not start");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let turn = controller
+            .start_agent_turn(
+                &explore.id,
+                &session.id,
+                StartAgentTurnRequest {
+                    prompt: "Explain the active catalog".to_owned(),
+                    input: None,
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let detail = controller.agent_session(&explore.id, &session.id).unwrap();
+            let observed = detail
+                .turns
+                .iter()
+                .find(|candidate| candidate.id == turn.id)
+                .unwrap();
+            if observed.status == AgentTurnStatus::Completed {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source turn did not finish");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let workspace_events = controller
+            .state(&explore.id)
+            .unwrap()
+            .bundle_dir
+            .join("events.jsonl");
+        let workspace_events_before_failed_draft = fs::read(&workspace_events).unwrap();
+        fs::remove_file(&workspace_events).unwrap();
+        fs::create_dir(&workspace_events).unwrap();
+        assert!(
+            controller
+                .create_evaluation_draft(
+                    &explore.id,
+                    CreateEvaluationDraftRequest {
+                        session_id: Some(session.id.clone()),
+                        from_turn_id: turn.id.clone(),
+                        through_turn_id: turn.id.clone(),
+                    },
+                    WorkbenchOrigin::Browser,
+                )
+                .is_err(),
+            "a workspace-event failure should roll back the pending draft bundle"
+        );
+        assert!(controller.list_evaluation_drafts().is_empty());
+        fs::remove_dir(&workspace_events).unwrap();
+        fs::write(&workspace_events, workspace_events_before_failed_draft).unwrap();
+
+        let draft = controller
+            .create_evaluation_draft(
+                &explore.id,
+                CreateEvaluationDraftRequest {
+                    session_id: Some(session.id.clone()),
+                    from_turn_id: turn.id.clone(),
+                    through_turn_id: turn.id.clone(),
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let first = draft.revisions.first().unwrap();
+        assert_eq!(first.task, "Explain the active catalog");
+        assert_eq!(draft.summary.status, "incomplete");
+        assert!(
+            first
+                .blocking_issues
+                .iter()
+                .any(|issue| issue.contains("review and confirm the suggested task"))
+        );
+        assert!(first.source.source_digest.starts_with("sha256:"));
+        assert_eq!(
+            first.source.driver.as_ref().map(|driver| (
+                driver.descriptor.name.as_str(),
+                driver.descriptor.version.as_str()
+            )),
+            Some(("promotion-fixture", "1"))
+        );
+        assert!(
+            first
+                .source
+                .driver
+                .as_ref()
+                .is_some_and(|driver| driver.launch_digest.starts_with("sha256:"))
+        );
+        let copied_source = data
+            .join("evaluation-library/drafts")
+            .join(&draft.summary.id)
+            .join("revisions")
+            .join(&first.id)
+            .join("source/README.md");
+        assert_eq!(
+            fs::metadata(copied_source).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+
+        let mut failing_evaluator = first.evaluator.clone();
+        failing_evaluator.parameters.active_names = vec!["not-the-catalog".to_owned()];
+        let mut validation_limits = first.limits.clone();
+        validation_limits.max_duration_ms = 10_000;
+        validation_limits.max_tool_invocations = 2;
+        let failing_update = UpdateEvaluationDraftRequest {
+            base_revision_id: first.id.clone(),
+            name: Some("Catalog regression".to_owned()),
+            revision: EvaluationRevisionUpdate {
+                task: Some(first.task.clone()),
+                evaluator: Some(failing_evaluator),
+                measurements: Some(first.measurements.clone()),
+                limits: Some(validation_limits),
+            },
+        };
+        let draft_root = data
+            .join("evaluation-library/drafts")
+            .join(&draft.summary.id);
+        let draft_manifest = draft_root.join("manifest.json");
+        let manifest_before_failed_edit = fs::read(&draft_manifest).unwrap();
+        fs::remove_file(&draft_manifest).unwrap();
+        fs::create_dir(&draft_manifest).unwrap();
+        assert!(
+            controller
+                .update_evaluation_draft(
+                    &draft.summary.id,
+                    failing_update.clone(),
+                    WorkbenchOrigin::Browser,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            controller
+                .evaluation_draft(&draft.summary.id)
+                .unwrap()
+                .summary
+                .current_revision_id,
+            first.id
+        );
+        fs::remove_dir(&draft_manifest).unwrap();
+        fs::write(&draft_manifest, manifest_before_failed_edit).unwrap();
+        let draft_events = draft_root.join("events.jsonl");
+        let events_before_failed_edit = fs::read(&draft_events).unwrap();
+        fs::remove_file(&draft_events).unwrap();
+        fs::create_dir(&draft_events).unwrap();
+        assert!(
+            controller
+                .update_evaluation_draft(
+                    &draft.summary.id,
+                    failing_update.clone(),
+                    WorkbenchOrigin::Browser,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            controller
+                .evaluation_draft(&draft.summary.id)
+                .unwrap()
+                .summary
+                .current_revision_id,
+            first.id
+        );
+        fs::remove_dir(&draft_events).unwrap();
+        fs::write(&draft_events, events_before_failed_edit).unwrap();
+        let failed_revision = controller
+            .update_evaluation_draft(&draft.summary.id, failing_update, WorkbenchOrigin::Browser)
+            .unwrap();
+        let failed_revision_id = failed_revision.summary.current_revision_id.clone();
+        assert_ne!(failed_revision_id, first.id);
+        assert_eq!(failed_revision.summary.status, "ready");
+        assert!(
+            failed_revision
+                .revisions
+                .last()
+                .unwrap()
+                .blocking_issues
+                .iter()
+                .all(|issue| !issue.contains("review and confirm the suggested task"))
+        );
+        assert!(matches!(
+            controller.update_evaluation_draft(
+                &draft.summary.id,
+                UpdateEvaluationDraftRequest {
+                    base_revision_id: first.id.clone(),
+                    name: None,
+                    revision: EvaluationRevisionUpdate::default(),
+                },
+                WorkbenchOrigin::Nushell,
+            ),
+            Err(RunError::Conflict(_))
+        ));
+
+        let manifest_before_failed_validation = fs::read(&draft_manifest).unwrap();
+        fs::remove_file(&draft_manifest).unwrap();
+        fs::create_dir(&draft_manifest).unwrap();
+        assert!(
+            controller
+                .start_evaluation_validation(&draft.summary.id, Some(&failed_revision_id))
+                .is_err()
+        );
+        assert!(
+            controller
+                .evaluation_draft(&draft.summary.id)
+                .unwrap()
+                .validations
+                .is_empty()
+        );
+        fs::remove_dir(&draft_manifest).unwrap();
+        fs::write(&draft_manifest, manifest_before_failed_validation).unwrap();
+        let events_before_failed_validation = fs::read(&draft_events).unwrap();
+        fs::remove_file(&draft_events).unwrap();
+        fs::create_dir(&draft_events).unwrap();
+        assert!(
+            controller
+                .start_evaluation_validation(&draft.summary.id, Some(&failed_revision_id))
+                .is_err()
+        );
+        assert!(
+            controller
+                .evaluation_draft(&draft.summary.id)
+                .unwrap()
+                .validations
+                .is_empty()
+        );
+        fs::remove_dir(&draft_events).unwrap();
+        fs::write(&draft_events, events_before_failed_validation).unwrap();
+        let failed_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&failed_revision_id))
+            .unwrap();
+        exercise_validation_capabilities(&controller, &draft.summary.id, &failed_attempt.id).await;
+        let failed_attempt =
+            wait_for_validation(&controller, &draft.summary.id, &failed_attempt.id).await;
+        assert_eq!(
+            failed_attempt.execution_status,
+            EvaluationExecutionStatus::Complete,
+            "a completed replay with assertion mismatches should remain conclusive: {failed_attempt:#?}"
+        );
+        assert_eq!(
+            failed_attempt.assertion_status,
+            ValidationAssertionStatus::Failed
+        );
+        let saved_failure = controller
+            .save_evaluation_draft(
+                &draft.summary.id,
+                SaveEvaluationDraftRequest {
+                    revision_id: Some(failed_revision_id.clone()),
+                    name: None,
+                },
+            )
+            .unwrap();
+        assert!(saved_failure.summary.saved);
+        assert!(saved_failure.summary.definition_id.is_none());
+
+        let corrected = controller
+            .update_evaluation_draft(
+                &draft.summary.id,
+                UpdateEvaluationDraftRequest {
+                    base_revision_id: failed_revision_id,
+                    name: None,
+                    revision: EvaluationRevisionUpdate {
+                        evaluator: Some(first.evaluator.clone()),
+                        ..EvaluationRevisionUpdate::default()
+                    },
+                },
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        let passing_revision_id = corrected.summary.current_revision_id.clone();
+        let passing_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        exercise_validation_capabilities(&controller, &draft.summary.id, &passing_attempt.id).await;
+        let passing_attempt =
+            wait_for_validation(&controller, &draft.summary.id, &passing_attempt.id).await;
+        assert_eq!(
+            passing_attempt.execution_status,
+            EvaluationExecutionStatus::Complete
+        );
+        assert_eq!(
+            passing_attempt.assertion_status,
+            ValidationAssertionStatus::Passed
+        );
+        let quarantined_passing_run_id = passing_attempt.run_id.clone().unwrap();
+        mark_workspace_evidence_unavailable(
+            &controller.state(&quarantined_passing_run_id).unwrap(),
+            false,
+        );
+        assert!(controller.get(&quarantined_passing_run_id).is_err());
+        assert!(controller.evaluation_draft(&draft.summary.id).is_ok());
+        let invalidated_passing = controller
+            .save_evaluation_draft(
+                &draft.summary.id,
+                SaveEvaluationDraftRequest {
+                    revision_id: Some(passing_revision_id.clone()),
+                    name: None,
+                },
+            )
+            .unwrap();
+        assert!(invalidated_passing.summary.definition_id.is_none());
+        let invalidated_attempt = invalidated_passing
+            .validations
+            .iter()
+            .find(|attempt| attempt.id == passing_attempt.id)
+            .unwrap();
+        assert_eq!(
+            invalidated_attempt.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            invalidated_attempt.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+
+        let replacement_passing_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        exercise_validation_capabilities(
+            &controller,
+            &draft.summary.id,
+            &replacement_passing_attempt.id,
+        )
+        .await;
+        let replacement_passing_attempt = wait_for_validation(
+            &controller,
+            &draft.summary.id,
+            &replacement_passing_attempt.id,
+        )
+        .await;
+        assert_eq!(
+            replacement_passing_attempt.execution_status,
+            EvaluationExecutionStatus::Complete
+        );
+        assert_eq!(
+            replacement_passing_attempt.assertion_status,
+            ValidationAssertionStatus::Passed
+        );
+        let passing_validation_run_id = replacement_passing_attempt.run_id.clone().unwrap();
+
+        controller.fail_next_validation_finalization_persist();
+        controller.fail_next_validation_fallback_persist();
+        let (_, mut finalization_events) = controller
+            .subscribe_evaluation_draft(&draft.summary.id)
+            .unwrap();
+        let finalization_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        exercise_validation_capabilities(&controller, &draft.summary.id, &finalization_attempt.id)
+            .await;
+        let finalization_event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = finalization_events.recv().await.unwrap();
+                if event.kind == "evaluation-validation.finished"
+                    && event.payload["validationId"] == finalization_attempt.id
+                {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("validation finalization failure should terminate the live event stream");
+        assert_eq!(finalization_event.payload["durable"], false);
+        assert_eq!(finalization_event.payload["durableAttempt"], false);
+        assert_eq!(
+            finalization_event.payload["executionStatus"],
+            "inconclusive"
+        );
+        let finalization_attempt =
+            wait_for_validation(&controller, &draft.summary.id, &finalization_attempt.id).await;
+        assert_eq!(
+            finalization_attempt.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            finalization_attempt.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(finalization_attempt.error.as_deref().is_some_and(|error| {
+            error.contains("injected validation finalization persistence failure")
+        }));
+
+        fs::write(&promotion_outcome, b"intervened").unwrap();
+        let intervened_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        exercise_validation_capabilities(&controller, &draft.summary.id, &intervened_attempt.id)
+            .await;
+        let intervened_attempt =
+            wait_for_validation(&controller, &draft.summary.id, &intervened_attempt.id).await;
+        assert_eq!(
+            intervened_attempt.execution_status,
+            EvaluationExecutionStatus::Intervened
+        );
+        assert_eq!(
+            intervened_attempt.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(
+            intervened_attempt
+                .score
+                .as_ref()
+                .is_some_and(|score| score["passed"] == true),
+            "a schema-complete score must not turn an intervened driver outcome into an assertion result"
+        );
+        fs::remove_file(&promotion_outcome).unwrap();
+
+        controller.fail_next_validation_assembly_persist();
+        let failed_assembly_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        let failed_assembly_attempt =
+            wait_for_validation(&controller, &draft.summary.id, &failed_assembly_attempt.id).await;
+        assert_eq!(
+            failed_assembly_attempt.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            failed_assembly_attempt.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(failed_assembly_attempt.run_id.is_none());
+        assert!(
+            failed_assembly_attempt.error.as_deref().is_some_and(
+                |error| error.contains("injected validation assembly persistence failure")
+            )
+        );
+        assert!(lock(&controller.inner.scenario_overrides).is_empty());
+        assert!(
+            controller
+                .list()
+                .into_iter()
+                .filter(|run| run.id != explore.id)
+                .all(|run| run.status.is_finished())
+        );
+        let (validation_pre_start, validation_resume) =
+            controller.install_validation_before_start_hook();
+        let cancelled_attempt = controller
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        validation_pre_start.wait().await;
+        controller
+            .cancel_evaluation_validation(&draft.summary.id, &cancelled_attempt.id)
+            .unwrap();
+        validation_resume.wait().await;
+        let cancelled_attempt =
+            wait_for_validation(&controller, &draft.summary.id, &cancelled_attempt.id).await;
+        assert_eq!(
+            cancelled_attempt.execution_status,
+            EvaluationExecutionStatus::Cancelled
+        );
+        let cancelled_run = cancelled_attempt.run_id.as_deref().unwrap();
+        assert!(
+            lock(&controller.state(cancelled_run).unwrap().events)
+                .iter()
+                .all(|event| event.kind != "driver.starting")
+        );
+        let definition_root = data.join("evaluation-library/definitions");
+        fs::set_permissions(&definition_root, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(
+            controller
+                .save_evaluation_draft(
+                    &draft.summary.id,
+                    SaveEvaluationDraftRequest {
+                        revision_id: Some(passing_revision_id.clone()),
+                        name: Some("Catalog regression".to_owned()),
+                    },
+                )
+                .is_err(),
+            "a definition publication failure should fail the save"
+        );
+        fs::set_permissions(&definition_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let rolled_back = controller.evaluation_draft(&draft.summary.id).unwrap();
+        assert!(rolled_back.summary.definition_id.is_none());
+        assert!(controller.list_evaluation_definitions().is_empty());
+        fs::set_permissions(&draft_root, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(
+            controller
+                .save_evaluation_draft(
+                    &draft.summary.id,
+                    SaveEvaluationDraftRequest {
+                        revision_id: Some(passing_revision_id.clone()),
+                        name: Some("Catalog regression".to_owned()),
+                    },
+                )
+                .is_err(),
+            "a draft commit failure should roll back a begun definition publication"
+        );
+        fs::set_permissions(&draft_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let rolled_back = controller.evaluation_draft(&draft.summary.id).unwrap();
+        assert!(rolled_back.summary.definition_id.is_none());
+        assert!(controller.list_evaluation_definitions().is_empty());
+        let promoted = controller
+            .save_evaluation_draft(
+                &draft.summary.id,
+                SaveEvaluationDraftRequest {
+                    revision_id: Some(passing_revision_id.clone()),
+                    name: Some("Catalog regression".to_owned()),
+                },
+            )
+            .unwrap();
+        let definition_id = promoted.summary.definition_id.clone().unwrap();
+        let definition = controller.evaluation_definition(&definition_id).unwrap();
+        assert_eq!(definition.summary.revision_id, passing_revision_id);
+        controller
+            .inner
+            .fail_next_scenario_override_persist
+            .store(true, Ordering::Release);
+        let override_failure_evaluation = controller
+            .start_workbench_definition_evaluation(
+                &explore.id,
+                &definition_id,
+                StartDefinitionEvaluationRequest::default(),
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut exercised_override_run = false;
+        let override_failure_evaluation = loop {
+            let detail = controller
+                .get_evaluation(&override_failure_evaluation.id)
+                .unwrap();
+            if let Some(run_id) = detail.summary.arms[1].run_id.as_deref()
+                && !detail.summary.status.is_finished()
+                && !exercised_override_run
+            {
+                exercised_override_run = true;
+                exercise_catalog_capabilities(&controller, run_id).await;
+            }
+            if detail.summary.status.is_finished() {
+                break detail;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "definition evaluation did not continue after override persistence failed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            override_failure_evaluation.summary.status,
+            EvaluationStatus::Failed
+        );
+        assert_eq!(override_failure_evaluation.summary.arms[0].status, "failed");
+        assert_eq!(override_failure_evaluation.summary.arms[1].status, "passed");
+        assert!(
+            override_failure_evaluation
+                .summary
+                .arms
+                .iter()
+                .filter_map(|arm| arm.run_id.as_deref())
+                .all(|run_id| controller.get(run_id).unwrap().summary.status.is_finished())
+        );
+        assert!(lock(&controller.inner.scenario_overrides).is_empty());
+        let renamed = controller
+            .save_evaluation_draft(
+                &draft.summary.id,
+                SaveEvaluationDraftRequest {
+                    revision_id: Some(passing_revision_id.clone()),
+                    name: Some("Renamed catalog regression".to_owned()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            renamed.summary.definition_id.as_deref(),
+            Some(definition_id.as_str())
+        );
+        assert_eq!(
+            controller
+                .evaluation_definition(&definition_id)
+                .unwrap()
+                .summary
+                .name,
+            "Renamed catalog regression"
+        );
+        let workspace = controller.state(&explore.id).unwrap();
+        invalidate_contaminated_secret_evidence(
+            &controller.inner.runs,
+            &controller.inner.evaluations,
+            &controller.inner.promotion,
+            &workspace,
+            &[EDITED_PROMOTION_SECRET.as_bytes().to_vec()],
+        )
+        .unwrap();
+        let before_protected_edit = controller.evaluation_draft(&draft.summary.id).unwrap();
+        let revision_directories_before_protected_edit = fs::read_dir(
+            data.join("evaluation-library/drafts")
+                .join(&draft.summary.id)
+                .join("revisions"),
+        )
+        .unwrap()
+        .count();
+        let error = controller
+            .update_evaluation_draft(
+                &draft.summary.id,
+                UpdateEvaluationDraftRequest {
+                    base_revision_id: before_protected_edit.summary.current_revision_id.clone(),
+                    name: None,
+                    revision: EvaluationRevisionUpdate {
+                        task: Some(format!("Do not persist {EDITED_PROMOTION_SECRET}")),
+                        ..EvaluationRevisionUpdate::default()
+                    },
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap_err();
+        assert!(matches!(error, RunError::EvidencePersistence(_)));
+        assert_eq!(
+            serde_json::to_value(controller.evaluation_draft(&draft.summary.id).unwrap()).unwrap(),
+            serde_json::to_value(&before_protected_edit).unwrap()
+        );
+        assert_eq!(
+            fs::read_dir(
+                data.join("evaluation-library/drafts")
+                    .join(&draft.summary.id)
+                    .join("revisions"),
+            )
+            .unwrap()
+            .count(),
+            revision_directories_before_protected_edit
+        );
+        let error = controller
+            .save_evaluation_draft(
+                &draft.summary.id,
+                SaveEvaluationDraftRequest {
+                    revision_id: Some(passing_revision_id.clone()),
+                    name: Some(format!("Do not persist {EDITED_PROMOTION_SECRET}")),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, RunError::EvidencePersistence(_)));
+        assert_eq!(
+            controller
+                .evaluation_definition(&definition_id)
+                .unwrap()
+                .summary
+                .name,
+            "Renamed catalog regression"
+        );
+        let saved_event = controller
+            .evaluation_draft(&draft.summary.id)
+            .unwrap()
+            .events
+            .into_iter()
+            .rev()
+            .find(|event| event.kind == "evaluation-draft.saved")
+            .unwrap();
+        assert_eq!(saved_event.payload["revisionId"], passing_revision_id);
+        assert_eq!(saved_event.payload["definitionId"], definition_id);
+        let explore_state = controller.state(&explore.id).unwrap();
+        let library_changes = lock(&explore_state.events)
+            .iter()
+            .filter(|event| {
+                event.kind == "workbench.evaluation-library.changed"
+                    && event.payload["draftId"] == draft.summary.id
+            })
+            .filter_map(|event| event.payload["change"].as_str().map(str::to_owned))
+            .collect::<HashSet<_>>();
+        assert!(library_changes.contains("revised"));
+        assert!(library_changes.contains("validation-started"));
+        assert!(library_changes.contains("validation-finished"));
+        assert!(library_changes.contains("saved"));
+
+        controller
+            .close_agent_session(&explore.id, &session.id)
+            .unwrap();
+        wait_for_agent_session_closed(&controller, &explore.id, &session.id).await;
+        let unterminated_passing_validation_id =
+            format!("validation-unterminated-{}", random_suffix());
+        controller
+            .inject_stale_validation_manifest_for_recovery_test(
+                &draft.summary.id,
+                EvaluationValidationAttempt {
+                    id: unterminated_passing_validation_id.clone(),
+                    draft_id: draft.summary.id.clone(),
+                    revision_id: passing_revision_id.clone(),
+                    execution_status: EvaluationExecutionStatus::Complete,
+                    assertion_status: ValidationAssertionStatus::Passed,
+                    harness_id: "v0".to_owned(),
+                    model_profile_id: "test".to_owned(),
+                    run_id: Some(passing_validation_run_id.clone()),
+                    started_at_ms: now_ms(),
+                    finished_at_ms: Some(now_ms()),
+                    error: None,
+                    score: controller.get(&passing_validation_run_id).unwrap().score,
+                },
+            )
+            .unwrap();
+        let uncommitted_definition_id = controller
+            .inject_definition_publication_before_draft_commit_for_recovery_test(
+                &draft.summary.id,
+                &passing_revision_id,
+                "Uncommitted catalog rename",
+            )
+            .unwrap();
+        assert_eq!(uncommitted_definition_id, definition_id);
+        drop(controller);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        assert_eq!(
+            controller.list_evaluation_drafts().len(),
+            1,
+            "a failed draft creation must not reappear after restart"
+        );
+        assert_eq!(
+            controller
+                .evaluation_definition(&definition_id)
+                .unwrap()
+                .summary
+                .name,
+            "Renamed catalog regression"
+        );
+        assert_eq!(
+            controller
+                .evaluation_draft(&draft.summary.id)
+                .unwrap()
+                .summary
+                .name,
+            "Renamed catalog regression"
+        );
+        let recovered_unterminated = controller
+            .evaluation_draft(&draft.summary.id)
+            .unwrap()
+            .validations
+            .into_iter()
+            .find(|attempt| attempt.id == unterminated_passing_validation_id)
+            .unwrap();
+        assert_eq!(
+            recovered_unterminated.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            recovered_unterminated.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(
+            recovered_unterminated
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("validation finalization evidence is missing"))
+        );
+        let recovered_definition_id = controller
+            .inject_definition_publication_after_draft_commit_for_recovery_test(
+                &draft.summary.id,
+                &passing_revision_id,
+                "Crash-recovered catalog regression",
+            )
+            .unwrap();
+        assert_eq!(recovered_definition_id, definition_id);
+        drop(controller);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        assert_eq!(
+            controller
+                .evaluation_definition(&definition_id)
+                .unwrap()
+                .summary
+                .name,
+            "Crash-recovered catalog regression"
+        );
+        let manifest_ahead_event = controller
+            .inject_draft_manifest_ahead_of_event_log_for_recovery_test(&draft.summary.id)
+            .unwrap();
+        drop(controller);
+        let controller =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        let recovered_draft = controller.evaluation_draft(&draft.summary.id).unwrap();
+        assert_eq!(
+            recovered_draft.events.last().map(|event| event.sequence),
+            Some(manifest_ahead_event.sequence)
+        );
+        assert_eq!(
+            recovered_draft
+                .events
+                .last()
+                .map(|event| event.kind.as_str()),
+            Some("evaluation-draft.recovery-test")
+        );
+        let evaluation = controller
+            .start_workbench_definition_evaluation(
+                &explore.id,
+                &definition_id,
+                StartDefinitionEvaluationRequest::default(),
+                WorkbenchOrigin::Nushell,
+            )
+            .unwrap();
+        assert!(
+            lock(&controller.state(&explore.id).unwrap().events)
+                .iter()
+                .any(|event| {
+                    event.kind == "workbench.evaluation.started"
+                        && event.payload["origin"] == "nushell"
+                        && event.payload["definitionId"] == definition_id
+                        && event.payload["evaluationId"] == evaluation.id
+                })
+        );
+        exercise_evaluation_capabilities(&controller, &evaluation.id).await;
+        let evaluation = wait_for_evaluation(&controller, &evaluation.id).await;
+        assert_eq!(evaluation.summary.status, EvaluationStatus::Passed);
+        assert!(lock(&controller.inner.scenario_overrides).is_empty());
+        assert_eq!(
+            evaluation.summary.definition_id.as_deref(),
+            Some(definition_id.as_str())
+        );
+        assert!(
+            evaluation
+                .summary
+                .arms
+                .iter()
+                .all(|arm| arm.status == "passed")
+        );
+        let edited_after_promotion = controller
+            .update_evaluation_draft(
+                &draft.summary.id,
+                UpdateEvaluationDraftRequest {
+                    base_revision_id: passing_revision_id.clone(),
+                    name: None,
+                    revision: EvaluationRevisionUpdate {
+                        measurements: Some(vec!["duration".to_owned()]),
+                        ..EvaluationRevisionUpdate::default()
+                    },
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap();
+        assert!(!edited_after_promotion.summary.saved);
+        assert!(edited_after_promotion.summary.definition_id.is_none());
+        let historical_promotion = controller
+            .save_evaluation_draft(
+                &draft.summary.id,
+                SaveEvaluationDraftRequest {
+                    revision_id: Some(passing_revision_id.clone()),
+                    name: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            historical_promotion.summary.current_revision_id,
+            edited_after_promotion.summary.current_revision_id
+        );
+        assert_eq!(historical_promotion.summary.status, "ready");
+        assert!(!historical_promotion.summary.saved);
+        assert_eq!(
+            historical_promotion.summary.definition_id.as_deref(),
+            Some(definition_id.as_str())
+        );
+        assert_eq!(
+            historical_promotion.summary.promoted_revision_id.as_deref(),
+            Some(passing_revision_id.as_str())
+        );
+
+        let interrupted_validation_id = format!("validation-recovery-{}", random_suffix());
+        let interrupted_validation = EvaluationValidationAttempt {
+            id: interrupted_validation_id.clone(),
+            draft_id: draft.summary.id.clone(),
+            revision_id: passing_revision_id.clone(),
+            execution_status: EvaluationExecutionStatus::Running,
+            assertion_status: ValidationAssertionStatus::NotEvaluated,
+            harness_id: "v0".to_owned(),
+            model_profile_id: "test".to_owned(),
+            run_id: None,
+            started_at_ms: now_ms(),
+            finished_at_ms: None,
+            error: None,
+            score: None,
+        };
+        controller
+            .inject_stale_validation_manifest_for_recovery_test(
+                &draft.summary.id,
+                interrupted_validation,
+            )
+            .unwrap();
+
+        drop(controller);
+        let reopened =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        let reopened_draft = reopened.evaluation_draft(&draft.summary.id).unwrap();
+        assert_eq!(reopened_draft.revisions.len(), 4);
+        assert_eq!(reopened_draft.validations.len(), 9);
+        let recovered_validation = reopened_draft
+            .validations
+            .iter()
+            .find(|attempt| attempt.id == interrupted_validation_id)
+            .unwrap();
+        assert_eq!(
+            recovered_validation.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            recovered_validation.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(
+            reopened_draft.events.iter().any(|event| {
+                event.kind == "evaluation-validation.finished"
+                    && event.payload["id"] == interrupted_validation_id
+                    && event.payload["executionStatus"] == "inconclusive"
+            }),
+            "recovery should make the terminal validation outcome observable"
+        );
+        assert_eq!(
+            reopened
+                .evaluation_definition(&definition_id)
+                .unwrap()
+                .summary,
+            EvaluationDefinitionSummary {
+                id: definition_id.clone(),
+                name: "Crash-recovered catalog regression".to_owned(),
+                draft_id: draft.summary.id.clone(),
+                revision_id: passing_revision_id.clone(),
+                created_at_ms: definition.summary.created_at_ms,
+            }
+        );
+        assert_eq!(
+            reopened
+                .get_evaluation(&evaluation.summary.id)
+                .unwrap()
+                .summary
+                .definition_id
+                .as_deref(),
+            Some(definition_id.as_str())
+        );
+        let mut base_revision_id = reopened_draft.summary.current_revision_id.clone();
+        for index in reopened_draft.revisions.len()..promotion::MAX_EVALUATION_DRAFT_REVISIONS {
+            let revised = reopened
+                .update_evaluation_draft(
+                    &draft.summary.id,
+                    UpdateEvaluationDraftRequest {
+                        base_revision_id,
+                        name: None,
+                        revision: EvaluationRevisionUpdate {
+                            task: Some(format!("Bounded revision {index}")),
+                            ..EvaluationRevisionUpdate::default()
+                        },
+                    },
+                    WorkbenchOrigin::Browser,
+                )
+                .unwrap();
+            base_revision_id = revised.summary.current_revision_id;
+        }
+        let at_revision_limit = reopened.evaluation_draft(&draft.summary.id).unwrap();
+        assert_eq!(
+            at_revision_limit.revisions.len(),
+            promotion::MAX_EVALUATION_DRAFT_REVISIONS
+        );
+        let revision_directories_before = fs::read_dir(
+            data.join("evaluation-library/drafts")
+                .join(&draft.summary.id)
+                .join("revisions"),
+        )
+        .unwrap()
+        .count();
+        let error = reopened
+            .update_evaluation_draft(
+                &draft.summary.id,
+                UpdateEvaluationDraftRequest {
+                    base_revision_id,
+                    name: None,
+                    revision: EvaluationRevisionUpdate {
+                        task: Some("One revision too many".to_owned()),
+                        ..EvaluationRevisionUpdate::default()
+                    },
+                },
+                WorkbenchOrigin::Browser,
+            )
+            .unwrap_err();
+        assert!(matches!(error, RunError::InvalidRequest(_)));
+        assert!(error.to_string().contains("retain at most"));
+        assert_eq!(
+            fs::read_dir(
+                data.join("evaluation-library/drafts")
+                    .join(&draft.summary.id)
+                    .join("revisions"),
+            )
+            .unwrap()
+            .count(),
+            revision_directories_before
+        );
+        let captured_harness_id = reopened_draft
+            .revisions
+            .iter()
+            .find(|revision| revision.id == passing_revision_id)
+            .unwrap()
+            .source
+            .harness_id
+            .clone();
+
+        drop(reopened);
+        let drifted_harnesses = || {
+            ["v0", "eve"]
+                .into_iter()
+                .map(|id| HarnessProfile {
+                    id: id.to_owned(),
+                    display_name: id.to_owned(),
+                    launch: promotion_fixture_launch(),
+                    models: BTreeMap::from([(
+                        "test".to_owned(),
+                        if id == captured_harness_id {
+                            format!("fixture/{id}-drifted")
+                        } else {
+                            format!("fixture/{id}")
+                        },
+                    )]),
+                })
+                .collect::<Vec<_>>()
+        };
+        let drifted =
+            RunController::new_with_harnesses(config(), drifted_harnesses(), models.clone())
+                .unwrap();
+        let drifted_attempt = drifted
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        let drifted_attempt =
+            wait_for_validation(&drifted, &draft.summary.id, &drifted_attempt.id).await;
+        assert_eq!(
+            drifted_attempt.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            drifted_attempt.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(drifted_attempt.run_id.is_none());
+        assert!(
+            drifted_attempt
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("captured validation model changed"))
+        );
+        drop(drifted);
+
+        let launch_drifted_harnesses = || {
+            ["v0", "eve"]
+                .into_iter()
+                .map(|id| {
+                    let mut launch = promotion_fixture_launch();
+                    launch.env.push((
+                        "AGENT_LAB_PROMOTION_OUTCOME_FILE".into(),
+                        if id == captured_harness_id {
+                            promotion_outcome.with_extension("changed").into_os_string()
+                        } else {
+                            promotion_outcome.clone().into_os_string()
+                        },
+                    ));
+                    HarnessProfile {
+                        id: id.to_owned(),
+                        display_name: id.to_owned(),
+                        launch,
+                        models: BTreeMap::from([("test".to_owned(), format!("fixture/{id}"))]),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let launch_drifted =
+            RunController::new_with_harnesses(config(), launch_drifted_harnesses(), models.clone())
+                .unwrap();
+        let launch_drifted_attempt = launch_drifted
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap();
+        let launch_drifted_attempt = wait_for_validation(
+            &launch_drifted,
+            &draft.summary.id,
+            &launch_drifted_attempt.id,
+        )
+        .await;
+        assert_eq!(
+            launch_drifted_attempt.execution_status,
+            EvaluationExecutionStatus::Inconclusive
+        );
+        assert_eq!(
+            launch_drifted_attempt.assertion_status,
+            ValidationAssertionStatus::NotEvaluated
+        );
+        assert!(launch_drifted_attempt.run_id.is_none());
+        assert!(
+            launch_drifted_attempt
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("captured validation harness launch changed"))
+        );
+        drop(launch_drifted);
+
+        let retention =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        retention
+            .fill_validation_retention_for_test(&draft.summary.id, &passing_revision_id)
+            .unwrap();
+        let at_validation_limit = retention.evaluation_draft(&draft.summary.id).unwrap();
+        assert_eq!(
+            at_validation_limit.validations.len(),
+            promotion::MAX_EVALUATION_VALIDATION_ATTEMPTS
+        );
+        let error = retention
+            .start_evaluation_validation(&draft.summary.id, Some(&passing_revision_id))
+            .unwrap_err();
+        assert!(matches!(error, RunError::InvalidRequest(_)));
+        assert!(error.to_string().contains("retain at most"));
+        assert_eq!(
+            retention
+                .evaluation_draft(&draft.summary.id)
+                .unwrap()
+                .validations
+                .len(),
+            promotion::MAX_EVALUATION_VALIDATION_ATTEMPTS
+        );
+        drop(retention);
+
+        fs::write(
+            data.join("evaluation-library/definitions")
+                .join(&definition_id)
+                .join("source/README.md"),
+            b"tampered definition source",
+        )
+        .unwrap();
+        let after_tamper =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        assert!(after_tamper.evaluation_definition(&definition_id).is_err());
+        assert!(after_tamper.evaluation_draft(&draft.summary.id).is_ok());
+
+        drop(after_tamper);
+        fs::write(
+            data.join("evaluation-library/definitions")
+                .join(&definition_id)
+                .join("source/README.md"),
+            b"seed\n",
+        )
+        .unwrap();
+        let before_secret =
+            RunController::new_with_harnesses(config(), harnesses(), models.clone()).unwrap();
+        assert!(before_secret.evaluation_definition(&definition_id).is_ok());
+        fs::write(
+            data.join("evaluation-library/drafts")
+                .join(&draft.summary.id)
+                .join("revisions")
+                .join(&passing_revision_id)
+                .join("source/credential.txt"),
+            LATER_PROMOTION_SECRET,
+        )
+        .unwrap();
+        fs::write(
+            data.join("evaluation-library/definitions")
+                .join(&definition_id)
+                .join("source/credential.txt"),
+            LATER_PROMOTION_SECRET,
+        )
+        .unwrap();
+        let workspace = before_secret.state(&explore.id).unwrap();
+        let error = invalidate_contaminated_secret_evidence(
+            &before_secret.inner.runs,
+            &before_secret.inner.evaluations,
+            &before_secret.inner.promotion,
+            &workspace,
+            &[LATER_PROMOTION_SECRET.as_bytes().to_vec()],
+        )
+        .unwrap_err();
+        assert!(matches!(error, RunError::EvidencePersistence(_)));
+        assert!(before_secret.evaluation_draft(&draft.summary.id).is_err());
+        assert!(before_secret.evaluation_definition(&definition_id).is_err());
+        assert!(before_secret.get(&passing_validation_run_id).is_err());
+        drop(workspace);
+        drop(before_secret);
+        let after_secret =
+            RunController::new_with_harnesses(config(), harnesses(), models).unwrap();
+        assert!(after_secret.evaluation_draft(&draft.summary.id).is_err());
+        assert!(after_secret.evaluation_definition(&definition_id).is_err());
+        drop(after_secret);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
     async fn prepare_interactive_fixture(
         label: &str,
         launch: DriverLaunch,
@@ -16381,7 +18128,7 @@ done
                 WorkbenchOrigin::Nushell,
             )
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let observed = controller
                 .list_agent_sessions(&explore.id)
@@ -18434,6 +20181,8 @@ totalScore = 11
             assertions: CatalogAssertions {
                 active_names: vec!["alpha".to_owned(), "gamma".to_owned()],
                 total_score: 11,
+                required_capability_sources: default_catalog_required_capability_sources(),
+                require_schema: true,
             },
         }
     }
@@ -18504,7 +20253,6 @@ totalScore = 11
             agent_session_directories,
             workspace,
             workspace_evidence_root,
-            output: "result.json".into(),
             initial_snapshot,
             capabilities: Mutex::new(Vec::new()),
             secret_values: Arc::new(Mutex::new(Vec::new())),
@@ -19833,6 +21581,8 @@ sleep 30
             model_profile_id: "haiku".to_owned(),
             source_workspace_id: "source-workspace".to_owned(),
             source_revision: "source-revision".to_owned(),
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: Vec::new(),
             arms: Vec::new(),
             status: EvaluationStatus::Running,
@@ -19851,6 +21601,8 @@ sleep 30
             bundle_directories,
             evidence_quarantined: AtomicBool::new(false),
             replay_failed: false,
+            scenario_override: None,
+            capability_recipe: None,
         });
         lock(&controller.inner.evaluations).insert(evaluation_id.to_owned(), state.clone());
         let (history, receiver) = controller.subscribe_evaluation(evaluation_id).unwrap();
@@ -22253,6 +24005,8 @@ fi
             model_profile_id: "haiku".to_owned(),
             source_workspace_id: "run-explore".to_owned(),
             source_revision: "revision-1".to_owned(),
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
             arms: vec![
                 EvaluationArmSummary {
@@ -22322,6 +24076,8 @@ fi
             model_profile_id: "haiku".to_owned(),
             source_workspace_id: "run-explore".to_owned(),
             source_revision: "revision-1".to_owned(),
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: vec!["v0".to_owned(), "eve".to_owned()],
             arms: Vec::new(),
             status: EvaluationStatus::Passed,
@@ -22777,7 +24533,6 @@ fi
             agent_session_directories,
             workspace: root.join("workspace"),
             workspace_evidence_root,
-            output: "result.json".into(),
             initial_snapshot: Some(snapshot_tree(&root.join("initial")).unwrap()),
             capabilities: Mutex::new(vec![CapabilityEndpoint {
                 id: "catalog".to_owned(),
@@ -23656,16 +25411,16 @@ fi
 
         let (quarantine_reached_tx, quarantine_reached_rx) = mpsc::channel();
         let (quarantine_release_tx, quarantine_release_rx) = mpsc::channel();
-        let runs = controller.inner.runs.clone();
-        let evaluations = controller.inner.evaluations.clone();
+        let inner = controller.inner.clone();
         let quarantined_workspace = workspace.clone();
         let invalidator = thread::spawn(move || {
             QUARANTINE_PUBLICATION_PAUSE.with(|pause| {
                 *pause.borrow_mut() = Some((quarantine_reached_tx, quarantine_release_rx));
             });
             invalidate_contaminated_secret_evidence(
-                &runs,
-                &evaluations,
+                &inner.runs,
+                &inner.evaluations,
+                &inner.promotion,
                 &quarantined_workspace,
                 &[LATER_SECRET.as_bytes().to_vec()],
             )
@@ -23775,6 +25530,8 @@ fi
             model_profile_id: "test".to_owned(),
             source_workspace_id: "run-events".to_owned(),
             source_revision: "concurrent-evaluation-source".to_owned(),
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: Vec::new(),
             arms: Vec::new(),
             status: EvaluationStatus::Running,
@@ -23798,6 +25555,8 @@ fi
             bundle_directories,
             evidence_quarantined: AtomicBool::new(false),
             replay_failed: false,
+            scenario_override: None,
+            capability_recipe: None,
         });
         lock(&controller.inner.evaluations).insert(evaluation_id.to_owned(), evaluation.clone());
         let mut lagged_receiver = evaluation.sender.subscribe();
@@ -23832,8 +25591,7 @@ fi
 
         let (quarantine_reached_tx, quarantine_reached_rx) = mpsc::channel();
         let (quarantine_release_tx, quarantine_release_rx) = mpsc::channel();
-        let runs = controller.inner.runs.clone();
-        let evaluations = controller.inner.evaluations.clone();
+        let inner = controller.inner.clone();
         let invalidator = {
             let workspace = workspace.clone();
             thread::spawn(move || {
@@ -23841,8 +25599,9 @@ fi
                     *pause.borrow_mut() = Some((quarantine_reached_tx, quarantine_release_rx));
                 });
                 invalidate_contaminated_secret_evidence(
-                    &runs,
-                    &evaluations,
+                    &inner.runs,
+                    &inner.evaluations,
+                    &inner.promotion,
                     &workspace,
                     &[LATER_SECRET.as_bytes().to_vec()],
                 )
@@ -23975,6 +25734,8 @@ fi
             model_profile_id: "test".to_owned(),
             source_workspace_id: "run-events".to_owned(),
             source_revision: "revision-before-secret".to_owned(),
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: vec!["fixture-a".to_owned(), "fixture-b".to_owned()],
             arms: vec![
                 EvaluationArmSummary {
@@ -24010,12 +25771,15 @@ fi
             bundle_directories,
             evidence_quarantined: AtomicBool::new(false),
             replay_failed: false,
+            scenario_override: None,
+            capability_recipe: None,
         });
         lock(&controller.inner.evaluations).insert(evaluation_id.to_owned(), evaluation.clone());
 
         invalidate_contaminated_secret_evidence(
             &controller.inner.runs,
             &controller.inner.evaluations,
+            &controller.inner.promotion,
             &workspace,
             &[LATER_SECRET.as_bytes().to_vec()],
         )
@@ -24104,6 +25868,8 @@ fi
             model_profile_id: "test".to_owned(),
             source_workspace_id: "source-workspace".to_owned(),
             source_revision: SOURCE_REVISION.to_owned(),
+            definition_id: None,
+            definition_revision_id: None,
             harness_ids: vec!["fixture".to_owned()],
             arms: vec![EvaluationArmSummary {
                 harness_id: "fixture".to_owned(),
@@ -24126,12 +25892,15 @@ fi
             bundle_directories,
             evidence_quarantined: AtomicBool::new(false),
             replay_failed: false,
+            scenario_override: None,
+            capability_recipe: None,
         });
         lock(&controller.inner.evaluations).insert(evaluation_id.to_owned(), evaluation.clone());
 
         let error = invalidate_contaminated_secret_evidence(
             &controller.inner.runs,
             &controller.inner.evaluations,
+            &controller.inner.promotion,
             &arm,
             &[LATER_SECRET.as_bytes().to_vec()],
         )

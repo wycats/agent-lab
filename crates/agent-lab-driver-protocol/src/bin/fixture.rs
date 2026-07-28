@@ -51,6 +51,7 @@ const CATALOG_CONCLUSION: &str = r#"# Catalog answer
     ```json
     {"name":"gamma","score":8}
     ```"#;
+const EVALUATION_PROPOSAL_PROMPT_CONTRACT: &str = "agent-lab/evaluation-proposal@1";
 
 impl Fixture {
     fn new() -> Self {
@@ -277,6 +278,7 @@ impl Fixture {
         capability_sources: &JsonValue,
     ) -> io::Result<()> {
         let mode = task.get("mode").and_then(JsonValue::as_str);
+        let prompt_contract = task.get("promptContract").and_then(JsonValue::as_str);
         self.emit(
             output,
             DriverBody::TurnEvent {
@@ -295,7 +297,9 @@ impl Fixture {
                 payload: (*capability_sources).clone(),
             },
         )?;
-        if mode == Some("real") {
+        if prompt_contract == Some(EVALUATION_PROPOSAL_PROMPT_CONTRACT) {
+            self.complete_evaluation_proposal(output, &session_id, &turn_id, task)?;
+        } else if mode == Some("real") {
             self.complete_catalog_scenario(output, &session_id, &turn_id, capability_sources)?;
         } else if mode == Some("interactive") {
             self.complete_interactive_turn(
@@ -306,7 +310,14 @@ impl Fixture {
                 capability_sources,
             )?;
         } else if mode == Some("evaluation-proposal") {
-            self.complete_evaluation_proposal(output, &session_id, &turn_id, task)?;
+            return self.fail(
+                output,
+                DriverFailureScope::Turn,
+                Some(session_id),
+                Some(turn_id),
+                "unsupported-mode",
+                "evaluation proposals use interactive mode with a versioned prompt contract",
+            );
         }
         self.emit(
             output,
@@ -487,7 +498,10 @@ impl Fixture {
             ],
             "rationale": "This span captures the complete catalog-to-file behavior."
         });
-        let answer = serde_json::to_string(&candidate).map_err(io::Error::other)?;
+        let candidate_json = serde_json::to_string(&candidate).map_err(io::Error::other)?;
+        let answer = format!(
+            "<Thinking>Reviewing the selected turn span and evaluator.</Thinking>\n{candidate_json}"
+        );
         let message_id = format!("fixture-proposal-{turn_id}");
         self.emit(
             output,

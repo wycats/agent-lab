@@ -9,7 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use agent_lab_driver_protocol::MAX_DRIVER_RECORD_BYTES;
+use agent_lab_driver_protocol::{
+    AssistantTextPartKind, MAX_DRIVER_RECORD_BYTES, split_assistant_text,
+};
 use nu_ansi_term::{Color, Style};
 use nu_engine::CallExt;
 use nu_parser::FlatShape;
@@ -1094,11 +1096,12 @@ fn print_repl_output(
         && let Some(response) = agent_answer_response(value)
     {
         let safe_response = neutralize_terminal_controls(response);
+        let display_response = assistant_markdown_for_terminal(&safe_response);
         let width = markdown_render_width(termimad::crossterm::terminal::size().ok());
         let formatted = renderer
-            .render(&safe_response, width)
+            .render(&display_response, width)
             .map(|rendered| filter_terminal_rendering(&rendered))
-            .unwrap_or(safe_response);
+            .unwrap_or(display_response);
         writer.write_all(formatted.as_bytes()).map_err(|error| {
             shell_error(
                 "Agent answer display failed",
@@ -1139,6 +1142,42 @@ fn print_repl_output(
         }
         output => output.print_table(engine_state, stack, false, false),
     }
+}
+
+fn assistant_markdown_for_terminal(source: &str) -> String {
+    let parts = split_assistant_text(source);
+    if !parts
+        .iter()
+        .any(|part| part.kind == AssistantTextPartKind::Thinking)
+    {
+        return source.to_owned();
+    }
+
+    parts
+        .iter()
+        .filter_map(|part| {
+            let text = part.text.trim_matches('\n');
+            match part.kind {
+                AssistantTextPartKind::Answer => (!text.is_empty()).then(|| text.to_owned()),
+                AssistantTextPartKind::Thinking => {
+                    let mut markdown = if part.complete {
+                        "> **Thinking**".to_owned()
+                    } else {
+                        "> **Thinking (in progress)**".to_owned()
+                    };
+                    for line in text.lines() {
+                        markdown.push_str("\n>");
+                        if !line.is_empty() {
+                            markdown.push(' ');
+                            markdown.push_str(line);
+                        }
+                    }
+                    Some(markdown)
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn print_terminal_text_stream(
@@ -4802,6 +4841,40 @@ mod tests {
         assert!(output.contains("# Safe\u{fffd}[31m\nnext"));
         assert!(output.ends_with('\n'));
         assert!(!output.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn direct_answer_rendering_labels_thinking_without_changing_the_record() {
+        let host = NushellHost::new();
+        let mut stack = Stack::new();
+        let source =
+            "<Thinking>Inspecting **alpha**.\n\n- checking score</Thinking>\n# Answer\n\nDone.";
+        let answer_value = json_to_nu(
+            json!({
+                "type": AGENT_ANSWER_TYPE,
+                "response": source
+            }),
+            Span::unknown(),
+        );
+        assert_eq!(agent_answer_response(&answer_value), Some(source));
+        let mut output = Vec::new();
+
+        print_repl_output(
+            answer_value.into_pipeline_data(),
+            &host.engine_state,
+            &mut stack,
+            &TestMarkdownRenderer { fail: false },
+            &mut output,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("> **Thinking**"));
+        assert!(output.contains("> Inspecting **alpha**."));
+        assert!(output.contains("> - checking score"));
+        assert!(output.contains("# Answer\n\nDone."));
+        assert!(!output.contains("<Thinking>"));
+        assert!(!output.contains("</Thinking>"));
     }
 
     #[test]

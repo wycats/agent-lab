@@ -15929,11 +15929,11 @@ while IFS= read -r line; do
     *'"type":"turn.start"'*)
       turn=$(printf '%s' "$line" | sed -E 's/.*"turnId":"([^"]+)".*/\1/')
       case "$line" in
-        *'"mode":"evaluation-proposal"'*)
+        *'"promptContract":"agent-lab/evaluation-proposal@1"'*)
           proposal_session=1
           from=$(printf '%s' "$line" | sed -E 's/.*"fromTurnId":"([^"]+)".*/\1/')
           through=$(printf '%s' "$line" | sed -E 's/.*"throughTurnId":"([^"]+)".*/\1/')
-          candidate='{\"schemaVersion\":1,\"fromTurnId\":\"'"$from"'\",\"throughTurnId\":\"'"$through"'\",\"task\":\"Use catalog list and analysis summarize to create and verify result.json.\",\"evaluator\":{\"id\":\"catalog-to-file\",\"version\":1,\"parameters\":{\"activeNames\":[\"alpha\",\"gamma\"],\"totalScore\":11,\"requiredCapabilitySources\":[\"catalog\",\"analysis\"],\"outputPath\":\"result.json\",\"requireSchema\":true}},\"measurements\":[\"duration\",\"model-turns\",\"capability-calls\",\"workspace-effects\",\"reported-usage\"],\"rationale\":\"This span captures the complete catalog-to-file behavior.\"}'
+          candidate='<Thinking>Reviewing the selected turn span.</Thinking>\n{\"schemaVersion\":1,\"fromTurnId\":\"'"$from"'\",\"throughTurnId\":\"'"$through"'\",\"task\":\"Use catalog list and analysis summarize to create and verify result.json.\",\"evaluator\":{\"id\":\"catalog-to-file\",\"version\":1,\"parameters\":{\"activeNames\":[\"alpha\",\"gamma\"],\"totalScore\":11,\"requiredCapabilitySources\":[\"catalog\",\"analysis\"],\"outputPath\":\"result.json\",\"requireSchema\":true}},\"measurements\":[\"duration\",\"model-turns\",\"capability-calls\",\"workspace-effects\",\"reported-usage\"],\"rationale\":\"This span captures the complete catalog-to-file behavior.\"}'
           if [ -n "${AGENT_LAB_PROPOSAL_SCRATCH_SECRET:-}" ]; then
             printf '%s' "$AGENT_LAB_PROPOSAL_SCRATCH_SECRET" > "$workspace/scratch-leak.txt"
           fi
@@ -16418,6 +16418,30 @@ done
             event.kind == "observation.progress" || event.kind == "observation.assistant.completed"
         }));
         let proposal_id = proposal.summary.id.clone();
+        let transcript: DriverTranscript = serde_json::from_slice(
+            &fs::read(
+                data.join("evaluation-library")
+                    .join("proposals")
+                    .join(&proposal_id)
+                    .join("driver.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let turn_task = transcript
+            .controller_records
+            .iter()
+            .filter_map(|record| serde_json::from_slice::<ControllerCommand>(record).ok())
+            .find_map(|command| match command.body {
+                CommandBody::StartTurn { task, .. } => Some(task),
+                _ => None,
+            })
+            .expect("the proposal transcript should retain its exact turn task");
+        assert_eq!(turn_task["mode"], json!("interactive"));
+        assert_eq!(
+            turn_task["promptContract"],
+            json!("agent-lab/evaluation-proposal@1")
+        );
         drop(controller);
 
         let proposal_events = data

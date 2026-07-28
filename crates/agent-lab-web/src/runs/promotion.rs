@@ -696,7 +696,7 @@ impl RunController {
         }
         let id = format!("proposal-{}-{}", now_ms(), random_suffix());
         let turn_task = json!({
-            "mode": "evaluation-proposal",
+            "mode": "interactive",
             "promptContract": PROPOSAL_PROMPT_CONTRACT,
             "prompt": proposal_prompt(),
             "input": source_input,
@@ -1265,12 +1265,7 @@ impl RunController {
                             .to_owned(),
                     )
                 })?;
-                let candidate: EvaluationProposalCandidate = serde_json::from_str(&response)
-                    .map_err(|error| {
-                        RunError::Protocol(format!(
-                            "evaluation proposal returned invalid JSON: {error}"
-                        ))
-                    })?;
+                let candidate = parse_evaluation_proposal_candidate(&response)?;
                 let (requested_from, requested_through) = {
                     let detail = lock(&state.detail);
                     (
@@ -3235,16 +3230,105 @@ fn selected_turns_digest(
 }
 
 fn proposal_prompt() -> &'static str {
-    r"You are proposing one portable evaluation from durable agent-turn evidence.
+    r#"You are proposing one portable evaluation from durable agent-turn evidence.
 Return exactly one JSON object and no Markdown.
 Use schemaVersion 1 with these fields:
 - fromTurnId and throughTurnId: a contiguous meaningful terminal span from the supplied turns
 - task: a standalone instruction that can be replayed from the first turn's starting state
 - evaluator: the reviewed catalog-to-file evaluator object supplied by the source scenario
-- measurements: a useful subset of duration, model-turns, capability-calls, workspace-effects, and reported-usage
+- measurements: a JSON array containing a useful subset of "duration", "model-turns", "capability-calls", "workspace-effects", and "reported-usage"
 - rationale: a concise explanation for the builder
 If requestedSpan contains turn IDs, use that exact span.
-Do not include a harness or model in the portable task."
+Do not include a harness or model in the portable task."#
+}
+
+fn parse_evaluation_proposal_candidate(
+    response: &str,
+) -> Result<EvaluationProposalCandidate, RunError> {
+    let answer = agent_lab_driver_protocol::answer_after_leading_thinking(response);
+    let source = answer.trim();
+    let source = markdown_json_fence_contents(source).unwrap_or(source);
+    let mut value: JsonValue = serde_json::from_str(source).map_err(|error| {
+        RunError::Protocol(format!(
+            "evaluation proposal returned invalid JSON: {error}"
+        ))
+    })?;
+    normalize_proposal_measurements(&mut value)?;
+    serde_json::from_value(value).map_err(|error| {
+        RunError::Protocol(format!(
+            "evaluation proposal returned an invalid object: {error}"
+        ))
+    })
+}
+
+fn normalize_proposal_measurements(value: &mut JsonValue) -> Result<(), RunError> {
+    let Some(measurements) = value.get_mut("measurements") else {
+        return Ok(());
+    };
+    let JsonValue::Object(entries) = measurements else {
+        return Ok(());
+    };
+    let mut selected = BTreeSet::new();
+    for key in entries.keys() {
+        let canonical = match key.as_str() {
+            "duration" => "duration",
+            "model-turns" | "modelTurns" => "model-turns",
+            "capability-calls" | "capabilityCalls" => "capability-calls",
+            "workspace-effects" | "workspaceEffects" => "workspace-effects",
+            "reported-usage" | "reportedUsage" => "reported-usage",
+            unsupported => {
+                return Err(RunError::Protocol(format!(
+                    "evaluation proposal selected unsupported measurement: {unsupported}"
+                )));
+            }
+        };
+        selected.insert(canonical);
+    }
+    *measurements = json!(
+        PROPOSAL_MEASUREMENTS
+            .iter()
+            .filter(|measurement| selected.contains(**measurement))
+            .copied()
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+fn markdown_json_fence_contents(source: &str) -> Option<&str> {
+    let first_line_end = source.find('\n')?;
+    let opening = source[..first_line_end].trim_end_matches('\r');
+    let opening = opening.trim_start();
+    let marker = *opening.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let width = opening
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    if width < 3 {
+        return None;
+    }
+    let language = opening[width..].trim();
+    if !language.is_empty() && !language.eq_ignore_ascii_case("json") {
+        return None;
+    }
+
+    let last_line_start = source.rfind('\n')?;
+    if last_line_start == first_line_end {
+        return None;
+    }
+    let closing = source[last_line_start + 1..].trim();
+    let closing_width = closing
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    if closing_width < width || !closing[closing_width..].trim().is_empty() {
+        return None;
+    }
+    Some(&source[first_line_end + 1..last_line_start])
 }
 
 fn validate_requested_proposal_span(
@@ -4901,6 +4985,78 @@ fn load_definitions(
 mod tests {
     use super::*;
 
+    fn proposal_candidate_json(measurements: &JsonValue) -> JsonValue {
+        json!({
+            "schemaVersion": 1,
+            "fromTurnId": "turn-1",
+            "throughTurnId": "turn-1",
+            "task": "Create result.json from the active catalog",
+            "evaluator": {
+                "id": "catalog-to-file",
+                "version": 1,
+                "parameters": {
+                    "activeNames": ["alpha"],
+                    "totalScore": 3,
+                    "requiredCapabilitySources": ["catalog"],
+                    "outputPath": "result.json",
+                    "requireSchema": true
+                }
+            },
+            "measurements": measurements,
+            "rationale": "This turn captures the reusable behavior."
+        })
+    }
+
+    #[test]
+    fn proposal_candidate_accepts_raw_or_markdown_fenced_json() {
+        let raw = serde_json::to_string(&proposal_candidate_json(&json!([
+            "duration",
+            "capability-calls"
+        ])))
+        .unwrap();
+        let parsed = parse_evaluation_proposal_candidate(&raw).unwrap();
+        assert_eq!(parsed.measurements, vec!["duration", "capability-calls"]);
+
+        let fenced = format!(
+            "<Thinking>Choose the stable measurements.</Thinking>\n```json\n{}\n```",
+            proposal_candidate_json(&json!({
+                "reportedUsage": {},
+                "duration": null,
+                "modelTurns": 1,
+                "capabilityCalls": 1,
+                "workspaceEffects": 0
+            }))
+        );
+        let parsed = parse_evaluation_proposal_candidate(&fenced).unwrap();
+        assert_eq!(
+            parsed.measurements,
+            PROPOSAL_MEASUREMENTS
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn proposal_candidate_keeps_the_json_wrapper_strict() {
+        let raw = proposal_candidate_json(&json!(["duration"])).to_string();
+        let with_prose = format!("Here is the proposal:\n```json\n{raw}\n```");
+        assert!(
+            parse_evaluation_proposal_candidate(&with_prose)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid JSON")
+        );
+
+        let unsupported = proposal_candidate_json(&json!({ "duration": null, "estimatedCost": 1 }));
+        assert!(
+            parse_evaluation_proposal_candidate(&unsupported.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported measurement")
+        );
+    }
+
     #[test]
     fn proposal_event_budget_bounds_progress_but_preserves_terminal_delivery() {
         enforce_proposal_event_budget(0, 0, 32, false).unwrap();
@@ -5044,7 +5200,7 @@ mod tests {
         });
         assert!(serde_json::to_vec(&source).unwrap().len() <= MAX_AGENT_TURN_INPUT_BYTES);
         let turn_task = json!({
-            "mode": "evaluation-proposal",
+            "mode": "interactive",
             "promptContract": PROPOSAL_PROMPT_CONTRACT,
             "prompt": proposal_prompt(),
             "input": source,

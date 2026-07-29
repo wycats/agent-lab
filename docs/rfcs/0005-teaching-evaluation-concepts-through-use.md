@@ -211,8 +211,12 @@ should distinguish at least:
   produced interpretable evidence.
 - **Replay was inconclusive.** Agent Lab could not restore, execute, evaluate,
   or finalize the declared experiment.
-- **Replay was cancelled or intervened.** The attempt stopped or no longer
-  represents controlled agent-only behavior.
+- **Replay was cancelled.** The attempt stopped; retained evidence may be
+  partial and does not establish a behavioral result.
+- **Replay was intervened.** Human action broke the controlled agent-only
+  condition. Evidence may still be complete, but the assertions remain
+  **not evaluated**, so the attempt cannot support a clean agent-only
+  validation.
 - **Current revision is unvalidated.** Earlier attempts belong to an older
   immutable revision.
 
@@ -234,7 +238,8 @@ meaning:
 | Validation queued or running | Agent Lab is replaying this exact version with the named harness and model. |
 | Complete with failed assertions | The replay ran successfully; these expectations did not match. |
 | Inconclusive and not evaluated | Agent Lab could not establish the behavioral result because execution or evidence was incomplete. |
-| Cancelled or intervened | Partial evidence was retained, but this is not a clean validation. |
+| Cancelled | The attempt stopped. Retained evidence may be partial and does not establish the behavioral result. |
+| Intervened | Human action broke the agent-only condition. Evidence may be complete, but assertions remain **not evaluated**, so the attempt cannot support a clean validation. |
 | Complete and passed | This exact version reproduced successfully once. |
 | Saved without a passing replay | The work is retained as an editable draft, not a runnable evaluation. |
 | Promoted definition | This exact passing version is saved and runnable. |
@@ -286,14 +291,20 @@ It should answer:
 The workbench may prefill fields, but it should show their origin and invite
 review. Proposal output is advice, not an established expectation.
 
-The immutable revision model should be explained through behavior. Draft
-creation may first persist a source-derived seed revision and, for assisted
-authoring, a second proposal-applied revision before the builder acts. The
-story presents these as attributed draft initialization, not as builder
-confirmation or a meaningful user edit; the precise projection retains both
-revision identities and contents. Builder review chooses whether to validate
-the current revision or edit it. Each later material edit creates another
-revision and retains the earlier one with its attempts. The formal term
+The immutable revision model should be explained through behavior. Manual
+authoring may begin with a controller-created seed revision derived from the
+selected source evidence and reviewed defaults. Assisted authoring may persist
+two proposal-attributed initialization revisions before the builder acts: the
+draft seed and the proposal-applied current revision. Both may contain
+proposer-derived task, evaluator, or measurement fields. If proposal publication
+stops after the first revision, that retained seed remains proposal-attributed
+rather than becoming source evidence.
+
+The story presents these revisions as attributed draft initialization, not as
+builder confirmation or a meaningful user edit; the precise projection retains
+each revision's identity, contents, and origin. Builder review chooses whether
+to validate the current revision or edit it. Each later material edit creates
+another revision and retains the earlier one with its attempts. The formal term
 **revision** and its identity remain visible in the precise projection.
 
 ### 3. Validation replays one exact version

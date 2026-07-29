@@ -94,14 +94,12 @@ Real-model proposer quality, general assertion languages, repository export,
 and repeated statistical claims remain outside the demonstrated boundary.
 
 The source-action feedback gap is now partially addressed for proposal
-initiation and failure. Direct use still exposed a broader presentation gap:
-the implemented browser makes the promotion resources operable, but builders
-need substantial coaching to understand how source turns, revisions,
-validation outcomes, saved definitions, and comparisons relate. The lifecycle
-evidence in this RFC remains valid.
+initiation and failure. A broader persona-level question remains open: can
+builders understand how source turns, revisions, validation outcomes, saved
+definitions, and comparisons relate without substantial coaching? The
+lifecycle evidence in this RFC remains valid but does not answer that question.
 [RFC 0005](0005-teaching-evaluation-concepts-through-use.md) defines the
-provisional interaction model that must make those relationships learnable
-through use.
+provisional interaction model and acceptance boundary that will test it.
 
 ## Motivation
 
@@ -788,12 +786,12 @@ including a retained assertion failure, corrected passing revision, explicit
 promotion, and paired variant run, establishes that the interaction survives
 contact with actual harnesses. The mechanical walkthrough completed locally,
 and its public-safe evidence is summarized in steel threads 0005 and 0006.
-Direct use nevertheless required ongoing coaching to relate source turns,
-revisions, validation outcomes, saved definitions, and comparisons. The
-persona-level acceptance criterion therefore remains open. RFC 0005 defines
-the uncoached interaction boundary that should close it. Steel thread 0006 uses
-deterministic adapters to prove proposer lifecycle and trust boundaries; it
-does not establish real-model proposal quality.
+Those records establish lifecycle conformance, not uncoached learnability.
+RFC 0005 defines the acceptance boundary that will test whether a participant
+can relate source turns, revisions, validation outcomes, saved definitions, and
+comparisons through use. Steel thread 0006 uses deterministic adapters to prove
+proposer lifecycle and trust boundaries; it does not establish real-model
+proposal quality.
 
 ## Boundaries
 

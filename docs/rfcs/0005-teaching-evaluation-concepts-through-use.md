@@ -1,13 +1,15 @@
 # RFC 0005: Teaching evaluation concepts through use
 
 - Status: Provisional
-- Motivation evidence: the mechanical lifecycle demonstrated by
+- Substrate evidence: the mechanical lifecycle demonstrated by
   [steel threads 0005](../steel-threads/0005-manual-evaluation-promotion.md)
-  and [0006](../steel-threads/0006-assisted-evaluation-proposal.md), plus the
-  coached-use presentation gap recorded by
-  [RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md)
+  and [0006](../steel-threads/0006-assisted-evaluation-proposal.md)
+- Product hypothesis: those rigorous resources do not yet teach their
+  causal relationships well enough through use
 - Acceptance evidence: not yet collected; see
   [Validation boundary](#validation-boundary)
+- Timebox: one implementation and acceptance slice, capped at five working
+  days; the uncoached walkthrough is capped at 45 minutes
 
 ## Summary
 
@@ -59,8 +61,10 @@ source turn span
 ```
 
 It has no independent identity or lifecycle. The same projection is reachable
-from the source and every descendant. Multiple drafts, revisions, or attempts
-branch rather than being collapsed into one current story.
+from the source and every descendant. Several drafts may share a source span;
+validation attempts may fan out from a revision, and evaluation attempts may
+fan out from a definition. Within one draft, revisions form a retained linear
+chain: each edit is based on the current revision, and stale edits are rejected.
 
 A **comparison** is the human projection of a paired evaluation attempt and its
 arms, not another resource identity.
@@ -95,9 +99,10 @@ invariant, and evidence available whenever precision is needed.
 
 [RFC 0001](0001-product-thesis.md) already says that the interface should teach
 its programming model through use and that evaluations are the durable
-continuation of exploration. Direct use of the implemented promotion loop
-shows that this principle needs a more specific interaction contract. Correct
-resource forms and status badges do not by themselves explain the loop.
+continuation of exploration. This RFC tests the product hypothesis that the
+implemented promotion loop needs a more specific interaction contract: correct
+resource forms and status badges may not by themselves explain the loop.
+Acceptance evidence for that hypothesis has not yet been collected.
 
 Current implementation demonstrates one useful transition-level pattern:
 proposal work begins beside the source turn, detailed lifecycle feedback remains
@@ -484,6 +489,14 @@ resulting expected-versus-observed mismatch after replay, but neither the
 participant instruction nor a facilitator identifies which field is stale or
 how to resolve it.
 
+The walkthrough ends when the participant completes the final explanation,
+explicitly stops, requests or receives task-specific coaching, or reaches 45
+minutes. In the latter three cases, record the terminal state, intervention if
+any, and observed gap as a non-accepting observation rather than extending the
+attempt. If the presentation slice cannot reach this boundary within five
+working days, preserve the blockers and revise the proposal instead of
+broadening the slice.
+
 The participant should be able to:
 
 1. choose a consequential completed turn and explain what state the evaluation
@@ -522,6 +535,17 @@ this interaction can support the intended mental model for that participant; it
 does not establish broad learnability. Preserve the participant instruction,
 starting UI state, errors or hesitations, any interventions, completion
 outcome, and final explanation as the steel-thread evidence.
+
+Raw recordings or transcripts, participant identity, machine-local paths,
+credentials, and private workspace or model content remain local. The public
+steel-thread artifact contains only a participant-approved, sanitized summary
+of the instruction, fixture and source revision, starting UI state, elapsed
+time and terminal state, observed decision points, hesitations, errors,
+interventions, outcome, and final explanation. Paraphrase participant language
+by default; include quotations or screenshots only with explicit consent.
+Retain or delete raw study material according to the participant agreement,
+and never check it into this repository. If sanitization removes evidence
+needed for a claim, mark that claim unsupported.
 
 ## Drawbacks
 

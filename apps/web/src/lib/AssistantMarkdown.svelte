@@ -8,10 +8,20 @@
     type SvelteMarkdownOptions,
     type Token
   } from '@humanspeak/svelte-markdown';
+  import { createAssistantThinkingProjector } from '$lib/assistant-thinking';
+  import type { Snippet } from 'svelte';
 
   export let source: string;
   export let streaming = false;
 
+  type ThinkingSnippetProps = {
+    complete: boolean;
+    children?: Snippet;
+  };
+
+  const thinkingProjector = createAssistantThinkingProjector();
+  const extensions = [thinkingProjector.extension];
+  $: projectedSource = thinkingProjector.project(source);
   const renderers: Partial<Renderers> = {
     ...defaultRenderers,
     html: buildUnsupportedHTML()
@@ -57,7 +67,30 @@
 </script>
 
 <div class="assistant-markdown" data-testid="assistant-markdown" data-streaming={streaming}>
-  <SvelteMarkdown {source} {streaming} {renderers} {options} sanitizeUrl={sanitizeAgentUrl}>
+  <SvelteMarkdown
+    source={projectedSource}
+    {streaming}
+    {extensions}
+    {renderers}
+    {options}
+    sanitizeUrl={sanitizeAgentUrl}
+  >
+    {#snippet thinking({ complete, children }: ThinkingSnippetProps)}
+      <details
+        class="thinking-block"
+        data-complete={complete}
+        open={streaming || !complete}
+      >
+        <summary>
+          <span>Thinking</span>
+          {#if streaming || !complete}<em>in progress</em>{/if}
+        </summary>
+        <div class="thinking-content">
+          {@render children?.()}
+        </div>
+      </details>
+    {/snippet}
+
     {#snippet heading({ depth, children })}
       {#if depth === 1}
         <h3 class="markdown-heading">{@render children?.()}</h3>
@@ -186,4 +219,45 @@
     font-size: 0.86em;
   }
   .assistant-markdown :global(hr) { margin: 0.9em 0; border: 0; border-top: 1px solid #2d3b35; }
+
+  .thinking-block {
+    min-width: 0;
+    margin: 0.58em 0;
+    border: 1px solid #2b3b33;
+    border-radius: 6px;
+    background: #0c1410;
+  }
+  .thinking-block summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 9px;
+    color: #91a098;
+    cursor: pointer;
+    font-size: 0.64rem;
+    font-weight: 570;
+    list-style-position: inside;
+  }
+  .thinking-block summary::marker { color: #65776d; }
+  .thinking-block summary em {
+    color: #72837a;
+    font-family: var(--font-mono);
+    font-size: 0.56rem;
+    font-style: normal;
+    font-weight: 450;
+  }
+  .thinking-block[open] summary { border-bottom: 1px solid #24322b; }
+  .thinking-content {
+    min-width: 0;
+    padding: 8px 10px 9px;
+    color: #a7b2ac;
+    font-size: 0.72rem;
+    opacity: 0.9;
+  }
+  .thinking-block:focus-within { border-color: #486052; }
+  .thinking-block summary:focus-visible {
+    outline: 2px solid #789d6b;
+    outline-offset: 2px;
+  }
 </style>

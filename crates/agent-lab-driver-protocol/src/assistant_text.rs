@@ -5,8 +5,17 @@
 
 use std::borrow::Cow;
 
+use pulldown_cmark::{Event, Options, Parser, Tag};
+
 const THINKING_OPEN: &str = "<Thinking>";
 const THINKING_CLOSE: &str = "</Thinking>";
+
+fn markdown_options() -> Options {
+    Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_GFM
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssistantTextPartKind {
@@ -28,9 +37,11 @@ enum ThinkingTag {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct MarkdownFence {
-    marker: u8,
-    width: usize,
+struct ThinkingCandidate {
+    start: usize,
+    end: usize,
+    tag: ThinkingTag,
+    top_level: bool,
 }
 
 #[must_use]
@@ -141,116 +152,231 @@ pub fn answer_after_leading_thinking(source: &str) -> Cow<'_, str> {
 }
 
 fn thinking_tags(source: &str) -> Vec<(usize, usize, ThinkingTag)> {
-    let mut tags = Vec::new();
-    let mut fence = None;
-    let mut inline_code_width = None;
-    let mut line_start = 0;
-    while line_start < source.len() {
-        let line_end = source[line_start..]
-            .find('\n')
-            .map_or(source.len(), |offset| line_start + offset + 1);
-        let line = &source[line_start..line_end];
-        if let Some(active) = fence {
-            if closes_fence(line, active) {
-                fence = None;
+    let mut candidates = Vec::new();
+    let mut blocks = Vec::new();
+    for (event, range) in Parser::new_ext(source, markdown_options()).into_offset_iter() {
+        match event {
+            Event::Start(tag) => {
+                if matches!(tag, Tag::HtmlBlock) && blocks.is_empty() {
+                    collect_thinking_html_block(source, range.clone(), &mut candidates);
+                }
+                blocks.push(matches!(tag, Tag::Paragraph));
             }
-        } else if inline_code_width.is_none()
-            && let Some(opened) = opens_fence(line)
-        {
-            fence = Some(opened);
-        } else {
-            find_tags_in_line(line, line_start, &mut inline_code_width, &mut tags);
+            Event::End(_) => {
+                blocks.pop();
+            }
+            Event::InlineHtml(html) => {
+                let top_level = blocks.as_slice() == [true];
+                if (html.as_ref() == THINKING_OPEN || html.as_ref() == THINKING_CLOSE)
+                    && (top_level || !blocks.is_empty())
+                {
+                    candidates.push(ThinkingCandidate {
+                        start: range.start,
+                        end: range.end,
+                        tag: if html.as_ref() == THINKING_OPEN {
+                            ThinkingTag::Open
+                        } else {
+                            ThinkingTag::Close
+                        },
+                        top_level,
+                    });
+                }
+            }
+            _ => {}
         }
-        line_start = line_end;
+    }
+
+    let mut tags = Vec::new();
+    let mut opening = None;
+    let mut nested_literal_opens = Vec::new();
+    for ThinkingCandidate {
+        start,
+        end,
+        tag,
+        top_level,
+    } in candidates
+    {
+        let current_line = line_start(source, start);
+        match (opening, tag) {
+            (None, ThinkingTag::Open) if top_level && is_thinking_block_start(source, start) => {
+                tags.push((start, end, tag));
+                opening = Some((current_line, line_indentation(source, start)));
+            }
+            (Some(_), ThinkingTag::Open) => {
+                nested_literal_opens.push((start, end));
+            }
+            (Some((opened_line, opened_indentation)), ThinkingTag::Close) => {
+                let block_aligned_outer_close = is_thinking_block_start(source, start)
+                    && line_indentation(source, start) <= opened_indentation;
+                let closes_nested_literal =
+                    nested_literal_opens
+                        .last()
+                        .is_some_and(|(nested_start, _)| {
+                            line_start(source, *nested_start) == current_line
+                                || line_remainder_is_whitespace(source, end)
+                        });
+                if !block_aligned_outer_close && closes_nested_literal {
+                    nested_literal_opens.pop();
+                    continue;
+                }
+                if block_aligned_outer_close
+                    || current_line == opened_line
+                    || (!top_level && line_remainder_is_whitespace(source, end))
+                {
+                    tags.push((start, end, tag));
+                    opening = None;
+                    nested_literal_opens.clear();
+                }
+            }
+            _ => {}
+        }
     }
     tags
 }
 
-fn find_tags_in_line(
-    line: &str,
-    line_start: usize,
-    inline_code_width: &mut Option<usize>,
-    tags: &mut Vec<(usize, usize, ThinkingTag)>,
+fn collect_thinking_html_block(
+    source: &str,
+    range: std::ops::Range<usize>,
+    candidates: &mut Vec<ThinkingCandidate>,
 ) {
-    let bytes = line.as_bytes();
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        if bytes[cursor] == b'`' && !is_escaped(bytes, cursor) {
-            let run_start = cursor;
-            while bytes.get(cursor) == Some(&b'`') {
-                cursor += 1;
-            }
-            let width = cursor - run_start;
-            match *inline_code_width {
-                None => *inline_code_width = Some(width),
-                Some(active) if active == width => *inline_code_width = None,
-                Some(_) => {}
-            }
-            continue;
-        }
-        if inline_code_width.is_none() && !is_escaped(bytes, cursor) {
-            let (tag, width) = if bytes[cursor..].starts_with(THINKING_OPEN.as_bytes()) {
-                (Some(ThinkingTag::Open), THINKING_OPEN.len())
-            } else if bytes[cursor..].starts_with(THINKING_CLOSE.as_bytes()) {
-                (Some(ThinkingTag::Close), THINKING_CLOSE.len())
-            } else {
-                (None, 0)
-            };
-            if let Some(tag) = tag {
-                tags.push((line_start + cursor, line_start + cursor + width, tag));
-                cursor += width;
-                continue;
-            }
-        }
-        cursor += 1;
+    let block = &source[range.clone()];
+    let tag_offset = block.bytes().take_while(|byte| *byte == b' ').count();
+    if tag_offset > 3 {
+        return;
+    }
+    let tag_start = range.start + tag_offset;
+    if block[tag_offset..].starts_with(THINKING_CLOSE)
+        && line_remainder_is_whitespace(source, tag_start + THINKING_CLOSE.len())
+    {
+        candidates.push(ThinkingCandidate {
+            start: tag_start,
+            end: tag_start + THINKING_CLOSE.len(),
+            tag: ThinkingTag::Close,
+            top_level: true,
+        });
+        return;
+    }
+    if !block[tag_offset..].starts_with(THINKING_OPEN) {
+        return;
+    }
+    let open_start = tag_start;
+    if !is_thinking_block_start(source, open_start)
+        || !line_remainder_is_whitespace(source, open_start + THINKING_OPEN.len())
+    {
+        return;
+    }
+    candidates.push(ThinkingCandidate {
+        start: open_start,
+        end: open_start + THINKING_OPEN.len(),
+        tag: ThinkingTag::Open,
+        top_level: true,
+    });
+
+    let body_start = source[open_start + THINKING_OPEN.len()..range.end]
+        .find('\n')
+        .map_or(range.end, |offset| {
+            open_start + THINKING_OPEN.len() + offset + 1
+        });
+    if body_start < range.end {
+        collect_thinking_body(&source[body_start..range.end], body_start, candidates);
     }
 }
 
-fn is_escaped(bytes: &[u8], at: usize) -> bool {
-    let mut backslashes = 0;
-    let mut cursor = at;
-    while cursor > 0 && bytes[cursor - 1] == b'\\' {
-        backslashes += 1;
-        cursor -= 1;
+fn collect_thinking_body(
+    body: &str,
+    source_offset: usize,
+    candidates: &mut Vec<ThinkingCandidate>,
+) {
+    let mut blocks = Vec::new();
+    for (event, range) in Parser::new_ext(body, markdown_options()).into_offset_iter() {
+        match event {
+            Event::Start(tag) => {
+                if matches!(tag, Tag::HtmlBlock) && blocks.is_empty() {
+                    collect_leading_thinking_html_tag(
+                        &body[range.clone()],
+                        source_offset + range.start,
+                        candidates,
+                    );
+                }
+                blocks.push(matches!(tag, Tag::Paragraph));
+            }
+            Event::End(_) => {
+                blocks.pop();
+            }
+            Event::InlineHtml(html) => {
+                let top_level = blocks.as_slice() == [true];
+                if (html.as_ref() == THINKING_OPEN || html.as_ref() == THINKING_CLOSE)
+                    && (top_level || !blocks.is_empty())
+                {
+                    candidates.push(ThinkingCandidate {
+                        start: source_offset + range.start,
+                        end: source_offset + range.end,
+                        tag: if html.as_ref() == THINKING_OPEN {
+                            ThinkingTag::Open
+                        } else {
+                            ThinkingTag::Close
+                        },
+                        top_level,
+                    });
+                }
+            }
+            _ => {}
+        }
     }
-    backslashes % 2 == 1
 }
 
-fn opens_fence(line: &str) -> Option<MarkdownFence> {
-    let marker = fence_marker(line)?;
-    Some(MarkdownFence {
-        marker: marker.0,
-        width: marker.1,
-    })
-}
-
-fn closes_fence(line: &str, fence: MarkdownFence) -> bool {
-    let Some((marker, width, remainder)) = fence_marker(line) else {
-        return false;
+fn collect_leading_thinking_html_tag(
+    block: &str,
+    source_offset: usize,
+    candidates: &mut Vec<ThinkingCandidate>,
+) {
+    let indentation = block.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 {
+        return;
+    }
+    let (tag, width) = if block[indentation..].starts_with(THINKING_OPEN) {
+        (ThinkingTag::Open, THINKING_OPEN.len())
+    } else if block[indentation..].starts_with(THINKING_CLOSE) {
+        (ThinkingTag::Close, THINKING_CLOSE.len())
+    } else {
+        return;
     };
-    marker == fence.marker && width >= fence.width && remainder.trim().is_empty()
+    let line_end = block[indentation + width..]
+        .find('\n')
+        .map_or(block.len(), |offset| indentation + width + offset);
+    if !block[indentation + width..line_end].trim().is_empty() {
+        return;
+    }
+    let start = source_offset + indentation;
+    candidates.push(ThinkingCandidate {
+        start,
+        end: start + width,
+        tag,
+        top_level: true,
+    });
 }
 
-fn fence_marker(line: &str) -> Option<(u8, usize, &str)> {
-    let line = line.trim_end_matches(['\r', '\n']);
-    let bytes = line.as_bytes();
-    let mut offset = 0;
-    while offset < bytes.len() && offset < 4 && bytes[offset] == b' ' {
-        offset += 1;
-    }
-    if offset > 3 {
-        return None;
-    }
-    let marker = *bytes.get(offset)?;
-    if marker != b'`' && marker != b'~' {
-        return None;
-    }
-    let mut end = offset;
-    while bytes.get(end) == Some(&marker) {
-        end += 1;
-    }
-    let width = end - offset;
-    (width >= 3).then_some((marker, width, &line[end..]))
+fn line_start(source: &str, at: usize) -> usize {
+    source[..at].rfind('\n').map_or(0, |line| line + 1)
+}
+
+fn is_thinking_block_start(source: &str, at: usize) -> bool {
+    let indentation = &source.as_bytes()[line_start(source, at)..at];
+    indentation.len() <= 3 && indentation.iter().all(|byte| *byte == b' ')
+}
+
+fn line_indentation(source: &str, at: usize) -> usize {
+    source.as_bytes()[line_start(source, at)..]
+        .iter()
+        .take_while(|byte| **byte == b' ')
+        .count()
+}
+
+fn line_remainder_is_whitespace(source: &str, at: usize) -> bool {
+    let end = source[at..]
+        .find('\n')
+        .map_or(source.len(), |offset| at + offset);
+    source[at..end].trim_end_matches('\r').trim().is_empty()
 }
 
 #[cfg(test)]
@@ -320,6 +446,439 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_thinking_open_tags_only_at_block_start() {
+        let literal = "Explain <Thinking>literal</Thinking> syntax.";
+        assert_eq!(
+            split_assistant_text(literal),
+            vec![AssistantTextPart {
+                kind: AssistantTextPartKind::Answer,
+                text: literal,
+                complete: true,
+            }]
+        );
+
+        assert_eq!(
+            split_assistant_text("   <Thinking>working</Thinking>"),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "   ",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "working",
+                    complete: true,
+                },
+            ]
+        );
+
+        let indented_code = "    <Thinking>literal</Thinking>";
+        assert_eq!(
+            split_assistant_text(indented_code),
+            vec![AssistantTextPart {
+                kind: AssistantTextPartKind::Answer,
+                text: indented_code,
+                complete: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn recognizes_thinking_close_tags_only_on_the_opening_or_a_block_line() {
+        let source = "<Thinking>\n\
+                      A literal </Thinking> marker remains in the thought.\n\
+                      final evidence\n\
+                      </Thinking>\n\
+                      answer";
+        assert_eq!(
+            split_assistant_text(source),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "\nA literal </Thinking> marker remains in the thought.\nfinal evidence\n",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "\nanswer",
+                    complete: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_multiline_thinking_and_markdown_container_tags_distinct() {
+        let multiline = "<Thinking>\none line\n</Thinking>\nAnswer";
+        assert_eq!(
+            split_assistant_text(multiline),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "\none line\n",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "\nAnswer",
+                    complete: true,
+                },
+            ]
+        );
+
+        let listed = "- item\n  <Thinking>literal</Thinking>\n\n<Thinking>visible</Thinking>";
+        assert_eq!(
+            split_assistant_text(listed),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "- item\n  <Thinking>literal</Thinking>\n\n",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "visible",
+                    complete: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn closes_multiline_thinking_after_a_markdown_list_without_a_blank_line() {
+        for (source, thinking) in [
+            (
+                "<Thinking>Inspecting **alpha**.\n\n\
+                 - checking alpha\n\
+                 - checking score</Thinking>\n\
+                 # Answer",
+                "Inspecting **alpha**.\n\n- checking alpha\n- checking score",
+            ),
+            (
+                "<Thinking>\n\
+                 - checking alpha\n\
+                 - checking score\n\
+                 </Thinking>\n\
+                 # Answer",
+                "\n- checking alpha\n- checking score\n",
+            ),
+        ] {
+            assert_eq!(
+                split_assistant_text(source),
+                vec![
+                    AssistantTextPart {
+                        kind: AssistantTextPartKind::Thinking,
+                        text: thinking,
+                        complete: true,
+                    },
+                    AssistantTextPart {
+                        kind: AssistantTextPartKind::Answer,
+                        text: "\n# Answer",
+                        complete: true,
+                    },
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn nested_literal_thinking_pair_does_not_close_the_outer_thought() {
+        let source = "<Thinking>\n\
+                      - literal <Thinking>nested</Thinking>\n\
+                      - still thinking\n\
+                      </Thinking>\n\
+                      answer";
+        assert_eq!(
+            split_assistant_text(source),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "\n- literal <Thinking>nested</Thinking>\n- still thinking\n",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "\nanswer",
+                    complete: true,
+                },
+            ]
+        );
+        assert_eq!(answer_after_leading_thinking(source), "\nanswer");
+    }
+
+    #[test]
+    fn matches_the_browser_gfm_dialect_around_thinking_blocks() {
+        for source in [
+            "[^1]: definition\n<Thinking>after footnote-like text</Thinking>\nAfter",
+            "$$\nmath\n<Thinking>after dollar-delimited text</Thinking>\n$$\nAfter",
+            "Term\n: definition\n<Thinking>after definition-like text</Thinking>\nAfter",
+        ] {
+            assert!(
+                split_assistant_text(source)
+                    .iter()
+                    .any(|part| part.kind == AssistantTextPartKind::Thinking),
+                "expected a thinking part in {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn comment_closes_stay_inert_across_consecutive_multiline_blocks() {
+        let source = "<Thinking>\n\
+                      Comment-safe thought remains open.\n\
+                      <!--\n\
+                      </Thinking>\n\
+                      hidden close\n\
+                      -->\n\
+                      Still in the first thought.\n\
+                      </Thinking>\n\
+                      Between.\n\
+                      <Thinking>\n\
+                      Second thought.\n\
+                      </Thinking>\n\
+                      After.";
+        let parts = split_assistant_text(source);
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|part| part.kind == AssistantTextPartKind::Thinking)
+                .map(|part| part.text)
+                .collect::<Vec<_>>(),
+            vec![
+                "\nComment-safe thought remains open.\n<!--\n</Thinking>\nhidden close\n-->\nStill in the first thought.\n",
+                "\nSecond thought.\n",
+            ]
+        );
+        assert!(parts.iter().any(|part| {
+            part.kind == AssistantTextPartKind::Answer && part.text.contains("Between.")
+        }));
+        assert!(parts.iter().any(|part| {
+            part.kind == AssistantTextPartKind::Answer && part.text.contains("After.")
+        }));
+    }
+
+    #[test]
+    fn treats_unmatched_backtick_runs_as_literal_text() {
+        let source = "Before ` literal.\n<Thinking>working carefully</Thinking>\nAfter.";
+        assert_eq!(
+            split_assistant_text(source),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "Before ` literal.\n",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "working carefully",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "\nAfter.",
+                    complete: true,
+                },
+            ]
+        );
+
+        let source = "<Thinking>working ` carefully</Thinking>\nDone.";
+        assert_eq!(
+            split_assistant_text(source),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "working ` carefully",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "\nDone.",
+                    complete: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unmatched_backticks_do_not_suppress_later_thinking() {
+        let later_paragraph = "Before ` literal.\n\
+                               <Thinking>real thought</Thinking>\n\
+                               Later literal.";
+        assert_eq!(
+            split_assistant_text(later_paragraph),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "Before ` literal.\n",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "real thought",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "\nLater literal.",
+                    complete: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unmatched_backticks_do_not_pair_into_fenced_blocks() {
+        let later_fence = "Before ` literal.\n\
+                           ```md\n\
+                           Later ` literal.\n\
+                           ```\n\
+                           <Thinking>real thought</Thinking>";
+        assert_eq!(
+            split_assistant_text(later_fence),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "Before ` literal.\n```md\nLater ` literal.\n```\n",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "real thought",
+                    complete: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_balanced_multiline_code_spans_in_answer_text() {
+        let source = "Use `code across\n<Thinking>literal</Thinking>\nlines`.\n\
+                      <Thinking>real</Thinking>";
+        assert_eq!(
+            split_assistant_text(source),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "Use `code across\n<Thinking>literal</Thinking>\nlines`.\n",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "real",
+                    complete: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn leaves_html_comment_tags_in_answer_text() {
+        let inline = "before <!-- <Thinking>hidden</Thinking> --> after";
+        assert_eq!(
+            split_assistant_text(inline),
+            vec![AssistantTextPart {
+                kind: AssistantTextPartKind::Answer,
+                text: inline,
+                complete: true,
+            }]
+        );
+
+        let source = "<!--\n<Thinking>hidden</Thinking>\n-->\n\
+                      <Thinking>visible</Thinking>\nanswer";
+        assert_eq!(
+            split_assistant_text(source),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "<!--\n<Thinking>hidden</Thinking>\n-->\n",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "visible",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "\nanswer",
+                    complete: true,
+                },
+            ]
+        );
+
+        let unclosed = "<!-- <Thinking>hidden</Thinking>";
+        assert_eq!(
+            split_assistant_text(unclosed),
+            vec![AssistantTextPart {
+                kind: AssistantTextPartKind::Answer,
+                text: unclosed,
+                complete: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn leaves_raw_html_block_tags_outside_the_thinking_projection() {
+        let source = "<script>\n\
+                      <Thinking>hidden script text</Thinking>\n\
+                      </script>\n\
+                      \n\
+                      <div>\n\
+                      <Thinking>hidden div text</Thinking>\n\
+                      </div>\n\
+                      \n\
+                      <Thinking>visible</Thinking>";
+        assert_eq!(
+            split_assistant_text(source),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "<script>\n<Thinking>hidden script text</Thinking>\n</script>\n\n<div>\n<Thinking>hidden div text</Thinking>\n</div>\n\n",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "visible",
+                    complete: true,
+                },
+            ]
+        );
+
+        let after_heading = "# heading\n<foo>\n<Thinking>hidden</Thinking>";
+        assert_eq!(
+            split_assistant_text(after_heading),
+            vec![AssistantTextPart {
+                kind: AssistantTextPartKind::Answer,
+                text: after_heading,
+                complete: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_backtick_fence_info_that_commonmark_treats_as_text() {
+        let source = "```bad`\n\
+                      \n\
+                      <Thinking>visible</Thinking>";
+        assert_eq!(
+            split_assistant_text(source),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "```bad`\n\n",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "visible",
+                    complete: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn exposes_an_unclosed_streaming_thinking_block() {
         assert_eq!(
             split_assistant_text("before\n<Thinking>still working"),
@@ -342,6 +901,12 @@ mod tests {
     fn strips_thinking_only_when_it_leads_the_response() {
         assert_eq!(
             answer_after_leading_thinking("<Thinking>working</Thinking>\n{\"task\":\"ok\"}"),
+            "\n{\"task\":\"ok\"}"
+        );
+        assert_eq!(
+            answer_after_leading_thinking(
+                "<Thinking>working ` carefully</Thinking>\n{\"task\":\"ok\"}"
+            ),
             "\n{\"task\":\"ok\"}"
         );
         assert_eq!(

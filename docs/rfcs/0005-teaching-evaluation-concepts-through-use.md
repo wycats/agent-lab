@@ -509,7 +509,7 @@ The participant should be able to:
    the earlier validation remains evidence about the previous revision;
 5. obtain one passing replay and save the exact current revision as an
    evaluation;
-6. run the saved evaluation through v0 and Eve;
+6. run the saved evaluation through two configured harness profiles;
 7. identify what the definition fixed, what the comparison varied and
    verified, and one evidence-supported difference between the attempts;
 8. reach exact identities, evaluator versions, limits, raw events, and
@@ -536,16 +536,21 @@ does not establish broad learnability. Preserve the participant instruction,
 starting UI state, errors or hesitations, any interventions, completion
 outcome, and final explanation as the steel-thread evidence.
 
-Raw recordings or transcripts, participant identity, machine-local paths,
-credentials, and private workspace or model content remain local. The public
-steel-thread artifact contains only a participant-approved, sanitized summary
-of the instruction, fixture and source revision, starting UI state, elapsed
-time and terminal state, observed decision points, hesitations, errors,
+The public walkthrough uses only checked-in neutral conformance fixtures,
+public-safe synthetic drivers, and non-sensitive workspace and model inputs.
+Its steel-thread artifact contains only a participant-approved, sanitized
+summary of the instruction, fixture and source revision, starting UI state,
+elapsed time and terminal state, observed decision points, hesitations, errors,
 interventions, outcome, and final explanation. Paraphrase participant language
 by default; include quotations or screenshots only with explicit consent.
-Retain or delete raw study material according to the participant agreement,
-and never check it into this repository. If sanitization removes evidence
-needed for a claim, mark that claim unsupported.
+
+If a walkthrough uses a private workspace, model, driver, adapter, or product
+system, the entire observation—including any derived summary—remains in its
+owning repository and does not support claims in this public repository. Raw
+recordings or transcripts, participant identity, machine-local paths, and
+credentials also remain outside this repository. Retain or delete raw study
+material according to the participant agreement. If sanitization removes
+evidence needed for a public claim, mark that claim unsupported.
 
 ## Drawbacks
 

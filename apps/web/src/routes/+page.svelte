@@ -3,7 +3,7 @@
   import '@fontsource-variable/geist-mono';
   import { onMount } from 'svelte';
   import AgentSessionLiveStatus from '$lib/AgentSessionLiveStatus.svelte';
-  import AssistantMarkdown from '$lib/AssistantMarkdown.svelte';
+  import AssistantResponse from '$lib/AssistantResponse.svelte';
   import { projectAgentSessionLiveStatus } from '$lib/agent-live-status';
   import {
     agentTurnActivityDetail,
@@ -131,6 +131,8 @@
   let evaluationProposals: EvaluationProposalSummary[] = [];
   let activeProposal: EvaluationProposalSummary | undefined;
   let proposalProgress = '';
+  let proposalSourceTurnId: string | undefined;
+  let dismissedProposalIds = new Set<string>();
   let selectedDraft: EvaluationDraftDetail | undefined;
   let selectedDefinition: EvaluationDefinitionDetail | undefined;
   let selectedEvaluation: EvaluationDetail | undefined;
@@ -392,6 +394,8 @@
       activeProposal = undefined;
       proposalBusy = false;
       proposalProgress = '';
+      proposalSourceTurnId = undefined;
+      dismissedProposalIds = new Set();
     }
     loadedWorkbenchId = id;
     applyWorkbenchSelection(workbench.selection);
@@ -999,7 +1003,7 @@
         : 'Reviewing the selected turns…';
       watchEvaluationProposal(workspaceId, running.id);
     } else if (!running && !activeProposal) {
-      const latest = proposals[0];
+      const latest = proposals.find((proposal) => !dismissedProposalIds.has(proposal.id));
       const terminalFailure =
         latest && (latest.status === 'failed' || latest.status === 'cancelled')
           ? latest
@@ -1172,6 +1176,7 @@
             ...evaluationProposals.filter((proposal) => proposal.id !== proposalId)
           ];
           proposalBusy = false;
+          proposalSourceTurnId = undefined;
           if (detail.summary.status === 'complete' && detail.summary.draftId) {
             proposalProgress = 'Evaluation draft ready';
             await openEvaluationDraft(workspaceId, detail.summary.draftId);
@@ -1199,6 +1204,7 @@
     proposalBusy = true;
     actionError = '';
     proposalProgress = 'Preparing proposal agent…';
+    proposalSourceTurnId = turn.id;
     try {
       const proposal = await runClient.proposeEvaluation(
         agentSession.summary.workspaceId,
@@ -1210,6 +1216,10 @@
       );
       const shouldStartStream =
         activeProposal?.id !== proposal.id || !proposalEventStream;
+      if (dismissedProposalIds.has(proposal.id)) {
+        dismissedProposalIds = new Set(dismissedProposalIds);
+        dismissedProposalIds.delete(proposal.id);
+      }
       activeProposal = proposal;
       evaluationProposals = [
         proposal,
@@ -1221,6 +1231,7 @@
     } catch (error) {
       proposalBusy = false;
       proposalProgress = '';
+      proposalSourceTurnId = undefined;
       actionError = message(error);
     }
   }
@@ -1233,6 +1244,18 @@
     } catch (error) {
       actionError = message(error);
     }
+  }
+
+  function dismissProposal(): void {
+    if (!activeProposal || !['failed', 'cancelled'].includes(activeProposal.status)) return;
+    proposalEventStream?.abort();
+    proposalEventStream = undefined;
+    dismissedProposalIds = new Set(dismissedProposalIds);
+    dismissedProposalIds.add(activeProposal.id);
+    activeProposal = undefined;
+    proposalProgress = '';
+    proposalSourceTurnId = undefined;
+    proposalBusy = false;
   }
 
   function draftRevisionUpdate(revision: EvaluationRevision) {
@@ -1808,6 +1831,10 @@
         ) {
           const shouldStartStream =
             activeProposal?.id !== payload.proposal.id || !proposalEventStream;
+          if (dismissedProposalIds.has(payload.proposal.id)) {
+            dismissedProposalIds = new Set(dismissedProposalIds);
+            dismissedProposalIds.delete(payload.proposal.id);
+          }
           activeProposal = payload.proposal;
           proposalBusy = true;
           proposalProgress = 'Preparing proposal agent…';
@@ -1845,6 +1872,8 @@
             ? payload.status as EvaluationProposalStatus
             : undefined;
           if (status) {
+            proposalEventStream?.abort();
+            proposalEventStream = undefined;
             activeProposal = {
               ...activeProposal,
               status,
@@ -1853,6 +1882,7 @@
             };
           }
           proposalBusy = false;
+          proposalSourceTurnId = undefined;
           if (status === 'complete' && typeof payload.draftId === 'string') {
             proposalProgress = 'Evaluation draft ready';
             void openEvaluationDraft(id, payload.draftId);
@@ -2641,6 +2671,8 @@
                   </div>
                   {#if ['queued', 'running'].includes(activeProposal.status)}
                     <button on:click={() => void cancelProposal()}>Cancel</button>
+                  {:else}
+                    <button on:click={dismissProposal}>Dismiss</button>
                   {/if}
                 </section>
               {/if}
@@ -2671,7 +2703,7 @@
                           {#each turnMessages(turn) as responseMessage (responseMessage.id)}
                             <article class="assistant-message" data-message-id={responseMessage.id} data-complete={responseMessage.complete}>
                               {#if agentAnswerView === 'rendered'}
-                                <AssistantMarkdown source={responseMessage.text} streaming={!responseMessage.complete} />
+                                <AssistantResponse source={responseMessage.text} streaming={!responseMessage.complete} />
                               {:else}
                                 <!-- svelte-ignore a11y_no_noninteractive_tabindex (keyboard access for overflow content) -->
                                 <pre class="response-source" tabindex="0" aria-label="Markdown source for agent response">{responseMessage.text}</pre>
@@ -2718,12 +2750,22 @@
                     </footer>
                     {#if turn.status !== 'queued' && turn.status !== 'running'}
                       <div class="turn-actions">
+                        {#if proposalBusy && proposalSourceTurnId === turn.id}
+                          <span
+                            class="turn-proposal-status"
+                            role="status"
+                            data-testid="turn-proposal-status"
+                          >
+                            <span class="proposal-status-marker" aria-hidden="true"></span>
+                            Shaping evaluation…
+                          </span>
+                        {/if}
                         <button
                           class="suggest"
                           disabled={proposalBusy || draftBusy || activeAgentSession?.summary.status === 'running'}
                           on:click={() => void proposeEvaluation(turn)}
                         >
-                          {proposalBusy ? 'Shaping evaluation…' : 'Suggest evaluation'}
+                          Suggest evaluation
                         </button>
                         <button
                           disabled={draftBusy || proposalBusy || activeAgentSession?.summary.status === 'running'}
@@ -3624,7 +3666,9 @@
   .turn-activity small { display: block; margin-top: 3px; color: #687870; font-family: var(--font-mono); font-size: 0.54rem; }
   .turn-summary { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 12px 0 0 56px; color: #6f7e76; font-family: var(--font-mono); font-size: 0.54rem; }
   .turn-summary .turn-error { color: #d98d92; }
-  .turn-actions { display: flex; justify-content: flex-end; gap: 6px; margin: 10px 0 0 56px; }
+  .turn-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; margin: 10px 0 0 56px; }
+  .turn-proposal-status { display: inline-flex; align-items: center; gap: 6px; margin-right: 2px; color: #9eafa6; font-family: var(--font-mono); font-size: 0.57rem; }
+  .turn-proposal-status .proposal-status-marker { flex: none; width: 7px; height: 7px; }
   .turn-actions button { padding: 6px 9px; border: 1px solid #34463d; border-radius: 5px; color: #a5b8ae; font-size: 0.6rem; }
   .turn-actions button.suggest { border-color: #58714f; color: #bdd4ad; background: #152016; }
   .turn-actions button:not(:disabled):hover { border-color: #567261; color: #d0d9d4; background: #121c17; }

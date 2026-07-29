@@ -2897,7 +2897,36 @@ test('agent answers render constrained Markdown and retain inspectable source', 
       }
     });
   });
+  const manyLiteralThinkingTags = Array.from(
+    { length: 256 },
+    (_, index) => `<Thinking>literal-${index + 1}</Thinking>`
+  );
   const firstMessage = [
+    '<Thinking>',
+    'I am checking the catalog evidence before answering.',
+    '',
+    'A literal </Thinking> marker remains part of this thought.',
+    '',
+    ...Array.from({ length: 16 }, (_, index) => `<Thinking>nested literal ${index + 1}`),
+    '',
+    '- compare `alpha`',
+    '- verify **gamma**',
+    '- literal <Thinking>nested evidence</Thinking>',
+    '',
+    '```md',
+    '</Thinking>',
+    '```',
+    '',
+    '<!--',
+    '</Thinking>',
+    'comment-contained close marker must stay hidden',
+    '-->',
+    '</Thinking>',
+    '',
+    '```md',
+    ...manyLiteralThinkingTags,
+    '```',
+    '',
     '# Findings',
     '',
     '- **Alpha** is active',
@@ -2911,6 +2940,63 @@ test('agent answers render constrained Markdown and retain inspectable source', 
     '| --- | ---: |',
     '| gamma | 8 |',
     '',
+    'Use `<Thinking>literal</Thinking>` when documenting the source convention.',
+    'Use \\<Thinking>escaped\\</Thinking> for a literal Markdown example.',
+    '',
+    'An unmatched ` delimiter stays literal.',
+    '',
+    'A multiline comment begins here <!--',
+    '<Thinking>comment-contained opening must stay hidden</Thinking>',
+    '--> and ends here.',
+    '',
+    'A balanced multiline `code span begins',
+    '<Thinking>code-contained opening remains literal</Thinking>',
+    'and ends here`.',
+    '',
+    '> <Thinking>quoted documentation remains ordinary</Thinking>',
+    '',
+    '- <Thinking>listed documentation remains ordinary</Thinking>',
+    '',
+    '[Shared guide][shared-guide]',
+    '<Thinking>Checking the shared reference after the unmatched delimiter.</Thinking>',
+    '',
+    '<!-- <Thinking>comment-only thought must stay hidden</Thinking> -->',
+    '',
+    '<Thinking>',
+    'Comment-safe thought remains open.',
+    '<!--',
+    '</Thinking>',
+    'comment-contained close must stay hidden',
+    '-->',
+    'Still in the first consecutive thought.',
+    '</Thinking>',
+    'Visible between consecutive thoughts.',
+    '<Thinking>',
+    'Second consecutive thought.',
+    '</Thinking>',
+    'Visible after consecutive thoughts.',
+    '',
+    '<Thinking>List-close thought:',
+    '- inspect alpha',
+    '- inspect gamma</Thinking>',
+    'Visible after the list-close thought.',
+    '',
+    '<Thinking>',
+    '- inspect a standalone close',
+    '</Thinking>',
+    'Visible after the standalone list close.',
+    '',
+    '[^1]: footnote-like text',
+    '$$',
+    'dollar-delimited text',
+    '$$',
+    'Term',
+    ': definition-like text',
+    '<Thinking>Still visible after non-Marked extension syntax.</Thinking>',
+    'Visible after extension-like syntax.',
+    '',
+    '[shared-guide]: https://example.com/shared-guide',
+    '',
     '[Guide](https://example.com/guide)',
     '[Protocol relative](//example.com/guide)',
     '[Dial](tel:+15551212)',
@@ -2919,8 +3005,24 @@ test('agent answers render constrained Markdown and retain inspectable source', 
     '<img src="https://example.com/raw-image.png" onerror="alert(1)">',
     '<script>window.agentMarkdownXss = true</script>'
   ].join('\n');
-  const streamingSecondMessage = '## Next\n\nWaiting for **authoritative';
-  const completedSecondMessage = '## Next\n\nAuthoritative completion keeps the **same evidence**.';
+  const streamingSecondMessage = [
+    '<Thinking>Checking authoritative completion.</Thinking>',
+    '',
+    '## Next',
+    '',
+    'Waiting for **authoritative'
+  ].join('\n');
+  const completedSecondMessage = [
+    '<Thinking>Checking authoritative completion.</Thinking>',
+    '',
+    '## Next',
+    '',
+    'Authoritative completion keeps the **same evidence**.'
+  ].join('\n');
+  const streamingMarkerMessage =
+    '<Thinking>Preparing a marker-safe completion.';
+  const completedMarkerMessage =
+    'Literal \u{e000}agent-lab-thinking-open and \u{e000}agent-lab-thinking-close remain ordinary text.';
   let authoritative = false;
   const resourceRequests: string[] = [];
   page.on('request', (request) => {
@@ -2960,6 +3062,12 @@ test('agent answers render constrained Markdown and retain inspectable source', 
           text: authoritative ? completedSecondMessage : streamingSecondMessage,
           complete: authoritative,
           sourceEventSequences: sourceSequences
+        },
+        {
+          id: `${turn.id}-three`,
+          text: authoritative ? completedMarkerMessage : streamingMarkerMessage,
+          complete: authoritative,
+          sourceEventSequences: sourceSequences
         }
       ];
     }
@@ -2976,19 +3084,95 @@ test('agent answers render constrained Markdown and retain inspectable source', 
 
   const session = page.getByTestId('interactive-agent-session');
   const answer = session.getByTestId('agent-response').first();
-  await expect(answer.locator('.assistant-message')).toHaveCount(2);
+  const assistantMessages = answer.locator('.assistant-message');
+  await expect(assistantMessages).toHaveCount(3);
+  await expect(answer.getByTestId('assistant-markdown')).toHaveCount(3);
   await expect(answer).not.toContainText('Flattened response should not replace message boundaries.');
+  const thinkingBlocks = answer.locator('.thinking-block');
+  await expect(thinkingBlocks).toHaveCount(9);
+  await expect(thinkingBlocks.first().locator('summary')).toContainText('Thinking');
+  await expect(thinkingBlocks.first()).not.toHaveAttribute('open', '');
+  await expect(thinkingBlocks.nth(1)).not.toHaveAttribute('open', '');
+  await expect(thinkingBlocks.last()).toHaveAttribute('open', '');
+  await expect(
+    assistantMessages.nth(1).locator('.thinking-block[data-complete="true"] summary em')
+  ).toHaveCount(0);
+  await expect(
+    assistantMessages.nth(2).locator('.thinking-block[data-complete="false"] summary em')
+  ).toHaveText('in progress');
+  await thinkingBlocks.first().locator('summary').click();
+  await expect(thinkingBlocks.first()).toContainText(
+    'I am checking the catalog evidence before answering.'
+  );
+  await expect(thinkingBlocks.first()).toContainText('verify gamma');
+  await expect(thinkingBlocks.first()).toContainText(
+    'literal <Thinking>nested evidence</Thinking>'
+  );
+  await expect(
+    thinkingBlocks.first().getByRole('region', { name: 'md code from agent response' })
+  ).toContainText('</Thinking>');
+  const literalThinkingCode = answer
+    .getByRole('region', { name: 'md code from agent response' })
+    .filter({ hasText: 'literal-256' });
+  await expect(literalThinkingCode.locator('code')).toHaveText(
+    manyLiteralThinkingTags.join('\n')
+  );
+  await expect(answer).not.toContainText('comment-contained close marker must stay hidden');
   await expect(answer.getByRole('heading', { name: 'Findings', level: 3 })).toBeVisible();
   await expect(answer.getByRole('heading', { name: 'Next', level: 4 })).toBeVisible();
   await expect(answer.locator('strong').filter({ hasText: 'Alpha' })).toBeVisible();
+  await expect(
+    answer.locator('code').filter({ hasText: '<Thinking>literal</Thinking>' })
+  ).toBeVisible();
+  await expect(answer).toContainText('Use <Thinking>escaped</Thinking> for a literal Markdown example.');
+  await expect(answer).toContainText('An unmatched ` delimiter stays literal.');
+  await expect(answer).not.toContainText('comment-contained opening must stay hidden');
+  await expect(
+    answer.locator('code').filter({ hasText: '<Thinking>code-contained opening remains literal</Thinking>' })
+  ).toBeVisible();
+  await expect(answer).toContainText('quoted documentation remains ordinary');
+  await expect(answer).toContainText('listed documentation remains ordinary');
+  await thinkingBlocks.nth(1).locator('summary').click();
+  await expect(thinkingBlocks.nth(1)).toContainText(
+    'Checking the shared reference after the unmatched delimiter.'
+  );
+  await thinkingBlocks.nth(2).locator('summary').click();
+  await expect(thinkingBlocks.nth(2)).toContainText('Comment-safe thought remains open.');
+  await expect(thinkingBlocks.nth(2)).toContainText(
+    'Still in the first consecutive thought.'
+  );
+  await expect(thinkingBlocks.nth(2)).not.toContainText(
+    'comment-contained close must stay hidden'
+  );
+  await thinkingBlocks.nth(3).locator('summary').click();
+  await expect(thinkingBlocks.nth(3)).toContainText('Second consecutive thought.');
+  await thinkingBlocks.nth(4).locator('summary').click();
+  await expect(thinkingBlocks.nth(4)).toContainText('List-close thought:');
+  await expect(thinkingBlocks.nth(4)).toContainText('inspect gamma');
+  await thinkingBlocks.nth(5).locator('summary').click();
+  await expect(thinkingBlocks.nth(5)).toContainText('inspect a standalone close');
+  await thinkingBlocks.nth(6).locator('summary').click();
+  await expect(thinkingBlocks.nth(6)).toContainText(
+    'Still visible after non-Marked extension syntax.'
+  );
+  await expect(answer).toContainText('Visible between consecutive thoughts.');
+  await expect(answer).toContainText('Visible after consecutive thoughts.');
+  await expect(answer).toContainText('Visible after the list-close thought.');
+  await expect(answer).toContainText('Visible after the standalone list close.');
+  await expect(answer).toContainText('Visible after extension-like syntax.');
+  await expect(answer).not.toContainText('comment-only thought must stay hidden');
   await expect(answer.getByRole('region', { name: 'Table in agent response' })).toContainText('gamma');
   await expect(answer.getByRole('region', { name: 'nu code from agent response' })).toContainText(
     'catalog list | where active'
   );
-  const guide = answer.getByRole('link', { name: 'Guide' });
+  const guide = answer.getByRole('link', { name: 'Guide', exact: true });
   await expect(guide).toHaveAttribute('href', 'https://example.com/guide');
   await expect(guide).toHaveAttribute('target', '_blank');
   await expect(guide).toHaveAttribute('rel', 'noopener noreferrer');
+  const sharedGuide = answer.getByRole('link', { name: 'Shared guide' });
+  await expect(sharedGuide).toHaveAttribute('href', 'https://example.com/shared-guide');
+  await expect(sharedGuide).toHaveAttribute('target', '_blank');
+  await expect(sharedGuide).toHaveAttribute('rel', 'noopener noreferrer');
   const protocolRelative = answer.getByRole('link', { name: 'Protocol relative' });
   await expect(protocolRelative).toHaveAttribute('href', '//example.com/guide');
   await expect(protocolRelative).toHaveAttribute('target', '_blank');
@@ -3002,25 +3186,52 @@ test('agent answers render constrained Markdown and retain inspectable source', 
       [...element.querySelectorAll('img, script')].map((unsafeElement) => unsafeElement.outerHTML)
     )
   ).toEqual([]);
-  await expect(answer.locator('[data-streaming="true"]')).toHaveCount(1);
+  await expect(
+    answer.locator('[data-testid="assistant-response"][data-streaming="true"]')
+  ).toHaveCount(2);
   expect(resourceRequests).toEqual([]);
   expect(await page.evaluate(() => (window as Window & { agentMarkdownXss?: boolean }).agentMarkdownXss)).toBeUndefined();
 
+  const nextHeading = answer.getByRole('heading', { name: 'Next', level: 4 });
+  await nextHeading.evaluate((heading) => (heading.dataset.streamingIdentity = 'retained'));
   await terminalCanvas.evaluate((canvas) => (canvas.dataset.markdownSessionProbe = 'same-canvas'));
   authoritative = true;
   await submit(page, 'agent "Confirm the conclusion"');
   await expect(answer.locator('.assistant-message').last()).toHaveAttribute('data-complete', 'true');
   await expect(answer).toContainText('Authoritative completion keeps the same evidence.');
-  await expect(answer.locator('[data-streaming="true"]')).toHaveCount(0);
+  await expect(answer).toContainText(
+    'Literal \u{e000}agent-lab-thinking-open and \u{e000}agent-lab-thinking-close remain ordinary text.'
+  );
+  await expect(thinkingBlocks).toHaveCount(8);
+  await expect(nextHeading).toHaveAttribute('data-streaming-identity', 'retained');
+  await expect(
+    answer.locator('[data-testid="assistant-response"][data-streaming="true"]')
+  ).toHaveCount(0);
+  await expect(thinkingBlocks.locator('summary em')).toHaveCount(0);
+  await expect(thinkingBlocks.last()).not.toHaveAttribute('open', '');
   await expect(terminalCanvas).toHaveAttribute('data-markdown-session-probe', 'same-canvas');
   await expect(terminalInput).toBeFocused();
 
   const presentation = session.getByRole('group', { name: 'Agent answer presentation' });
   await presentation.getByRole('button', { name: 'Source' }).click();
-  await expect(answer.locator('.response-source')).toHaveCount(2);
+  await expect(answer.locator('.response-source')).toHaveCount(3);
   await expect(answer.locator('.response-source').first()).toContainText('# Findings');
+  await expect(answer.locator('.response-source').first()).toContainText('<Thinking>');
+  await expect(answer.locator('.response-source').first()).toContainText('</Thinking>');
+  await expect(answer.locator('.response-source').first()).toContainText(
+    '<!-- <Thinking>comment-only thought must stay hidden</Thinking> -->'
+  );
+  await expect(answer.locator('.response-source').first()).toContainText(
+    '[shared-guide]: https://example.com/shared-guide'
+  );
+  await expect(answer.locator('.response-source').first()).toContainText(
+    '<Thinking>literal-256</Thinking>'
+  );
   await expect(answer.locator('.response-source').first()).toContainText('<script>window.agentMarkdownXss = true</script>');
-  await expect(answer.locator('.response-source').last()).toContainText('Authoritative completion');
+  await expect(answer.locator('.response-source').nth(1)).toContainText('Authoritative completion');
+  await expect(answer.locator('.response-source').last()).toContainText(
+    '\u{e000}agent-lab-thinking-open'
+  );
   await expect(presentation.getByRole('button', { name: 'Source' })).toHaveAttribute('aria-pressed', 'true');
   await presentation.getByRole('button', { name: 'Rendered' }).click();
   await expect(answer.getByRole('heading', { name: 'Findings', level: 3 })).toBeVisible();
@@ -3419,9 +3630,12 @@ test('a completed turn becomes a revised, validated, saved, and rerunnable evalu
   await page.getByLabel('Default harness').selectOption('v0');
   await expect(page.getByLabel('Default model')).toHaveValue('fixture');
 
-  await submit(page, 'agent "Explain the active catalog as a reusable task"');
   const session = page.getByTestId('interactive-agent-session');
-  const turn = session.getByTestId('session-turn').last();
+  const turns = session.getByTestId('session-turn');
+  const turnCountBefore = await turns.count();
+  await submit(page, 'agent "Explain the active catalog as a reusable task"');
+  await expect(turns).toHaveCount(turnCountBefore + 1);
+  const turn = turns.nth(turnCountBefore);
   await expect(turn).toHaveAttribute('data-status', 'completed');
 
   await submit(
@@ -3672,11 +3886,24 @@ test('a separate proposal agent turns completed evidence into an attributed draf
   await page.getByLabel('Default harness').selectOption('v0');
   await expect(page.getByLabel('Default model')).toHaveValue('fixture');
 
-  await submit(page, 'agent "Explain the active catalog as a reusable task"');
   const session = page.getByTestId('interactive-agent-session');
-  const turn = session.getByTestId('session-turn').last();
+  const turns = session.getByTestId('session-turn');
+  const turnCountBefore = await turns.count();
+  await submit(page, 'agent "Explain the active catalog as a reusable task"');
+  await expect(turns).toHaveCount(turnCountBefore + 1);
+  const turn = turns.nth(turnCountBefore);
   await expect(turn).toHaveAttribute('data-status', 'completed');
 
+  let releaseProposalRequest: (() => void) | undefined;
+  const proposalRequestGate = new Promise<void>((resolve) => {
+    releaseProposalRequest = resolve;
+  });
+  await page.route(/\/api\/workbench\/[^/]+\/evaluation-proposals$/, async (route) => {
+    if (route.request().method() === 'POST') {
+      await proposalRequestGate;
+    }
+    await route.continue();
+  });
   const proposalStarted = page.waitForResponse((response) => {
     const path = new URL(response.url()).pathname;
     return (
@@ -3685,6 +3912,11 @@ test('a separate proposal agent turns completed evidence into an attributed draf
     );
   });
   await turn.getByRole('button', { name: 'Suggest evaluation' }).click();
+  const localProposalStatus = turn.getByTestId('turn-proposal-status');
+  await expect(localProposalStatus).toBeVisible();
+  await expect(localProposalStatus).toContainText('Shaping evaluation');
+  await expect(localProposalStatus.locator('.proposal-status-marker')).toBeVisible();
+  releaseProposalRequest?.();
   await expect((await proposalStarted).status()).toBe(202);
 
   const draft = page.getByTestId('evaluation-draft-view');
@@ -3728,8 +3960,8 @@ test('browser-originated proposals synchronize across attached tabs', async ({ p
 
   const initiatingDraft = page.getByTestId('evaluation-draft-view');
   const synchronizedDraft = observer.getByTestId('evaluation-draft-view');
-  await expect(initiatingDraft).toBeVisible();
-  await expect(synchronizedDraft).toBeVisible();
+  await expect(initiatingDraft).toBeVisible({ timeout: 30_000 });
+  await expect(synchronizedDraft).toBeVisible({ timeout: 30_000 });
   await expect(synchronizedDraft).toContainText('Suggested by');
   await expect(synchronizedDraft).toContainText(
     'This span captures the complete catalog-to-file behavior.'
@@ -3761,18 +3993,19 @@ test('terminal proposal failures remain visible after reload', async ({ page }) 
     finishedAtMs: 2,
     error: 'evaluation proposal returned invalid JSON'
   });
+  let proposalCreated = false;
+  let proposalEventRequests = 0;
   await page.route('**/evaluation-proposals/proposal-ui-failure/events', async (route) => {
+    proposalEventRequests += 1;
     await route.fulfill({
       status: 200,
       contentType: 'text/event-stream',
       body: `data: ${JSON.stringify({
         sequence: 1,
-        atMs: 2,
-        type: 'evaluation-proposal.finished',
+        atMs: 1,
+        type: 'evaluation-proposal.session.ready',
         payload: {
-          proposalId: 'proposal-ui-failure',
-          status: 'failed',
-          error: 'evaluation proposal returned invalid JSON'
+          proposalId: 'proposal-ui-failure'
         }
       })}\n\n`
     });
@@ -3788,6 +4021,7 @@ test('terminal proposal failures remain visible after reload', async ({ page }) 
     const path = new URL(route.request().url()).pathname;
     workspaceId = path.split('/')[3] ?? '';
     if (route.request().method() === 'POST') {
+      proposalCreated = true;
       await route.fulfill({
         status: 202,
         contentType: 'application/json',
@@ -3797,7 +4031,11 @@ test('terminal proposal failures remain visible after reload', async ({ page }) 
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
-        body: JSON.stringify([failedSummary()])
+        body: JSON.stringify(
+          proposalCreated
+            ? [{ ...failedSummary(), status: 'queued', finishedAtMs: undefined, error: undefined }]
+            : []
+        )
       });
     }
   });
@@ -3811,15 +4049,42 @@ test('terminal proposal failures remain visible after reload', async ({ page }) 
     id: 'proposal-ui-failure',
     status: 'queued'
   });
-  const failure = page.getByTestId('proposal-status');
-  await expect(failure).toHaveAttribute('data-status', 'failed');
-  await expect(failure).toContainText('Evaluation suggestion failed');
-  await expect(failure).toContainText('invalid JSON');
 
+  await page.route(/\/api\/runs\/[^/]+\/events(?:\?|$)/, async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: `data: ${JSON.stringify({
+        sequence: 999_999,
+        atMs: 2,
+        type: 'workbench.evaluation-proposal.finished',
+        payload: {
+          proposalId: 'proposal-ui-failure',
+          status: 'failed',
+          error: 'evaluation proposal returned invalid JSON'
+        }
+      })}\n\n`
+    });
+  });
   await page.reload();
   await expect(page.locator('.connection')).toHaveAttribute('data-state', 'connected');
+  const failure = page.getByTestId('proposal-status');
   await expect(page.getByTestId('proposal-status')).toHaveAttribute('data-status', 'failed');
   await expect(page.getByTestId('proposal-status')).toContainText('invalid JSON');
+  await page.getByTestId('proposal-status').getByRole('button', { name: 'Dismiss' }).click();
+  await expect(page.getByTestId('proposal-status')).toHaveCount(0);
+  await page.waitForTimeout(150);
+  const requestsAfterDismiss = proposalEventRequests;
+  await page.waitForTimeout(500);
+  expect(proposalEventRequests).toBe(requestsAfterDismiss);
+  await expect(
+    page
+      .getByTestId('interactive-agent-session')
+      .getByTestId('session-turn')
+      .last()
+      .getByRole('button', { name: 'Suggest evaluation' })
+  ).toBeEnabled();
 });
 
 test('a shell-originated proposal streams while the shared browser opens its draft', async ({ page }) => {

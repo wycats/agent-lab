@@ -3,10 +3,14 @@
 //! This crate exists to generate evidence for steel thread 0002. Its message
 //! names and Rust types are not stable Agent Lab contracts.
 
+mod assistant_text;
 mod evidence;
 mod process;
 mod protocol;
 
+pub use assistant_text::{
+    AssistantTextPart, AssistantTextPartKind, answer_after_leading_thinking, split_assistant_text,
+};
 pub use evidence::{
     CanonicalProjection, CanonicalizationPolicy, DriverEvidenceBundle, EVIDENCE_SCHEMA_VERSION,
     EvidenceError, EvidenceManifest,

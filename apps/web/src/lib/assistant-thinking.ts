@@ -4,7 +4,6 @@ import { Lexer } from 'marked';
 const THINKING_OPEN = '<Thinking>';
 const THINKING_CLOSE = '</Thinking>';
 const MARKER_PREFIX = '\u{e000}agent-lab-thinking';
-const MAX_THINKING_TAGS = 512;
 
 type ThinkingToken = Token & {
   type: 'thinking';
@@ -47,13 +46,7 @@ export function createAssistantThinkingProjector(): AssistantThinkingProjector {
     extension: thinkingExtension(() => markers),
     project(source) {
       markers = uniqueMarkers(source);
-      const tagCount = thinkingTagCount(source);
-      if (tagCount === 0) return source;
-      if (tagCount > MAX_THINKING_TAGS) {
-        return source
-          .replaceAll(THINKING_OPEN, '\\<Thinking>')
-          .replaceAll(THINKING_CLOSE, '\\</Thinking>');
-      }
+      if (!source.includes(THINKING_OPEN) && !source.includes(THINKING_CLOSE)) return source;
       const parsedTags = parsedThinkingTags(source);
       const ranges = thinkingRanges(source, parsedTags);
       const selected = new Set(
@@ -96,15 +89,6 @@ export function createAssistantThinkingProjector(): AssistantThinkingProjector {
       return projected.join('');
     }
   };
-}
-
-function thinkingTagCount(source: string): number {
-  let count = 0;
-  const tags = /<\/?Thinking>/g;
-  while (count <= MAX_THINKING_TAGS && tags.exec(source)) {
-    count += 1;
-  }
-  return count;
 }
 
 function thinkingRanges(

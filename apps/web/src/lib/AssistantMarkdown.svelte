@@ -83,7 +83,7 @@
       >
         <summary>
           <span>Thinking</span>
-          {#if streaming || !complete}<em>in progress</em>{/if}
+          {#if !complete}<em>in progress</em>{/if}
         </summary>
         <div class="thinking-content">
           {@render children?.()}

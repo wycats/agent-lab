@@ -3248,50 +3248,16 @@ fn parse_evaluation_proposal_candidate(
     let answer = agent_lab_driver_protocol::answer_after_leading_thinking(response);
     let source = answer.trim();
     let source = markdown_json_fence_contents(source).unwrap_or(source);
-    let mut value: JsonValue = serde_json::from_str(source).map_err(|error| {
+    let value: JsonValue = serde_json::from_str(source).map_err(|error| {
         RunError::Protocol(format!(
             "evaluation proposal returned invalid JSON: {error}"
         ))
     })?;
-    normalize_proposal_measurements(&mut value)?;
     serde_json::from_value(value).map_err(|error| {
         RunError::Protocol(format!(
             "evaluation proposal returned an invalid object: {error}"
         ))
     })
-}
-
-fn normalize_proposal_measurements(value: &mut JsonValue) -> Result<(), RunError> {
-    let Some(measurements) = value.get_mut("measurements") else {
-        return Ok(());
-    };
-    let JsonValue::Object(entries) = measurements else {
-        return Ok(());
-    };
-    let mut selected = BTreeSet::new();
-    for key in entries.keys() {
-        let canonical = match key.as_str() {
-            "duration" => "duration",
-            "model-turns" | "modelTurns" => "model-turns",
-            "capability-calls" | "capabilityCalls" => "capability-calls",
-            "workspace-effects" | "workspaceEffects" => "workspace-effects",
-            "reported-usage" | "reportedUsage" => "reported-usage",
-            unsupported => {
-                return Err(RunError::Protocol(format!(
-                    "evaluation proposal selected unsupported measurement: {unsupported}"
-                )));
-            }
-        };
-        selected.insert(canonical);
-    }
-    *measurements = json!(
-        PROPOSAL_MEASUREMENTS
-            .iter()
-            .filter(|measurement| selected.contains(**measurement))
-            .copied()
-            .collect::<Vec<_>>()
-    );
-    Ok(())
 }
 
 fn markdown_json_fence_contents(source: &str) -> Option<&str> {
@@ -5019,13 +4985,13 @@ mod tests {
 
         let fenced = format!(
             "<Thinking>Choose the stable measurements.</Thinking>\n```json\n{}\n```",
-            proposal_candidate_json(&json!({
-                "reportedUsage": {},
-                "duration": null,
-                "modelTurns": 1,
-                "capabilityCalls": 1,
-                "workspaceEffects": 0
-            }))
+            proposal_candidate_json(&json!([
+                "duration",
+                "model-turns",
+                "capability-calls",
+                "workspace-effects",
+                "reported-usage"
+            ]))
         );
         let parsed = parse_evaluation_proposal_candidate(&fenced).unwrap();
         assert_eq!(
@@ -5048,12 +5014,15 @@ mod tests {
                 .contains("invalid JSON")
         );
 
-        let unsupported = proposal_candidate_json(&json!({ "duration": null, "estimatedCost": 1 }));
+        let object = proposal_candidate_json(&json!({
+            "duration": false,
+            "reportedUsage": true
+        }));
         assert!(
-            parse_evaluation_proposal_candidate(&unsupported.to_string())
+            parse_evaluation_proposal_candidate(&object.to_string())
                 .unwrap_err()
                 .to_string()
-                .contains("unsupported measurement")
+                .contains("expected a sequence")
         );
     }
 
@@ -5158,6 +5127,21 @@ mod tests {
             .collect::<Vec<_>>();
 
         validate_proposal_candidate(&candidate, &source_turns, &evaluator, None, None).unwrap();
+
+        for measurements in [
+            Vec::new(),
+            vec!["duration".to_owned(), "duration".to_owned()],
+            vec!["estimated-cost".to_owned()],
+        ] {
+            candidate.measurements = measurements;
+            assert!(
+                validate_proposal_candidate(&candidate, &source_turns, &evaluator, None, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unique non-empty supported subset")
+            );
+        }
+        candidate.measurements = vec!["duration".to_owned(), "capability-calls".to_owned()];
 
         candidate.through_turn_id = "turn-3".to_owned();
         assert!(

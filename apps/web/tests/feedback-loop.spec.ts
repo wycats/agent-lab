@@ -2897,6 +2897,10 @@ test('agent answers render constrained Markdown and retain inspectable source', 
       }
     });
   });
+  const manyLiteralThinkingTags = Array.from(
+    { length: 256 },
+    (_, index) => `<Thinking>literal-${index + 1}</Thinking>`
+  );
   const firstMessage = [
     '<Thinking>',
     'I am checking the catalog evidence before answering.',
@@ -2918,6 +2922,10 @@ test('agent answers render constrained Markdown and retain inspectable source', 
     'comment-contained close marker must stay hidden',
     '-->',
     '</Thinking>',
+    '',
+    '```md',
+    ...manyLiteralThinkingTags,
+    '```',
     '',
     '# Findings',
     '',
@@ -3076,7 +3084,8 @@ test('agent answers render constrained Markdown and retain inspectable source', 
 
   const session = page.getByTestId('interactive-agent-session');
   const answer = session.getByTestId('agent-response').first();
-  await expect(answer.locator('.assistant-message')).toHaveCount(3);
+  const assistantMessages = answer.locator('.assistant-message');
+  await expect(assistantMessages).toHaveCount(3);
   await expect(answer.getByTestId('assistant-markdown')).toHaveCount(3);
   await expect(answer).not.toContainText('Flattened response should not replace message boundaries.');
   const thinkingBlocks = answer.locator('.thinking-block');
@@ -3085,6 +3094,12 @@ test('agent answers render constrained Markdown and retain inspectable source', 
   await expect(thinkingBlocks.first()).not.toHaveAttribute('open', '');
   await expect(thinkingBlocks.nth(1)).not.toHaveAttribute('open', '');
   await expect(thinkingBlocks.last()).toHaveAttribute('open', '');
+  await expect(
+    assistantMessages.nth(1).locator('.thinking-block[data-complete="true"] summary em')
+  ).toHaveCount(0);
+  await expect(
+    assistantMessages.nth(2).locator('.thinking-block[data-complete="false"] summary em')
+  ).toHaveText('in progress');
   await thinkingBlocks.first().locator('summary').click();
   await expect(thinkingBlocks.first()).toContainText(
     'I am checking the catalog evidence before answering.'
@@ -3096,6 +3111,12 @@ test('agent answers render constrained Markdown and retain inspectable source', 
   await expect(
     thinkingBlocks.first().getByRole('region', { name: 'md code from agent response' })
   ).toContainText('</Thinking>');
+  const literalThinkingCode = answer
+    .getByRole('region', { name: 'md code from agent response' })
+    .filter({ hasText: 'literal-256' });
+  await expect(literalThinkingCode.locator('code')).toHaveText(
+    manyLiteralThinkingTags.join('\n')
+  );
   await expect(answer).not.toContainText('comment-contained close marker must stay hidden');
   await expect(answer.getByRole('heading', { name: 'Findings', level: 3 })).toBeVisible();
   await expect(answer.getByRole('heading', { name: 'Next', level: 4 })).toBeVisible();
@@ -3186,6 +3207,7 @@ test('agent answers render constrained Markdown and retain inspectable source', 
   await expect(
     answer.locator('[data-testid="assistant-response"][data-streaming="true"]')
   ).toHaveCount(0);
+  await expect(thinkingBlocks.locator('summary em')).toHaveCount(0);
   await expect(thinkingBlocks.last()).not.toHaveAttribute('open', '');
   await expect(terminalCanvas).toHaveAttribute('data-markdown-session-probe', 'same-canvas');
   await expect(terminalInput).toBeFocused();
@@ -3201,6 +3223,9 @@ test('agent answers render constrained Markdown and retain inspectable source', 
   );
   await expect(answer.locator('.response-source').first()).toContainText(
     '[shared-guide]: https://example.com/shared-guide'
+  );
+  await expect(answer.locator('.response-source').first()).toContainText(
+    '<Thinking>literal-256</Thinking>'
   );
   await expect(answer.locator('.response-source').first()).toContainText('<script>window.agentMarkdownXss = true</script>');
   await expect(answer.locator('.response-source').nth(1)).toContainText('Authoritative completion');

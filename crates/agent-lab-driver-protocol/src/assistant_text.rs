@@ -431,6 +431,37 @@ mod tests {
     }
 
     #[test]
+    fn many_fenced_literal_tags_do_not_disable_a_later_thinking_block() {
+        let literals = (1..=256)
+            .map(|index| format!("<Thinking>literal-{index}</Thinking>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = format!("```md\n{literals}\n```\n<Thinking>real</Thinking>\nanswer");
+        let fence_end = source.find("\n<Thinking>real").unwrap();
+
+        assert_eq!(
+            split_assistant_text(&source),
+            vec![
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: &source[..=fence_end],
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Thinking,
+                    text: "real",
+                    complete: true,
+                },
+                AssistantTextPart {
+                    kind: AssistantTextPartKind::Answer,
+                    text: "\nanswer",
+                    complete: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn leaves_inline_code_tags_in_answer_text() {
         let source = "Use `<Thinking>literal</Thinking>` in output.\n\
                       Use ``<Thinking>`literal`</Thinking>`` too.\n\

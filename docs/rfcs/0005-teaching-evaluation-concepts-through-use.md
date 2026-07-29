@@ -285,11 +285,15 @@ It should answer:
 The workbench may prefill fields, but it should show their origin and invite
 review. Proposal output is advice, not an established expectation.
 
-The immutable revision model should be explained through behavior. The first
-confirmation creates a version that can be replayed. A later material edit
-creates another version and retains the earlier one with its attempts. The
-formal term **revision** and its identity remain visible in the precise
-projection.
+The immutable revision model should be explained through behavior. Draft
+creation may first persist a source-derived seed revision and, for assisted
+authoring, a second proposal-applied revision before the builder acts. The
+story presents these as attributed draft initialization, not as builder
+confirmation or a meaningful user edit; the precise projection retains both
+revision identities and contents. Builder review chooses whether to validate
+the current revision or edit it. Each later material edit creates another
+revision and retains the earlier one with its attempts. The formal term
+**revision** and its identity remain visible in the precise projection.
 
 ### 3. Validation replays one exact version
 
@@ -297,14 +301,18 @@ Before launch, validation should summarize:
 
 - the revision being exercised;
 - the captured starting state;
-- the requested harness, model, driver, adapter, and execution host;
+- the selected harness and model;
+- driver and adapter identities available in the current assembly;
+- any execution-host identity retained by controller-owned evidence, otherwise
+  **not reported**;
 - the capability recipe and limits; and
 - the assertions that will determine the result.
 
 The completed attempt should then distinguish requested configuration from the
 concrete identities it exercised, any stack or capability drift, unavailable
 adapter acknowledgement, and which fixed dimensions Agent Lab verified rather
-than merely requested.
+than merely requested. Execution-host identity is shown only when retained by
+the attempt's evidence; otherwise it remains **not reported**.
 
 While it runs, progress belongs in the draft story as well as global activity.
 The UI should connect restoration, harness startup, agent activity, workspace
@@ -366,12 +374,13 @@ workbench should show:
 - **Fixed by the definition:** revision, snapshot digest, task, declared
   capability recipe and source revisions, assertions, evaluator version, and
   limits.
-- **Selected variation:** harness, model, execution host, capability
-  projection, or another named dimension.
+- **Selected variation:** harness, model, capability projection, or another
+  named dimension that the controller will retain in the attempt.
 - **Verified for this attempt:** the concrete harness, model, driver, adapter,
-  host, and capability identities each arm actually exercised; any drift or
-  unavailable acknowledgement; and which fixed dimensions Agent Lab verified
-  rather than merely requested.
+  and capability identities each arm actually exercised; execution-host
+  identity when retained, otherwise **not reported**; any drift or unavailable
+  acknowledgement; and which fixed dimensions Agent Lab verified rather than
+  merely requested.
 - **Measured:** correctness gates, activity, effects, latency, usage, context,
   and any scenario-specific observations.
 

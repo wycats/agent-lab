@@ -4,8 +4,9 @@
 - Substrate evidence: the mechanical lifecycle demonstrated by
   [steel threads 0005](../steel-threads/0005-manual-evaluation-promotion.md)
   and [0006](../steel-threads/0006-assisted-evaluation-proposal.md)
-- Product hypothesis: those rigorous resources do not yet teach their
-  causal relationships well enough through use
+- Product hypothesis: one controller-derived evaluation story can help a
+  builder form an accurate causal model through use while retaining precise
+  resource and evidence access
 - Acceptance evidence: not yet collected; see
   [Validation boundary](#validation-boundary)
 - Timebox: one implementation and acceptance slice, capped at five working
@@ -99,10 +100,10 @@ invariant, and evidence available whenever precision is needed.
 
 [RFC 0001](0001-product-thesis.md) already says that the interface should teach
 its programming model through use and that evaluations are the durable
-continuation of exploration. This RFC tests the product hypothesis that the
-implemented promotion loop needs a more specific interaction contract: correct
-resource forms and status badges may not by themselves explain the loop.
-Acceptance evidence for that hypothesis has not yet been collected.
+continuation of exploration. This RFC tests whether the proposed evaluation
+story can help one participant form an accurate causal model through use while
+retaining precise access to the underlying resources and evidence. Acceptance
+evidence for that hypothesis has not yet been collected.
 
 Current implementation demonstrates one useful transition-level pattern:
 proposal work begins beside the source turn, detailed lifecycle feedback remains
@@ -384,10 +385,11 @@ workbench should show:
 - **Measured:** correctness gates, activity, effects, latency, usage, context,
   and any scenario-specific observations.
 
-The result should lead with the observed difference between these attempts,
+The result should lead with the supported comparison outcome: an observed
+difference between the attempts, or that no supported difference was observed;
 then offer aligned activity and raw evidence. Call the comparison controlled
 only for dimensions Agent Lab verified; one paired attempt does not establish
-that the selected variant caused the difference. It should not declare a
+that the selected variant caused a difference. It should not declare a
 universal winner or imply a repeated quality claim.
 
 ## Workbench projection
@@ -487,10 +489,22 @@ workspace problem taught through this interaction model.
 ## Validation boundary
 
 The first evidence boundary is an uncoached catalog walkthrough. The
-participant understands agent harnesses but receives only this goal:
+participant understands agent harnesses and receives this complete written
+task:
 
 > Turn something the agent did into a repeatable evaluation, then use it to
 > compare two harnesses.
+>
+> When you believe that is complete:
+>
+> 1. show where you can inspect the exact identities, evaluator version,
+>    limits, raw events, and structured Nushell value;
+> 2. restart the workbench and reopen the same evaluation story without live
+>    harnesses; and
+> 3. explain in your own words what the draft, revision, validation attempt,
+>    saved evaluation, and paired evaluation attempt each represent; why the
+>    failed replay remains useful; what one passing replay establishes; and
+>    which facts make the comparison controlled.
 
 The recorded acceptance setup gives either authoring path a reviewed catalog
 evaluator with one stale total-score expectation. The interface identifies the
@@ -502,7 +516,9 @@ The walkthrough ends when the participant completes the final explanation,
 explicitly stops, requests or receives task-specific coaching, or reaches 45
 minutes. In the latter three cases, record the terminal state, intervention if
 any, and observed gap as a non-accepting observation rather than extending the
-attempt. If the presentation slice cannot reach this boundary within five
+attempt. The written task above is the complete standardized protocol, not an
+intervention; any additional product-specific prompt or navigational hint is
+coaching. If the presentation slice cannot reach this boundary within five
 working days, preserve the blockers and revise the proposal instead of
 broadening the slice.
 
@@ -520,7 +536,8 @@ The participant should be able to:
    evaluation;
 6. run the saved evaluation through two configured harness profiles;
 7. identify what the definition fixed, what the comparison varied and
-   verified, and one evidence-supported difference between the attempts;
+   verified, and either one evidence-supported difference between the attempts
+   or that no supported difference was observed;
 8. reach exact identities, evaluator versions, limits, raw events, and
    structured Nushell records through a deliberate disclosure or command
    without losing the causal account; and

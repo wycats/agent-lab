@@ -107,6 +107,10 @@ The interface should teach this model through use. Completion, help, examples,
 structured values, visible state, and origin-labelled events are product
 behavior, not documentation added after the fact.
 
+[RFC 0005](0005-teaching-evaluation-concepts-through-use.md) specifies how the
+evaluation workbench should make that learning visible while preserving exact
+resource identities and evidence.
+
 A useful exploration can leave behind several kinds of durable material:
 
 - workspace state can become a seed or fixture;
@@ -422,6 +426,10 @@ Existing steel threads have demonstrated:
 - immutable draft revisions with retained failed and passing validations;
 - explicit promotion of an exactly validated revision into the local
   evaluation library;
+- layered answer presentation that distinguishes harness-reported thinking from
+  the useful response while retaining exact source and structured values;
+- source-turn-local proposal progress with durable, dismissible terminal
+  failure;
 - attributable read-only proposal assistance over durable turn evidence; and
 - a promoted definition rerun through v0 and Eve and reopened after restart.
 
@@ -438,11 +446,18 @@ change has yet been followed by a controlled rerun of the preserved evaluation.
 
 ## Next validation boundary
 
-Use the completed interaction-to-evaluation loop for the first richer
-capability experiment: live code-server diagnostics. Expose the same settled
-diagnostic source through MCP and harness-native projections, preserve the
-workspace revision that each observation describes, and test whether semantic
-diagnostics improve repair behavior while preserving correctness.
+Extend the source-turn-local feedback now demonstrated for proposal work into a
+coherent evaluation story across drafting, replay, revision, saving, and
+comparison. RFC 0005 defines an uncoached catalog walkthrough in which a
+builder can explain the captured state, a failed replay, revision, promotion,
+and controlled comparison without first learning the controller's resource
+graph.
+
+After that product boundary works, use it for the first richer capability
+experiment: live code-server diagnostics. Expose the same settled diagnostic
+source through MCP and harness-native projections, preserve the workspace
+revision that each observation describes, and test whether semantic diagnostics
+improve repair behavior while preserving correctness.
 
 Real-model proposal observations can refine the assistance contract in
 [RFC 0004](0004-interactive-agent-sessions-and-evaluation-promotion.md) without

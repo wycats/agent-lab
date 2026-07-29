@@ -56,6 +56,11 @@ It proposes a meaningful turn span and editable resource while preserving the
 manual path and the identities demonstrated here. Its candidate remains advice:
 the builder edits, validates, and explicitly promotes the resulting revision.
 
+[RFC 0005](0005-teaching-evaluation-concepts-through-use.md) defines how the
+workbench should teach and operate this lifecycle as one causal evaluation
+story. This RFC continues to own the resource identities, trust boundaries,
+and lifecycle semantics underneath that projection.
+
 ## Implementation status
 
 This milestone implements the interactive-session, assisted-drafting, and
@@ -67,12 +72,15 @@ manual-promotion substrate:
 - attributable assistant, capability, native-action, usage, and workspace
   projections;
 - answer-first `agent-answer` records, terminal Markdown, streaming and raw
-  modes, and durable turn reopening; and
+  modes, durable turn reopening, and distinct rendering of harness-reported
+  thinking;
 - a synchronized browser Session view with live progress and
   **Rendered**/**Source** presentation;
 - a separate read-only `ProposalSession` with explicit source/proposer
-  provenance, versioned structured output, cancellation, recovery, and shared
-  Nushell/browser progress;
+  provenance, versioned structured output, cancellation, recovery, shared
+  Nushell/browser progress, source-turn-local browser feedback, and retained
+  terminal failures, while allowing attributed thinking before the strict
+  proposal candidate;
 - editable draft revisions derived from stable turn spans and revision-owned
   pre-turn snapshots;
 - reviewed `catalog-to-file@1` validation with distinct execution and
@@ -84,6 +92,16 @@ manual-promotion substrate:
 
 Real-model proposer quality, general assertion languages, repository export,
 and repeated statistical claims remain outside the demonstrated boundary.
+
+The source-action feedback gap is now partially addressed for proposal
+initiation and failure. Direct use still exposed a broader presentation gap:
+the implemented browser makes the promotion resources operable, but builders
+need substantial coaching to understand how source turns, revisions,
+validation outcomes, saved definitions, and comparisons relate. The lifecycle
+evidence in this RFC remains valid.
+[RFC 0005](0005-teaching-evaluation-concepts-through-use.md) defines the
+provisional interaction model that must make those relationships learnable
+through use.
 
 ## Motivation
 
@@ -532,6 +550,12 @@ remote images are not fetched, and unsafe links are disabled. **Source**
 preserves message boundaries and exposes the retained Markdown without mutating
 evidence.
 
+When the harness reports Thinking inside an assistant message, **Rendered**
+projects it as distinct collapsible work-in-progress or completed thinking
+beside the useful answer. **Source** retains the exact tag bytes, and direct
+Nushell display distinguishes the same thinking without changing the structured
+answer record.
+
 The Session view does not place an unrelated Explore-run review beneath the
 conversation. Assembly and raw lifecycle state remain available as secondary
 disclosures.
@@ -542,10 +566,16 @@ separate proposer and opens its editable draft; **Create manually** opens the
 same resource without proposal assistance. Neither action silently saves model
 output as an evaluation.
 
-A shell-created evaluation proposal opens the corresponding draft review
-without unmounting the terminal or stealing its focus.
+While a browser-originated proposal runs, the initiating turn shows its local
+**Shaping evaluation** state. Proposal progress also remains available in the
+session activity area, and a terminal failure remains visible and dismissible
+after reload. Completion opens the shared draft in attached browser tabs, and a
+shell-originated proposal opens the same draft without unmounting the terminal
+or stealing its focus. This is the first demonstrated instance of the
+transition-local feedback generalized by RFC 0005.
 
-The draft view makes the following relationships visible:
+The current draft view exposes the data needed to reconstruct these
+relationships:
 
 - selected source turns and their pre-turn state;
 - proposed task, assertions, and measurements;
@@ -554,6 +584,12 @@ The draft view makes the following relationships visible:
 - validation attempts, assertion mismatches, and workspace effects;
 - whether the current draft revision has been promoted into a runnable
   definition.
+
+RFC 0005 defines the missing presentation contract. Those relationships should
+appear as one question-oriented evaluation story attached to the source turn.
+Resource tabs remain available for precise inspection, but they are not the
+only explanation of causality. Progress, failures, revision changes, saving,
+and comparison choices appear beside the action and resource they describe.
 
 The browser's **Create manually** operation uses the same `new` operation as
 Nushell: the builder selects an evidence span and receives an incomplete,
@@ -704,9 +740,9 @@ checked-in scenario.
 
 ## Validation boundary
 
-The first steel threads prove one complete catalog-based path as a
-five-minute harness-builder walkthrough. The participant understands agent
-harnesses but receives only this orientation:
+The first steel threads exercise one complete catalog-based path as a
+harness-builder walkthrough. The intended persona-level boundary assumes that
+the participant understands agent harnesses but receives only this orientation:
 
 > Use the shell to work with the agent and the Session view to understand what
 > the harness did.
@@ -729,9 +765,10 @@ assisted promotion boundary demonstrated by steel threads 0005 and 0006.
    turns that have no pipeline input.
 5. Create a second session, switch between sessions, and reopen the first with
    its conversation and evidence intact.
-6. Choose **Suggest evaluation** on a stable turn. Observe the separate,
-   read-only proposer and open its attributed editable draft. Demonstrate
-   **Create manually** as the equivalent no-proposer path.
+6. Choose **Suggest evaluation** on a stable turn. Observe source-turn-local
+   initiation, detailed lifecycle feedback, the separate read-only proposer,
+   and its attributed editable draft. Demonstrate **Create manually** as the
+   equivalent no-proposer path.
 7. Review and edit the same draft through Nushell and the browser.
 8. Replay it from the captured state, retain one complete failed validation,
    revise the evaluator parameters, and produce a passing current revision.
@@ -749,10 +786,14 @@ Deterministic external drivers establish session, projection, validation,
 failure, and recovery contracts. One real-model catalog demonstration,
 including a retained assertion failure, corrected passing revision, explicit
 promotion, and paired variant run, establishes that the interaction survives
-contact with actual harnesses. The visible walkthrough completed locally; its
-public-safe evidence is summarized in steel threads 0005 and 0006. Steel thread
-0006 uses deterministic adapters to prove proposer lifecycle and trust
-boundaries; it does not establish real-model proposal quality.
+contact with actual harnesses. The mechanical walkthrough completed locally,
+and its public-safe evidence is summarized in steel threads 0005 and 0006.
+Direct use nevertheless required ongoing coaching to relate source turns,
+revisions, validation outcomes, saved definitions, and comparisons. The
+persona-level acceptance criterion therefore remains open. RFC 0005 defines
+the uncoached interaction boundary that should close it. Steel thread 0006 uses
+deterministic adapters to prove proposer lifecycle and trust boundaries; it
+does not establish real-model proposal quality.
 
 ## Boundaries
 
@@ -775,8 +816,11 @@ The following work remains available for subsequent evidence:
 ## Remaining implementation questions
 
 The promotion and proposal steel threads answered the initial snapshot,
-evaluator, revision, validation, local-library, proposal-attribution, and
-progress-projection questions. The next slices should answer:
+evaluator, revision, validation, local-library, and proposal-attribution
+questions. The proposal feedback slice also answered proposal-operation
+progress, recovery, and failure-retention questions. RFC 0005 asks how that
+contextual pattern extends across the complete evaluation lifecycle. The next
+slices should answer:
 
 - Which normalized assistant, capability, native-action, workspace-effect, and
   usage observations must an adapter supply, and how should incomplete
@@ -800,3 +844,9 @@ controller, driver, capability, surface, and evidence boundaries. Promotion and
 proposal assistance add revision-owned snapshots, distinct validation
 attempts, portable definitions, and operation-scoped read-only agent work
 without changing RFC 0003's Candidate status.
+
+[RFC 0005](0005-teaching-evaluation-concepts-through-use.md) defines the
+question-oriented browser and Nushell projection over the lifecycle specified
+here. Its uncoached-use boundary tests whether the implemented resources become
+an accurate working intuition rather than a vocabulary the builder must learn
+in advance.
